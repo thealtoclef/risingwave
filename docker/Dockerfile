@@ -24,11 +24,10 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- --no-mo
 ENV PATH /root/.cargo/bin:$PATH
 ENV CARGO_INCREMENTAL=0
 
-COPY rust-toolchain rust-toolchain
-
 # We need to add the `rustfmt` dependency, otherwise `risingwave_pb` will not compile
 RUN rustup self update \
   && rustup set profile minimal \
+  && rustup default nightly-2024-10-11 \
   && rustup show \
   && rustup component add rustfmt \
   && rustup target add wasm32-wasi
