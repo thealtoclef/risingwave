@@ -118,8 +118,6 @@ RUN mvn -B package -Dmaven.test.skip=true -Dno-build-rust && \
 
 FROM base AS risingwave
 
-LABEL org.opencontainers.image.source https://github.com/risingwavelabs/risingwave
-
 RUN apt-get update && apt-get -y install linux-tools-generic \
     && ln -s "$(find /usr/lib/linux-tools/*/perf | head -1)" /usr/local/bin/perf
 
