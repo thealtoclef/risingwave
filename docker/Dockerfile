@@ -74,6 +74,7 @@ ENV ENABLE_BUILD_DASHBOARD=1
 ENV OPENSSL_STATIC=1
 
 RUN cargo fetch && \
+  npm install && \
   cargo build -p risingwave_cmd_all --profile ${CARGO_PROFILE} --features "rw-static-link" --features all-udf && \
   mkdir -p /risingwave/bin && \
     mv /risingwave/target/${CARGO_PROFILE}/risingwave /risingwave/bin/ && \
