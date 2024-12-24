@@ -1,0 +1,33 @@
+name: Release Docker Image
+
+on:
+  workflow_dispatch: # for manual testing
+    inputs:
+      runs_on:
+        type: choice
+        description: "Runs on"
+        options:
+          - self-hosted
+          - self-hosted-dind
+          - ubuntu-latest
+      dind:
+        type: boolean
+        description: "Docker-in-Docker runner"
+        default: false
+  push:
+    # Publish semver tags as releases:
+    tags: ["v*.*.*"]
+
+jobs:
+  call-docker-release:
+    permissions:
+      contents: read
+      packages: write
+    uses: thealtoclef/modular-automations/.github/workflows/docker-release.yaml@main
+    with:
+      runs_on: ${{ github.event.inputs.runs_on || 'self-hosted' }}
+      dind: ${{ github.event.inputs.dind == 'true' }}
+      dockerfile_path: docker/Dockerfile
+      build_args: |
+        GIT_SHA=${{ github.sha }}
+        CARGO_PROFILE=production
