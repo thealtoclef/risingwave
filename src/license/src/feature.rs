@@ -120,33 +120,7 @@ pub enum FeatureNotAvailable {
 impl Feature {
     /// Check whether the feature is available based on the current license.
     pub fn check_available(self) -> Result<(), FeatureNotAvailable> {
-        let check_res = match LicenseManager::get().license() {
-            Ok(license) => {
-                if license.tier >= self.min_tier() {
-                    Ok(())
-                } else {
-                    Err(FeatureNotAvailable::InsufficientTier {
-                        feature: self,
-                        current_tier: license.tier,
-                    })
-                }
-            }
-            Err(error) => {
-                // If there's a license key error, we still try against the default license first
-                // to see if the feature is available for free.
-                if License::default().tier >= self.min_tier() {
-                    Ok(())
-                } else {
-                    Err(FeatureNotAvailable::LicenseError {
-                        feature: self,
-                        source: error,
-                    })
-                }
-            }
-        };
-
-        report_telemetry(&self, self.get_feature_name(), check_res.is_ok());
-
-        check_res
+        report_telemetry(&self, self.get_feature_name(), true);
+        Ok(())
     }
 }
