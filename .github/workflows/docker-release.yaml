@@ -1,0 +1,20 @@
+name: Release Docker Image
+
+on:
+  workflow_dispatch: # for manual testing
+  push:
+    # Publish semver tags as releases:
+    tags: ["*.*.*"]
+
+jobs:
+  call-docker-release:
+    permissions:
+      contents: write
+      packages: write
+    uses: thealtoclef/modular-automations/.github/workflows/docker-release.yaml@main
+    with:
+      force_build: true
+      dockerfile_path: docker/Dockerfile
+      build_args: |
+        GIT_SHA=${{ github.sha }}
+        CARGO_PROFILE=production
