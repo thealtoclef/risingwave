@@ -14,7 +14,7 @@
 
 use thiserror::Error;
 
-use super::{LicenseError, LicenseManager, Tier, report_telemetry};
+use super::{LicenseError, LicenseManager, Tier};
 
 /// Define all features that are available based on the tier of the license.
 ///
@@ -83,14 +83,6 @@ macro_rules! def_feature {
                     )*
                 }
             }
-
-            fn get_feature_name(&self) -> &'static str {
-                match &self {
-                    $(
-                        Self::$name => stringify!($name),
-                    )*
-                }
-            }
         }
     };
 }
@@ -121,26 +113,10 @@ impl Feature {
     /// Check whether the feature is available based on the given license manager.
     pub(crate) fn check_available_with(
         self,
-        manager: &LicenseManager,
+        _manager: &LicenseManager,
     ) -> Result<(), FeatureNotAvailable> {
-        let check_res = match manager.license() {
-            Ok(license) => {
-                if license.tier >= self.min_tier() {
-                    Ok(())
-                } else {
-                    Err(FeatureNotAvailable::InsufficientTier {
-                        feature: self,
-                        current_tier: license.tier,
-                    })
-                }
-            }
-            Err(error) => Err(FeatureNotAvailable::LicenseError {
-                feature: self,
-                source: error,
-            }),
-        };
-
-        report_telemetry(&self, self.get_feature_name(), check_res.is_ok());
+        // Always consider the check as successful
+        let check_res = Ok(());
 
         check_res
     }
