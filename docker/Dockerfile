@@ -27,7 +27,7 @@ ENV CARGO_INCREMENTAL=0
 COPY rust-toolchain rust-toolchain
 
 # We need to add the `rustfmt` dependency, otherwise `risingwave_pb` will not compile
-RUN rustup self update \
+RUN rustup toolchain install \
   && rustup set profile minimal \
   && rustup show \
   && rustup component add rustfmt \
