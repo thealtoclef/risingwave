@@ -59,6 +59,7 @@ const fn _default_stream_load_http_timeout_ms() -> u64 {
     30 * 1000
 }
 
+#[serde_as]
 #[derive(Deserialize, Debug, Clone, WithOptions)]
 pub struct StarrocksCommon {
     /// The `StarRocks` host address.
@@ -82,6 +83,10 @@ pub struct StarrocksCommon {
     /// The `StarRocks` table you want to sink data to.
     #[serde(rename = "starrocks.table")]
     pub table: String,
+    /// Auto-create table if it doesn't exist
+    #[serde(default)] // default false
+    #[serde_as(as = "DisplayFromStr")]
+    pub auto_create: bool,
 }
 
 #[serde_as]
@@ -253,6 +258,146 @@ impl StarrocksSink {
             )),
         }
     }
+
+    fn get_starrocks_type_string(data_type: &DataType) -> Result<String> {
+        match data_type {
+            DataType::Boolean => Ok("BOOLEAN".to_string()),
+            DataType::Int16 => Ok("SMALLINT".to_string()),
+            DataType::Int32 => Ok("INT".to_string()),
+            DataType::Int64 | DataType::Serial => Ok("BIGINT".to_string()),
+            DataType::Float32 => Ok("FLOAT".to_string()),
+            DataType::Float64 => Ok("DOUBLE".to_string()),
+            DataType::Decimal => Ok("DECIMAL(38, 9)".to_string()),
+            DataType::Date => Ok("DATE".to_string()),
+            DataType::Varchar => Ok("VARCHAR(65533)".to_string()),
+            DataType::Timestamp => Ok("DATETIME".to_string()),
+            DataType::Jsonb => Ok("JSON".to_string()),
+            DataType::List(list) => {
+                let inner_type = Self::get_starrocks_type_string(list.as_ref())?;
+                Ok(format!("ARRAY<{}>", inner_type))
+            },
+            // Handle unsupported types
+            DataType::Time => Err(SinkError::Starrocks(
+                "TIME is not supported for Starrocks sink. Please convert to VARCHAR or other supported types.".to_owned(),
+            )),
+            DataType::Timestamptz => Err(SinkError::Starrocks(
+                "TIMESTAMP WITH TIMEZONE is not supported for Starrocks sink as Starrocks doesn't store time values with timezone information. Please convert to TIMESTAMP first.".to_owned(),
+            )),
+            DataType::Interval => Err(SinkError::Starrocks(
+                "INTERVAL is not supported for Starrocks sink. Please convert to VARCHAR or other supported types.".to_owned(),
+            )),
+            DataType::Struct(_) => Err(SinkError::Starrocks(
+                "STRUCT is not supported for Starrocks sink.".to_owned(),
+            )),
+            DataType::Bytea => Err(SinkError::Starrocks(
+                "BYTEA is not supported for Starrocks sink. Please convert to VARCHAR or other supported types.".to_owned(),
+            )),
+            DataType::Int256 => Err(SinkError::Starrocks(
+                "INT256 is not supported for Starrocks sink.".to_owned(),
+            )),
+            DataType::Map(_) => Err(SinkError::Starrocks(
+                "MAP is not supported for Starrocks sink.".to_owned(),
+            )),
+        }
+    }
+
+    async fn create_table(&self, client: &mut StarrocksSchemaClient) -> Result<()> {
+        // Build column definitions
+        let mut columns = Vec::new();
+        let mut primary_keys = Vec::new();
+        let mut distribute_keys = Vec::new();
+
+        for (index, field) in self.schema.fields().iter().enumerate() {
+            let sr_type = Self::get_starrocks_type_string(&field.data_type)?;
+            columns.push(format!("`{}` {}", field.name, sr_type));
+
+            if self.pk_indices.contains(&index) {
+                primary_keys.push(format!("`{}`", field.name));
+                // Also use primary keys as distribution keys
+                distribute_keys.push(format!("`{}`", field.name));
+            }
+        }
+
+        // If no primary keys, use the first column as distribution key
+        if distribute_keys.is_empty() && !self.schema.fields().is_empty() {
+            distribute_keys.push(format!("`{}`", self.schema.fields()[0].name));
+        }
+
+        // Start building the CREATE TABLE statement
+        let mut create_table_sql = format!(
+            "CREATE TABLE `{}`.`{}` ({}) ",
+            self.config.common.database,
+            self.config.common.table,
+            columns.join(", ")
+        );
+
+        // Add engine type
+        create_table_sql.push_str("ENGINE=OLAP ");
+
+        // Add key definition based on mode if primary keys exist
+        if !primary_keys.is_empty() {
+            if !self.is_append_only {
+                // For upsert mode, use PRIMARY KEY
+                create_table_sql.push_str(&format!("PRIMARY KEY ({}) ", primary_keys.join(", ")));
+            } else {
+                // For append-only mode, use DUPLICATE KEY for better performance
+                create_table_sql.push_str(&format!("DUPLICATE KEY ({}) ", primary_keys.join(", ")));
+            }
+        }
+
+        // Add distribution strategy - only specify if we need HASH distribution
+        if !self.is_append_only || primary_keys.is_empty() {
+            // For upsert mode or when specific distribution is needed (no primary keys), use HASH distribution
+            create_table_sql.push_str(&format!(
+                "DISTRIBUTED BY HASH({}) ",
+                distribute_keys.join(", ")
+            ));
+        }
+
+        // Add table properties
+        let mut properties = Vec::new();
+
+        // Add bloom filter support for eligible columns
+        let bloom_filter_columns: Vec<String> = self
+            .schema
+            .fields()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, field)| {
+                // Check if column type supports bloom filter
+                let supports_bloom = match &field.data_type {
+                    // These types don't support bloom filter according to StarRocks docs
+                    DataType::Float32 | DataType::Float64 | DataType::Decimal => false,
+
+                    // All other types can have bloom filters
+                    _ => true,
+                };
+
+                // Add column to bloom filter list if it supports bloom filters and is a primary key
+                if supports_bloom && self.pk_indices.contains(&index) {
+                    Some(field.name.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Add bloom filter property if we have eligible columns
+        if !bloom_filter_columns.is_empty() {
+            properties.push(format!(
+                "\"bloom_filter_columns\"=\"{}\"",
+                bloom_filter_columns.join(",")
+            ));
+        }
+
+        if !properties.is_empty() {
+            create_table_sql.push_str(&format!("PROPERTIES ({})", properties.join(", ")));
+        }
+
+        tracing::info!("Creating StarRocks table with SQL: {}", create_table_sql);
+        client.execute_sql(&create_table_sql).await?;
+        Ok(())
+    }
 }
 
 impl Sink for StarrocksSink {
@@ -276,6 +421,53 @@ impl Sink for StarrocksSink {
             self.config.common.password.clone(),
         )
         .await?;
+
+        // Check if database exists, create it if auto_create is true
+        let db_exists = client.database_exists().await?;
+        if !db_exists {
+            if self.config.common.auto_create {
+                tracing::info!(
+                    "Database {} doesn't exist. Creating it automatically...",
+                    self.config.common.database
+                );
+                client.create_database().await?;
+                tracing::info!(
+                    "Database {} created successfully.",
+                    self.config.common.database
+                );
+            } else {
+                return Err(SinkError::Starrocks(format!(
+                    "Database {} doesn't exist. Set starrocks.auto_create=true to create it automatically.",
+                    self.config.common.database
+                )));
+            }
+        }
+
+        // Check if table exists, create it if auto_create is true
+        let table_exists = client.table_exists().await?;
+        if !table_exists {
+            if self.config.common.auto_create {
+                tracing::info!(
+                    "Table {}.{} doesn't exist. Creating it automatically...",
+                    self.config.common.database,
+                    self.config.common.table
+                );
+                self.create_table(&mut client).await?;
+                tracing::info!(
+                    "Table {}.{} created successfully.",
+                    self.config.common.database,
+                    self.config.common.table
+                );
+                return Ok(());
+            } else {
+                return Err(SinkError::Starrocks(format!(
+                    "Table {}.{} doesn't exist. Set starrocks.auto_create=true to create it automatically.",
+                    self.config.common.database, self.config.common.table
+                )));
+            }
+        }
+
+        // If table exists, validate schema
         let (read_model, pks) = client.get_pk_from_starrocks().await?;
 
         if !self.is_append_only && read_model.ne("PRIMARY_KEYS") {
@@ -646,12 +838,11 @@ impl StarrocksSchemaClient {
         let password = form_urlencoded::byte_serialize(password.as_bytes()).collect::<String>();
 
         let conn_uri = format!(
-            "mysql://{}:{}@{}:{}/{}?prefer_socket={}&max_allowed_packet={}&wait_timeout={}",
+            "mysql://{}:{}@{}:{}/?prefer_socket={}&max_allowed_packet={}&wait_timeout={}",
             user,
             password,
             host,
             port,
-            db,
             STARROCK_MYSQL_PREFER_SOCKET,
             STARROCK_MYSQL_MAX_ALLOWED_PACKET,
             STARROCK_MYSQL_WAIT_TIMEOUT
@@ -698,6 +889,51 @@ impl StarrocksSchemaClient {
             })?
             .clone();
         Ok(table_mode_pk)
+    }
+
+    pub async fn database_exists(&mut self) -> Result<bool> {
+        let query = format!(
+            "SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name = {:?}",
+            self.db
+        );
+
+        let count: u64 = self
+            .conn
+            .query_first(query)
+            .await
+            .map_err(|err| SinkError::DorisStarrocksConnect(anyhow!(err)))?
+            .unwrap_or(0);
+
+        Ok(count > 0)
+    }
+
+    pub async fn create_database(&mut self) -> Result<()> {
+        let sql = format!("CREATE DATABASE IF NOT EXISTS `{}`", self.db);
+        self.execute_sql(&sql).await
+    }
+
+    pub async fn table_exists(&mut self) -> Result<bool> {
+        let query = format!(
+            "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = {:?} AND table_schema = {:?}",
+            self.table, self.db
+        );
+
+        let count: u64 = self
+            .conn
+            .query_first(query)
+            .await
+            .map_err(|err| SinkError::DorisStarrocksConnect(anyhow!(err)))?
+            .unwrap_or(0);
+
+        Ok(count > 0)
+    }
+
+    pub async fn execute_sql(&mut self, sql: &str) -> Result<()> {
+        self.conn
+            .query_drop(sql)
+            .await
+            .map_err(|err| SinkError::DorisStarrocksConnect(anyhow!(err)))?;
+        Ok(())
     }
 }
 
