@@ -68,6 +68,9 @@ ENV GIT_SHA=$GIT_SHA
 ARG CARGO_PROFILE
 ENV CARGO_PROFILE=$CARGO_PROFILE
 
+# Use Git CLI instead of libgit2
+ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
+
 COPY ./ /risingwave
 WORKDIR /risingwave
 
