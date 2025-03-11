@@ -12,17 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::anyhow;
 use rand::seq::SliceRandom;
 use rand::thread_rng;
 use replace_job_plan::{ReplaceSource, ReplaceTable};
-use risingwave_common::catalog::ColumnCatalog;
+use risingwave_common::catalog::{ColumnCatalog, Schema};
 use risingwave_common::types::DataType;
 use risingwave_common::util::column_index_mapping::ColIndexMapping;
 use risingwave_connector::sink::catalog::SinkId;
+use risingwave_connector::sink::starrocks::StarrocksSink;
 use risingwave_meta::manager::{EventLogManagerRef, MetadataManager};
 use risingwave_meta::rpc::metrics::MetaMetrics;
 use risingwave_meta_model::ObjectId;
@@ -114,6 +115,134 @@ impl DdlServiceImpl {
             fragment_graph: fragment_graph.unwrap(),
             col_index_mapping,
         }
+    }
+
+    async fn propagate_schema_change_to_sinks(
+        &self,
+        table: &Table,
+        new_columns: &HashSet<(String, DataType)>,
+        original_columns: &HashSet<(String, DataType)>,
+    ) -> Result<(), MetaError> {
+        tracing::info!(
+            target: "auto_schema_change",
+            table_id = table.id,
+            cdc_table_id = table.cdc_table_id,
+            "Starting schema propagation to dependent sinks"
+        );
+
+        // Find sinks that depend on this table
+        let dependent_sinks = self
+            .metadata_manager
+            .catalog_controller
+            .get_sinks_depending_on_table(table.database_id.clone(), table.name.clone())
+            .await?;
+
+        tracing::info!(
+            target: "auto_schema_change",
+            table_id = table.id,
+            cdc_table_id = table.cdc_table_id,
+            sink_count = dependent_sinks.len(),
+            "Found dependent sinks"
+        );
+
+        // Log sink properties for debugging
+        for (i, sink) in dependent_sinks.iter().enumerate() {
+            // Log detailed sink properties
+            for (k, v) in &sink.properties {
+                tracing::debug!(
+                    target: "auto_schema_change",
+                    table_id = table.id,
+                    sink_id = sink.id,
+                    sink_name = sink.name,
+                    sink_index = i,
+                    property_key = k,
+                    property_value = v,
+                    "Sink property"
+                );
+            }
+
+            // Check connector type directly
+            let is_starrocks = sink
+                .properties
+                .get("connector")
+                .map_or(false, |v| v == "starrocks");
+
+            tracing::info!(
+                target: "auto_schema_change",
+                table_id = table.id,
+                sink_id = sink.id,
+                sink_name = sink.name,
+                is_starrocks,
+                "Checking sink type"
+            );
+
+            if is_starrocks {
+                tracing::info!(
+                    target: "auto_schema_change",
+                    table_id = table.id,
+                    sink_id = sink.id,
+                    sink_name = sink.name,
+                    "Propagating schema changes to StarRocks sink"
+                );
+
+                // Get the sink properties and convert HashMap to BTreeMap
+                let properties_map: BTreeMap<String, String> = sink
+                    .properties
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+
+                // Create old and new schemas
+                let old_schema = Schema::new(
+                    original_columns
+                        .iter()
+                        .map(|(name, data_type)| {
+                            risingwave_common::catalog::Field::with_name(
+                                data_type.clone(),
+                                name.clone(),
+                            )
+                        })
+                        .collect(),
+                );
+
+                let new_schema = Schema::new(
+                    new_columns
+                        .iter()
+                        .map(|(name, data_type)| {
+                            risingwave_common::catalog::Field::with_name(
+                                data_type.clone(),
+                                name.clone(),
+                            )
+                        })
+                        .collect(),
+                );
+
+                // Apply the schema changes directly
+                if let Err(e) =
+                    StarrocksSink::apply_schema_changes(&properties_map, &old_schema, &new_schema)
+                        .await
+                {
+                    tracing::error!(
+                        target: "auto_schema_change",
+                        error = %e.as_report(),
+                        table_id = table.id,
+                        sink_id = sink.id,
+                        sink_name = sink.name,
+                        "Failed to synchronize schema changes with StarRocks sink"
+                    );
+                } else {
+                    tracing::info!(
+                        target: "auto_schema_change",
+                        table_id = table.id,
+                        sink_id = sink.id,
+                        sink_name = sink.name,
+                        "Successfully propagated schema changes to StarRocks sink"
+                    );
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -1061,6 +1190,24 @@ impl DdlService for DdlServiceImpl {
                                         ])
                                         .inc();
                                     latency_timer.observe_duration();
+
+                                    // After successful table schema change, propagate to associated StarRocks sinks
+                                    if let Err(e) = self
+                                        .propagate_schema_change_to_sinks(
+                                            &table,
+                                            &new_columns,
+                                            &original_columns,
+                                        )
+                                        .await
+                                    {
+                                        tracing::error!(
+                                            target: "auto_schema_change",
+                                            error = %e.as_report(),
+                                            table_id = table.id,
+                                            cdc_table_id = table.cdc_table_id,
+                                            "Failed to propagate schema changes to associated sinks"
+                                        );
+                                    }
                                 }
                                 Err(e) => {
                                     tracing::error!(
