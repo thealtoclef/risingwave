@@ -96,6 +96,23 @@ impl CatalogController {
             .collect())
     }
 
+    pub async fn get_sinks_depending_on_table(&self, table_id: TableId) -> MetaResult<Vec<PbSink>> {
+        let inner = self.inner.read().await;
+
+        // Find sinks that directly target this table
+        let direct_sink_objs = Sink::find()
+            .find_also_related(Object)
+            .filter(sink::Column::TargetTable.eq(table_id))
+            .all(&inner.db)
+            .await?;
+
+        // Convert to PbSink
+        Ok(direct_sink_objs
+            .into_iter()
+            .map(|(sink, obj)| ObjectModel(sink, obj.unwrap()).into())
+            .collect())
+    }
+
     pub async fn get_subscription_by_id(
         &self,
         subscription_id: SubscriptionId,
