@@ -96,6 +96,29 @@ impl CatalogController {
             .collect())
     }
 
+    pub async fn get_sinks_depending_on_table(
+        &self,
+        database_id: u32,
+        table_name: String,
+    ) -> MetaResult<Vec<PbSink>> {
+        let inner = self.inner.read().await;
+
+        let sink_objs = Sink::find()
+            .find_also_related(Object)
+            .join(JoinType::InnerJoin, object::Relation::Database2.def())
+            .filter(
+                sink::Column::SinkFromName
+                    .eq(table_name)
+                    .and(database::Column::DatabaseId.eq(database_id)),
+            )
+            .all(&inner.db)
+            .await?;
+        Ok(sink_objs
+            .into_iter()
+            .map(|(sink, obj)| ObjectModel(sink, obj.unwrap()).into())
+            .collect())
+    }
+
     pub async fn get_subscription_by_id(
         &self,
         subscription_id: SubscriptionId,

@@ -301,6 +301,86 @@ impl StarrocksSink {
         }
     }
 
+    pub async fn apply_schema_changes(
+        properties: &BTreeMap<String, String>,
+        old_schema: &Schema,
+        new_schema: &Schema,
+    ) -> Result<()> {
+        let config = StarrocksConfig::from_btreemap(properties.clone())?;
+
+        // Create schema client directly from properties
+        let mut client = StarrocksSchemaClient::new(
+            config.common.host.clone(),
+            config.common.mysql_port.clone(),
+            config.common.table.clone(),
+            config.common.database.clone(),
+            config.common.user.clone(),
+            config.common.password.clone(),
+        )
+        .await?;
+
+        // Get column differences
+        let old_columns: HashMap<String, &risingwave_common::catalog::Field> = old_schema
+            .fields()
+            .iter()
+            .map(|f| (f.name.clone(), f))
+            .collect();
+
+        let new_columns: HashMap<String, &risingwave_common::catalog::Field> = new_schema
+            .fields()
+            .iter()
+            .map(|f| (f.name.clone(), f))
+            .collect();
+
+        // Find added columns
+        for (name, field) in &new_columns {
+            if !old_columns.contains_key(name) {
+                // Column is new, add it
+                let sr_type = Self::get_starrocks_type_string(&field.data_type)?;
+                client
+                    .alter_table_add_column(name, &sr_type, true) // Assume nullable by default for safety
+                    .await?;
+                tracing::info!(
+                    "Added column {name} with type {sr_type} to StarRocks sink table {}.{}",
+                    config.common.database,
+                    config.common.table
+                );
+            } else {
+                // Column exists in both schemas, check if type changed
+                let old_field = old_columns.get(name).unwrap();
+                if old_field.data_type != field.data_type {
+                    // Type changed, nullability is set to true for safety
+                    let sr_type = Self::get_starrocks_type_string(&field.data_type)?;
+                    client
+                        .alter_table_modify_column(name, &sr_type, true) // Assume nullable by default for safety
+                        .await?;
+                    tracing::info!(
+                        "Modified column {name} to type {sr_type} in StarRocks sink table {}.{}",
+                        config.common.database,
+                        config.common.table
+                    );
+                }
+            }
+        }
+
+        // Find dropped columns - be cautious as deleting columns can be risky
+        // Only drop columns if auto_create is true, indicating we manage the schema
+        if config.common.auto_create {
+            for name in old_columns.keys() {
+                if !new_columns.contains_key(name) {
+                    client.alter_table_drop_column(name).await?;
+                    tracing::info!(
+                        "Dropped column {name} from StarRocks sink table {}.{}",
+                        config.common.database,
+                        config.common.table
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     async fn create_table(&self, client: &mut StarrocksSchemaClient) -> Result<()> {
         // Build column definitions
         let mut columns = Vec::new();
@@ -934,6 +1014,54 @@ impl StarrocksSchemaClient {
             .await
             .map_err(|err| SinkError::DorisStarrocksConnect(anyhow!(err)))?;
         Ok(())
+    }
+
+    pub async fn alter_table_add_column(
+        &mut self,
+        column_name: &str,
+        column_type: &str,
+        allow_null: bool,
+    ) -> Result<()> {
+        let nullability = if allow_null { "NULL" } else { "NOT NULL" };
+        let sql = format!(
+            "ALTER TABLE `{}`.`{}` ADD COLUMN `{}` {} {}",
+            self.db, self.table, column_name, column_type, nullability
+        );
+        self.execute_sql(&sql).await
+    }
+
+    pub async fn alter_table_drop_column(&mut self, column_name: &str) -> Result<()> {
+        let sql = format!(
+            "ALTER TABLE `{}`.`{}` DROP COLUMN `{}`",
+            self.db, self.table, column_name
+        );
+        self.execute_sql(&sql).await
+    }
+
+    pub async fn alter_table_modify_column(
+        &mut self,
+        column_name: &str,
+        column_type: &str,
+        allow_null: bool,
+    ) -> Result<()> {
+        let nullability = if allow_null { "NULL" } else { "NOT NULL" };
+        let sql = format!(
+            "ALTER TABLE `{}`.`{}` MODIFY COLUMN `{}` {} {}",
+            self.db, self.table, column_name, column_type, nullability
+        );
+        self.execute_sql(&sql).await
+    }
+
+    pub async fn alter_table_rename_column(
+        &mut self,
+        old_name: &str,
+        new_name: &str,
+    ) -> Result<()> {
+        let sql = format!(
+            "ALTER TABLE `{}`.`{}` RENAME COLUMN `{}` TO `{}`",
+            self.db, self.table, old_name, new_name
+        );
+        self.execute_sql(&sql).await
     }
 }
 
