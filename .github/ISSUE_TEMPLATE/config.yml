@@ -1,7 +1,0 @@
-contact_links:
-  - name: Questions and General Discussion
-    url: https://github.com/risingwavelabs/risingwave/discussions
-    about: Have questions? Welcome to open a discussion.
-  - name: Community Chat
-    url: https://risingwave.com/slack
-    about: Join the RisingWave Slack community and chat with us.
