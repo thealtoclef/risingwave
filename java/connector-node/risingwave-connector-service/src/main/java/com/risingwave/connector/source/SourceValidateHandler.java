@@ -165,6 +165,16 @@ public class SourceValidateHandler {
                     sqlServerValidator.validateAll();
                 }
                 break;
+            case SPANNER:
+                ensureRequiredProps(props, isCdcSourceJob);
+                ensurePropNotBlank(props, "project_id");
+                ensurePropNotBlank(props, "instance_id");
+                ensurePropNotBlank(props, "database_id");
+                ensurePropNotBlank(props, "change_stream_name");
+                try (var validator = new SpannerValidator(props, tableSchema, isCdcSourceJob)) {
+                    validator.validateAll();
+                }
+                break;
             default:
                 LOG.warn("Unknown source type");
                 throw ValidatorUtils.invalidArgument("Unknown source type");

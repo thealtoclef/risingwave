@@ -49,7 +49,7 @@ use crate::parser::schema_change::SchemaChangeEnvelope;
 use crate::parser::ParserConfig;
 use crate::source::filesystem::FsPageItem;
 use crate::source::monitor::EnumeratorMetrics;
-use crate::source::SplitImpl::{CitusCdc, MongodbCdc, MysqlCdc, PostgresCdc, SqlServerCdc};
+use crate::source::SplitImpl::{CitusCdc, MongodbCdc, MysqlCdc, PostgresCdc, SqlServerCdc, SpannerCdc};
 use crate::with_options::WithOptions;
 use crate::{
     dispatch_source_prop, dispatch_split_impl, for_all_connections, for_all_sources,
@@ -533,7 +533,7 @@ impl SplitImpl {
     pub fn is_cdc_split(&self) -> bool {
         matches!(
             self,
-            MysqlCdc(_) | PostgresCdc(_) | MongodbCdc(_) | CitusCdc(_) | SqlServerCdc(_)
+            MysqlCdc(_) | PostgresCdc(_) | MongodbCdc(_) | CitusCdc(_) | SqlServerCdc(_) | SpannerCdc(_)
         )
     }
 
@@ -545,6 +545,7 @@ impl SplitImpl {
             MongodbCdc(split) => split.start_offset().clone().unwrap_or_default(),
             CitusCdc(split) => split.start_offset().clone().unwrap_or_default(),
             SqlServerCdc(split) => split.start_offset().clone().unwrap_or_default(),
+            SpannerCdc(split) => split.start_offset().clone().unwrap_or_default(),
             _ => unreachable!("get_cdc_split_offset() is only for cdc split"),
         }
     }

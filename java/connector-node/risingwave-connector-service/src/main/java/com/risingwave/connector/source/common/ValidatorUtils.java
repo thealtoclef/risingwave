@@ -69,6 +69,8 @@ public final class ValidatorUtils {
             case SQL_SERVER:
                 return String.format(
                         "jdbc:sqlserver://%s:%s;databaseName=%s", host, port, database);
+            case SPANNER:
+                return String.format("spanner:%s;instanceId=%s;databaseId=%s", host, port, database);
             default:
                 throw ValidatorUtils.invalidArgument("Unknown source type: " + sourceType);
         }

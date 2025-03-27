@@ -73,6 +73,12 @@ public class DbzConnectorConfig {
     private static final String SNAPSHOT_MODE_KEY = "debezium.snapshot.mode";
     private static final String SNAPSHOT_MODE_BACKFILL = "rw_cdc_backfill";
 
+    public static final String SPANNER_CHANGE_STREAM = "gcp.spanner.change.stream";
+    public static final String SPANNER_PROJECT_ID = "gcp.spanner.project.id";
+    public static final String SPANNER_INSTANCE_ID = "gcp.spanner.instance.id";
+    public static final String SPANNER_DATABASE_ID = "gcp.spanner.database.id";
+    public static final String SPANNER_CONFIG_FILE = "spanner.properties";
+
     public static class MongoDb {
         public static final String MONGO_URL = "mongodb.url";
         public static final String MONGO_COLLECTION_NAME = "collection.name";
@@ -316,6 +322,26 @@ public class DbzConnectorConfig {
                 LOG.info("Disable table filtering for the shared Sql Server source");
                 dbzProps.remove("table.include.list");
             }
+        } else if (source == SourceTypeE.SPANNER) {
+            var spannerProps = initiateDbConfig(SPANNER_CONFIG_FILE, substitutor);
+            
+            // Set properties for Spanner
+            if (startOffset != null) {
+                spannerProps.setProperty("gcp.spanner.start.timestamp", startOffset);
+            } else if (snapshotDone) {
+                spannerProps.setProperty("snapshot.mode", "never");
+            } else if (SNAPSHOT_MODE_BACKFILL.equals(userProps.get(SNAPSHOT_MODE_KEY))) {
+                spannerProps.setProperty("snapshot.mode", "schema_only");
+            } else {
+                spannerProps.setProperty("snapshot.mode", userProps.getOrDefault(SNAPSHOT_MODE_KEY, "initial"));
+            }
+            
+            // For shared CDC source, we don't need to filter tables
+            if (isCdcSourceJob) {
+                spannerProps.put("table.include.list", "");
+            }
+            
+            dbzProps.putAll(spannerProps);
         } else {
             throw new RuntimeException("unsupported source type: " + source);
         }

@@ -52,6 +52,7 @@ pub const POSTGRES_CDC_CONNECTOR: &str = Postgres::CDC_CONNECTOR_NAME;
 pub const CITUS_CDC_CONNECTOR: &str = Citus::CDC_CONNECTOR_NAME;
 pub const MONGODB_CDC_CONNECTOR: &str = Mongodb::CDC_CONNECTOR_NAME;
 pub const SQL_SERVER_CDC_CONNECTOR: &str = SqlServer::CDC_CONNECTOR_NAME;
+pub const SPANNER_CDC_CONNECTOR: &str = Spanner::CDC_CONNECTOR_NAME;
 
 /// Build a unique CDC table identifier from a source ID and external table name
 pub fn build_cdc_table_id(source_id: u32, external_table_name: &str) -> String {
@@ -73,6 +74,7 @@ impl<'a> From<&'a str> for CdcSourceType {
             CITUS_CDC_CONNECTOR => CdcSourceType::Citus,
             MONGODB_CDC_CONNECTOR => CdcSourceType::Mongodb,
             SQL_SERVER_CDC_CONNECTOR => CdcSourceType::SqlServer,
+            SPANNER_CDC_CONNECTOR => CdcSourceType::Spanner,
             _ => CdcSourceType::Unspecified,
         }
     }
@@ -86,6 +88,7 @@ impl CdcSourceType {
             CdcSourceType::Citus => "Citus",
             CdcSourceType::Mongodb => "MongoDB",
             CdcSourceType::SqlServer => "SQL Server",
+            CdcSourceType::Spanner => "Spanner",
             CdcSourceType::Unspecified => "Unspecified",
         }
     }

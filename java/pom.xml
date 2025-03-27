@@ -383,6 +383,11 @@
                 <version>${testcontainers.version}</version>
                 <scope>test</scope>
             </dependency>
+            <dependency>
+                <groupId>io.debezium</groupId>
+                <artifactId>debezium-connector-spanner</artifactId>
+                <version>${debezium.version}</version>
+            </dependency>
         </dependencies>
     </dependencyManagement>
 

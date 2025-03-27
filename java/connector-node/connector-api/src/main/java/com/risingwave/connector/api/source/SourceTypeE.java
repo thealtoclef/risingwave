@@ -22,6 +22,7 @@ public enum SourceTypeE {
     CITUS,
     MONGODB,
     SQL_SERVER,
+    SPANNER,
     INVALID;
 
     public static SourceTypeE valueOf(ConnectorServiceProto.SourceType type) {
@@ -36,6 +37,8 @@ public enum SourceTypeE {
                 return SourceTypeE.MONGODB;
             case SQL_SERVER:
                 return SourceTypeE.SQL_SERVER;
+            case SPANNER:
+                return SourceTypeE.SPANNER;
             default:
                 return SourceTypeE.INVALID;
         }

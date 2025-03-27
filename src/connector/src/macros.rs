@@ -22,7 +22,8 @@ macro_rules! for_all_classified_sources {
                 { Postgres },
                 { Citus },
                 { Mongodb },
-                { SqlServer }
+                { SqlServer },
+                { Spanner }
             },
             // other sources
             // todo: file source do not nest with mq source.
@@ -334,7 +335,7 @@ macro_rules! impl_cdc_source_type {
                         CdcSourceType::$cdc_source_type
                     }
                 }
-                pub type [<$cdc_source_type CdcProperties>] = CdcProperties<$cdc_source_type>;
+                pub type [<$cdc_source_type Cdc Properties>] = CdcProperties<$cdc_source_type>;
             }
         )*
 

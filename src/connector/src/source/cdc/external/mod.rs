@@ -15,6 +15,7 @@
 pub mod mock_external_table;
 pub mod postgres;
 pub mod sql_server;
+pub mod spanner;
 
 pub mod mysql;
 
@@ -39,6 +40,9 @@ use crate::source::cdc::external::mysql::{
     MySqlExternalTable, MySqlExternalTableReader, MySqlOffset,
 };
 use crate::source::cdc::external::postgres::{PostgresExternalTableReader, PostgresOffset};
+use crate::source::cdc::external::spanner::{
+    SpannerExternalTable, SpannerExternalTableReader, SpannerOffset,
+};
 use crate::source::cdc::external::sql_server::{
     SqlServerExternalTable, SqlServerExternalTableReader, SqlServerOffset,
 };
@@ -53,6 +57,7 @@ pub enum CdcTableType {
     Postgres,
     SqlServer,
     Citus,
+    Spanner,
 }
 
 impl CdcTableType {
@@ -63,12 +68,13 @@ impl CdcTableType {
             "postgres-cdc" => Self::Postgres,
             "citus-cdc" => Self::Citus,
             "sqlserver-cdc" => Self::SqlServer,
+            "spanner-cdc" => Self::Spanner,
             _ => Self::Undefined,
         }
     }
 
     pub fn can_backfill(&self) -> bool {
-        matches!(self, Self::MySql | Self::Postgres | Self::SqlServer)
+        matches!(self, Self::MySql | Self::Postgres | Self::SqlServer | Self::Spanner)
     }
 
     pub fn enable_transaction_metadata(&self) -> bool {
@@ -79,7 +85,7 @@ impl CdcTableType {
     }
 
     pub fn shareable_only(&self) -> bool {
-        matches!(self, Self::SqlServer)
+        matches!(self, Self::SqlServer | Self::Spanner)
     }
 
     pub async fn create_table_reader(
@@ -97,6 +103,9 @@ impl CdcTableType {
             )),
             Self::SqlServer => Ok(ExternalTableReaderImpl::SqlServer(
                 SqlServerExternalTableReader::new(config, schema, pk_indices).await?,
+            )),
+            Self::Spanner => Ok(ExternalTableReaderImpl::Spanner(
+                SpannerExternalTableReader::new(config, schema, pk_indices).await?,
             )),
             Self::Mock => Ok(ExternalTableReaderImpl::Mock(MockExternalTableReader::new())),
             _ => bail!("invalid external table type: {:?}", *self),
@@ -128,7 +137,7 @@ impl SchemaTableName {
             CdcTableType::Postgres | CdcTableType::Citus => {
                 properties.get(SCHEMA_NAME_KEY).cloned().unwrap_or_default()
             }
-            CdcTableType::SqlServer => properties.get(SCHEMA_NAME_KEY).cloned().unwrap_or_default(),
+            CdcTableType::SqlServer | CdcTableType::Spanner => properties.get(SCHEMA_NAME_KEY).cloned().unwrap_or_default(),
             _ => {
                 unreachable!("invalid external table type: {:?}", table_type);
             }
@@ -143,9 +152,11 @@ impl SchemaTableName {
 
 #[derive(Debug, Clone, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub enum CdcOffset {
+    Mock,
     MySql(MySqlOffset),
     Postgres(PostgresOffset),
     SqlServer(SqlServerOffset),
+    Spanner(SpannerOffset),
 }
 
 // Example debezium offset for Postgres:
@@ -160,7 +171,8 @@ pub enum CdcOffset {
 //         "lsn": 29973552,
 //         "txId": 1046,
 //         "ts_usec": 1670826189008456,
-//         "snapshot": true
+//         "snapshot": true,
+//         "token": "sometoken123"
 //     }
 // }
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -193,6 +205,10 @@ pub struct DebeziumSourceOffset {
     // sql server offset
     pub commit_lsn: Option<String>,
     pub change_lsn: Option<String>,
+    
+    // spanner offset
+    pub token: Option<String>,
+    pub read_at_timestamp: Option<i64>,
 }
 
 pub type CdcOffsetParseFunc = Box<dyn Fn(&str) -> ConnectorResult<CdcOffset> + Send>;
@@ -214,6 +230,7 @@ pub enum ExternalTableReaderImpl {
     Postgres(PostgresExternalTableReader),
     SqlServer(SqlServerExternalTableReader),
     Mock(MockExternalTableReader),
+    Spanner(SpannerExternalTableReader),
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -273,6 +290,7 @@ impl ExternalTableReader for ExternalTableReaderImpl {
             ExternalTableReaderImpl::Postgres(postgres) => postgres.current_cdc_offset().await,
             ExternalTableReaderImpl::SqlServer(sql_server) => sql_server.current_cdc_offset().await,
             ExternalTableReaderImpl::Mock(mock) => mock.current_cdc_offset().await,
+            ExternalTableReaderImpl::Spanner(spanner) => spanner.current_cdc_offset().await,
         }
     }
 
@@ -298,6 +316,9 @@ impl ExternalTableReaderImpl {
                 SqlServerExternalTableReader::get_cdc_offset_parser()
             }
             ExternalTableReaderImpl::Mock(_) => MockExternalTableReader::get_cdc_offset_parser(),
+            ExternalTableReaderImpl::Spanner(_) => {
+                SpannerExternalTableReader::get_cdc_offset_parser()
+            }
         }
     }
 
@@ -322,6 +343,9 @@ impl ExternalTableReaderImpl {
             ExternalTableReaderImpl::Mock(mock) => {
                 mock.snapshot_read(table_name, start_pk, primary_keys, limit)
             }
+            ExternalTableReaderImpl::Spanner(spanner) => {
+                spanner.snapshot_read(table_name, start_pk, primary_keys, limit)
+            }
         };
 
         pin_mut!(stream);
@@ -337,6 +361,7 @@ pub enum ExternalTableImpl {
     MySql(MySqlExternalTable),
     Postgres(PostgresExternalTable),
     SqlServer(SqlServerExternalTable),
+    Spanner(SpannerExternalTable),
 }
 
 impl ExternalTableImpl {
@@ -364,6 +389,9 @@ impl ExternalTableImpl {
             CdcSourceType::SqlServer => Ok(ExternalTableImpl::SqlServer(
                 SqlServerExternalTable::connect(config).await?,
             )),
+            CdcSourceType::Spanner => Ok(ExternalTableImpl::Spanner(
+                SpannerExternalTable::connect(config).await?,
+            )),
             _ => Err(anyhow!("Unsupported cdc connector type: {}", config.connector).into()),
         }
     }
@@ -373,6 +401,7 @@ impl ExternalTableImpl {
             ExternalTableImpl::MySql(mysql) => mysql.column_descs(),
             ExternalTableImpl::Postgres(postgres) => postgres.column_descs(),
             ExternalTableImpl::SqlServer(sql_server) => sql_server.column_descs(),
+            ExternalTableImpl::Spanner(spanner) => spanner.column_descs(),
         }
     }
 
@@ -381,6 +410,7 @@ impl ExternalTableImpl {
             ExternalTableImpl::MySql(mysql) => mysql.pk_names(),
             ExternalTableImpl::Postgres(postgres) => postgres.pk_names(),
             ExternalTableImpl::SqlServer(sql_server) => sql_server.pk_names(),
+            ExternalTableImpl::Spanner(spanner) => spanner.pk_names(),
         }
     }
 }
