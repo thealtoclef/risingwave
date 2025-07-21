@@ -126,26 +126,7 @@ impl Feature {
         self,
         manager: &LicenseManager,
     ) -> Result<(), FeatureNotAvailable> {
-        let check_res = match manager.license() {
-            Ok(license) => {
-                if license.tier >= self.min_tier() {
-                    Ok(())
-                } else {
-                    Err(FeatureNotAvailable::InsufficientTier {
-                        feature: self,
-                        current_tier: license.tier,
-                    })
-                }
-            }
-            Err(error) => Err(FeatureNotAvailable::LicenseError {
-                feature: self,
-                source: error,
-            }),
-        };
-
-        report_telemetry(&self, self.get_feature_name(), check_res.is_ok());
-
-        check_res
+        Ok(())
     }
 
     /// Check whether the feature is available based on the current license.
