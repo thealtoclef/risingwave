@@ -25,7 +25,7 @@ use risingwave_common::types::DataType;
 use serde::Deserialize;
 use serde_derive::Serialize;
 use serde_json::Value;
-use serde_with::serde_as;
+use serde_with::{DisplayFromStr, serde_as};
 use thiserror_ext::AsReport;
 use with_options::WithOptions;
 
@@ -43,6 +43,7 @@ use crate::sink::{DummySinkCommitCoordinator, Sink, SinkParam, SinkWriter, SinkW
 
 pub const DORIS_SINK: &str = "doris";
 
+#[serde_as]
 #[derive(Deserialize, Debug, Clone, WithOptions)]
 pub struct DorisCommon {
     #[serde(rename = "doris.url")]
@@ -57,6 +58,9 @@ pub struct DorisCommon {
     pub table: String,
     #[serde(rename = "doris.partial_update")]
     pub partial_update: Option<String>,
+    #[serde(default)] // default false
+    #[serde_as(as = "DisplayFromStr")]
+    pub auto_create: bool,
 }
 
 impl EnforceSecret for DorisCommon {
@@ -219,6 +223,153 @@ impl DorisSink {
             DataType::Vector(_) => todo!("VECTOR_PLACEHOLDER"),
         }
     }
+
+    fn get_doris_type_string(data_type: &DataType) -> Result<String> {
+        match data_type {
+            // Numeric types
+            DataType::Boolean => Ok("BOOLEAN".to_string()),
+            DataType::Int16 => Ok("SMALLINT".to_string()),
+            DataType::Int32 => Ok("INT".to_string()),
+            DataType::Int64 | DataType::Serial => Ok("BIGINT".to_string()),
+            DataType::Float32 => Ok("FLOAT".to_string()),
+            DataType::Float64 => Ok("DOUBLE".to_string()),
+            DataType::Decimal => Ok("DECIMAL(38, 9)".to_string()), 
+            
+            // Date/Time types
+            DataType::Date => Ok("DATE".to_string()),
+            DataType::Timestamp => Ok("DATETIME".to_string()),
+            
+            // String types
+            DataType::Varchar => Ok("VARCHAR(65533)".to_string()), 
+            
+            // Semi-structured types
+            DataType::Jsonb => Ok("JSON".to_string()),
+            DataType::List(list) => {
+                let inner_type = Self::get_doris_type_string(list.as_ref())?;
+                Ok(format!("ARRAY<{}>", inner_type))
+            },
+            DataType::Struct(_) => Ok("STRUCT".to_string()),
+            DataType::Map(_) => Ok("MAP".to_string()),  
+            
+            // Unsupported types with clear error messages
+            DataType::Time => Err(SinkError::Doris(
+                "TIME type is not supported in Doris. Please convert to VARCHAR or TIMESTAMP".to_owned(),
+            )),
+            DataType::Timestamptz => Err(SinkError::Doris(
+                "TIMESTAMP WITH TIMEZONE is not supported in Doris as it doesn't store timezone information. Please convert to DATETIME first.".to_owned(),
+            )),
+            DataType::Interval => Err(SinkError::Doris(
+                "INTERVAL type is not supported in Doris. Please convert to VARCHAR or TIMESTAMP".to_owned(),
+            )),
+            DataType::Bytea => Err(SinkError::Doris(
+                "BYTEA type is not supported in Doris. Please convert to VARCHAR or use a different storage format".to_owned(),
+            )),
+            DataType::Int256 => Err(SinkError::Doris(
+                "INT256 type is not supported in Doris. Please use a different integer type".to_owned(),
+            )),
+            DataType::Vector(_) => Err(SinkError::Doris(
+                "VECTOR type is not currently supported in Doris".to_owned(),
+            )),
+        }
+    }
+
+    async fn auto_create_database(&self, client: &mut DorisSchemaClient) -> Result<()> {
+        let create_database_sql = format!(
+            "CREATE DATABASE IF NOT EXISTS `{}`",
+            self.config.common.database
+        );
+
+        tracing::info!("Creating Doris database with SQL: {}", create_database_sql);
+        client.statement_execute(&create_database_sql).await?;
+        Ok(())
+    }
+
+    async fn auto_create_table(&self, client: &mut DorisSchemaClient) -> Result<()> {
+        // Build column definitions
+        let mut columns = Vec::new();
+        let mut primary_keys = Vec::new();
+
+        for (index, field) in self.schema.fields().iter().enumerate() {
+            // Get the Doris type string for the column
+            let doris_type = Self::get_doris_type_string(&field.data_type)?;
+            columns.push(format!("`{}` {}", field.name, doris_type));
+
+            // If the column is a primary key, add it to the primary keys list
+            if self.pk_indices.contains(&index) {
+                primary_keys.push(format!("`{}`", field.name));
+            }
+        }
+
+        // Start building the CREATE TABLE statement
+        let mut create_table_sql = format!(
+            "CREATE TABLE IF NOT EXISTS `{}`.`{}` ({}) ",
+            self.config.common.database,
+            self.config.common.table,
+            columns.join(", ")
+        );
+
+        // Add engine type (OLAP is the default in Doris)
+        create_table_sql.push_str("ENGINE=OLAP ");
+
+        if !primary_keys.is_empty() {
+            // Add key definition based on mode
+            create_table_sql.push_str(&format!(
+                "{} ({}) ",
+                if !self.is_append_only { "UNIQUE KEY" } else { "DUPLICATE KEY" },
+                primary_keys.join(", ")
+            ));
+
+            // Add distribution strategy
+            create_table_sql.push_str(&format!(
+                "DISTRIBUTED BY HASH({}) BUCKETS AUTO ",
+                primary_keys.join(", ")
+            ));
+        }
+
+        // Add table properties
+        let mut properties = Vec::new();
+
+        // Add bloom filter support for eligible columns
+        let bloom_filter_columns: Vec<String> = self
+            .schema
+            .fields()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, field)| {
+                // Check if column type supports bloom filter
+                let supports_bloom = match &field.data_type {
+                    // These types don't support bloom filter according to Doris docs
+                    DataType::Float32 | DataType::Float64 | DataType::Decimal => false,
+
+                    // All other types can have bloom filters
+                    _ => true,
+                };
+
+                // Add column to bloom filter list if it supports bloom filters and is a primary key
+                if supports_bloom && self.pk_indices.contains(&index) {
+                    Some(field.name.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Add bloom filter property if we have eligible columns
+        if !bloom_filter_columns.is_empty() {
+            properties.push(format!(
+                "\"bloom_filter_columns\" = \"{}\"",
+                bloom_filter_columns.join(",")
+            ));
+        }
+
+        if !properties.is_empty() {
+            create_table_sql.push_str(&format!("PROPERTIES ({})", properties.join(", ")));
+        }
+
+        tracing::info!("Creating Doris table with SQL: {}", create_table_sql);
+        client.statement_execute(&create_table_sql).await?;
+        Ok(())
+    }
 }
 
 impl Sink for DorisSink {
@@ -239,6 +390,20 @@ impl Sink for DorisSink {
     }
 
     async fn validate(&self) -> Result<()> {
+        // create database and table if auto_create is true
+        if self.config.common.auto_create {
+            let mut client = self.config.common.build_get_client();
+            self.auto_create_database(&mut client).await?;
+            self.auto_create_table(&mut client).await?;
+
+            tracing::info!(
+                "Database {} and table {} are created successfully if they don't exist.",
+                self.config.common.database,
+                self.config.common.table
+            );
+            return Ok(());
+        }
+
         if !self.is_append_only && self.pk_indices.is_empty() {
             return Err(SinkError::Config(anyhow!(
                 "Primary key not defined for upsert doris sink (please define in `primary_key` field)"
@@ -486,6 +651,42 @@ impl DorisSchemaClient {
             .context("Can't get schema from json")
             .map_err(SinkError::DorisStarrocksConnect)?;
         Ok(schema)
+    }
+
+    pub async fn statement_execute(&mut self, sql: &str) -> Result<()> {
+        let uri = format!("{}/api/query/internal/information_schema", self.url);
+
+        let client = reqwest::Client::builder()
+            .pool_idle_timeout(POOL_IDLE_TIMEOUT)
+            .build()
+            .map_err(|err| SinkError::DorisStarrocksConnect(err.into()))?;
+
+        let request_body = serde_json::json!({ "stmt": sql });
+
+        let response = client
+            .post(uri)
+            .header(
+                "Authorization",
+                format!(
+                    "Basic {}",
+                    general_purpose::STANDARD.encode(format!("{}:{}", self.user, self.password))
+                ),
+            )
+            .header("Content-Type", "application/json")
+            .json(&request_body)
+            .send()
+            .await
+            .map_err(|err| SinkError::DorisStarrocksConnect(err.into()))?;
+
+        // Check if the request was successful (status code 2xx)
+        if !response.status().is_success() {
+            return Err(SinkError::DorisStarrocksConnect(anyhow!(
+                "Request failed with status: {}",
+                response.status()
+            )));
+        }
+
+        Ok(())
     }
 }
 #[derive(Debug, Serialize, Deserialize)]

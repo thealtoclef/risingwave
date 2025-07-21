@@ -224,6 +224,10 @@ DorisConfig:
   - name: doris.table
     field_type: String
     required: true
+  - name: auto_create
+    field_type: bool
+    required: false
+    default: Default::default
   - name: doris.partial_update
     field_type: String
     required: false
