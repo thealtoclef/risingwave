@@ -15,7 +15,7 @@
 use strum::{EnumMessage, VariantArray};
 use thiserror::Error;
 
-use super::{LicenseError, LicenseManager, report_telemetry};
+use super::{LicenseError, LicenseManager};
 
 // Define all features that require a license to use.
 //
@@ -89,25 +89,9 @@ impl Feature {
     /// Check whether the feature is available based on the given license manager.
     pub(crate) fn check_available_with(
         self,
-        manager: &LicenseManager,
+        _manager: &LicenseManager,
     ) -> Result<(), FeatureNotAvailable> {
-        let check_res = match manager.license() {
-            Ok(license) => {
-                if license.tier.available_features().any(|x| x == self) {
-                    Ok(())
-                } else {
-                    Err(FeatureNotAvailable::NotAvailable { feature: self })
-                }
-            }
-            Err(error) => Err(FeatureNotAvailable::LicenseError {
-                feature: self,
-                source: error,
-            }),
-        };
-
-        report_telemetry(&self, self.name(), check_res.is_ok());
-
-        check_res
+        Ok(())
     }
 
     /// Check whether the feature is available based on the current license.
