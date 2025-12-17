@@ -167,6 +167,26 @@ pub struct IcebergCommon {
     /// Enable vended credentials for iceberg REST catalog.
     #[serde(default, deserialize_with = "deserialize_optional_bool_from_string")]
     pub vended_credentials: Option<bool>,
+
+    /// Authentication type for iceberg REST catalog.
+    #[serde(rename = "catalog.rest.auth_type")]
+    pub rest_auth_type: Option<String>,
+
+    /// FileIO implementation for iceberg catalog.
+    #[serde(rename = "catalog.io_impl")]
+    pub io_impl: Option<String>,
+
+    /// Enable metrics reporting for REST catalog.
+    #[serde(rename = "catalog.rest.metrics_reporting_enabled")]
+    #[serde(default, deserialize_with = "deserialize_optional_bool_from_string")]
+    pub rest_metrics_reporting_enabled: Option<bool>,
+
+    /// Namespace properties for creating Iceberg namespaces/schemas.
+    /// Format: "key1=value1;key2=value2"
+    /// Example for BigQuery: "location=gs://my-bucket/{namespace};gcp-region=us-east1"
+    /// The {namespace} placeholder will be replaced with the actual namespace name.
+    #[serde(rename = "namespace.properties")]
+    pub namespace_properties: Option<String>,
 }
 
 impl EnforceSecret for IcebergCommon {
@@ -430,11 +450,13 @@ impl IcebergCommon {
             }
             java_catalog_configs.extend(java_catalog_props.clone());
 
-            // Currently we only support s3, so let's set it to s3
-            java_catalog_configs.insert(
-                "io-impl".to_owned(),
-                "org.apache.iceberg.aws.s3.S3FileIO".to_owned(),
-            );
+            // Set FileIO implementation only if not explicitly configured
+            if !java_catalog_configs.contains_key("io-impl") {
+                java_catalog_configs.insert(
+                    "io-impl".to_owned(),
+                    "org.apache.iceberg.aws.s3.S3FileIO".to_owned(),
+                );
+            }
 
             // suppress log of S3FileIO like: Unclosed S3FileIO instance created by...
             java_catalog_configs.insert("init-creation-stacktrace".to_owned(), "false".to_owned());
@@ -467,6 +489,21 @@ impl IcebergCommon {
 
             match self.catalog_type() {
                 "rest" => {
+                    if let Some(rest_auth_type) = &self.rest_auth_type {
+                        java_catalog_configs
+                            .insert("rest.auth.type".to_owned(), rest_auth_type.clone());
+                    }
+                    if let Some(io_impl) = &self.io_impl {
+                        java_catalog_configs.insert("io-impl".to_owned(), io_impl.clone());
+                    }
+                    if let Some(rest_metrics_reporting_enabled) =
+                        self.rest_metrics_reporting_enabled
+                    {
+                        java_catalog_configs.insert(
+                            "rest-metrics-reporting-enabled".to_owned(),
+                            rest_metrics_reporting_enabled.to_string(),
+                        );
+                    }
                     if let Some(credential) = &self.catalog_credential {
                         java_catalog_configs.insert("credential".to_owned(), credential.clone());
                     }

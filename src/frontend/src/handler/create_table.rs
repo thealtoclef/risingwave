@@ -1516,6 +1516,26 @@ pub async fn handle_create_table(
     Ok(PgResponse::empty_result(StatementType::CREATE_TABLE))
 }
 
+/// Check if the iceberg engine connection refers to an external catalog (not hosted)
+fn is_external_iceberg_catalog(session: &SessionImpl, _handler_args: &HandlerArgs) -> Result<bool> {
+    let conn_str = session.config().iceberg_engine_connection();
+    if conn_str.is_empty() {
+        return Ok(false);
+    }
+
+    let parts: Vec<&str> = conn_str.split('.').collect();
+    assert_eq!(parts.len(), 2);
+    let connection_catalog = session.get_connection_by_name(Some(parts[0].to_owned()), parts[1])?;
+
+    Ok(
+        matches!(&connection_catalog.info, ConnectionInfo::ConnectionParams(params)
+        if params.connection_type == ConnectionType::Iceberg as i32
+        && !params.properties.get("hosted_catalog")
+            .map(|s| s.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)),
+    )
+}
+
 /// Iceberg table engine is composed of hummock table, iceberg sink and iceberg source.
 ///
 /// 1. fetch iceberg engine options from the meta node. Or use iceberg engine connection provided by users.
@@ -1536,7 +1556,16 @@ pub async fn create_iceberg_engine_table(
     if_not_exists: bool,
 ) -> Result<()> {
     let meta_client = session.env().meta_client();
-    let meta_store_endpoint = meta_client.get_meta_store_endpoint().await?;
+
+    // Check if this is an external catalog - if so, skip meta store endpoint parsing
+    let is_external_catalog = is_external_iceberg_catalog(&session, &handler_args)?;
+
+    let meta_store_endpoint = if is_external_catalog {
+        // For external catalogs, use dummy endpoint since it won't be used
+        "postgres://dummy:dummy@localhost:5432/dummy".to_owned()
+    } else {
+        meta_client.get_meta_store_endpoint().await?
+    };
 
     let meta_store_endpoint = url::Url::parse(&meta_store_endpoint).map_err(|_| {
         ErrorCode::InternalError("failed to parse the meta store endpoint".to_owned())

@@ -578,6 +578,27 @@ IcebergConfig:
     comments: Enable vended credentials for iceberg REST catalog.
     required: false
     default: Default::default
+  - name: catalog.rest.auth_type
+    field_type: String
+    comments: Authentication type for iceberg REST catalog.
+    required: false
+  - name: catalog.io_impl
+    field_type: String
+    comments: FileIO implementation for iceberg catalog.
+    required: false
+  - name: catalog.rest.metrics_reporting_enabled
+    field_type: bool
+    comments: Enable metrics reporting for REST catalog.
+    required: false
+    default: Default::default
+  - name: namespace.properties
+    field_type: String
+    comments: |-
+      Namespace properties for creating Iceberg namespaces/schemas.
+      Format: "key1=value1;key2=value2"
+      Example for BigQuery: "location=gs://my-bucket/{namespace};gcp-region=us-east1"
+      The {namespace} placeholder will be replaced with the actual namespace name.
+    required: false
   - name: database.name
     field_type: String
     required: false
