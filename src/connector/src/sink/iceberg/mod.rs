@@ -599,8 +599,23 @@ async fn create_table_if_not_exists_impl(config: &IcebergConfig, param: &SinkPar
             .await
             .map_err(|e| SinkError::Iceberg(anyhow!(e)))?
         {
+            // Build namespace properties from namespace.properties configuration
+            // Format: "key1=value1;key2=value2"
+            let mut namespace_properties = HashMap::new();
+            if let Some(props_str) = &config.common.namespace_properties {
+                for pair in props_str.split(';') {
+                    let pair = pair.trim();
+                    if pair.is_empty() {
+                        continue;
+                    }
+                    if let Some((key, value)) = pair.split_once('=') {
+                        namespace_properties.insert(key.trim().to_string(), value.trim().to_string());
+                    }
+                }
+            }
+            
             catalog
-                .create_namespace(&namespace, HashMap::default())
+                .create_namespace(&namespace, namespace_properties)
                 .await
                 .map_err(|e| SinkError::Iceberg(anyhow!(e)))
                 .context("failed to create iceberg namespace")?;
@@ -644,10 +659,12 @@ async fn create_table_if_not_exists_impl(config: &IcebergConfig, param: &SinkPar
             match &config.common.warehouse_path {
                 Some(warehouse_path) => {
                     let is_s3_tables = warehouse_path.starts_with("arn:aws:s3tables");
+                    let is_bigquery = warehouse_path.starts_with("bq://");
                     let url = Url::parse(warehouse_path);
-                    if url.is_err() || is_s3_tables {
+                    if url.is_err() || is_s3_tables || is_bigquery {
                         // For rest catalog, the warehouse_path could be a warehouse name.
-                        // In this case, we should specify the location when creating a table.
+                        // Or it could be a s3tables path or a BigQuery path, which is not a valid URL but a valid warehouse path,
+                        // In this case, we should not specify the location when creating a table (let the catalog decide).
                         if config.common.catalog_type() == "rest"
                             || config.common.catalog_type() == "rest_rust"
                         {
@@ -2928,6 +2945,10 @@ mod test {
                 adlsgen2_account_key: None,
                 adlsgen2_endpoint: None,
                 vended_credentials: None,
+                rest_auth_type: None,
+                io_impl: None,
+                rest_metrics_reporting_enabled: None,
+                namespace_properties: None,
             },
             table: IcebergTableIdentifier {
                 database_name: Some("demo_db".to_owned()),

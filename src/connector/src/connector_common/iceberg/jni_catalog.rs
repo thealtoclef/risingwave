@@ -147,7 +147,7 @@ impl Catalog for JniCatalog {
     async fn create_namespace(
         &self,
         namespace: &iceberg::NamespaceIdent,
-        _properties: HashMap<String, String>,
+        properties: HashMap<String, String>,
     ) -> iceberg::Result<iceberg::Namespace> {
         execute_with_jni_env(self.jvm, |env| {
             let namespace_jstr = if namespace.is_empty() {
@@ -159,8 +159,25 @@ impl Catalog for JniCatalog {
                 env.new_string(&namespace[0]).unwrap()
             };
 
-            call_method!(env, self.java_catalog.as_obj(), {void createNamespace(String)},
-                &namespace_jstr)
+            // Convert properties HashMap to Java String array
+            let props_vec: Vec<String> = properties
+                .iter()
+                .flat_map(|(k, v)| vec![k.clone(), v.clone()])
+                .collect();
+            
+            let props_array = env.new_object_array(
+                props_vec.len() as i32,
+                "java/lang/String",
+                env.new_string("").unwrap()
+            )?;
+            
+            for (i, prop) in props_vec.iter().enumerate() {
+                let jstr = env.new_string(prop)?;
+                env.set_object_array_element(&props_array, i as i32, jstr)?;
+            }
+
+            call_method!(env, self.java_catalog.as_obj(), {void createNamespace(String, String[])},
+                &namespace_jstr, &props_array)
             .with_context(|| format!("Failed to create namespace: {namespace}"))?;
 
             Ok(Namespace::new(namespace.clone()))

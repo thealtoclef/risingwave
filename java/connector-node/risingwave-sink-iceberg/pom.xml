@@ -16,7 +16,7 @@
     <name>risingwave-sink-iceberg</name>
 
     <properties>
-        <iceberg.version>1.9.2</iceberg.version>
+        <iceberg.version>1.10.0</iceberg.version>
         <maven.compiler.source>11</maven.compiler.source>
         <maven.compiler.target>11</maven.compiler.target>
         <maven.javadoc.skip>true</maven.javadoc.skip>
@@ -136,7 +136,13 @@
         <dependency>
             <groupId>org.apache.iceberg</groupId>
             <artifactId>iceberg-snowflake</artifactId>
-            <version>1.9.2</version>
+            <version>${iceberg.version}</version>
+        </dependency>
+        <!-- Google Cloud OAuth2 credentials for BigQuery/BigLake support -->
+        <dependency>
+            <groupId>com.google.auth</groupId>
+            <artifactId>google-auth-library-oauth2-http</artifactId>
+            <version>1.40.0</version>
         </dependency>
     </dependencies>
 </project>
