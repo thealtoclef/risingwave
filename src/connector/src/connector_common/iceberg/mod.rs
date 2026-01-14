@@ -187,6 +187,12 @@ pub struct IcebergCommon {
     /// The {namespace} placeholder will be replaced with the actual namespace name.
     #[serde(rename = "namespace.properties")]
     pub namespace_properties: Option<String>,
+
+    /// Table properties for creating Iceberg tables.
+    /// Format: "key1=value1;key2=value2"
+    /// Example for BigQuery: "bq_connection=projects/my-project/locations/us/connections/my-connection"
+    #[serde(rename = "table.properties")]
+    pub table_properties: Option<String>,
 }
 
 impl EnforceSecret for IcebergCommon {

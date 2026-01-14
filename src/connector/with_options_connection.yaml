@@ -170,6 +170,13 @@ IcebergConnection:
       Example for BigQuery: "location=gs://my-bucket/{namespace};gcp-region=us-east1"
       The {namespace} placeholder will be replaced with the actual namespace name.
     required: false
+  - name: table.properties
+    field_type: String
+    comments: |-
+      Table properties for creating Iceberg tables.
+      Format: "key1=value1;key2=value2"
+      Example for BigQuery: "bq_connection=projects/my-project/locations/us/connections/my-connection"
+    required: false
   - name: catalog.jdbc.user
     field_type: String
     required: false

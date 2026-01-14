@@ -716,6 +716,21 @@ async fn create_table_if_not_exists_impl(config: &IcebergConfig, param: &SinkPar
             None => None,
         };
 
+        // Build table properties from table.properties configuration
+        // Format: "key1=value1;key2=value2"
+        let mut table_properties = HashMap::new();
+        if let Some(props_str) = &config.common.table_properties {
+            for pair in props_str.split(';') {
+                let pair = pair.trim();
+                if pair.is_empty() {
+                    continue;
+                }
+                if let Some((key, value)) = pair.split_once('=') {
+                    table_properties.insert(key.trim().to_string(), value.trim().to_string());
+                }
+            }
+        }
+
         let table_creation_builder = TableCreation::builder()
             .name(config.table.table_name().to_owned())
             .schema(iceberg_schema);
@@ -724,12 +739,19 @@ async fn create_table_if_not_exists_impl(config: &IcebergConfig, param: &SinkPar
             (Some(location), Some(partition_spec)) => table_creation_builder
                 .location(location)
                 .partition_spec(partition_spec)
+                .properties(table_properties)
                 .build(),
-            (Some(location), None) => table_creation_builder.location(location).build(),
+            (Some(location), None) => table_creation_builder
+                .location(location)
+                .properties(table_properties)
+                .build(),
             (None, Some(partition_spec)) => table_creation_builder
                 .partition_spec(partition_spec)
+                .properties(table_properties)
                 .build(),
-            (None, None) => table_creation_builder.build(),
+            (None, None) => table_creation_builder
+                .properties(table_properties)
+                .build(),
         };
 
         catalog
