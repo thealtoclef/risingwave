@@ -193,12 +193,23 @@ impl FragmentActorBuilder {
                     _ => unreachable!(),
                 };
 
+                let edge_id = EdgeId::UpstreamExternal {
+                    upstream_job_id: upstream_source_id.as_share_source_job_id(),
+                    downstream_fragment_id: self.fragment_id,
+                };
+
+                tracing::debug!(
+                    ?upstream_source_id,
+                    upstream_job_id = ?upstream_source_id.as_share_source_job_id(),
+                    ?self.fragment_id,
+                    ?edge_id,
+                    upstreams_available = ?self.upstreams.keys().collect::<Vec<_>>(),
+                    "rewrite_inner: CdcFilter/SourceBackfill looking up upstream"
+                );
+
                 // Index the upstreams by the an external edge ID.
                 let (upstream_fragment_id, upstream_actors) = &self.upstreams
-                    [&EdgeId::UpstreamExternal {
-                        upstream_job_id: upstream_source_id.as_share_source_job_id(),
-                        downstream_fragment_id: self.fragment_id,
-                    }];
+                    [&edge_id];
 
                 assert!(
                     upstream_actors.is_some(),
@@ -443,6 +454,13 @@ impl ActorGraphBuildStateInner {
         no_shuffle_actor_mapping: Option<HashMap<GlobalActorId, GlobalActorId>>,
     ) {
         if let Some(builder) = self.fragment_actor_builders.get_mut(&fragment_id) {
+            tracing::debug!(
+                ?fragment_id,
+                ?edge_id,
+                ?upstream_fragment_id,
+                has_no_shuffle_mapping = no_shuffle_actor_mapping.is_some(),
+                "add_upstream: adding upstream to fragment_actor_builder"
+            );
             builder
                 .upstreams
                 .try_insert(edge_id, (upstream_fragment_id, no_shuffle_actor_mapping))
@@ -451,6 +469,12 @@ impl ActorGraphBuildStateInner {
             let EdgeId::DownstreamExternal(edge_id) = edge_id else {
                 unreachable!("edge from internal to external must be `DownstreamExternal`")
             };
+            tracing::debug!(
+                ?fragment_id,
+                ?edge_id,
+                ?upstream_fragment_id,
+                "add_upstream: adding to downstream_fragment_changes (fragment not in fragment_actor_builders)"
+            );
             self.downstream_fragment_changes
                 .entry(fragment_id)
                 .or_default()
@@ -483,6 +507,16 @@ impl ActorGraphBuildStateInner {
         edge: &'a StreamFragmentEdge,
     ) {
         let dt = edge.dispatch_strategy.r#type();
+
+        tracing::debug!(
+            ?edge.id,
+            upstream_fragment_id = ?upstream.fragment_id,
+            downstream_fragment_id = ?downstream.fragment_id,
+            upstream_actor_count = upstream.actor_ids.len(),
+            downstream_actor_count = downstream.actor_ids.len(),
+            ?dt,
+            "add_link: creating link between fragments"
+        );
 
         match dt {
             // For `NoShuffle`, make n "1-1" links between the actors.
@@ -822,10 +856,20 @@ impl ActorGraphBuilder {
             }
 
             {
+                tracing::debug!(
+                    "generate_graph: sealing {} fragments",
+                    fragment_actors.len()
+                );
                 fragment_actors
                     .into_iter()
                     .map(|(fragment_id, (stream_node, actors))| {
                         let distribution = self.distributions[&fragment_id].clone();
+                        tracing::debug!(
+                            ?fragment_id,
+                            actor_count = actors.len(),
+                            actor_ids = ?actors.iter().map(|a| a.actor_id).collect::<Vec<_>>(),
+                            "generate_graph: sealing fragment"
+                        );
                         let fragment = self.fragment_graph.seal_fragment(
                             fragment_id,
                             actors,
@@ -940,6 +984,13 @@ impl ActorGraphBuilder {
         let current_fragment = self.fragment_graph.get_fragment(fragment_id);
         let distribution = self.get_distribution(fragment_id);
 
+        tracing::debug!(
+            ?fragment_id,
+            is_building = matches!(current_fragment, EitherFragment::Building(_)),
+            ?distribution,
+            "build_actor_graph_fragment: processing fragment"
+        );
+
         // First, add or record the actors for the current fragment into the state.
         let actor_ids = match current_fragment {
             // For building fragments, we need to generate the actor builders.
@@ -952,14 +1003,28 @@ impl ActorGraphBuilder {
                     .expect("non-duplicate");
                 let bitmaps = distribution.as_hash().map(|m| m.to_bitmaps());
 
-                distribution
-                    .actors()
+                let actors = distribution.actors().collect_vec();
+                tracing::debug!(
+                    ?fragment_id,
+                    actor_count = actors.len(),
+                    "build_actor_graph_fragment: creating actors for Building fragment"
+                );
+
+                actors
+                    .into_iter()
                     .map(|alignment_id| {
                         let actor_id = state.next_actor_id();
                         let vnode_bitmap = bitmaps
                             .as_ref()
                             .map(|m: &HashMap<ActorAlignmentId, Bitmap>| &m[&alignment_id])
                             .cloned();
+
+                        tracing::debug!(
+                            ?fragment_id,
+                            ?actor_id,
+                            ?alignment_id,
+                            "build_actor_graph_fragment: creating actor for fragment"
+                        );
 
                         state
                             .inner

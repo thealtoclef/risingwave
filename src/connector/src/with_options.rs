@@ -164,6 +164,11 @@ pub trait WithPropertiesExt: Get + GetKeyIter + Sized {
         self.is_cdc_connector() && ExternalCdcTableType::from_properties(self).can_backfill()
     }
 
+    /// Returns true if this is a Debezium-based CDC connector
+    fn is_debezium(&self) -> bool {
+        ExternalCdcTableType::from_properties(self).is_debezium()
+    }
+
     /// Tables with MySQL and PostgreSQL connectors are maintained for backward compatibility.
     /// The newly added SQL Server CDC connector is only supported when created as shared.
     fn is_shareable_only_cdc_connector(&self) -> bool {

@@ -282,6 +282,13 @@ fn task_main(
                     ctx.pb
                         .set_message(format!("pubsub {}:{}", c.address, c.port));
                 }
+
+                ServiceConfig::Spanner(c) => {
+                    let mut service = risedev::SpannerService::new(c.clone())?;
+                    service.execute(&mut ctx)?;
+                    ctx.pb
+                        .set_message(format!("spanner {}:{}", c.address, c.port));
+                }
                 ServiceConfig::Pulsar(c) => {
                     PulsarService::new(c.clone()).execute(&mut ctx)?;
                     let mut task = risedev::TcpReadyCheckTask::new(

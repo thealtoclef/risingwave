@@ -32,6 +32,7 @@ use crate::parser::utils::{
     extract_timestamp_from_meta,
 };
 use crate::source::{SourceColumnDesc, SourceColumnType, SourceCtrlOpts, SourceMeta};
+use crate::source::spanner_cdc::SpannerCdcMeta;
 
 /// Maximum number of rows in a transaction. If a transaction is larger than this, it will be force
 /// committed to avoid potential OOM.
@@ -313,7 +314,7 @@ impl SourceStreamChunkRowWriter<'_> {
                 (&SourceColumnType::Meta, _)
                     if matches!(
                         &self.row_meta.map(|ele| ele.source_meta),
-                        &Some(SourceMeta::Kafka(_) | SourceMeta::DebeziumCdc(_))
+                        &Some(SourceMeta::Kafka(_) | SourceMeta::DebeziumCdc(_) | SourceMeta::SpannerCdc(_))
                     ) =>
                 {
                     // SourceColumnType is for CDC source only.
@@ -331,16 +332,27 @@ impl SourceStreamChunkRowWriter<'_> {
                 ) => {
                     match self.row_meta {
                         Some(row_meta) => {
-                            if let SourceMeta::DebeziumCdc(cdc_meta) = row_meta.source_meta {
-                                Ok(A::output_for(extract_cdc_meta_column(
-                                    cdc_meta,
-                                    col,
-                                    desc.name.as_str(),
-                                )?))
-                            } else {
-                                Err(AccessError::Uncategorized {
+                            match row_meta.source_meta {
+                                SourceMeta::DebeziumCdc(cdc_meta) => {
+                                    Ok(A::output_for(extract_cdc_meta_column(
+                                        cdc_meta,
+                                        col,
+                                        desc.name.as_str(),
+                                    )?))
+                                }
+                                SourceMeta::SpannerCdc(spanner_cdc_meta) => {
+                                    // For Spanner CDC, extract table name directly
+                                    if matches!(col, AdditionalColumnType::TableName(_)) {
+                                        Ok(A::output_for(spanner_cdc_meta.extract_table_name()))
+                                    } else {
+                                        Err(AccessError::Uncategorized {
+                                            message: "Database name is not supported for Spanner CDC".to_owned(),
+                                        })
+                                    }
+                                }
+                                _ => Err(AccessError::Uncategorized {
                                     message: "CDC metadata not found in the message".to_owned(),
-                                })
+                                }),
                             }
                         }
                         None => parse_field(desc), // parse from payload

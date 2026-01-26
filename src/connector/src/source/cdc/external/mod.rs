@@ -17,10 +17,11 @@ pub mod postgres;
 pub mod sql_server;
 
 pub mod mysql;
+pub mod spanner;
 
 use std::collections::{BTreeMap, HashMap};
 
-use anyhow::anyhow;
+use anyhow::{Context, anyhow};
 use futures::pin_mut;
 use futures::stream::BoxStream;
 use futures_async_stream::try_stream;
@@ -43,6 +44,9 @@ use crate::source::cdc::external::mysql::{
     MySqlExternalTable, MySqlExternalTableReader, MySqlOffset,
 };
 use crate::source::cdc::external::postgres::{PostgresExternalTableReader, PostgresOffset};
+use crate::source::cdc::external::spanner::{
+    SpannerExternalTable, SpannerExternalTableReader, SpannerOffset,
+};
 use crate::source::cdc::external::sql_server::{
     SqlServerExternalTable, SqlServerExternalTableReader, SqlServerOffset,
 };
@@ -56,6 +60,7 @@ pub enum ExternalCdcTableType {
     SqlServer,
     Citus,
     Mongo,
+    Spanner,
 }
 
 impl ExternalCdcTableType {
@@ -67,12 +72,18 @@ impl ExternalCdcTableType {
             "citus-cdc" => Self::Citus,
             "sqlserver-cdc" => Self::SqlServer,
             "mongodb-cdc" => Self::Mongo,
+            "spanner-cdc" => Self::Spanner,
             _ => Self::Undefined,
         }
     }
 
     pub fn can_backfill(&self) -> bool {
-        matches!(self, Self::MySql | Self::Postgres | Self::SqlServer)
+        matches!(self, Self::MySql | Self::Postgres | Self::SqlServer | Self::Spanner)
+    }
+
+    /// Returns true if this is a Debezium-based CDC connector
+    pub fn is_debezium(&self) -> bool {
+        matches!(self, Self::MySql | Self::Postgres | Self::SqlServer | Self::Citus | Self::Mongo)
     }
 
     pub fn enable_transaction_metadata(&self) -> bool {
@@ -83,7 +94,7 @@ impl ExternalCdcTableType {
     }
 
     pub fn shareable_only(&self) -> bool {
-        matches!(self, Self::SqlServer)
+        matches!(self, Self::SqlServer | Self::Spanner)
     }
 
     pub async fn create_table_reader(
@@ -104,6 +115,12 @@ impl ExternalCdcTableType {
             Self::SqlServer => Ok(ExternalTableReaderImpl::SqlServer(
                 SqlServerExternalTableReader::new(config, schema, pk_indices).await?,
             )),
+            Self::Spanner => {
+                let enable_databoost = config.enable_databoost;
+                Ok(ExternalTableReaderImpl::Spanner(
+                    SpannerExternalTableReader::new(config, schema, enable_databoost).await?,
+                ))
+            }
             // citus is never supported for cdc backfill (create source + create table).
             Self::Mock => Ok(ExternalTableReaderImpl::Mock(MockExternalTableReader::new())),
             _ => bail!("invalid external table type: {:?}", *self),
@@ -120,6 +137,7 @@ impl From<ExternalCdcTableType> for PbCdcTableType {
 
             ExternalCdcTableType::Citus => Self::Citus,
             ExternalCdcTableType::Mongo => Self::Mongo,
+            ExternalCdcTableType::Spanner => Self::Unspecified, // Spanner CDC doesn't use Debezium format
             ExternalCdcTableType::Undefined | ExternalCdcTableType::Mock => Self::Unspecified,
         }
     }
@@ -165,6 +183,10 @@ impl SchemaTableName {
             ExternalCdcTableType::SqlServer => {
                 properties.get(SCHEMA_NAME_KEY).cloned().unwrap_or_default()
             }
+            ExternalCdcTableType::Spanner => {
+                // Spanner doesn't use schema names
+                String::new()
+            }
             _ => {
                 unreachable!("invalid external table type: {:?}", table_type);
             }
@@ -182,6 +204,7 @@ pub enum CdcOffset {
     MySql(MySqlOffset),
     Postgres(PostgresOffset),
     SqlServer(SqlServerOffset),
+    Spanner(SpannerOffset),
 }
 
 // Example debezium offset for Postgres:
@@ -276,6 +299,7 @@ pub enum ExternalTableReaderImpl {
     MySql(MySqlExternalTableReader),
     Postgres(PostgresExternalTableReader),
     SqlServer(SqlServerExternalTableReader),
+    Spanner(SpannerExternalTableReader),
     Mock(MockExternalTableReader),
 }
 
@@ -283,12 +307,15 @@ pub enum ExternalTableReaderImpl {
 pub struct ExternalTableConfig {
     pub connector: String,
 
-    #[serde(rename = "hostname")]
+    #[serde(rename = "hostname", default = "Default::default")]
     pub host: String,
+    #[serde(default = "Default::default")]
     pub port: String,
+    #[serde(default = "Default::default")]
     pub username: String,
+    #[serde(default = "Default::default")]
     pub password: String,
-    #[serde(rename = "database.name")]
+    #[serde(rename = "database.name", default = "Default::default")]
     pub database: String,
     #[serde(rename = "schema.name", default = "Default::default")]
     pub schema: String,
@@ -309,6 +336,39 @@ pub struct ExternalTableConfig {
     /// Only "true" means using SSL. All other values are treated as "false".
     #[serde(rename = "database.encrypt", default = "Default::default")]
     pub encrypt: String,
+
+    /// Spanner Google Cloud project ID
+    #[serde(rename = "spanner.project")]
+    #[serde(default = "Default::default")]
+    pub spanner_project: String,
+
+    /// Spanner instance ID
+    #[serde(rename = "spanner.instance")]
+    #[serde(default = "Default::default")]
+    pub spanner_instance: String,
+
+    /// Spanner database name
+    #[serde(rename = "spanner.database")]
+    #[serde(default = "Default::default")]
+    pub spanner_database: String,
+
+    /// Spanner emulator host for testing
+    #[serde(rename = "spanner.emulator_host")]
+    pub emulator_host: Option<String>,
+
+    /// GCP credentials JSON string
+    #[serde(rename = "spanner.credentials")]
+    pub credentials: Option<String>,
+
+    /// Path to GCP service account credentials file
+    /// Alternative to `spanner.credentials` for file-based credentials
+    #[serde(rename = "spanner.credentials_path")]
+    pub credentials_path: Option<String>,
+
+    /// Enable databoost for parallel reads (default: false)
+    #[serde(rename = "spanner.enable_databoost")]
+    #[serde(default, deserialize_with = "crate::deserialize_bool_from_string")]
+    pub enable_databoost: bool,
 }
 
 fn postgres_ssl_mode_default() -> SslMode {
@@ -335,6 +395,7 @@ impl ExternalTableReader for ExternalTableReaderImpl {
             ExternalTableReaderImpl::MySql(mysql) => mysql.current_cdc_offset().await,
             ExternalTableReaderImpl::Postgres(postgres) => postgres.current_cdc_offset().await,
             ExternalTableReaderImpl::SqlServer(sql_server) => sql_server.current_cdc_offset().await,
+            ExternalTableReaderImpl::Spanner(spanner) => spanner.current_cdc_offset().await,
             ExternalTableReaderImpl::Mock(mock) => mock.current_cdc_offset().await,
         }
     }
@@ -377,6 +438,14 @@ impl ExternalTableReaderImpl {
             ExternalTableReaderImpl::SqlServer(_) => {
                 SqlServerExternalTableReader::get_cdc_offset_parser()
             }
+            ExternalTableReaderImpl::Spanner(_) => {
+                // Spanner uses timestamp-based offsets
+                Box::new(|offset_str: &str| {
+                    let timestamp = offset_str.parse::<i64>()
+                        .context("failed to parse Spanner timestamp")?;
+                    Ok(CdcOffset::Spanner(SpannerOffset::new(timestamp)))
+                })
+            }
             ExternalTableReaderImpl::Mock(_) => MockExternalTableReader::get_cdc_offset_parser(),
         }
     }
@@ -399,6 +468,9 @@ impl ExternalTableReaderImpl {
             ExternalTableReaderImpl::SqlServer(sql_server) => {
                 sql_server.snapshot_read(table_name, start_pk, primary_keys, limit)
             }
+            ExternalTableReaderImpl::Spanner(spanner) => {
+                spanner.snapshot_read(table_name, start_pk, primary_keys, limit)
+            }
             ExternalTableReaderImpl::Mock(mock) => {
                 mock.snapshot_read(table_name, start_pk, primary_keys, limit)
             }
@@ -418,6 +490,7 @@ impl ExternalTableReaderImpl {
             ExternalTableReaderImpl::MySql(e) => e.get_parallel_cdc_splits(options),
             ExternalTableReaderImpl::Postgres(e) => e.get_parallel_cdc_splits(options),
             ExternalTableReaderImpl::SqlServer(e) => e.get_parallel_cdc_splits(options),
+            ExternalTableReaderImpl::Spanner(e) => e.get_parallel_cdc_splits(options),
             ExternalTableReaderImpl::Mock(e) => e.get_parallel_cdc_splits(options),
         };
         pin_mut!(stream);
@@ -446,6 +519,9 @@ impl ExternalTableReaderImpl {
             ExternalTableReaderImpl::SqlServer(sql_server) => {
                 sql_server.split_snapshot_read(table_name, left, right, split_columns)
             }
+            ExternalTableReaderImpl::Spanner(spanner) => {
+                spanner.split_snapshot_read(table_name, left, right, split_columns)
+            }
             ExternalTableReaderImpl::Mock(mock) => {
                 mock.split_snapshot_read(table_name, left, right, split_columns)
             }
@@ -464,16 +540,33 @@ pub enum ExternalTableImpl {
     MySql(MySqlExternalTable),
     Postgres(PostgresExternalTable),
     SqlServer(SqlServerExternalTable),
+    Spanner(SpannerExternalTable),
 }
 
 impl ExternalTableImpl {
     pub async fn connect(config: ExternalTableConfig) -> ConnectorResult<Self> {
-        let cdc_source_type = CdcSourceType::from(config.connector.as_str());
-        match cdc_source_type {
-            CdcSourceType::Mysql => Ok(ExternalTableImpl::MySql(
+        let cdc_table_type = ExternalCdcTableType::from_properties(
+            &std::collections::BTreeMap::new()
+        );
+        // Actually we need to determine type from the config directly
+        // For Spanner, check if spanner_project/instance/database are present
+        let table_type = if !config.spanner_project.is_empty() && !config.spanner_instance.is_empty() && !config.spanner_database.is_empty() {
+            ExternalCdcTableType::Spanner
+        } else if config.connector.contains("mysql") || config.connector.contains("my_sql") {
+            ExternalCdcTableType::MySql
+        } else if config.connector.contains("postgres") {
+            ExternalCdcTableType::Postgres
+        } else if config.connector.contains("sqlserver") {
+            ExternalCdcTableType::SqlServer
+        } else {
+            return Err(anyhow!("Unsupported cdc connector type: {}", config.connector).into());
+        };
+
+        match table_type {
+            ExternalCdcTableType::MySql => Ok(ExternalTableImpl::MySql(
                 MySqlExternalTable::connect(config).await?,
             )),
-            CdcSourceType::Postgres => Ok(ExternalTableImpl::Postgres(
+            ExternalCdcTableType::Postgres => Ok(ExternalTableImpl::Postgres(
                 PostgresExternalTable::connect(
                     &config.username,
                     &config.password,
@@ -488,8 +581,11 @@ impl ExternalTableImpl {
                 )
                 .await?,
             )),
-            CdcSourceType::SqlServer => Ok(ExternalTableImpl::SqlServer(
+            ExternalCdcTableType::SqlServer => Ok(ExternalTableImpl::SqlServer(
                 SqlServerExternalTable::connect(config).await?,
+            )),
+            ExternalCdcTableType::Spanner => Ok(ExternalTableImpl::Spanner(
+                SpannerExternalTable::connect(config).await?,
             )),
             _ => Err(anyhow!("Unsupported cdc connector type: {}", config.connector).into()),
         }
@@ -500,6 +596,7 @@ impl ExternalTableImpl {
             ExternalTableImpl::MySql(mysql) => mysql.column_descs(),
             ExternalTableImpl::Postgres(postgres) => postgres.column_descs(),
             ExternalTableImpl::SqlServer(sql_server) => sql_server.column_descs(),
+            ExternalTableImpl::Spanner(spanner) => spanner.column_descs(),
         }
     }
 
@@ -508,6 +605,7 @@ impl ExternalTableImpl {
             ExternalTableImpl::MySql(mysql) => mysql.pk_names(),
             ExternalTableImpl::Postgres(postgres) => postgres.pk_names(),
             ExternalTableImpl::SqlServer(sql_server) => sql_server.pk_names(),
+            ExternalTableImpl::Spanner(spanner) => spanner.pk_names(),
         }
     }
 }

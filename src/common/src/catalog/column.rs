@@ -21,8 +21,10 @@ use risingwave_common::types::Datum;
 use risingwave_pb::expr::ExprNode;
 use risingwave_pb::expr::expr_node::{RexNode, Type as ExprType};
 use risingwave_pb::plan_common::column_desc::GeneratedOrDefaultColumn;
+use risingwave_pb::plan_common::additional_column::ColumnType as AdditionalColumnType;
 use risingwave_pb::plan_common::{
-    AdditionalColumn, ColumnDescVersion, DefaultColumnDesc, PbColumnCatalog, PbColumnDesc,
+    AdditionalColumn, AdditionalColumnPayload, ColumnDescVersion, DefaultColumnDesc,
+    PbColumnCatalog, PbColumnDesc,
 };
 
 use super::schema::FieldLike;
@@ -443,10 +445,15 @@ impl ColumnCatalog {
     /// May also look for the usage of `SourceColumnType`.
     pub fn debezium_cdc_source_cols() -> [Self; 3] {
         [
-            Self::visible(ColumnDesc::named(
+            // For shared CDC sources, the payload column contains the entire JSON (Debezium envelope)
+            // We use AdditionalColumnType::Payload to signal the parser to return the entire JSON
+            Self::visible(ColumnDesc::named_with_additional_column(
                 "payload",
                 ColumnId::placeholder(),
                 DataType::Jsonb,
+                AdditionalColumn {
+                    column_type: Some(AdditionalColumnType::Payload(AdditionalColumnPayload {})),
+                },
             )),
             // upstream offset
             Self::hidden(ColumnDesc::named(

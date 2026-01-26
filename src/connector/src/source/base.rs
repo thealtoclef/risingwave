@@ -45,6 +45,7 @@ use super::monitor::SourceMetrics;
 use super::nats::source::NatsMeta;
 use super::nexmark::source::message::NexmarkMeta;
 use super::pulsar::source::PulsarMeta;
+use super::spanner_cdc::SpannerCdcMeta;
 use crate::enforce_secret::EnforceSecret;
 use crate::error::ConnectorResult as Result;
 use crate::parser::ParserConfig;
@@ -701,6 +702,7 @@ impl ConnectorProperties {
             || matches!(self, ConnectorProperties::OpendalS3(_))
             || matches!(self, ConnectorProperties::Gcs(_))
             || matches!(self, ConnectorProperties::Azblob(_))
+            || matches!(self, ConnectorProperties::SpannerCdc(_))
     }
 
     pub async fn create_split_enumerator(
@@ -909,6 +911,7 @@ pub enum SourceMeta {
     Datagen(DatagenMeta),
     DebeziumCdc(DebeziumCdcMeta),
     Nats(NatsMeta),
+    SpannerCdc(SpannerCdcMeta),
     // For the source that doesn't have meta data.
     Empty,
 }

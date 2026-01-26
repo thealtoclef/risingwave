@@ -49,6 +49,7 @@ use crate::error::ConnectorResult;
 use crate::parser::maxwell::MaxwellParser;
 use crate::schema::schema_registry::SchemaRegistryConfig;
 use crate::source::monitor::GLOBAL_SOURCE_METRICS;
+use crate::source::spanner_cdc::SpannerCdcMeta;
 use crate::source::{
     BoxSourceMessageStream, SourceChunkStream, SourceColumnDesc, SourceColumnType, SourceContext,
     SourceContextRef, SourceCtrlOpts, SourceMeta,
@@ -119,6 +120,14 @@ impl<'a> MessageMeta<'a> {
                     "unexpected cdc meta column name"
                 );
                 Some(cdc_meta.full_table_name.as_str().into())
+            }
+            SourceColumnType::Meta if let SourceMeta::SpannerCdc(spanner_cdc_meta) = self.source_meta => {
+                assert_eq!(
+                    desc.name.as_str(),
+                    CDC_TABLE_NAME_COLUMN_NAME,
+                    "unexpected cdc meta column name"
+                );
+                spanner_cdc_meta.extract_table_name()
             }
 
             // For other cases, return `None`.
@@ -287,6 +296,20 @@ async fn parse_message_stream<P: ByteStreamSourceParser>(
                             .with_guarded_label_values(&[&msg_meta.full_table_name])
                     });
                 direct_cdc_event_lag_latency.observe(lag_ms as f64);
+            } else if let SourceMeta::SpannerCdc(msg_meta) = &msg.meta {
+                // Spanner CDC uses OffsetDateTime for commit_timestamp
+                let commit_ts_nanos = msg_meta.commit_timestamp.unix_timestamp_nanos();
+                let commit_ts_ms = (commit_ts_nanos / 1_000_000) as i64; // convert to milliseconds
+                let lag_ms = process_time_ms.saturating_sub(commit_ts_ms);
+                // report to prometheus
+                let direct_cdc_event_lag_latency = direct_cdc_event_lag_latency_metrics
+                    .entry(msg_meta.table_name.clone())
+                    .or_insert_with(|| {
+                        GLOBAL_SOURCE_METRICS
+                            .direct_cdc_event_lag_latency
+                            .with_guarded_label_values(&[&msg_meta.table_name])
+                    });
+                direct_cdc_event_lag_latency.observe(lag_ms as f64);
             }
 
             // Parse the message and write to the chunk builder, it's possible that the message
@@ -318,7 +341,7 @@ async fn parse_message_stream<P: ByteStreamSourceParser>(
                                 split_id = &*msg.split_id,
                                 offset = msg.offset,
                                 suppressed_count,
-                                "failed to parse message, skipping"
+                                "failed to parse message, failing stream to prevent data loss"
                             );
                         }
 
@@ -330,6 +353,10 @@ async fn parse_message_stream<P: ByteStreamSourceParser>(
                             context.source_name.clone(),
                             context.fragment_id.to_string(),
                         ]);
+
+                        // FAIL FAST: Propagate error to stop the stream immediately
+                        // This prevents silent data loss and alerts operators to investigate
+                        return Err(error.into());
                     }
 
                     for chunk in chunk_builder.consume_ready_chunks() {
@@ -359,7 +386,18 @@ async fn parse_message_stream<P: ByteStreamSourceParser>(
                 },
 
                 Ok(ParseResult::SchemaChange(schema_change)) => {
+                    tracing::info!(
+                        target: "spanner_cdc_schema_evolution",
+                        "into_chunk_stream received ParseResult::SchemaChange with {} table_changes, schema_change_tx: {}",
+                        schema_change.table_changes.len(),
+                        parser.source_ctx().schema_change_tx.is_some()
+                    );
+
                     if schema_change.is_empty() {
+                        tracing::debug!(
+                            target: "spanner_cdc_schema_evolution",
+                            "Schema change is empty, skipping"
+                        );
                         continue;
                     }
 
@@ -368,15 +406,29 @@ async fn parse_message_stream<P: ByteStreamSourceParser>(
                     // and wait for the source executor to finish the schema change process before
                     // parsing the following messages.
                     if let Some(ref tx) = parser.source_ctx().schema_change_tx {
+                        tracing::info!(
+                            target: "spanner_cdc_schema_evolution",
+                            "Sending schema change through schema_change_tx to executor"
+                        );
                         tx.send((schema_change, oneshot_tx))
                             .await
                             .expect("send schema change to executor");
                         match oneshot_rx.await {
-                            Ok(()) => {}
+                            Ok(()) => {
+                                tracing::info!(
+                                    target: "spanner_cdc_schema_evolution",
+                                    "Schema change successfully applied by executor"
+                                );
+                            }
                             Err(e) => {
                                 tracing::error!(error = %e.as_report(), "failed to wait for schema change");
                             }
                         }
+                    } else {
+                        tracing::warn!(
+                            target: "spanner_cdc_schema_evolution",
+                            "schema_change_tx is None - auto schema change is disabled globally"
+                        );
                     }
                 }
             }
