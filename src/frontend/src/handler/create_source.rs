@@ -66,7 +66,7 @@ pub use risingwave_connector::source::{
 use risingwave_connector::source::{
     AZBLOB_CONNECTOR, ConnectorProperties, GCS_CONNECTOR, GOOGLE_PUBSUB_CONNECTOR, KAFKA_CONNECTOR,
     KINESIS_CONNECTOR, LEGACY_S3_CONNECTOR, MQTT_CONNECTOR, NATS_CONNECTOR, NEXMARK_CONNECTOR,
-    OPENDAL_S3_CONNECTOR, POSIX_FS_CONNECTOR, PULSAR_CONNECTOR,
+    OPENDAL_S3_CONNECTOR, POSIX_FS_CONNECTOR, PULSAR_CONNECTOR, SPANNER_CDC_CONNECTOR,
 };
 use risingwave_connector::{AUTO_SCHEMA_CHANGE_KEY, WithPropertiesExt};
 use risingwave_pb::catalog::connection_params::PbConnectionType;
@@ -768,24 +768,28 @@ pub fn bind_connector_props(
             Feature::CdcAutoSchemaChange.check_available()?;
         }
 
-        // set connector to backfill mode
-        with_properties.insert(CDC_SNAPSHOT_MODE_KEY.into(), CDC_SNAPSHOT_BACKFILL.into());
-        // enable cdc sharing mode, which will capture all tables in the given `database.name`
-        with_properties.insert(CDC_SHARING_MODE_KEY.into(), "true".into());
-        // enable transactional cdc
-        if with_properties.enable_transaction_metadata() {
-            with_properties.insert(CDC_TRANSACTIONAL_KEY.into(), "true".into());
-        }
-        // Only set CDC_WAIT_FOR_STREAMING_START_TIMEOUT if not already specified by user.
-        if !with_properties.contains_key(CDC_WAIT_FOR_STREAMING_START_TIMEOUT) {
-            with_properties.insert(
-                CDC_WAIT_FOR_STREAMING_START_TIMEOUT.into(),
-                handler_args
-                    .session
-                    .config()
-                    .cdc_source_wait_streaming_start_timeout()
-                    .to_string(),
-            );
+        // Only set Debezium-specific properties for Debezium-based CDC connectors
+        // Non-Debezium CDC connectors (e.g., Spanner CDC) don't use these properties
+        if with_properties.is_debezium() {
+            // set connector to backfill mode
+            with_properties.insert(CDC_SNAPSHOT_MODE_KEY.into(), CDC_SNAPSHOT_BACKFILL.into());
+            // enable cdc sharing mode, which will capture all tables in the given `database.name`
+            with_properties.insert(CDC_SHARING_MODE_KEY.into(), "true".into());
+            // enable transactional cdc
+            if with_properties.enable_transaction_metadata() {
+                with_properties.insert(CDC_TRANSACTIONAL_KEY.into(), "true".into());
+            }
+            // Only set CDC_WAIT_FOR_STREAMING_START_TIMEOUT if not already specified by user.
+            if !with_properties.contains_key(CDC_WAIT_FOR_STREAMING_START_TIMEOUT) {
+                with_properties.insert(
+                    CDC_WAIT_FOR_STREAMING_START_TIMEOUT.into(),
+                    handler_args
+                        .session
+                        .config()
+                        .cdc_source_wait_streaming_start_timeout()
+                        .to_string(),
+                );
+            }
         }
     }
     if with_properties.is_mysql_cdc_connector() {

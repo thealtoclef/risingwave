@@ -204,7 +204,14 @@ impl<S: StateStore> SourceExecutor<S> {
     }
 
     fn is_auto_schema_change_enable(&self) -> bool {
-        self.actor_ctx.config.developer.enable_auto_schema_change
+        let enabled = self.actor_ctx.config.developer.enable_auto_schema_change;
+        tracing::info!(
+            target: "spanner_cdc_schema_evolution",
+            "is_auto_schema_change_enable: {}, source_name: {}",
+            enabled,
+            self.stream_source_core.source_name
+        );
+        enabled
     }
 
     /// `source_id | source_name | actor_id | fragment_id`

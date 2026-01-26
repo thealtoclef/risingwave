@@ -76,6 +76,7 @@ either = "1"
 elasticsearch = { version = "8.17.0-alpha.1", features = ["rustls-tls"] }
 enum-as-inner = "0.6"
 futures = { version = "0.3", default-features = false, features = ["alloc"] }
+parse-display = "0.10"
 futures-async-stream = { workspace = true }
 gcp-bigquery-client = { version = "0.18.0", optional = true }
 glob = "0.3"
@@ -88,6 +89,7 @@ google-cloud-googleapis = { package = "gcloud-googleapis", version = "1", featur
     "bigquery",
 ], optional = true }
 google-cloud-pubsub = { package = "gcloud-pubsub", version = "1.5" }
+google-cloud-spanner = { package = "gcloud-spanner", version = "1" }
 iceberg = { workspace = true }
 iceberg-catalog-glue = { workspace = true }
 iceberg-catalog-rest = { workspace = true }
@@ -193,7 +195,7 @@ tiberius = { git = "https://github.com/risingwavelabs/tiberius.git", rev = "5935
     "tds73",
     "time",
 ] }
-time = "0.3.30"
+time = { version = "0.3.30", features = ["serde", "serde-well-known", "macros"] }
 tokio = { version = "0.2", package = "madsim-tokio", features = [
     "rt",
     "rt-multi-thread",

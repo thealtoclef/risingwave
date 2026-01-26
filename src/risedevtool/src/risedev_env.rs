@@ -123,6 +123,12 @@ pub fn generate_risedev_env(services: &Vec<ServiceConfig>) -> String {
                 writeln!(env, r#"PUBSUB_EMULATOR_HOST="{address}:{port}""#,).unwrap();
                 writeln!(env, r#"RISEDEV_PUBSUB_WITH_OPTIONS_COMMON="connector='google_pubsub',pubsub.emulator_host='{address}:{port}'""#,).unwrap();
             }
+            ServiceConfig::Spanner(c) => {
+                let address = &c.address;
+                let port = &c.port;
+                writeln!(env, r#"SPANNER_EMULATOR_HOST="{address}:{port}""#,).unwrap();
+                writeln!(env, r#"RISEDEV_SPANNER_WITH_OPTIONS_COMMON="connector='spanner-cdc',spanner.emulator_host='{address}:{port}',spanner.project='test-project',spanner.instance='test-instance',spanner.database='test-database'""#,).unwrap();
+            }
             ServiceConfig::Postgres(c) => {
                 let host = &c.address;
                 let port = &c.port;

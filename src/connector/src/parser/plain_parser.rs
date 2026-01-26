@@ -31,6 +31,7 @@ use crate::parser::unified::debezium::{parse_schema_change, parse_transaction_me
 use crate::parser::upsert_parser::get_key_column_name;
 use crate::parser::{BytesProperties, ParseResult, ParserFormat};
 use crate::source::cdc::CdcMessageType;
+use crate::source::spanner_cdc::SpannerCdcMeta;
 use crate::source::{SourceColumnDesc, SourceContext, SourceContextRef, SourceMeta};
 
 /// Parser for `FORMAT PLAIN`, i.e., append-only source.
@@ -187,6 +188,87 @@ impl PlainParser {
                 }
                 CdcMessageType::Unspecified => {
                     unreachable!()
+                }
+            }
+        }
+
+        // Handle Spanner CDC messages following the same pattern as Debezium CDC
+        if let Some(msg_meta) = writer.row_meta()
+            && let SourceMeta::SpannerCdc(cdc_meta) = msg_meta.source_meta
+            && let Some(data) = payload
+        {
+            tracing::info!(
+                target: "spanner_cdc_schema_evolution",
+                "PlainParser received SpannerCdc message with msg_type: {:?}, payload_len: {}",
+                cdc_meta.msg_type,
+                data.len()
+            );
+
+            match cdc_meta.msg_type {
+                CdcMessageType::Data | CdcMessageType::Heartbeat => {
+                    tracing::debug!(
+                        target: "spanner_cdc_schema_evolution",
+                        "Processing data/heartbeat message"
+                    );
+                    return self.parse_rows(key, Some(data), writer).await;
+                }
+                CdcMessageType::SchemaChange => {
+                    tracing::info!(
+                        target: "spanner_cdc_schema_evolution",
+                        "Detected SchemaChange message, parsing schema change from payload: {}",
+                        String::from_utf8_lossy(&data)
+                    );
+
+                    // For Spanner CDC, we use native parsing instead of Debezium parser
+                    // because Spanner has its own schema change format
+                    use crate::source::spanner_cdc::schema_track::parse_spanner_schema_change;
+
+                    return match parse_spanner_schema_change(&data) {
+                        Ok(schema_change) => {
+                            tracing::info!(
+                                target: "spanner_cdc_schema_evolution",
+                                "Successfully parsed Spanner CDC schema change, table_changes: {}",
+                                schema_change.table_changes.len()
+                            );
+                            Ok(ParseResult::SchemaChange(schema_change))
+                        }
+                        Err(err) => {
+                            let fail_info = format!(
+                                "Failed to parse Spanner CDC schema change: {}, source: {}",
+                                err,
+                                self.source_ctx.source_name
+                            );
+                            tracing::error!(
+                                target: "spanner_cdc_schema_evolution",
+                                error = %err.as_report(),
+                                "{}",
+                                fail_info
+                            );
+                            self.source_ctx.on_cdc_auto_schema_change_failure(
+                                self.source_ctx.source_id,
+                                "".to_owned(),
+                                "".to_owned(),
+                                "".to_owned(),
+                                fail_info,
+                            );
+                            Err(err)
+                        }
+                    };
+                }
+                CdcMessageType::TransactionMeta => {
+                    // Spanner CDC does not use transaction metadata messages
+                    tracing::debug!(
+                        target: "spanner_cdc_schema_evolution",
+                        "Received TransactionMeta message (unexpected for Spanner CDC), treating as data"
+                    );
+                    return self.parse_rows(key, Some(data), writer).await;
+                }
+                CdcMessageType::Unspecified => {
+                    tracing::debug!(
+                        target: "spanner_cdc_schema_evolution",
+                        "Received Unspecified message type, treating as data"
+                    );
+                    return self.parse_rows(key, Some(data), writer).await;
                 }
             }
         }

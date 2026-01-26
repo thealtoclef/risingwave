@@ -65,6 +65,9 @@ static CONNECTORS_COMPATIBLE_FORMATS: LazyLock<HashMap<String, HashMap<Format, V
                     Format::Maxwell => vec![Encode::Json],
                     Format::Canal => vec![Encode::Json],
                 ),
+                SPANNER_CDC_CONNECTOR => hashmap!(
+                    Format::Plain => vec![Encode::Json],
+                ),
                 NEXMARK_CONNECTOR => hashmap!(
                     Format::Native => vec![Encode::Native],
                     Format::Plain => vec![Encode::Bytes],

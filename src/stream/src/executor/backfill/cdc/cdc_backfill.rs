@@ -761,9 +761,27 @@ impl<S: StateStore> CdcBackfillExecutor<S> {
             "CdcBackfill has already finished and will forward messages directly to the downstream"
         );
 
+        // Add debug logging for CDC streaming
+        tracing::debug!(
+            "Starting CDC streaming phase, waiting for messages from upstream..."
+        );
+
         // Wait for first barrier to come after backfill is finished.
         // So we can update our progress + persist the status.
         while let Some(Ok(msg)) = upstream.next().await {
+            // Debug: log what we received
+            match &msg {
+                Message::Chunk(chunk) => {
+                    tracing::debug!(
+                        "CDC streaming: received chunk with {} rows in CDC streaming phase",
+                        chunk.cardinality()
+                    );
+                }
+                Message::Barrier(_) => {
+                    tracing::debug!("CDC streaming: received barrier in CDC streaming phase");
+                }
+                _ => {}
+            }
             if let Some(msg) = mapping_message(msg, &self.output_indices) {
                 // If not finished then we need to update state, otherwise no need.
                 if let Message::Barrier(barrier) = &msg {
@@ -794,11 +812,28 @@ impl<S: StateStore> CdcBackfillExecutor<S> {
         // After backfill progress finished
         // we can forward messages directly to the downstream,
         // as backfill is finished.
+        tracing::info!(
+            "CDC streaming phase: forwarding messages directly to downstream"
+        );
         #[for_await]
         for msg in upstream {
+            let msg = msg?;
+            // Debug: log what we received
+            match &msg {
+                Message::Chunk(chunk) => {
+                    tracing::debug!(
+                        "CDC streaming forward: received chunk with {} rows",
+                        chunk.cardinality()
+                    );
+                }
+                Message::Barrier(_) => {
+                    tracing::debug!("CDC streaming forward: received barrier");
+                }
+                _ => {}
+            }
             // upstream offsets will be removed from the message before forwarding to
             // downstream
-            if let Some(msg) = mapping_message(msg?, &self.output_indices) {
+            if let Some(msg) = mapping_message(msg, &self.output_indices) {
                 if let Message::Barrier(barrier) = &msg {
                     // commit state just to bump the epoch of state table
                     state_impl.commit_state(barrier.epoch).await?;

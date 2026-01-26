@@ -1,0 +1,258 @@
+control substitution on
+
+# =============================================================================
+# PART 1: SETUP AND BACKFILL SNAPSHOT TEST
+# =============================================================================
+
+# Clean up any existing resources from previous test runs
+# This is robust and will not error if resources don't exist
+system ok
+e2e_test/source_inline/spanner_cdc/prepare-data.rs cleanup
+
+# Setup Spanner instance and database (not table or change stream)
+system ok
+e2e_test/source_inline/spanner_cdc/prepare-data.rs setup
+
+# Create the users table
+system ok
+e2e_test/source_inline/spanner_cdc/prepare-data.rs create-table
+
+# Insert data BEFORE creating change stream - this tests backfill/snapshot
+system ok
+e2e_test/source_inline/spanner_cdc/prepare-data.rs insert-data
+
+# NOW create the change stream (AFTER data was inserted)
+# The change stream will NOT contain the initial data - backfill must capture it
+system ok
+e2e_test/source_inline/spanner_cdc/prepare-data.rs create-change-stream
+
+# Test error handling: missing field `spanner.stream_name`
+statement error missing field `spanner.stream_name`
+CREATE SOURCE s WITH (connector = 'spanner-cdc', spanner.project = 'test-project', spanner.instance = 'test-instance', spanner.database = 'test-database');
+
+# Test error handling: change stream does not exist
+statement error change stream 'nonexistent_stream' does not exist
+CREATE SOURCE s WITH (
+    ${RISEDEV_SPANNER_WITH_OPTIONS_COMMON},
+    spanner.stream_name = 'nonexistent_stream'
+);
+
+# =============================================================================
+# PART 2: CREATE SOURCE AND TABLE - TEST BACKFILL/SNAPSHOT
+# =============================================================================
+
+# Create shared CDC source
+# NOTE: spanner.enable_databoost = 'true' enables Spanner's databoost (partitioned reads)
+# for faster snapshot backfill. This can be verified by checking RisingWave logs:
+# - Look for: "=== DATABOOST ENABLED for table users - using partitioned query"
+# - And: "got N partitions for table users with databoost"
+# - With databoost disabled, you would see: "databoost disabled, using single split"
+statement ok
+CREATE SOURCE spanner_source WITH (
+    ${RISEDEV_SPANNER_WITH_OPTIONS_COMMON},
+    spanner.stream_name = 'test_stream',
+    spanner.parallelism = '1',
+    spanner.heartbeat_interval = '5s',
+    spanner.enable_databoost = 'true',
+    auto.schema.change = 'true'
+);
+
+# Create table from the source - triggers BACKFILL with automatic schema discovery
+# The backfill should capture the data that was inserted before the change stream was created
+statement ok
+CREATE TABLE spanner_cdc_test FROM spanner_source TABLE 'users';
+
+sleep 30s
+
+# Verify backfill captured the initial data (inserted before change stream)
+query T
+select id from spanner_cdc_test order by id limit 10;
+----
+1
+2
+
+query I
+select count(*) from spanner_cdc_test;
+----
+2
+
+# Verify schema was correctly discovered
+query T
+select column_name from information_schema.columns where table_name = 'spanner_cdc_test' order by ordinal_position;
+----
+id
+name
+email
+age
+
+# =============================================================================
+# PART 3: CDC STREAMING TEST - INSERT, UPDATE, DELETE
+# =============================================================================
+
+# Test INSERT via CDC
+system ok
+cat << 'EOF' | gcloud spanner databases execute-sql test-database --instance=test-instance --sql="INSERT INTO users (id, name, email, age) VALUES ('3', 'Charlie', 'charlie@example.com', 35), ('4', 'Diana', 'diana@example.com', 28)"
+EOF
+
+sleep 30s
+
+query T
+select id from spanner_cdc_test order by id limit 10;
+----
+1
+2
+3
+4
+
+query I
+select count(*) from spanner_cdc_test;
+----
+4
+
+# Test UPDATE via CDC
+system ok
+cat << 'EOF' | gcloud spanner databases execute-sql test-database --instance=test-instance --sql="UPDATE users SET age = 31 WHERE id = '1'"
+EOF
+
+sleep 30s
+
+query I
+select count(*) from spanner_cdc_test;
+----
+4
+
+query I
+select age from spanner_cdc_test where id = '1';
+----
+31
+
+# Test DELETE via CDC
+system ok
+cat << 'EOF' | gcloud spanner databases execute-sql test-database --instance=test-instance --sql="DELETE FROM users WHERE id = '2'"
+EOF
+
+sleep 30s
+
+query I
+select count(*) from spanner_cdc_test;
+----
+3
+
+# =============================================================================
+# PART 4: SCHEMA EVOLUTION STORY 1 - ADD SINGLE COLUMN
+# This tests adding one column and verifying the schema change is applied
+# =============================================================================
+
+# Add a new column 'city' to the Spanner table
+system ok
+cat << 'EOF' | gcloud spanner databases ddl update test-database --instance=test-instance --ddl="ALTER TABLE users ADD COLUMN city STRING(MAX)"
+EOF
+
+# Insert data with the new column to trigger schema evolution
+system ok
+cat << 'EOF' | gcloud spanner databases execute-sql test-database --instance=test-instance --sql="INSERT INTO users (id, name, email, age, city) VALUES ('5', 'Eve', 'eve@example.com', 32, 'SF'), ('6', 'Frank', 'frank@example.com', 40, 'NYC')"
+EOF
+
+sleep 30s
+
+# Verify schema evolved - new column 'city' should exist
+query T
+select column_name from information_schema.columns where table_name = 'spanner_cdc_test' and column_name = 'city';
+----
+city
+
+# Verify all columns including the new one
+query T
+select column_name from information_schema.columns where table_name = 'spanner_cdc_test' order by ordinal_position;
+----
+id
+name
+email
+age
+city
+
+# Verify new data is captured with the new schema
+query TT
+select id, city from spanner_cdc_test where id in ('5', '6') order by id;
+----
+5 SF
+6 NYC
+
+# Verify old data still works (NULL for new column)
+query TT
+select id, city from spanner_cdc_test where id = '1' limit 1;
+----
+1 NULL
+
+# =============================================================================
+# PART 5: SCHEMA EVOLUTION STORY 2 - ADD MULTIPLE COLUMNS
+# This tests that schema evolution correctly detects multiple new columns
+# from a single data record (the DML triggers schema change, not the ALTER)
+# =============================================================================
+
+# Add two columns in SEPARATE ALTER statements (Spanner limitation)
+system ok
+cat << 'EOF' | gcloud spanner databases ddl update test-database --instance=test-instance --ddl="ALTER TABLE users ADD COLUMN zipcode STRING(MAX)"
+EOF
+
+system ok
+cat << 'EOF' | gcloud spanner databases ddl update test-database --instance=test-instance --ddl="ALTER TABLE users ADD COLUMN state STRING(MAX)"
+EOF
+
+# Insert data with BOTH new columns to trigger schema change
+# The schema tracker will detect that 2 columns were added and create ONE schema change
+system ok
+cat << 'EOF' | gcloud spanner databases execute-sql test-database --instance=test-instance --sql="INSERT INTO users (id, name, email, age, city, zipcode, state) VALUES ('7', 'Grace', 'grace@example.com', 29, 'Boston', '02101', 'MA')"
+EOF
+
+sleep 30s
+
+# Verify both new columns exist
+query TT
+select column_name from information_schema.columns where table_name = 'spanner_cdc_test' and column_name in ('zipcode', 'state') order by column_name;
+----
+state
+zipcode
+
+# Verify all columns including the new ones (columns are ordered by when they were added)
+query T
+select column_name from information_schema.columns where table_name = 'spanner_cdc_test' order by ordinal_position;
+----
+id
+name
+email
+age
+city
+zipcode
+state
+
+# Verify data - Check if we captured values for BOTH new columns
+query TTTTT
+select id, zipcode, state from spanner_cdc_test where id = '7';
+----
+7 02101 MA
+
+# =============================================================================
+# PART 6: VERIFICATION AND CLEANUP
+# =============================================================================
+
+query I
+select count(*) from spanner_cdc_test;
+----
+6
+
+sleep 30s
+
+query I
+select count(distinct id) from spanner_cdc_test;
+----
+6
+
+statement ok
+DROP TABLE spanner_cdc_test;
+
+statement ok
+DROP SOURCE spanner_source;
+
+system ok
+e2e_test/source_inline/spanner_cdc/prepare-data.rs cleanup

@@ -962,12 +962,21 @@ fn derive_with_options_for_cdc_table(
     external_table_name: String,
 ) -> Result<WithOptionsSecResolved> {
     use source::cdc::{MYSQL_CDC_CONNECTOR, POSTGRES_CDC_CONNECTOR, SQL_SERVER_CDC_CONNECTOR};
-    // we should remove the prefix from `full_table_name`
+    
+    let mut with_options = source_with_properties.clone();
+    
+    // Non-Debezium CDC connectors (e.g., Spanner CDC) use table.name directly
+    if !source_with_properties.is_debezium() {
+        with_options.insert(TABLE_NAME_KEY.into(), external_table_name.into());
+        return Ok(with_options);
+    }
+    
+    // For Debezium-based CDC connectors, we need database.name and connector-specific logic
     let source_database_name: &str = source_with_properties
         .get("database.name")
         .ok_or_else(|| anyhow!("The source with properties does not contain 'database.name'"))?
         .as_str();
-    let mut with_options = source_with_properties.clone();
+    
     if let Some(connector) = source_with_properties.get(UPSTREAM_SOURCE_KEY) {
         match connector.as_str() {
             MYSQL_CDC_CONNECTOR => {
@@ -1185,28 +1194,35 @@ pub(super) async fn handle_create_table_plan(
             let (columns, pk_names) = match wildcard_idx {
                 Some(_) => bind_cdc_table_schema_externally(cdc_with_options.clone()).await?,
                 None => {
-                    for column_def in &column_defs {
-                        for option_def in &column_def.options {
-                            if let ColumnOption::DefaultValue(_)
-                            | ColumnOption::DefaultValueInternal { .. } = option_def.option
-                            {
-                                return Err(ErrorCode::NotSupported(
-                                            "Default value for columns defined on the table created from a CDC source".into(),
-                                            "Remove the default value expression in the column definitions".into(),
-                                        )
-                                            .into());
+                    // If column_defs is empty, use external schema discovery
+                    if column_defs.is_empty() {
+                        bind_cdc_table_schema_externally(cdc_with_options.clone()).await?
+                    } else {
+                        for column_def in &column_defs {
+                            for option_def in &column_def.options {
+                                if let ColumnOption::DefaultValue(_)
+                                | ColumnOption::DefaultValueInternal { .. } = option_def.option
+                                {
+                                    return Err(ErrorCode::NotSupported(
+                                                "Default value for columns defined on the table created from a CDC source".into(),
+                                                "Remove the default value expression in the column definitions".into(),
+                                            )
+                                                .into());
+                                }
                             }
                         }
+
+                        let (columns, pk_names) =
+                            bind_cdc_table_schema(&column_defs, &constraints, false)?;
+                        // read default value definition from external db (only for Debezium-based connectors)
+                        if source.with_properties.is_debezium() {
+                            let (options, secret_refs) = cdc_with_options.clone().into_parts();
+                            let _config = ExternalTableConfig::try_from_btreemap(options, secret_refs)
+                                .context("failed to extract external table config")?;
+                        }
+
+                        (columns, pk_names)
                     }
-
-                    let (columns, pk_names) =
-                        bind_cdc_table_schema(&column_defs, &constraints, false)?;
-                    // read default value definition from external db
-                    let (options, secret_refs) = cdc_with_options.clone().into_parts();
-                    let _config = ExternalTableConfig::try_from_btreemap(options, secret_refs)
-                        .context("failed to extract external table config")?;
-
-                    (columns, pk_names)
                 }
             };
 
@@ -1307,6 +1323,9 @@ fn sanity_check_for_table_on_cdc_source(
     constraints: &Vec<TableConstraint>,
     source_watermarks: &Vec<SourceWatermark>,
 ) -> Result<()> {
+    tracing::info!("sanity_check_for_table_on_cdc_source: wildcard_idx={:?}, column_defs={}, constraints={}",
+        wildcard_idx, column_defs.len(), constraints.len());
+
     // wildcard cannot be used with column definitions
     if wildcard_idx.is_some() && !column_defs.is_empty() {
         return Err(ErrorCode::NotSupported(
@@ -1317,7 +1336,10 @@ fn sanity_check_for_table_on_cdc_source(
     }
 
     // cdc table must have primary key constraint or primary key column
+    // However, if column_defs is empty, we'll use external schema discovery which will
+    // discover the primary key from the external database (e.g., Spanner INFORMATION_SCHEMA)
     if !wildcard_idx.is_some()
+        && !column_defs.is_empty()
         && !constraints.iter().any(|c| {
             matches!(
                 c,
@@ -1333,6 +1355,8 @@ fn sanity_check_for_table_on_cdc_source(
                 .any(|opt| matches!(opt.option, ColumnOption::Unique { is_primary: true }))
         })
     {
+        tracing::error!("sanity_check failed: wildcard_idx={:?}, constraints={:?}, column_defs={:?}",
+            wildcard_idx, constraints, column_defs);
         return Err(ErrorCode::NotSupported(
             "CDC table without primary key constraint is not supported".to_owned(),
             "Please define a primary key".to_owned(),
@@ -1363,14 +1387,20 @@ fn sanity_check_for_table_on_cdc_source(
 async fn bind_cdc_table_schema_externally(
     cdc_with_options: WithOptionsSecResolved,
 ) -> Result<(Vec<ColumnCatalog>, Vec<String>)> {
+    tracing::info!("bind_cdc_table_schema_externally: starting");
+
     // read cdc table schema from external db or parsing the schema from SQL definitions
     let (options, secret_refs) = cdc_with_options.into_parts();
     let config = ExternalTableConfig::try_from_btreemap(options, secret_refs)
         .context("failed to extract external table config")?;
 
+    tracing::info!("bind_cdc_table_schema_externally: config created, table={}", config.table);
+
     let table = ExternalTableImpl::connect(config)
         .await
         .context("failed to auto derive table schema")?;
+
+    tracing::info!("bind_cdc_table_schema_externally: pk_names={:?}", table.pk_names());
 
     Ok((
         table

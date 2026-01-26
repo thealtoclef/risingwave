@@ -5,6 +5,7 @@ extend = [
     { path = "src/risedevtool/lakekeeper.toml" },
     { path = "src/risedevtool/tempo.toml" },
     { path = "src/risedevtool/gcloud-pubsub.toml" },
+    { path = "src/risedevtool/gcloud-spanner.toml" },
     { path = "src/risedevtool/redis.toml" },
     { path = "src/risedevtool/connector.toml" },
     { path = "src/risedevtool/risedev-components.toml" },
@@ -599,6 +600,7 @@ dependencies = [
     "download-lakekeeper",
     "download-prometheus",
     "download-pubsub",
+    "download-spanner",
     "download-redis",
     "download-moat"
 ]
