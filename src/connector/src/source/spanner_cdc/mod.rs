@@ -36,15 +36,6 @@ pub mod types;
 #[cfg(test)]
 mod tests;
 
-// TEMPORARY: Integration tests disabled due to pre-existing compilation issues
-// with google_cloud_spanner library API changes.
-// TODO: Re-enable after fixing integration tests:
-// - Update Statement API (bind() method no longer exists)
-// - Update SpannerCdcProperties (spanner_dsn field split into project/instance/database)
-// - Update gcloud_spanner admin client imports (v1 module path changes)
-// See: src/connector/src/source/spanner_cdc/integration_tests.rs.disabled
-// #[cfg(test)]
-// mod integration_tests;
 
 pub use enumerator::*;
 pub use partition_manager::*;

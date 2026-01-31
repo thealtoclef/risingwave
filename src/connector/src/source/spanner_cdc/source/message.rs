@@ -44,14 +44,7 @@ impl From<TaggedChangeRecord> for SourceMessage {
         let mod_json = record
             .modification
             .to_json_map(&record.data_change.mod_type, &record.data_change)
-            .and_then(|map| {
-                tracing::info!(
-                    "Spanner CDC JSON payload: mod_type={}, json={}",
-                    record.data_change.mod_type,
-                    serde_json::to_string(&map).unwrap_or_default()
-                );
-                serde_json::to_vec(&map).map_err(Into::into)
-            })
+            .and_then(|map| serde_json::to_vec(&map).map_err(Into::into))
             .map_err(|e| anyhow::anyhow!(
                 "Failed to serialize Spanner change record to JSON for table '{}', mod_type='{}': {}",
                 record.data_change.table_name,

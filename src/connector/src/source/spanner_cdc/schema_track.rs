@@ -98,31 +98,12 @@ impl SchemaTracker {
         &self,
         record: &DataChangeRecord,
         source_id: u32,
-        source_name: &str,
+        _source_name: &str,
     ) -> ConnectorResult<Option<SchemaChangeEnvelope>> {
-        tracing::info!("[SPANNER_CDC] check_and_evolve called for table '{}'", record.table_name);
-
         let table_name = record.table_name.clone();
 
         // Extract schema from column_types
         let new_schema = Self::extract_schema_from_record(record)?;
-
-        // Log column_types for debugging
-        tracing::info!(
-            target: "spanner_cdc_schema_evolution",
-            "Received record for table '{}' with {} columns: {:?}",
-            table_name,
-            new_schema.columns.len(),
-            new_schema.columns.iter().map(|c| &c.name).collect::<Vec<_>>()
-        );
-
-        // Also log without target for debugging
-        tracing::info!(
-            "[SPANNER_CDC] Received record for table '{}' with {} columns: {:?}",
-            table_name,
-            new_schema.columns.len(),
-            new_schema.columns.iter().map(|c| &c.name).collect::<Vec<_>>()
-        );
 
         // Get the old schema (if any)
         let old_schema = {
@@ -142,17 +123,6 @@ impl SchemaTracker {
 
         // Compare schemas
         if let Some(changes) = Self::compare_schemas(&old_schema, &new_schema) {
-            let cdc_table_id = build_cdc_table_id(SourceId::new(source_id), &table_name);
-            tracing::info!(
-                target: "spanner_cdc_schema_evolution",
-                "Schema change detected for table '{}': added={}, dropped={}, type_changed={}, cdc_table_id='{}'",
-                table_name,
-                changes.added_columns.len(),
-                changes.dropped_columns.len(),
-                changes.type_changed_columns.len(),
-                cdc_table_id
-            );
-
             // Update known schema
             {
                 let mut schemas = self.known_schemas.write().await;
@@ -167,21 +137,12 @@ impl SchemaTracker {
                 .collect::<Result<Vec<_>, _>>()?;
 
             // Create the schema change envelope
-            let cdc_table_id = build_cdc_table_id(SourceId::new(source_id), &table_name);
-
             let table_change = TableSchemaChange {
-                cdc_table_id: cdc_table_id.clone(),
+                cdc_table_id: build_cdc_table_id(SourceId::new(source_id), &table_name),
                 columns: column_catalogs,
                 change_type: crate::parser::schema_change::TableChangeType::Alter,
                 upstream_ddl: Self::format_upstream_ddl(&table_name, &changes),
             };
-
-            tracing::info!(
-                target: "spanner_cdc_schema_evolution",
-                "Emitting schema change event for table '{}': {:?}",
-                table_name,
-                changes
-            );
 
             return Ok(Some(SchemaChangeEnvelope {
                 table_changes: vec![table_change],

@@ -119,10 +119,6 @@ impl SpannerCdcSplitReader {
 
                 // If the split has a watermark from a previous run, update it
                 if split.watermark != split.start_timestamp {
-                    tracing::info!(
-                        "Restoring root partition with watermark from checkpoint: watermark={:?}",
-                        split.watermark
-                    );
                     // Update to finished state with watermark
                     partition_manager
                         .mark_finished(&token_key, split.watermark)
@@ -142,18 +138,7 @@ impl SpannerCdcSplitReader {
                     .await;
 
                 if !is_new {
-                    tracing::debug!(
-                        "Child partition {:?} already in partition manager (may be from restoration)",
-                        token_key
-                    );
-                } else {
-                    tracing::info!(
-                        "Restored child partition from checkpoint: token={:?}, state={:?}, start_time={:?}, watermark={:?}",
-                        token_key,
-                        split.state,
-                        split.start_timestamp,
-                        split.watermark
-                    );
+                    // Child partition already tracked
                 }
             }
         }
@@ -186,10 +171,6 @@ impl SpannerCdcSplitReader {
         for split in &self.splits {
             // Skip splits that are already finished
             if split.is_finished() {
-                tracing::info!(
-                    "Skipping already-finished partition: token={:?}",
-                    split.partition_token
-                );
                 continue;
             }
 
@@ -253,7 +234,6 @@ impl SpannerCdcSplitReader {
         }
 
         // Yield an initial empty chunk to signal the stream is alive
-        tracing::debug!("Yielding initial empty chunk to signal stream is alive");
         yield Vec::new();
 
         // Process messages from all partitions and spawn children inline
@@ -303,12 +283,6 @@ impl SpannerCdcSplitReader {
                     tracing::warn!("Child partition {:?} not found in manager", child_token);
                     continue;
                 };
-
-                tracing::info!(
-                    "Spawning child partition: token={:?}, start_time={:?}",
-                    child_token,
-                    info.start_timestamp
-                );
 
                 let client = child_ctx.client.clone();
                 let stream_name = child_ctx.stream_name.clone();
@@ -432,11 +406,6 @@ impl SpannerCdcSplitReader {
         for (attempt_index, delay) in retry_strategy.enumerate() {
             // Check for cancellation before attempting query
             if shutdown_token.is_cancelled() {
-                tracing::info!(
-                    "Shutdown requested for partition {:?}, marking as finished with watermark={:?}",
-                    split.partition_token,
-                    split.watermark
-                );
                 // Save final watermark before shutdown
                 partition_manager
                     .mark_finished(&split.partition_token, split.watermark)
@@ -465,13 +434,6 @@ impl SpannerCdcSplitReader {
                     partition_manager
                         .mark_finished(&split.partition_token, split.watermark)
                         .await;
-
-                    tracing::info!(
-                        "Partition {:?} finished, processed {} messages, watermark={:?}",
-                        split.partition_token,
-                        split.messages_processed,
-                        split.watermark
-                    );
 
                     return Ok(messages);
                 }
@@ -502,7 +464,7 @@ impl SpannerCdcSplitReader {
         stmt: &Statement,
         split: &mut SpannerCdcSplit,
         split_id: &crate::source::SplitId,
-        stream_name: &str,
+        _stream_name: &str,
         table_name_filter: &Option<String>,
         schema_tracker: Arc<SchemaTracker>,
         source_id: u32,
@@ -510,14 +472,6 @@ impl SpannerCdcSplitReader {
         partition_manager: Arc<PartitionManager>,
         shutdown_token: CancellationToken,
     ) -> Result<Vec<SourceMessage>> {
-        tracing::info!(
-            "Executing change stream query for partition {:?}, stream: {}, start_time: {:?}, watermark: {:?}",
-            split.partition_token,
-            stream_name,
-            split.start_timestamp,
-            split.watermark
-        );
-
         let mut txn = client
             .single()
             .await
@@ -528,7 +482,6 @@ impl SpannerCdcSplitReader {
             .map_err(|e| anyhow::anyhow!("failed to execute query: {}", e))?;
 
         let mut messages = Vec::new();
-        let mut total_records = 0;
 
         // Process each row from the change stream
         while let Some(row) = result_set
@@ -538,12 +491,6 @@ impl SpannerCdcSplitReader {
         {
             // Check for graceful shutdown
             if shutdown_token.is_cancelled() {
-                tracing::info!(
-                    "Graceful shutdown requested for partition {:?}, exiting with {} messages processed, watermark={:?}",
-                    split.partition_token,
-                    total_records,
-                    split.watermark
-                );
                 // Return messages processed so far with current watermark for checkpointing
                 return Ok(messages);
             }
@@ -558,24 +505,6 @@ impl SpannerCdcSplitReader {
                     // Update watermark with commit timestamp
                     split.update_watermark(data_change.commit_time());
                     split.messages_processed += 1;
-
-                    // Log for debugging - especially for UPDATE records
-                    tracing::info!(
-                        "Data change: table='{}', mod_type='{}', commit_time={:?}, num_mods={}, num_columns={}",
-                        data_change.table_name,
-                        data_change.mod_type,
-                        data_change.commit_timestamp,
-                        data_change.mods.len(),
-                        data_change.column_types.len()
-                    );
-
-                    // Log column names for schema evolution tracking
-                    tracing::debug!(
-                        target: "spanner_cdc_schema_evolution",
-                        "Column names for table '{}': {:?}",
-                        data_change.table_name,
-                        data_change.column_types.iter().map(|c| &c.name).collect::<Vec<_>>()
-                    );
 
                     // Validate value capture type
                     match data_change.value_capture_type.as_str() {
@@ -597,23 +526,9 @@ impl SpannerCdcSplitReader {
                         .await
                     {
                         Ok(Some(schema_change)) => {
-                            tracing::info!(
-                                target: "spanner_cdc_schema_evolution",
-                                "Schema change detected for table '{}', {} columns changed",
-                                data_change.table_name,
-                                schema_change.table_changes.len()
-                            );
-
                             // Convert schema change to JSON format (native serialization)
                             let schema_change_json = schema_change_to_json(&schema_change)
                                 .map_err(|e| anyhow::anyhow!("failed to convert schema change to JSON: {}", e))?;
-
-                            // Log the JSON payload for debugging
-                            tracing::info!(
-                                target: "spanner_cdc_schema_evolution",
-                                "Schema change JSON payload: {}",
-                                String::from_utf8_lossy(&schema_change_json)
-                            );
 
                             // Emit schema change as a SourceMessage following standard CDC architecture
                             // Include full partition state for checkpointing
@@ -639,21 +554,7 @@ impl SpannerCdcSplitReader {
                                 ),
                             };
 
-                            tracing::info!(
-                                target: "spanner_cdc_schema_evolution",
-                                "Schema change message created with msg_type: {:?}, table: {}",
-                                schema_change_msg.meta,
-                                data_change.table_name
-                            );
-
                             messages.push(schema_change_msg);
-
-                            tracing::info!(
-                                target: "spanner_cdc_schema_evolution",
-                                "Schema change message emitted for table '{}', total messages in batch: {}",
-                                data_change.table_name,
-                                messages.len()
-                            );
                         }
                         Err(e) => {
                             tracing::error!(
@@ -665,12 +566,7 @@ impl SpannerCdcSplitReader {
                             return Err(e);
                         }
                         Ok(None) => {
-                            tracing::info!(
-                                target: "spanner_cdc_schema_evolution",
-                                "No schema change detected for table '{}' (current: {:?})",
-                                data_change.table_name,
-                                schema_tracker.get_schema(&data_change.table_name).await
-                            );
+                            // No schema change detected
                         }
                     }
 
@@ -687,12 +583,6 @@ impl SpannerCdcSplitReader {
                             data_change: data_change.clone(),
                             modification: modification.clone(),
                         };
-                        tracing::info!(
-                            "Creating SourceMessage: mod_type={}, keys={:?}, new_values={:?}",
-                            data_change.mod_type,
-                            modification.keys,
-                            modification.new_values
-                        );
 
                         // Create SourceMessage with full partition state for checkpointing
                         let mut source_msg = SourceMessage::from(tagged_record);
@@ -715,11 +605,6 @@ impl SpannerCdcSplitReader {
 
                 // Process heartbeat records - advance watermark
                 for heartbeat in &record.heartbeat_record {
-                    tracing::debug!(
-                        "Heartbeat for partition {:?}: timestamp={:?}",
-                        split.partition_token,
-                        heartbeat.timestamp
-                    );
                     // Update watermark with heartbeat timestamp
                     split.update_watermark(heartbeat.heartbeat_time());
                 }
@@ -728,18 +613,11 @@ impl SpannerCdcSplitReader {
                 for child_partition_record in &record.child_partitions_record {
                     let child_start_time = child_partition_record.start_time();
 
-                    tracing::info!(
-                        "Partition {:?} has {} child partition(s) at {:?}",
-                        split.partition_token,
-                        child_partition_record.child_partitions.len(),
-                        child_start_time
-                    );
-
                     for child_partition in &child_partition_record.child_partitions {
                         let child_token = child_partition.token.clone();
 
                         // Add to partition manager (deduplicated internally)
-                        let is_new = partition_manager
+                        let _is_new = partition_manager
                             .add_child_partition(
                                 child_token.clone(),
                                 child_partition.parent_partition_tokens.clone(),
@@ -747,34 +625,9 @@ impl SpannerCdcSplitReader {
                                 format!("{}-child", split_id as &str).into(),
                             )
                             .await;
-
-                        if is_new {
-                            tracing::info!(
-                                "Discovered child partition: token={:?}, start_time={:?}, parents={:?}",
-                                child_token,
-                                child_start_time,
-                                child_partition.parent_partition_tokens
-                            );
-                        }
                     }
                 }
             }
-            total_records += 1;
-        }
-
-        if total_records == 0 {
-            tracing::warn!(
-                "Change stream query returned NO ROWS for partition {:?}, stream: {}, start: {:?}",
-                split.partition_token,
-                stream_name,
-                split.start_timestamp
-            );
-        } else {
-            tracing::info!(
-                "Change stream query returned {} record(s) for partition {:?}",
-                total_records,
-                split.partition_token
-            );
         }
 
         Ok(messages)
@@ -813,20 +666,6 @@ impl SplitReader for SpannerCdcSplitReader {
 
         // Create schema tracker
         let schema_tracker = Arc::new(SchemaTracker::new());
-
-        // Log the schema evolution mode
-        if properties.auto_schema_change {
-            tracing::info!(
-                target: "spanner_cdc_schema_evolution",
-                "Event-based schema evolution enabled (schema changes will be emitted as messages)"
-            );
-        }
-
-        tracing::info!(
-            "Spanner CDC reader initialized with {} split(s), stream={}",
-            splits.len(),
-            stream_name
-        );
 
         // Create cancellation token for graceful shutdown
         let shutdown_token = CancellationToken::new();

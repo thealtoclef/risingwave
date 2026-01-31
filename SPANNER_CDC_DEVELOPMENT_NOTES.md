@@ -1,5 +1,7 @@
 # Spanner CDC Source - Development Notes
 
+> **Release Candidate 1 (RC1)**: A compact version of these notes is available in [SPANNER_CDC_RC1.md](SPANNER_CDC_RC1.md) for the RC1 release.
+
 ## Feature Overview
 
 **Goal**: Implement a production-ready Google Cloud Spanner CDC (Change Data Capture) source connector for RisingWave that follows the shared CDC source pattern (like MySQL/Postgres CDC).

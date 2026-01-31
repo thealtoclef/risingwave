@@ -106,14 +106,8 @@ impl PartitionManager {
         split_id: SplitId,
     ) {
         let mut partitions = self.partitions.lock().await;
-        let split_id_clone = split_id.clone();
         let root_info = PartitionInfo::new(None, vec![], start_timestamp, split_id);
         partitions.insert(None, root_info);
-        tracing::info!(
-            "Initialized root partition with start_timestamp={:?}, split_id={:?}",
-            start_timestamp,
-            split_id_clone
-        );
     }
 
     /// Add a child partition discovered from a parent partition.
@@ -152,10 +146,6 @@ impl PartitionManager {
         let key = Some(token.clone());
 
         if partitions.contains_key(&key) {
-            tracing::debug!(
-                "Child partition {:?} already tracked, skipping duplicate",
-                token
-            );
             return false;
         }
 
@@ -169,15 +159,6 @@ impl PartitionManager {
         info.watermark = watermark;
 
         partitions.insert(key, info.clone());
-
-        tracing::info!(
-            "Added child partition: token={:?}, start_time={:?}, watermark={:?}, parents={:?}, split_id={:?}",
-            token,
-            start_timestamp,
-            info.watermark,
-            info.parent_tokens,
-            split_id
-        );
 
         // Notify waiting tasks
         self.notify.notify_waiters();
@@ -194,21 +175,11 @@ impl PartitionManager {
         let mut partitions = self.partitions.lock().await;
 
         if let Some(info) = partitions.get_mut(partition_token) {
-            tracing::info!(
-                "Marking partition {:?} as finished, watermark={:?}",
-                partition_token,
-                watermark
-            );
             info.state = PartitionState::Finished;
             info.watermark = watermark;
 
             // Notify waiting tasks that a parent has finished
             self.notify.notify_waiters();
-        } else {
-            tracing::warn!(
-                "Attempted to mark unknown partition {:?} as finished",
-                partition_token
-            );
         }
     }
 
@@ -217,7 +188,6 @@ impl PartitionManager {
         let mut partitions = self.partitions.lock().await;
 
         if let Some(info) = partitions.get_mut(partition_token) {
-            tracing::debug!("Marking partition {:?} as running", partition_token);
             info.state = PartitionState::Running;
         }
     }
@@ -232,7 +202,6 @@ impl PartitionManager {
         let key = Some(token.to_string());
 
         let Some(info) = partitions.get(&key) else {
-            tracing::warn!("Child partition {:?} not found in manager", token);
             return false;
         };
 
@@ -241,31 +210,16 @@ impl PartitionManager {
             let parent_key = Some(parent_token.clone());
             match partitions.get(&parent_key) {
                 None => {
-                    tracing::debug!(
-                        "Parent {:?} of child {:?} not found yet",
-                        parent_token,
-                        token
-                    );
                     return false;
                 }
                 Some(parent_info) => {
                     if parent_info.state != PartitionState::Finished {
-                        tracing::debug!(
-                            "Parent {:?} of child {:?} not finished yet (state={:?})",
-                            parent_token,
-                            token,
-                            parent_info.state
-                        );
                         return false;
                     }
                 }
             }
         }
 
-        tracing::debug!(
-            "Child partition {:?} can be scheduled (all parents finished)",
-            token
-        );
         true
     }
 
@@ -393,10 +347,6 @@ impl PartitionManager {
         let key = Some(token.clone());
 
         if partitions.contains_key(&key) {
-            tracing::debug!(
-                "Child partition {:?} already tracked during restore, skipping",
-                token
-            );
             return false;
         }
 
@@ -410,15 +360,6 @@ impl PartitionManager {
         };
 
         partitions.insert(key, info.clone());
-
-        tracing::info!(
-            "Restored child partition from checkpoint: token={:?}, state={:?}, start_time={:?}, watermark={:?}, parents={:?}",
-            token,
-            info.state,
-            start_timestamp,
-            watermark,
-            info.parent_tokens
-        );
 
         // Notify waiting tasks
         self.notify.notify_waiters();

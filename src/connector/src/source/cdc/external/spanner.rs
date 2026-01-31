@@ -222,8 +222,6 @@ impl SpannerExternalTable {
         client: &Client,
         table_name: &str,
     ) -> ConnectorResult<Vec<String>> {
-        tracing::info!("discover_primary_keys: table_name={}", table_name);
-
         let sql = r#"
             SELECT COLUMN_NAME
             FROM INFORMATION_SCHEMA.INDEX_COLUMNS
@@ -249,11 +247,9 @@ impl SpannerExternalTable {
             let column_name: String = row
                 .column_by_name("COLUMN_NAME")
                 .context("failed to get column name")?;
-            tracing::info!("discover_primary_keys: found pk column: {}", column_name);
             pk_names.push(column_name);
         }
 
-        tracing::info!("discover_primary_keys: found {} pk columns", pk_names.len());
         Ok(pk_names)
     }
 
@@ -451,8 +447,6 @@ impl SpannerExternalTableReader {
     #[try_stream(boxed, ok = CdcTableSnapshotSplit, error = ConnectorError)]
     async fn get_parallel_cdc_splits_inner(&self, _options: CdcTableSnapshotSplitOption) {
         if self.enable_databoost {
-            tracing::warn!("=== DATABOOST ENABLED for table {} - using partitioned query for faster backfill ===", self.table_name);
-
             // Create batch read-only transaction for partitioned queries
             let mut batch_txn = self
                 .client
@@ -476,12 +470,6 @@ impl SpannerExternalTableReader {
                 )
                 .await
                 .context("failed to get partitions for databoost query")?;
-
-            tracing::info!(
-                "got {} partitions for table {} with databoost",
-                partitions.len(),
-                self.table_name
-            );
 
             // Convert each partition to a CdcTableSnapshotSplit
             // Store the partition_token in the left_bound for later use
@@ -519,15 +507,8 @@ impl SpannerExternalTableReader {
                 yield split;
                 split_id += 1;
             }
-
-            tracing::info!(
-                "created {} databoost splits for table {}",
-                split_id - 1,
-                self.table_name
-            );
         } else {
             // databoost disabled - return a single split covering the entire table
-            tracing::info!("databoost disabled, using single split for table {}", self.table_name);
 
             let split_id = 1;
             let left_bound = OwnedRow::new(vec
@@ -563,11 +544,6 @@ impl SpannerExternalTableReader {
             let partition_token = base64::engine::general_purpose::STANDARD
                 .decode(encoded_token.as_bytes())
                 .context("failed to decode partition token")?;
-
-            tracing::debug!(
-                "reading from databoost partition with token size={} bytes",
-                partition_token.len()
-            );
 
             // Build SELECT query for the table
             let columns_str = column_names.join(", ");
