@@ -237,12 +237,6 @@ impl SplitMetaData for SpannerCdcSplit {
         // The offset string contains the serialized SpannerOffset for checkpointing
         if let Ok(spanner_offset) = serde_json::from_str::<crate::source::cdc::external::spanner::SpannerOffset>(&last_seen_offset) {
             self.update_from_offset(&spanner_offset);
-            tracing::debug!(
-                "Updated split {:?} from offset: watermark={:?}, state={:?}",
-                self.partition_token,
-                self.watermark,
-                self.state
-            );
         }
         Ok(())
     }

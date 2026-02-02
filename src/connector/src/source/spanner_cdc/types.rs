@@ -529,11 +529,6 @@ impl Mod {
             "INSERT" => {
                 // INSERT: before is null, after has keys + new_values
                 let after_data = merge_keys_and_values(&self.keys, &self.new_values)?;
-                tracing::debug!(
-                    "Spanner CDC INSERT: keys={:?}, new_values={:?}, merged={:?}",
-                    self.keys, self.new_values,
-                    serde_json::to_string(&after_data).unwrap_or_else(|_| "INVALID".to_string())
-                );
                 (JsonValue::Null, JsonValue::Object(after_data), "c")
             }
             "UPDATE" => {

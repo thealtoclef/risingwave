@@ -97,8 +97,6 @@ impl SplitEnumerator for SpannerCdcSplitEnumerator {
     }
 
     async fn list_splits(&mut self) -> ConnectorResult<Vec<SpannerCdcSplit>> {
-        tracing::debug!("enumerating spanner cdc splits");
-
         // Use current time if start_time is not specified
         let start_timestamp = self.start_time.unwrap_or_else(OffsetDateTime::now_utc);
 
