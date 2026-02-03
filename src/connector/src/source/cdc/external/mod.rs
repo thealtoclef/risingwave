@@ -38,7 +38,6 @@ use crate::connector_common::{PostgresExternalTable, SslMode};
 use crate::error::{ConnectorError, ConnectorResult};
 use crate::parser::mysql_row_to_owned_row;
 use crate::source::CdcTableSnapshotSplit;
-use crate::source::cdc::CdcSourceType;
 use crate::source::cdc::external::mock_external_table::MockExternalTableReader;
 use crate::source::cdc::external::mysql::{
     MySqlExternalTable, MySqlExternalTableReader, MySqlOffset,
@@ -545,9 +544,6 @@ pub enum ExternalTableImpl {
 
 impl ExternalTableImpl {
     pub async fn connect(config: ExternalTableConfig) -> ConnectorResult<Self> {
-        let cdc_table_type = ExternalCdcTableType::from_properties(
-            &std::collections::BTreeMap::new()
-        );
         // Actually we need to determine type from the config directly
         // For Spanner, check if spanner_project/instance/database are present
         let table_type = if !config.spanner_project.is_empty() && !config.spanner_instance.is_empty() && !config.spanner_database.is_empty() {

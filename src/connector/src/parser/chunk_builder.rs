@@ -32,7 +32,6 @@ use crate::parser::utils::{
     extract_timestamp_from_meta,
 };
 use crate::source::{SourceColumnDesc, SourceColumnType, SourceCtrlOpts, SourceMeta};
-use crate::source::spanner_cdc::SpannerCdcMeta;
 
 /// Maximum number of rows in a transaction. If a transaction is larger than this, it will be force
 /// committed to avoid potential OOM.

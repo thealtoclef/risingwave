@@ -276,7 +276,6 @@ pub struct SpannerExternalTableReader {
     pk_types: Vec<DataType>,
     client: Client,
     table_name: String,
-    start_timestamp: Option<i64>,
     enable_databoost: bool,
 }
 
@@ -319,7 +318,6 @@ impl SpannerExternalTableReader {
             pk_types,
             client,
             table_name: external_table.table_name().to_string(),
-            start_timestamp: None,
             enable_databoost,
         })
     }
@@ -404,7 +402,7 @@ impl SpannerExternalTableReader {
         _primary_keys: Vec<String>,
         limit: u32,
     ) {
-        let fields = self.rw_schema.fields().clone();
+        let fields = self.rw_schema.fields();
         let column_names = self.field_names.clone();
         let table_name = &self.table_name;
 
@@ -534,7 +532,7 @@ impl SpannerExternalTableReader {
         right: OwnedRow,
         _split_columns: Vec<Field>,
     ) {
-        let fields = self.rw_schema.fields().clone();
+        let fields = self.rw_schema.fields();
         let column_names = self.field_names.clone();
 
         // Check if left_bound contains a partition token (for databoost partitioned reads)

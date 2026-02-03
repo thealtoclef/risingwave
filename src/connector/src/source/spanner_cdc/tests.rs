@@ -120,7 +120,6 @@ mod tests {
             end_time: None,
             credentials: None,
             emulator_host: None,
-            parallelism: Some(1),
             max_concurrent_partitions: None,
             buffer_size: None,
             enable_partition_discovery: true,

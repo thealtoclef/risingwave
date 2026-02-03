@@ -49,7 +49,6 @@ use crate::error::ConnectorResult;
 use crate::parser::maxwell::MaxwellParser;
 use crate::schema::schema_registry::SchemaRegistryConfig;
 use crate::source::monitor::GLOBAL_SOURCE_METRICS;
-use crate::source::spanner_cdc::SpannerCdcMeta;
 use crate::source::{
     BoxSourceMessageStream, SourceChunkStream, SourceColumnDesc, SourceColumnType, SourceContext,
     SourceContextRef, SourceCtrlOpts, SourceMeta,

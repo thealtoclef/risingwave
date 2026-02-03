@@ -104,11 +104,6 @@ pub struct SpannerCdcProperties {
     #[serde(rename = "spanner.emulator_host")]
     pub emulator_host: Option<String>,
 
-    /// Number of parallel readers (default: 1)
-    #[serde_as(as = "Option<DisplayFromStr>")]
-    #[serde(rename = "spanner.parallelism")]
-    pub parallelism: Option<u32>,
-
     /// Maximum number of concurrent partitions to read (default: 100)
     #[serde_as(as = "Option<DisplayFromStr>")]
     #[serde(rename = "spanner.max_concurrent_partitions")]
@@ -292,6 +287,7 @@ impl SpannerCdcProperties {
     }
 
     /// Get the DSN string for this connection (used for external table config)
+    #[allow(dead_code)]
     pub(crate) fn get_dsn(&self) -> String {
         format!(
             "projects/{}/instances/{}/databases/{}",

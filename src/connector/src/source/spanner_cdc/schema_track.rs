@@ -27,7 +27,6 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use risingwave_common::catalog::{ColumnCatalog, ColumnDesc, ColumnId};
-use risingwave_common::types::DataType;
 use tokio::sync::RwLock;
 
 use crate::error::ConnectorResult;

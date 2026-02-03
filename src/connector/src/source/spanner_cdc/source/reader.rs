@@ -64,7 +64,6 @@ struct ChildPartitionContext {
     retry_backoff_max_delay_ms: u64,
     retry_backoff_factor: u64,
     schema_tracker: Arc<SchemaTracker>,
-    source_id: u32,
     source_name: String,
     partition_manager: Arc<PartitionManager>,
     shutdown_token: CancellationToken,
@@ -159,7 +158,6 @@ impl SpannerCdcSplitReader {
             retry_backoff_max_delay_ms: self.retry_backoff_max_delay_ms,
             retry_backoff_factor: self.retry_backoff_factor,
             schema_tracker: self.schema_tracker.clone(),
-            source_id,
             source_name,
             partition_manager: partition_manager.clone(),
             shutdown_token: self.shutdown_token.clone(),
@@ -298,6 +296,7 @@ impl SpannerCdcSplitReader {
                 let schema_tracker = child_ctx.schema_tracker.clone();
                 let pm = child_ctx.partition_manager.clone();
                 let _ctx = child_ctx.clone();
+                let source_id = self.source_ctx.source_id.as_raw_id();
 
                 // Mark as running
                 pm.mark_running(&child_token_key).await;

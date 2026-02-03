@@ -31,7 +31,6 @@ use crate::parser::unified::debezium::{parse_schema_change, parse_transaction_me
 use crate::parser::upsert_parser::get_key_column_name;
 use crate::parser::{BytesProperties, ParseResult, ParserFormat};
 use crate::source::cdc::CdcMessageType;
-use crate::source::spanner_cdc::SpannerCdcMeta;
 use crate::source::{SourceColumnDesc, SourceContext, SourceContextRef, SourceMeta};
 
 /// Parser for `FORMAT PLAIN`, i.e., append-only source.

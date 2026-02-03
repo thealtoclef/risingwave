@@ -27,7 +27,6 @@ pub struct SpannerCdcSplitEnumerator {
     stream_name: String,
     #[allow(dead_code)] // Used for error messages
     database_name: String,
-    split_count: u32,
     start_time: Option<OffsetDateTime>,
 }
 
@@ -40,11 +39,6 @@ impl SplitEnumerator for SpannerCdcSplitEnumerator {
         properties: Self::Properties,
         _context: SourceEnumeratorContextRef,
     ) -> ConnectorResult<SpannerCdcSplitEnumerator> {
-        let split_count = properties.parallelism.unwrap_or(1);
-        if split_count < 1 {
-            bail!("parallelism must be >= 1");
-        }
-
         // Note: Authentication is handled by create_client() which supports:
         // 1. emulator_host - for testing with emulator
         // 2. credentials_path - for file-based service account credentials
@@ -91,7 +85,6 @@ impl SplitEnumerator for SpannerCdcSplitEnumerator {
         Ok(Self {
             stream_name: properties.stream_name,
             database_name: properties.database,
-            split_count,
             start_time,
         })
     }
