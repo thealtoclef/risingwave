@@ -51,7 +51,6 @@ statement ok
 CREATE SOURCE spanner_source WITH (
     ${RISEDEV_SPANNER_WITH_OPTIONS_COMMON},
     spanner.stream_name = 'test_stream',
-    spanner.parallelism = '1',
     spanner.heartbeat_interval = '5s',
     spanner.enable_databoost = 'true',
     auto.schema.change = 'true'
