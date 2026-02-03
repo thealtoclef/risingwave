@@ -2,8 +2,14 @@
 # Usage: make -C scripts/remote <target> [profile=<profile>]
 
 PROFILE ?=
-
-.PHONY: help setup shell sync clean deploy test run logs
+# Accept both uppercase and lowercase
+ifeq ($(profile),)
+  ifneq ($(PROFILE),)
+    profile := $(PROFILE)
+  endif
+else
+  PROFILE := $(profile)
+endif
 
 help: ## Show this help
 	@echo "Remote Build Commands:"

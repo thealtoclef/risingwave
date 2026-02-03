@@ -122,9 +122,10 @@ show_usage() {
 }
 
 # Parse arguments
-PROFILE=""  # Default: no profile (for real Spanner)
+PROFILE="${PROFILE:-}"  # Default: no profile (for real Spanner), preserve env var if set
 
-# Parse arguments
+# Parse arguments (profile can come before or after command)
+COMMAND=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --profile=*)
@@ -132,13 +133,13 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         *)
-            break
+            if [ -z "$COMMAND" ]; then
+                COMMAND="$1"
+            fi
+            shift
             ;;
     esac
 done
-
-COMMAND="${1:-}"
-shift || true
 
 case "$COMMAND" in
     setup)
