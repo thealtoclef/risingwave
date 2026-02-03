@@ -61,6 +61,8 @@ profile:
 
   # Minimal profile for testing Spanner CDC source only
   spanner-only:
+    env:
+      ENABLE_SPANNER: "true"
     steps:
       - use: meta-node
       - use: compute-node

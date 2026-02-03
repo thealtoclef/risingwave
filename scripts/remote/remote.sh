@@ -121,7 +121,22 @@ show_usage() {
     echo "  make -C scripts/remote run"
 }
 
-# Main
+# Parse arguments
+PROFILE=""  # Default: no profile (for real Spanner)
+
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --profile=*)
+            PROFILE="${1#*=}"
+            shift
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
 COMMAND="${1:-}"
 shift || true
 
@@ -402,6 +417,7 @@ EOF
         echo "Syncing via rsync (port-forward on localhost:$SSH_PORT)..."
         rsync -avz --delete \
             -e "ssh -p $SSH_PORT -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o ServerAliveInterval=5" \
+            --exclude='.bin/' \
             --exclude='target/' \
             --exclude='.git/' \
             --exclude='.risingwave/' \
@@ -444,7 +460,7 @@ EOF
             sleep 2
         " || echo "Emulator cleanup completed"
         echo -e "${YELLOW}Cleaning Spanner emulator files...${NC}"
-        exec_in_builder "cd $WORKSPACE && export ENABLE_SPANNER=true && ./risedev remove-spanner" || echo "No Spanner files to clean"
+        exec_in_builder "cd $WORKSPACE && ./risedev remove-spanner" || echo "No Spanner files to clean"
         echo -e "${YELLOW}Checking ports...${NC}"
         exec_in_builder "
             # Quick check if ports are in use (non-blocking)
@@ -468,7 +484,13 @@ EOF
     deploy)
         echo -e "${YELLOW}Deploying RisingWave cluster...${NC}"
         echo -e "${YELLOW}Note: This will rebuild if needed.${NC}"
-        exec_in_builder "export ENABLE_SPANNER=true && cd $WORKSPACE && ./risedev d spanner-only"
+        if [ -z "$PROFILE" ]; then
+            echo -e "${BLUE}Using default risedev profile (no emulator)${NC}"
+            exec_in_builder "cd $WORKSPACE && ./risedev d"
+        else
+            echo -e "${BLUE}Using risedev profile: ${PROFILE}${NC}"
+            exec_in_builder "cd $WORKSPACE && ./risedev d ${PROFILE}"
+        fi
         echo -e "${GREEN}Deploy complete${NC}"
         ;;
 
@@ -476,7 +498,7 @@ EOF
         echo -e "${YELLOW}Running tests...${NC}"
         echo -e "${YELLOW}Note: This assumes RisingWave cluster is already running.${NC}"
         echo -e "${YELLOW}If cluster is not running, use 'deploy' command first or 'run' command instead.${NC}"
-        exec_in_builder "export ENABLE_SPANNER=true && cd $WORKSPACE && ./risedev slt 'e2e_test/source_inline/spanner_cdc/spanner_cdc.slt.serial'"
+        exec_in_builder "cd $WORKSPACE && ./risedev slt 'e2e_test/source_inline/spanner_cdc/spanner_cdc.slt.serial'"
         echo -e "${GREEN}Tests complete${NC}"
         ;;
 
@@ -487,7 +509,7 @@ EOF
         echo -e "${YELLOW}Step 2/4: Cleaning existing cluster...${NC}"
         "$0" clean
         echo -e "${YELLOW}Step 3/4: Deploying cluster (will rebuild if needed)...${NC}"
-        "$0" deploy
+        "$0" deploy $(if [ -n "$PROFILE" ]; then echo "--profile=$PROFILE"; fi)
         echo -e "${YELLOW}Step 4/4: Running tests...${NC}"
         "$0" test
         echo -e "${GREEN}=== Full workflow complete ===${NC}"

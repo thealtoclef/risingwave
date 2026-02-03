@@ -127,6 +127,10 @@ pub fn generate_risedev_env(services: &Vec<ServiceConfig>) -> String {
                 let address = &c.address;
                 let port = &c.port;
                 writeln!(env, r#"SPANNER_EMULATOR_HOST="{address}:{port}""#,).unwrap();
+                // Default values used by tests - can be overridden with real Spanner values
+                writeln!(env, r#"SPANNER_PROJECT="test-project""#,).unwrap();
+                writeln!(env, r#"SPANNER_INSTANCE="test-instance""#,).unwrap();
+                writeln!(env, r#"SPANNER_DATABASE="test-database""#,).unwrap();
                 writeln!(env, r#"RISEDEV_SPANNER_WITH_OPTIONS_COMMON="connector='spanner-cdc',spanner.emulator_host='{address}:{port}',spanner.project='test-project',spanner.instance='test-instance',spanner.database='test-database'""#,).unwrap();
             }
             ServiceConfig::Postgres(c) => {

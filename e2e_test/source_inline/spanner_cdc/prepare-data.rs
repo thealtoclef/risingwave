@@ -14,9 +14,13 @@ tokio = { version = "0.2", package = "madsim-tokio", features = [
 ---
 use std::process::Command;
 
-const PROJECT: &str = "test-project";
-const INSTANCE: &str = "test-instance";
-const DATABASE: &str = "test-database";
+fn get_env_or_default(key: &str, default: &str) -> String {
+    std::env::var(key).unwrap_or_else(|_| default.to_string())
+}
+
+fn get_project() -> String { get_env_or_default("SPANNER_PROJECT", "test-project") }
+fn get_instance() -> String { get_env_or_default("SPANNER_INSTANCE", "test-instance") }
+fn get_database() -> String { get_env_or_default("SPANNER_DATABASE", "test-database") }
 const STREAM: &str = "test_stream";
 
 /// Get the full path to gcloud, including PREFIX_BIN if needed
@@ -31,23 +35,37 @@ fn gcloud_cmd() -> String {
     }
 }
 
+/// Check if we're using emulator (SPANNER_EMULATOR_HOST is set)
+fn is_using_emulator() -> bool {
+    std::env::var("SPANNER_EMULATOR_HOST").is_ok()
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let command = args.get(1).map(|s| s.as_str()).unwrap_or("setup");
 
-    let emulator_host = std::env::var("SPANNER_EMULATOR_HOST")
-        .expect("SPANNER_EMULATOR_HOST must be set for emulator testing");
+    let project = get_project();
+    let instance = get_instance();
+    let database = get_database();
+    let using_emulator = is_using_emulator();
+
+    println!("Spanner config: project={}, instance={}, database={}, emulator={}",
+        project, instance, database, using_emulator);
 
     match command {
-        "cleanup" => cleanup_resources(&emulator_host).await?,
-        "setup" => setup_resources(&emulator_host).await?,
-        "create-table" => create_table(&emulator_host).await?,
-        "create-change-stream" => create_change_stream(&emulator_host).await?,
-        "insert-data" => insert_test_data(&emulator_host).await?,
+        "cleanup" => cleanup_resources().await?,
+        "setup" => setup_resources().await?,
+        "create-table" => create_table().await?,
+        "create-change-stream" => create_change_stream().await?,
+        "insert-data" => insert_test_data().await?,
         _ => {
             eprintln!("Unknown command: {}", command);
             eprintln!("Usage: prepare-data.rs [cleanup|setup|create-table|create-change-stream|insert-data]");
+            eprintln!();
+            eprintln!("For emulator (via risedev): All env vars are set automatically");
+            eprintln!("For real Spanner: Set SPANNER_PROJECT, SPANNER_INSTANCE, SPANNER_DATABASE");
+            eprintln!("                 Ensure gcloud is authenticated: gcloud auth login");
             std::process::exit(1);
         }
     }
@@ -57,10 +75,12 @@ async fn main() -> anyhow::Result<()> {
 
 /// Cleanup resources: drop table, drop change stream, delete all data
 /// This is robust and will not error if resources don't exist
-async fn cleanup_resources(_emulator_host: &str) -> anyhow::Result<()> {
+async fn cleanup_resources() -> anyhow::Result<()> {
     println!("Cleaning up Spanner resources...");
 
     let gcloud = gcloud_cmd();
+    let instance = get_instance();
+    let database = get_database();
 
     // Drop change stream if it exists (ignore errors)
     println!("  Dropping change stream if exists...");
@@ -71,23 +91,23 @@ async fn cleanup_resources(_emulator_host: &str) -> anyhow::Result<()> {
             "databases",
             "ddl",
             "update",
-            DATABASE,
-            &format!("--instance={}", INSTANCE),
+            &database,
+            &format!("--instance={}", instance),
             &format!("--ddl={}", drop_stream_ddl),
         ])
         .output();
 
     // Drop table if it exists (ignore errors)
     println!("  Dropping table if exists...");
-    let drop_table_ddl = format!("DROP TABLE IF EXISTS users");
+    let drop_table_ddl = "DROP TABLE IF EXISTS users";
     let _ = Command::new(&gcloud)
         .args(&[
             "spanner",
             "databases",
             "ddl",
             "update",
-            DATABASE,
-            &format!("--instance={}", INSTANCE),
+            &database,
+            &format!("--instance={}", instance),
             &format!("--ddl={}", drop_table_ddl),
         ])
         .output();
@@ -100,8 +120,8 @@ async fn cleanup_resources(_emulator_host: &str) -> anyhow::Result<()> {
             "spanner",
             "databases",
             "execute-sql",
-            DATABASE,
-            &format!("--instance={}", INSTANCE),
+            &database,
+            &format!("--instance={}", instance),
             &format!("--sql={}", delete_sql),
         ])
         .output();
@@ -111,100 +131,125 @@ async fn cleanup_resources(_emulator_host: &str) -> anyhow::Result<()> {
 }
 
 /// Setup resources: create instance and database only
-async fn setup_resources(emulator_host: &str) -> anyhow::Result<()> {
-    println!("Setting up Spanner resources (instance and database)...");
-    println!("   Emulator: {}", emulator_host);
-
+async fn setup_resources() -> anyhow::Result<()> {
+    let using_emulator = is_using_emulator();
+    let project = get_project();
+    let instance = get_instance();
+    let database = get_database();
     let gcloud = gcloud_cmd();
 
-    let grpc_port = emulator_host.split(':').nth(1).unwrap_or("9010");
-    let rest_port: u16 = grpc_port.parse::<u16>().unwrap_or(9010) + 10;
-    let rest_endpoint = format!("http://127.0.0.1:{}/", rest_port);
+    if using_emulator {
+        println!("Setting up Spanner emulator resources...");
+        configure_gcloud_for_emulator(&gcloud, &project)?;
+    } else {
+        println!("Setting up real Spanner resources...");
+        println!("  Using existing project: {}", project);
+        println!("  Ensure gcloud is authenticated: gcloud auth login");
+    }
 
-    // Configure gcloud for emulator
-    println!("   Configuring gcloud...");
+    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
 
-    Command::new(&gcloud)
-        .args(&["config", "configurations", "create", "emulator"])
-        .output()?;
+    // For emulator: create instance
+    // For real Spanner: instance should already exist
+    if using_emulator {
+        println!("  Creating instance...");
+        let create_instance_result = Command::new(&gcloud)
+            .args(&[
+                "spanner",
+                "instances",
+                "create",
+                &instance,
+                "--config=emulator-config",
+                "--description=Test Instance",
+                "--nodes=1",
+            ])
+            .output()?;
 
-    Command::new(&gcloud)
-        .args(&["config", "configurations", "activate", "emulator"])
-        .output()?;
-
-    Command::new(&gcloud)
-        .args(&["config", "set", "auth/disable_credentials", "true"])
-        .output()?;
-
-    Command::new(&gcloud)
-        .args(&["config", "set", "project", PROJECT])
-        .output()?;
-
-    Command::new(&gcloud)
-        .args(&["config", "set", "api_endpoint_overrides/spanner", &rest_endpoint])
-        .output()?;
-
-    println!("   gcloud configured");
-
-    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-
-    // Create instance
-    println!("   Creating instance...");
-    let create_instance_result = Command::new(&gcloud)
-        .args(&[
-            "spanner",
-            "instances",
-            "create",
-            INSTANCE,
-            "--config=emulator-config",
-            "--description=Test Instance",
-            "--nodes=1",
-        ])
-        .output()?;
-
-    if !create_instance_result.status.success() {
-        let stderr = String::from_utf8_lossy(&create_instance_result.stderr);
-        if stderr.contains("already exists") || stderr.contains("AlreadyExists") {
-            println!("   Instance already exists");
+        if !create_instance_result.status.success() {
+            let stderr = String::from_utf8_lossy(&create_instance_result.stderr);
+            if stderr.contains("already exists") || stderr.contains("AlreadyExists") {
+                println!("  Instance already exists");
+            } else {
+                eprintln!("  Warning: Failed to create instance");
+            }
         } else {
-            eprintln!("   Warning: Failed to create instance");
+            println!("  Instance created");
         }
     } else {
-        println!("   Instance created");
+        println!("  Verifying instance exists...");
+        let list_result = Command::new(&gcloud)
+            .args(&[
+                "spanner",
+                "instances",
+                "list",
+                &format!("--project={}", project),
+                &format!("--filter=name:{}", instance),
+            ])
+            .output()?;
+
+        if !list_result.status.success() || String::from_utf8_lossy(&list_result.stdout).is_empty() {
+            eprintln!("  ERROR: Instance '{}' not found in project '{}'", instance, project);
+            eprintln!("  Please create the instance first:");
+            eprintln!("    gcloud spanner instances create {} --project={} --description=Test --nodes=1", instance, project);
+            std::process::exit(1);
+        }
+        println!("  Instance verified");
     }
 
     // Create database
-    println!("   Creating database...");
+    println!("  Creating database...");
     let create_db_result = Command::new(&gcloud)
         .args(&[
             "spanner",
             "databases",
             "create",
-            DATABASE,
-            &format!("--instance={}", INSTANCE),
+            &database,
+            &format!("--instance={}", instance),
         ])
         .output()?;
 
     if !create_db_result.status.success() {
         let stderr = String::from_utf8_lossy(&create_db_result.stderr);
         if stderr.contains("already exists") || stderr.contains("AlreadyExists") {
-            println!("   Database already exists");
+            println!("  Database already exists");
         } else {
-            eprintln!("   Warning: Failed to create database");
+            eprintln!("  Warning: Failed to create database: {}", stderr);
         }
     } else {
-        println!("   Database created");
+        println!("  Database created");
     }
 
-    println!("Spanner resources setup complete (instance and database)!");
+    println!("Spanner resources setup complete!");
+    Ok(())
+}
+
+/// Configure gcloud for emulator use
+fn configure_gcloud_for_emulator(gcloud: &str, project: &str) -> anyhow::Result<()> {
+    println!("  Configuring gcloud for emulator...");
+
+    Command::new(gcloud)
+        .args(&["config", "configurations", "activate", "emulator"])
+        .output()?;
+
+    Command::new(gcloud)
+        .args(&["config", "set", "auth/disable_credentials", "true"])
+        .output()?;
+
+    Command::new(gcloud)
+        .args(&["config", "set", "project", project])
+        .output()?;
+
+    println!("  gcloud configured for emulator");
     Ok(())
 }
 
 /// Create the users table
-async fn create_table(_emulator_host: &str) -> anyhow::Result<()> {
+async fn create_table() -> anyhow::Result<()> {
     println!("Creating table users...");
 
     let gcloud = gcloud_cmd();
+    let instance = get_instance();
+    let database = get_database();
 
     let create_table_ddl = "CREATE TABLE IF NOT EXISTS users (id STRING(MAX) NOT NULL, name STRING(MAX), email STRING(MAX), age INT64) PRIMARY KEY (id)";
 
@@ -214,8 +259,8 @@ async fn create_table(_emulator_host: &str) -> anyhow::Result<()> {
             "databases",
             "ddl",
             "update",
-            DATABASE,
-            &format!("--instance={}", INSTANCE),
+            &database,
+            &format!("--instance={}", instance),
             &format!("--ddl={}", create_table_ddl),
         ])
         .output()?;
@@ -225,10 +270,12 @@ async fn create_table(_emulator_host: &str) -> anyhow::Result<()> {
 }
 
 /// Create the change stream
-async fn create_change_stream(_emulator_host: &str) -> anyhow::Result<()> {
+async fn create_change_stream() -> anyhow::Result<()> {
     println!("Creating change stream {}...", STREAM);
 
     let gcloud = gcloud_cmd();
+    let instance = get_instance();
+    let database = get_database();
 
     let create_stream_ddl = format!(
         "CREATE CHANGE STREAM {} FOR users OPTIONS (retention_period='7d', value_capture_type='NEW_ROW')",
@@ -241,8 +288,8 @@ async fn create_change_stream(_emulator_host: &str) -> anyhow::Result<()> {
             "databases",
             "ddl",
             "update",
-            DATABASE,
-            &format!("--instance={}", INSTANCE),
+            &database,
+            &format!("--instance={}", instance),
             &format!("--ddl={}", create_stream_ddl),
         ])
         .output()?;
@@ -262,10 +309,12 @@ async fn create_change_stream(_emulator_host: &str) -> anyhow::Result<()> {
 }
 
 /// Insert test data
-async fn insert_test_data(_emulator_host: &str) -> anyhow::Result<()> {
+async fn insert_test_data() -> anyhow::Result<()> {
     println!("Inserting test data...");
 
     let gcloud = gcloud_cmd();
+    let instance = get_instance();
+    let database = get_database();
 
     let insert_sql = "INSERT INTO users (id, name, email, age) VALUES ('1', 'Alice', 'alice@example.com', 30), ('2', 'Bob', 'bob@example.com', 25)";
 
@@ -274,8 +323,8 @@ async fn insert_test_data(_emulator_host: &str) -> anyhow::Result<()> {
             "spanner",
             "databases",
             "execute-sql",
-            DATABASE,
-            &format!("--instance={}", INSTANCE),
+            &database,
+            &format!("--instance={}", instance),
             &format!("--sql={}", insert_sql),
         ])
         .output()?;
