@@ -1,15 +1,8 @@
 # Makefile for K8s remote build operations
-# Usage: make -C scripts/remote <target> [profile=<profile>]
+# Usage: make -C scripts/remote <target> [profile=<profile>] [envs=<KEY1=VAL1,KEY2=VAL2>]
 
-PROFILE ?=
-# Accept both uppercase and lowercase
-ifeq ($(profile),)
-  ifneq ($(PROFILE),)
-    profile := $(PROFILE)
-  endif
-else
-  PROFILE := $(profile)
-endif
+profile ?=
+envs ?=
 
 help: ## Show this help
 	@echo "Remote Build Commands:"
@@ -23,12 +16,14 @@ help: ## Show this help
 	@echo "  logs     - View all logs"
 	@echo ""
 	@echo "Options:"
-	@echo "  profile  - risedev profile to use (default: empty, use spanner-only for emulator)"
+	@echo "  profile  - risedev profile to use (default: empty)"
+	@echo "  envs     - Extra env vars (comma-separated KEY=VAL pairs)"
 	@echo ""
 	@echo "Examples:"
-	@echo "  make -C scripts/remote deploy                           # Default profile (no emulator, for real Spanner)"
-	@echo "  make -C scripts/remote deploy profile=spanner-only      # Use emulator"
-	@echo "  make -C scripts/remote run profile=spanner-only         # Full workflow with emulator"
+	@echo "  make -C scripts/remote deploy                                    # Default profile"
+	@echo "  make -C scripts/remote deploy profile=spanner-emulator            # Use emulator"
+	@echo "  make -C scripts/remote deploy envs='SPANNER_PROJECT=p,SPANNER_INSTANCE=i'  # Real Spanner"
+	@echo "  make -C scripts/remote run profile=spanner-emulator               # Full workflow with emulator"
 
 setup: ## Set up build environment
 	./remote.sh setup
@@ -42,14 +37,17 @@ sync: ## Sync source code
 clean: ## Clean cluster
 	./remote.sh clean
 
+# Define comma for use in subst (must be defined before use)
+comma := ,
+
 deploy: ## Deploy cluster
-	./remote.sh deploy $(if $(PROFILE),--profile=$(PROFILE))
+	./remote.sh deploy $(if $(profile),--profile=$(profile)) $(if $(envs),$(foreach env,$(subst $(comma), ,$(envs)),--env=$(env)))
 
 test: ## Run tests
 	./remote.sh test
 
 run: ## Full workflow: sync -> clean -> deploy -> test
-	./remote.sh run $(if $(PROFILE),--profile=$(PROFILE))
+	./remote.sh run $(if $(profile),--profile=$(profile)) $(if $(envs),$(foreach env,$(subst $(comma), ,$(envs)),--env=$(env)))
 
 logs: ## View logs
 	./remote.sh logs

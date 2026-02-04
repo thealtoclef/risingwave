@@ -11,6 +11,10 @@
 #   test        - Run tests (assumes cluster is running)
 #   run         - Full workflow: sync -> clean -> deploy -> test
 #   logs [file] - View logs (default: all)
+#
+# Options:
+#   --profile=<name>  - risedev profile to use
+#   --env=KEY=VALUE   - Set environment variable (can be used multiple times)
 
 set -e
 
@@ -106,23 +110,28 @@ exec_in_builder() {
 # Show usage
 show_usage() {
     echo -e "${BLUE}Remote Build Commands${NC}"
-    grep "^# Commands:" "$0" -A 10 | sed 's/^# //'
+    grep "^# Commands:" "$0" -A 12 | sed 's/^# //'
     echo ""
     echo "Examples:"
-    echo "  ./scripts/remote/remote.sh setup      # Initial setup"
-    echo "  ./scripts/remote/remote.sh sync       # Sync source code"
-    echo "  ./scripts/remote/remote.sh deploy     # Deploy cluster"
-    echo "  ./scripts/remote/remote.sh test       # Run tests"
-    echo "  ./scripts/remote/remote.sh run        # Full workflow: sync -> clean -> deploy -> test"
-    echo "  ./scripts/remote/remote.sh shell      # Open shell in builder"
-    echo "  ./scripts/remote/remote.sh logs meta  # View meta logs"
+    echo "  ./scripts/remote/remote.sh setup                                    # Initial setup"
+    echo "  ./scripts/remote/remote.sh sync                                     # Sync source code"
+    echo "  ./scripts/remote/remote.sh deploy                                   # Deploy cluster"
+    echo "  ./scripts/remote/remote.sh deploy --profile=spanner-emulator"
+    echo "  ./scripts/remote/remote.sh deploy --env=KEY1=VAL1 --env=KEY2=VAL2  # Multiple env vars"
+    echo "  ./scripts/remote/remote.sh test                                     # Run tests"
+    echo "  ./scripts/remote/remote.sh run                                      # Full workflow"
+    echo "  ./scripts/remote/remote.sh shell                                    # Open shell"
+    echo "  ./scripts/remote/remote.sh logs meta                                # View logs"
     echo ""
-    echo "  make -C scripts/remote setup          # Using Makefile"
+    echo "  make -C scripts/remote setup                                       # Using Makefile"
     echo "  make -C scripts/remote run"
+    echo "  make -C scripts/remote deploy profile=spanner-emulator"
+    echo "  make -C scripts/remote deploy envs='KEY1=VAL1,KEY2=VAL2'           # Comma-separated"
 }
 
 # Parse arguments
 PROFILE="${PROFILE:-}"  # Default: no profile (for real Spanner), preserve env var if set
+EXTRA_ENVS=()  # Extra env vars to pass through
 
 # Parse arguments (profile can come before or after command)
 COMMAND=""
@@ -130,6 +139,10 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --profile=*)
             PROFILE="${1#*=}"
+            shift
+            ;;
+        --env=*)
+            EXTRA_ENVS+=("${1#*=}")
             shift
             ;;
         *)
@@ -475,12 +488,29 @@ EOF
     deploy)
         echo -e "${YELLOW}Deploying RisingWave cluster...${NC}"
         echo -e "${YELLOW}Note: This will rebuild if needed.${NC}"
+
+        # Build env export string for extra envs
+        env_exports=""
+        for env_var in "${EXTRA_ENVS[@]}"; do
+            env_exports="$env_exports export $env_var;"
+        done
+
         if [ -z "$PROFILE" ]; then
             echo -e "${BLUE}Using default risedev profile (no emulator)${NC}"
-            exec_in_builder "cd $WORKSPACE && ./risedev d"
+            if [ -n "$env_exports" ]; then
+                echo -e "${BLUE}With extra env vars: ${EXTRA_ENVS[*]}${NC}"
+                exec_in_builder "cd $WORKSPACE && $env_exports ./risedev d"
+            else
+                exec_in_builder "cd $WORKSPACE && ./risedev d"
+            fi
         else
             echo -e "${BLUE}Using risedev profile: ${PROFILE}${NC}"
-            exec_in_builder "cd $WORKSPACE && ./risedev d ${PROFILE}"
+            if [ -n "$env_exports" ]; then
+                echo -e "${BLUE}With extra env vars: ${EXTRA_ENVS[*]}${NC}"
+                exec_in_builder "cd $WORKSPACE && $env_exports ./risedev d ${PROFILE}"
+            else
+                exec_in_builder "cd $WORKSPACE && ./risedev d ${PROFILE}"
+            fi
         fi
         echo -e "${GREEN}Deploy complete${NC}"
         ;;
@@ -500,7 +530,7 @@ EOF
         echo -e "${YELLOW}Step 2/4: Cleaning existing cluster...${NC}"
         "$0" clean
         echo -e "${YELLOW}Step 3/4: Deploying cluster (will rebuild if needed)...${NC}"
-        "$0" deploy $(if [ -n "$PROFILE" ]; then echo "--profile=$PROFILE"; fi)
+        "$0" deploy $(if [ -n "$PROFILE" ]; then echo "--profile=$PROFILE"; fi) $(for env in "${EXTRA_ENVS[@]}"; do echo "--env=$env"; done)
         echo -e "${YELLOW}Step 4/4: Running tests...${NC}"
         "$0" test
         echo -e "${GREEN}=== Full workflow complete ===${NC}"
