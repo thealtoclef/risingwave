@@ -62,11 +62,6 @@ async fn create_environment() -> anyhow::Result<Environment> {
         let config = Config::default().with_scopes(SCOPES);
         let token_source_provider = DefaultTokenSourceProvider::new(config).await?;
 
-        // Debug: Print the SA email to confirm auth is working
-        if let Some(ref sa) = token_source_provider.source_credentials {
-            eprintln!("  Using Spanner SA: {}", sa.client_email.as_ref().unwrap_or(&"(unknown)".to_string()));
-        }
-
         Ok(Environment::GoogleCloud(Box::new(token_source_provider)))
     }
 }
