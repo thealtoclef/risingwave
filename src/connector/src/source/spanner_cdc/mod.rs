@@ -285,13 +285,4 @@ impl SpannerCdcProperties {
 
         Ok(client)
     }
-
-    /// Get the DSN string for this connection (used for external table config)
-    #[allow(dead_code)]
-    pub(crate) fn get_dsn(&self) -> String {
-        format!(
-            "projects/{}/instances/{}/databases/{}",
-            self.project, self.instance, self.database
-        )
-    }
 }
