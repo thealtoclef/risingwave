@@ -9,6 +9,7 @@ google-cloud-googleapis = { package = "gcloud-googleapis", version = "1", featur
 google-cloud-longrunning = { package = "gcloud-longrunning", version = "1.3" }
 google-cloud-auth = { package = "gcloud-auth", version = "1.2", default-features = false }
 uuid = { version = "1", features = ["v4"] }
+rustls = { version = "0.23", features = ["ring"] }
 ---
 use std::env;
 
@@ -50,7 +51,14 @@ async fn create_environment() -> anyhow::Result<Environment> {
         use google_cloud_auth::token::DefaultTokenSourceProvider;
         use google_cloud_auth::project::Config;
 
-        let token_source_provider = DefaultTokenSourceProvider::new(Config::default()).await?;
+        // Scopes required for Spanner
+        const SCOPES: &[&str] = &[
+            "https://www.googleapis.com/auth/cloud-platform",
+            "https://www.googleapis.com/auth/spanner.data",
+        ];
+
+        let config = Config::default().with_scopes(SCOPES);
+        let token_source_provider = DefaultTokenSourceProvider::new(config).await?;
         Ok(Environment::GoogleCloud(Box::new(token_source_provider)))
     }
 }
@@ -170,6 +178,9 @@ async fn execute_sql(sql: &str) -> anyhow::Result<()> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Install default CryptoProvider for rustls TLS
+    rustls::crypto::ring::default_provider().install_default().unwrap();
+
     let args: Vec<String> = env::args().collect();
     let command = args.get(1).map(|s| s.as_str()).unwrap_or("setup");
 
@@ -203,7 +214,7 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Cleanup resources: drop table, drop change stream, delete all data
+/// Cleanup resources: drop table, drop change stream
 async fn cleanup_resources() -> anyhow::Result<()> {
     println!("Cleaning up Spanner resources...");
 
@@ -214,10 +225,6 @@ async fn cleanup_resources() -> anyhow::Result<()> {
     // Drop table
     println!("  Dropping table if exists...");
     let _ = execute_ddl("DROP TABLE IF EXISTS users").await;
-
-    // Delete any remaining data
-    println!("  Deleting any remaining data...");
-    let _ = execute_sql("DELETE FROM users WHERE true").await;
 
     println!("Spanner resources cleaned up");
     Ok(())
