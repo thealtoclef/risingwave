@@ -11,6 +11,7 @@ google-cloud-auth = { package = "gcloud-auth", version = "1.2", default-features
 rustls = { version = "0.23", features = ["ring"] }
 ---
 use std::env;
+use std::io::{self, Read};
 
 use google_cloud_gax::conn::{ConnectionManager, ConnectionOptions, Environment};
 use google_cloud_googleapis::spanner::admin::database::v1::UpdateDatabaseDdlRequest;
@@ -61,6 +62,11 @@ async fn create_environment() -> anyhow::Result<Environment> {
 
         let config = Config::default().with_scopes(SCOPES);
         let token_source_provider = DefaultTokenSourceProvider::new(config).await?;
+
+        // Debug: Print the SA email to confirm auth is working
+        if let Some(ref sa) = token_source_provider.source_credentials {
+            eprintln!("  Using Spanner SA: {}", sa.client_email.as_ref().unwrap_or(&"(unknown)".to_string()));
+        }
 
         Ok(Environment::GoogleCloud(Box::new(token_source_provider)))
     }
@@ -214,6 +220,21 @@ async fn execute_sql(sql: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Read SQL from stdin or from argument
+fn read_sql() -> String {
+    let args: Vec<String> = env::args().collect();
+
+    // If SQL is provided as argument (2nd arg), use it
+    if let Some(sql) = args.get(2) {
+        return sql.clone();
+    }
+
+    // Otherwise, read from stdin
+    let mut buffer = String::new();
+    io::stdin().read_to_string(&mut buffer).expect("Failed to read SQL from stdin");
+    buffer.trim().to_string()
+}
+
 // ============================================================================
 // Commands
 // ============================================================================
@@ -224,27 +245,118 @@ async fn main() -> anyhow::Result<()> {
     rustls::crypto::ring::default_provider().install_default().unwrap();
 
     let args: Vec<String> = env::args().collect();
-    let command = args.get(1).map(|s| s.as_str()).unwrap_or("setup");
+    let command = args.get(1).map(|s| s.as_str()).unwrap_or("help");
 
     let project = get_project();
     let instance = get_instance();
     let database = get_database();
     let using_emulator = is_using_emulator();
 
-    println!(
-        "Spanner config: project={}, instance={}, database={}, emulator={}",
-        project, instance, database, using_emulator
-    );
-
     match command {
-        "cleanup" => cleanup_resources().await?,
-        "setup" => setup_resources().await?,
-        "create-table" => create_table().await?,
-        "create-change-stream" => create_change_stream().await?,
-        "insert-data" => insert_test_data().await?,
-        _ => {
-            eprintln!("Unknown command: {}", command);
-            eprintln!("Usage: prepare-data.rs [cleanup|setup|create-table|create-change-stream|insert-data]");
+        "cleanup" => {
+            println!("Cleaning up Spanner resources...");
+            println!("  Dropping change stream if exists...");
+            let _ = execute_ddl(&format!("DROP CHANGE STREAM IF EXISTS {}", STREAM)).await;
+            println!("  Dropping table if exists...");
+            let _ = execute_ddl("DROP TABLE IF EXISTS users").await;
+            println!("Spanner resources cleaned up");
+        }
+        "setup" => {
+            if using_emulator {
+                println!("Setting up Spanner emulator resources...");
+                println!("  Creating instance...");
+                let _ = std::process::Command::new("gcloud")
+                    .args([
+                        "spanner",
+                        "instances",
+                        "create",
+                        &instance,
+                        "--config=emulator-config",
+                        "--description=Test Instance",
+                        "--nodes=1",
+                    ])
+                    .output();
+                println!("  Creating database...");
+                let _ = std::process::Command::new("gcloud")
+                    .args([
+                        "spanner",
+                        "databases",
+                        "create",
+                        &database,
+                        &format!("--instance={}", instance),
+                    ])
+                    .output();
+                println!("  Emulator resources created");
+            } else {
+                println!("Setting up real Spanner resources...");
+                println!("  Using existing Spanner resources:");
+                println!("    Project: {}", project);
+                println!("    Instance: {}", instance);
+                println!("    Database: {}", database);
+                println!("  Note: For real Spanner, instance and database must already exist");
+            }
+            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+            println!("Spanner resources setup complete!");
+        }
+        "create-table" => {
+            println!("Creating table users...");
+            let ddl = "CREATE TABLE IF NOT EXISTS users (id STRING(MAX) NOT NULL, name STRING(MAX), email STRING(MAX), age INT64) PRIMARY KEY (id)";
+            execute_ddl(ddl).await?;
+            println!("Table created");
+        }
+        "create-change-stream" => {
+            println!("Creating change stream {}...", STREAM);
+            let ddl = format!(
+                "CREATE CHANGE STREAM {} FOR users OPTIONS (retention_period='7d', value_capture_type='NEW_ROW')",
+                STREAM
+            );
+            execute_ddl(&ddl).await?;
+            println!("  Change stream created");
+        }
+        "insert-data" => {
+            println!("Inserting test data...");
+            let sql = "INSERT INTO users (id, name, email, age) VALUES ('1', 'Alice', 'alice@example.com', 30), ('2', 'Bob', 'bob@example.com', 25)";
+            execute_sql(sql).await?;
+            println!("Test data inserted (Alice, Bob)");
+        }
+        "dml" => {
+            let sql = read_sql();
+            if sql.is_empty() {
+                eprintln!("Error: No SQL provided. Use: prepare-data.rs dml \"<SQL>\" or echo \"<SQL>\" | prepare-data.rs dml");
+                std::process::exit(1);
+            }
+            execute_sql(&sql).await?;
+            println!("  DML executed successfully");
+        }
+        "ddl" => {
+            let ddl = read_sql();
+            if ddl.is_empty() {
+                eprintln!("Error: No DDL provided. Use: prepare-data.rs ddl \"<DDL>\" or echo \"<DDL>\" | prepare-data.rs ddl");
+                std::process::exit(1);
+            }
+            execute_ddl(&ddl).await?;
+        }
+        "help" | _ => {
+            eprintln!("Spanner test data preparation script");
+            eprintln!();
+            eprintln!("Usage:");
+            eprintln!("  prepare-data.rs <command> [args]");
+            eprintln!();
+            eprintln!("Setup commands:");
+            eprintln!("  cleanup              Drop table and change stream");
+            eprintln!("  setup                Create instance and database (emulator only)");
+            eprintln!("  create-table         Create the users table");
+            eprintln!("  create-change-stream Create the test_stream change stream");
+            eprintln!("  insert-data          Insert initial test data");
+            eprintln!();
+            eprintln!("Generic commands (accept SQL via argument or stdin):");
+            eprintln!("  dml \"<SQL>\"          Execute DML (INSERT, UPDATE, DELETE)");
+            eprintln!("  ddl \"<DDL>\"          Execute DDL (CREATE, ALTER, DROP)");
+            eprintln!();
+            eprintln!("Examples:");
+            eprintln!("  prepare-data.rs dml \"INSERT INTO users (id, name) VALUES ('1', 'Alice')\"");
+            eprintln!("  prepare-data.rs ddl \"ALTER TABLE users ADD COLUMN city STRING(MAX)\"");
+            eprintln!("  echo \"UPDATE users SET age = 30 WHERE id = '1'\" | prepare-data.rs dml");
             eprintln!();
             eprintln!("For emulator (via risedev): All env vars are set automatically");
             eprintln!("For real Spanner: Set SPANNER_PROJECT, SPANNER_INSTANCE, SPANNER_DATABASE");
@@ -252,109 +364,5 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    Ok(())
-}
-
-/// Cleanup resources: drop table, drop change stream
-async fn cleanup_resources() -> anyhow::Result<()> {
-    println!("Cleaning up Spanner resources...");
-
-    // Drop change stream
-    println!("  Dropping change stream if exists...");
-    let _ = execute_ddl(&format!("DROP CHANGE STREAM IF EXISTS {}", STREAM)).await;
-
-    // Drop table
-    println!("  Dropping table if exists...");
-    let _ = execute_ddl("DROP TABLE IF EXISTS users").await;
-
-    println!("Spanner resources cleaned up");
-    Ok(())
-}
-
-/// Setup resources: create instance and database only
-async fn setup_resources() -> anyhow::Result<()> {
-    let using_emulator = is_using_emulator();
-    let project = get_project();
-    let instance = get_instance();
-    let database = get_database();
-
-    if using_emulator {
-        println!("Setting up Spanner emulator resources...");
-        println!("  Creating instance...");
-
-        // For emulator, we still need gcloud to create the instance
-        // This is a limitation - Spanner API doesn't provide instance creation
-        let _ = std::process::Command::new("gcloud")
-            .args([
-                "spanner",
-                "instances",
-                "create",
-                &instance,
-                "--config=emulator-config",
-                "--description=Test Instance",
-                "--nodes=1",
-            ])
-            .output();
-
-        println!("  Creating database...");
-        let _ = std::process::Command::new("gcloud")
-            .args([
-                "spanner",
-                "databases",
-                "create",
-                &database,
-                &format!("--instance={}", instance),
-            ])
-            .output();
-
-        println!("  Emulator resources created");
-    } else {
-        println!("Setting up real Spanner resources...");
-        println!("  Using existing Spanner resources:");
-        println!("    Project: {}", project);
-        println!("    Instance: {}", instance);
-        println!("    Database: {}", database);
-        println!("  Note: For real Spanner, instance and database must already exist");
-    }
-
-    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-
-    println!("Spanner resources setup complete!");
-    Ok(())
-}
-
-/// Create the users table
-async fn create_table() -> anyhow::Result<()> {
-    println!("Creating table users...");
-
-    let ddl = "CREATE TABLE IF NOT EXISTS users (id STRING(MAX) NOT NULL, name STRING(MAX), email STRING(MAX), age INT64) PRIMARY KEY (id)";
-    execute_ddl(ddl).await?;
-
-    println!("Table created");
-    Ok(())
-}
-
-/// Create the change stream
-async fn create_change_stream() -> anyhow::Result<()> {
-    println!("Creating change stream {}...", STREAM);
-
-    let ddl = format!(
-        "CREATE CHANGE STREAM {} FOR users OPTIONS (retention_period='7d', value_capture_type='NEW_ROW')",
-        STREAM
-    );
-    execute_ddl(&ddl).await?;
-
-    println!("  Change stream created");
-    Ok(())
-}
-
-/// Insert test data
-async fn insert_test_data() -> anyhow::Result<()> {
-    println!("Inserting test data...");
-
-    let sql = "INSERT INTO users (id, name, email, age) VALUES ('1', 'Alice', 'alice@example.com', 30), ('2', 'Bob', 'bob@example.com', 25)";
-    execute_sql(sql).await?;
-
-    println!("Test data inserted (Alice, Bob)");
     Ok(())
 }

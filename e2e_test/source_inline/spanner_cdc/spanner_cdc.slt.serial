@@ -90,8 +90,7 @@ age
 
 # Test INSERT via CDC
 system ok
-cat << 'EOF' | gcloud spanner databases execute-sql test-database --instance=test-instance --sql="INSERT INTO users (id, name, email, age) VALUES ('3', 'Charlie', 'charlie@example.com', 35), ('4', 'Diana', 'diana@example.com', 28)"
-EOF
+e2e_test/source_inline/spanner_cdc/prepare-data.rs dml "INSERT INTO users (id, name, email, age) VALUES ('3', 'Charlie', 'charlie@example.com', 35), ('4', 'Diana', 'diana@example.com', 28)"
 
 sleep 30s
 
@@ -110,8 +109,7 @@ select count(*) from spanner_cdc_test;
 
 # Test UPDATE via CDC
 system ok
-cat << 'EOF' | gcloud spanner databases execute-sql test-database --instance=test-instance --sql="UPDATE users SET age = 31 WHERE id = '1'"
-EOF
+e2e_test/source_inline/spanner_cdc/prepare-data.rs dml "UPDATE users SET age = 31 WHERE id = '1'"
 
 sleep 30s
 
@@ -127,8 +125,7 @@ select age from spanner_cdc_test where id = '1';
 
 # Test DELETE via CDC
 system ok
-cat << 'EOF' | gcloud spanner databases execute-sql test-database --instance=test-instance --sql="DELETE FROM users WHERE id = '2'"
-EOF
+e2e_test/source_inline/spanner_cdc/prepare-data.rs dml "DELETE FROM users WHERE id = '2'"
 
 sleep 30s
 
@@ -144,13 +141,11 @@ select count(*) from spanner_cdc_test;
 
 # Add a new column 'city' to the Spanner table
 system ok
-cat << 'EOF' | gcloud spanner databases ddl update test-database --instance=test-instance --ddl="ALTER TABLE users ADD COLUMN city STRING(MAX)"
-EOF
+e2e_test/source_inline/spanner_cdc/prepare-data.rs ddl "ALTER TABLE users ADD COLUMN city STRING(MAX)"
 
 # Insert data with the new column to trigger schema evolution
 system ok
-cat << 'EOF' | gcloud spanner databases execute-sql test-database --instance=test-instance --sql="INSERT INTO users (id, name, email, age, city) VALUES ('5', 'Eve', 'eve@example.com', 32, 'SF'), ('6', 'Frank', 'frank@example.com', 40, 'NYC')"
-EOF
+e2e_test/source_inline/spanner_cdc/prepare-data.rs dml "INSERT INTO users (id, name, email, age, city) VALUES ('5', 'Eve', 'eve@example.com', 32, 'SF'), ('6', 'Frank', 'frank@example.com', 40, 'NYC')"
 
 sleep 30s
 
@@ -191,18 +186,15 @@ select id, city from spanner_cdc_test where id = '1' limit 1;
 
 # Add two columns in SEPARATE ALTER statements (Spanner limitation)
 system ok
-cat << 'EOF' | gcloud spanner databases ddl update test-database --instance=test-instance --ddl="ALTER TABLE users ADD COLUMN zipcode STRING(MAX)"
-EOF
+e2e_test/source_inline/spanner_cdc/prepare-data.rs ddl "ALTER TABLE users ADD COLUMN zipcode STRING(MAX)"
 
 system ok
-cat << 'EOF' | gcloud spanner databases ddl update test-database --instance=test-instance --ddl="ALTER TABLE users ADD COLUMN state STRING(MAX)"
-EOF
+e2e_test/source_inline/spanner_cdc/prepare-data.rs ddl "ALTER TABLE users ADD COLUMN state STRING(MAX)"
 
 # Insert data with BOTH new columns to trigger schema change
 # The schema tracker will detect that 2 columns were added and create ONE schema change
 system ok
-cat << 'EOF' | gcloud spanner databases execute-sql test-database --instance=test-instance --sql="INSERT INTO users (id, name, email, age, city, zipcode, state) VALUES ('7', 'Grace', 'grace@example.com', 29, 'Boston', '02101', 'MA')"
-EOF
+e2e_test/source_inline/spanner_cdc/prepare-data.rs dml "INSERT INTO users (id, name, email, age, city, zipcode, state) VALUES ('7', 'Grace', 'grace@example.com', 29, 'Boston', '02101', 'MA')"
 
 sleep 30s
 
