@@ -8,14 +8,16 @@ google-cloud-gax = { package = "gcloud-gax", version = "1.3" }
 google-cloud-googleapis = { package = "gcloud-googleapis", version = "1", features = ["spanner"] }
 google-cloud-longrunning = { package = "gcloud-longrunning", version = "1.3" }
 google-cloud-auth = { package = "gcloud-auth", version = "1.2", default-features = false }
-uuid = { version = "1", features = ["v4"] }
 rustls = { version = "0.23", features = ["ring"] }
 ---
 use std::env;
 
 use google_cloud_gax::conn::{ConnectionManager, ConnectionOptions, Environment};
 use google_cloud_googleapis::spanner::admin::database::v1::UpdateDatabaseDdlRequest;
-use google_cloud_googleapis::spanner::v1::{ExecuteSqlRequest, CreateSessionRequest, DeleteSessionRequest};
+use google_cloud_googleapis::spanner::v1::{ExecuteSqlRequest, CreateSessionRequest, DeleteSessionRequest, BeginTransactionRequest, CommitRequest, TransactionSelector};
+use google_cloud_googleapis::spanner::v1::{transaction_options, TransactionOptions};
+use google_cloud_googleapis::spanner::v1::commit_request;
+
 use google_cloud_spanner::admin::database::database_admin_client::DatabaseAdminClient;
 use google_cloud_googleapis::spanner::v1::spanner_client::SpannerClient;
 use google_cloud_longrunning::autogen::operations_client::OperationsClient;
@@ -111,9 +113,11 @@ async fn execute_ddl(ddl: &str) -> anyhow::Result<()> {
         get_database()
     );
 
+    // operation_id should be empty string for most cases
+    // (only needed for retrying operations)
     let request = UpdateDatabaseDdlRequest {
         database: database_name,
-        operation_id: uuid::Uuid::new_v4().to_string(),
+        operation_id: "".to_string(),
         statements: vec![ddl.to_string()],
         proto_descriptors: vec![],
         throughput_mode: false,
@@ -129,6 +133,8 @@ async fn execute_ddl(ddl: &str) -> anyhow::Result<()> {
 }
 
 /// Execute SQL using SpannerClient
+/// For DML statements, this uses a read-write transaction.
+/// For DDL statements, use execute_ddl() instead.
 async fn execute_sql(sql: &str) -> anyhow::Result<()> {
     let mut spanner_client = create_spanner_client().await?;
 
@@ -149,10 +155,32 @@ async fn execute_sql(sql: &str) -> anyhow::Result<()> {
 
     let session_name = session.name.clone();
 
+    // Begin a read-write transaction for DML
+    let begin_txn_response = spanner_client
+        .begin_transaction(BeginTransactionRequest {
+            session: session_name.clone(),
+            options: Some(TransactionOptions {
+                mode: Some(transaction_options::Mode::ReadWrite(transaction_options::ReadWrite::default())),
+                exclude_txn_from_change_streams: false,
+                isolation_level: 0,
+            }),
+            mutation_key: None,
+            request_options: None,
+        })
+        .await?;
+
+    let transaction_id = begin_txn_response.into_inner().id;
+    let transaction_selector = Some(TransactionSelector {
+        selector: Some(google_cloud_googleapis::spanner::v1::transaction_selector::Selector::Id(
+            transaction_id.clone(),
+        )),
+    });
+
+    // Execute the SQL with the transaction
     let request = ExecuteSqlRequest {
         session: session_name.clone(),
         sql: sql.to_string(),
-        transaction: None,
+        transaction: transaction_selector,
         params: None,
         param_types: Default::default(),
         resume_token: vec![],
@@ -167,6 +195,19 @@ async fn execute_sql(sql: &str) -> anyhow::Result<()> {
     };
 
     let _ = spanner_client.execute_sql(request).await?;
+
+    // Commit the transaction
+    spanner_client
+        .commit(CommitRequest {
+            session: session_name.clone(),
+            transaction: Some(commit_request::Transaction::TransactionId(transaction_id)),
+            mutations: vec![],
+            max_commit_delay: None,
+            precommit_token: None,
+            return_commit_stats: false,
+            request_options: None,
+        })
+        .await?;
 
     // Delete the session
     let _ = spanner_client
