@@ -519,7 +519,19 @@ EOF
         echo -e "${YELLOW}Running tests...${NC}"
         echo -e "${YELLOW}Note: This assumes RisingWave cluster is already running.${NC}"
         echo -e "${YELLOW}If cluster is not running, use 'deploy' command first or 'run' command instead.${NC}"
-        exec_in_builder "cd $WORKSPACE && ./risedev slt 'e2e_test/source_inline/spanner_cdc/spanner_cdc.slt.serial'"
+
+        # Build env export string for extra envs
+        env_exports=""
+        for env_var in "${EXTRA_ENVS[@]}"; do
+            env_exports="$env_exports export $env_var;"
+        done
+
+        if [ -n "$env_exports" ]; then
+            echo -e "${BLUE}With extra env vars: ${EXTRA_ENVS[*]}${NC}"
+            exec_in_builder "cd $WORKSPACE && $env_exports ./risedev slt 'e2e_test/source_inline/spanner_cdc/spanner_cdc.slt.serial'"
+        else
+            exec_in_builder "cd $WORKSPACE && ./risedev slt 'e2e_test/source_inline/spanner_cdc/spanner_cdc.slt.serial'"
+        fi
         echo -e "${GREEN}Tests complete${NC}"
         ;;
 
@@ -532,7 +544,7 @@ EOF
         echo -e "${YELLOW}Step 3/4: Deploying cluster (will rebuild if needed)...${NC}"
         "$0" deploy $(if [ -n "$PROFILE" ]; then echo "--profile=$PROFILE"; fi) $(for env in "${EXTRA_ENVS[@]}"; do echo "--env=$env"; done)
         echo -e "${YELLOW}Step 4/4: Running tests...${NC}"
-        "$0" test
+        "$0" test $(for env in "${EXTRA_ENVS[@]}"; do echo "--env=$env"; done)
         echo -e "${GREEN}=== Full workflow complete ===${NC}"
         ;;
 
