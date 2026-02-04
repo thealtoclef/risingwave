@@ -59,6 +59,12 @@ async fn create_environment() -> anyhow::Result<Environment> {
 
         let config = Config::default().with_scopes(SCOPES);
         let token_source_provider = DefaultTokenSourceProvider::new(config).await?;
+
+        // Debug: Print the SA email to confirm auth is working
+        if let Some(ref sa) = token_source_provider.source_credentials {
+            eprintln!("  Using Spanner SA: {}", sa.client_email.as_ref().unwrap_or(&"(unknown)".to_string()));
+        }
+
         Ok(Environment::GoogleCloud(Box::new(token_source_provider)))
     }
 }
@@ -206,7 +212,6 @@ async fn main() -> anyhow::Result<()> {
             eprintln!();
             eprintln!("For emulator (via risedev): All env vars are set automatically");
             eprintln!("For real Spanner: Set SPANNER_PROJECT, SPANNER_INSTANCE, SPANNER_DATABASE");
-            eprintln!("                 Provide GOOGLE_APPLICATION_CREDENTIALS_JSON for authentication");
             std::process::exit(1);
         }
     }
@@ -274,7 +279,6 @@ async fn setup_resources() -> anyhow::Result<()> {
         println!("    Instance: {}", instance);
         println!("    Database: {}", database);
         println!("  Note: For real Spanner, instance and database must already exist");
-        println!("  The test will use provided GOOGLE_APPLICATION_CREDENTIALS_JSON for authentication");
     }
 
     tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
