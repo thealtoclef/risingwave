@@ -305,16 +305,6 @@ else
     echo "SSH server already running"
 fi
 
-
-echo "Configuring Cargo..."
-mkdir -p /root/.cargo
-cat > /root/.cargo/config.toml << 'CARGO'
-[build]
-jobs = 16
-[profile.dev.package."*"]
-opt-level = 2
-CARGO
-
 echo "Verifying setup..."
 if [ ! -d "/root/workspace" ]; then
     echo "ERROR: Workspace directory /root/workspace does not exist after setup"

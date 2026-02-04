@@ -60,7 +60,7 @@ profile:
       # - use: schema-registry
 
   # Minimal profile for testing Spanner CDC source only
-  spanner-only:
+  spanner-emulator:
     env:
       ENABLE_SPANNER: "true"
     steps:
