@@ -44,7 +44,7 @@ deploy: ## Deploy cluster
 	./remote.sh deploy $(if $(profile),--profile=$(profile)) $(if $(envs),$(foreach env,$(subst $(comma), ,$(envs)),--env=$(env)))
 
 test: ## Run tests
-	./remote.sh test
+	./remote.sh test $(if $(envs),$(foreach env,$(subst $(comma), ,$(envs)),--env=$(env)))
 
 run: ## Full workflow: sync -> clean -> deploy -> test
 	./remote.sh run $(if $(profile),--profile=$(profile)) $(if $(envs),$(foreach env,$(subst $(comma), ,$(envs)),--env=$(env)))
