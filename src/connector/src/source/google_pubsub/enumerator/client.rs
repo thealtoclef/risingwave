@@ -44,13 +44,6 @@ impl SplitEnumerator for PubsubSplitEnumerator {
         };
 
         let sub = properties.subscription_client().await?;
-        if !sub
-            .exists(None)
-            .await
-            .context("error checking subscription validity")?
-        {
-            bail!("subscription {} does not exist", &sub.id())
-        }
 
         let seek_to = match (properties.start_offset, properties.start_snapshot) {
             (None, None) => None,
