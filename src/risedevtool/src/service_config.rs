@@ -321,6 +321,20 @@ pub struct PubsubConfig {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 #[serde(deny_unknown_fields)]
+pub struct SpannerConfig {
+    #[serde(rename = "use")]
+    phantom_use: Option<String>,
+    pub id: String,
+    #[serde(with = "string")]
+    pub port: u16,
+    pub address: String,
+
+    pub persist_data: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[serde(deny_unknown_fields)]
 pub struct PulsarConfig {
     #[serde(rename = "use")]
     phantom_use: Option<String>,
@@ -504,6 +518,7 @@ pub enum ServiceConfig {
     Kafka(KafkaConfig),
     SchemaRegistry(SchemaRegistryConfig),
     Pubsub(PubsubConfig),
+    Spanner(SpannerConfig),
     Pulsar(PulsarConfig),
     Redis(RedisConfig),
     MySql(MySqlConfig),
@@ -521,6 +536,7 @@ pub enum TaskGroup {
     Observability,
     Kafka,
     Pubsub,
+    Spanner,
     Pulsar,
     MySql,
     Postgres,
@@ -547,6 +563,7 @@ impl ServiceConfig {
             Self::AwsS3(c) => &c.id,
             Self::Kafka(c) => &c.id,
             Self::Pubsub(c) => &c.id,
+            Self::Spanner(c) => &c.id,
             Self::Pulsar(c) => &c.id,
             Self::Redis(c) => &c.id,
             Self::Opendal(c) => &c.id,
@@ -576,6 +593,7 @@ impl ServiceConfig {
             Self::AwsS3(_) => None,
             Self::Kafka(c) => Some(c.port),
             Self::Pubsub(c) => Some(c.port),
+            Self::Spanner(c) => Some(c.port),
             Self::Pulsar(c) => Some(c.http_port),
             Self::Redis(c) => Some(c.port),
             Self::Opendal(_) => None,
@@ -604,6 +622,7 @@ impl ServiceConfig {
             Self::AwsS3(_c) => false,
             Self::Kafka(c) => c.user_managed,
             Self::Pubsub(c) => c.user_managed,
+            Self::Spanner(_c) => false,
             Self::Pulsar(c) => c.user_managed,
             Self::Redis(_c) => false,
             Self::Opendal(_c) => false,
@@ -633,6 +652,7 @@ impl ServiceConfig {
             ServiceConfig::Opendal(_) | ServiceConfig::AwsS3(_) => RisingWave,
             ServiceConfig::Kafka(_) | ServiceConfig::SchemaRegistry(_) => Kafka,
             ServiceConfig::Pubsub(_) => Pubsub,
+            ServiceConfig::Spanner(_) => Spanner,
             ServiceConfig::Pulsar(_) => Pulsar,
             ServiceConfig::Redis(_) => Redis,
             ServiceConfig::MySql(my_sql_config) => {
