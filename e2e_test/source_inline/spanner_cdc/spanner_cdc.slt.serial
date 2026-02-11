@@ -1,0 +1,637 @@
+control substitution on
+
+# =============================================================================
+# PART 1: SETUP - THREE TABLES BEFORE CHANGE STREAM
+# =============================================================================
+
+# Clean up any existing resources from previous test runs
+system ok
+e2e_test/source_inline/spanner_cdc/prepare-data.rs cleanup
+
+# Setup Spanner instance and database
+system ok
+e2e_test/source_inline/spanner_cdc/prepare-data.rs setup
+
+# Create tables before the change stream:
+# - users: STRING PK (for non-parallel backfill V1)
+# - products: STRING PK (for parallel backfill, uneven splits)
+# - inventory: INT64 PK (for parallel backfill, even splits)
+system ok
+e2e_test/source_inline/spanner_cdc/prepare-data.rs create-table
+
+system ok
+e2e_test/source_inline/spanner_cdc/prepare-data.rs ddl "CREATE TABLE IF NOT EXISTS products (id STRING(MAX) NOT NULL, name STRING(MAX), price FLOAT64, category STRING(MAX)) PRIMARY KEY (id)"
+
+system ok
+e2e_test/source_inline/spanner_cdc/prepare-data.rs ddl "CREATE TABLE IF NOT EXISTS inventory (id INT64 NOT NULL, name STRING(MAX), quantity INT64) PRIMARY KEY (id)"
+
+# Insert initial data into users BEFORE change stream (for backfill/snapshot test)
+system ok
+e2e_test/source_inline/spanner_cdc/prepare-data.rs insert-data
+
+# Create change stream FOR ALL (captures all current and future tables)
+system ok
+e2e_test/source_inline/spanner_cdc/prepare-data.rs create-change-stream
+
+# Insert products and inventory data AFTER the change stream exists.
+# This data will be in BOTH the snapshot and the CDC stream when we create the RW tables later.
+system ok
+e2e_test/source_inline/spanner_cdc/prepare-data.rs dml "INSERT INTO products (id, name, price, category) VALUES ('p1', 'Widget', 9.99, 'gadgets'), ('p2', 'Gizmo', 24.50, 'gadgets'), ('p3', 'Thingamajig', 4.99, 'misc')"
+
+system ok
+e2e_test/source_inline/spanner_cdc/prepare-data.rs dml "INSERT INTO inventory (id, name, quantity) VALUES (1, 'Bolt', 100), (2, 'Nut', 200), (3, 'Washer', 150), (4, 'Screw', 300), (5, 'Nail', 250)"
+
+# =============================================================================
+# PART 2: ERROR HANDLING
+# =============================================================================
+
+statement error missing field `spanner.change_stream.name`
+CREATE SOURCE s WITH (connector = 'spanner-cdc', spanner.project = 'test-project', spanner.instance = 'test-instance', database.name = 'test-database');
+
+statement error change stream 'nonexistent_stream' does not exist
+CREATE SOURCE s WITH (
+    ${RISEDEV_SPANNER_WITH_OPTIONS_COMMON},
+    spanner.change_stream.name = 'nonexistent_stream'
+);
+
+# =============================================================================
+# PART 3: SHARED SOURCE
+# =============================================================================
+
+# Create shared CDC source (no table filter - captures all tables via FOR ALL)
+statement ok
+CREATE SOURCE spanner_source WITH (
+    ${RISEDEV_SPANNER_WITH_OPTIONS_COMMON},
+    spanner.change_stream.name = 'test_stream',
+    spanner.change_stream.max_concurrent_partitions = 10,
+    spanner.heartbeat_interval = '5s',
+    auto.schema.change = 'true'
+);
+
+# =============================================================================
+# PART 4: NON-PARALLEL BACKFILL (V1) - users table (STRING PK)
+# backfill.parallelism omitted (default 0) → uses legacy single-actor snapshot_read
+# =============================================================================
+
+statement ok
+CREATE TABLE t_users (*) FROM spanner_source TABLE 'users';
+
+sleep 30s
+
+# Verify backfill captured the initial users data
+query T
+select id from t_users order by id limit 10;
+----
+1
+2
+
+query I
+select count(*) from t_users;
+----
+2
+
+# Verify users schema was correctly discovered
+query T
+select column_name from information_schema.columns where table_name = 't_users' order by ordinal_position;
+----
+id
+name
+email
+age
+
+# =============================================================================
+# PART 5: PARALLEL BACKFILL - UNEVEN SPLITS - products table (STRING PK)
+# STRING PK → uneven (data-driven sampling) splits
+# databoost disabled → uses regular read_only_transaction path
+# num_rows_per_split=2 to force multiple splits with small data
+# =============================================================================
+
+statement ok
+CREATE TABLE t_products (*) WITH (
+    backfill.parallelism = 3,
+    backfill.num_rows_per_split = 2,
+    spanner.databoost.enabled = 'false',
+    spanner.partition_query.parallelism = 2,
+)
+FROM spanner_source
+TABLE 'products';
+
+sleep 30s
+
+query TT
+select id, name from t_products order by id limit 10;
+----
+p1 Widget
+p2 Gizmo
+p3 Thingamajig
+
+query I
+select count(*) from t_products;
+----
+3
+
+# Verify products schema was correctly discovered
+query T
+select column_name from information_schema.columns where table_name = 't_products' order by ordinal_position;
+----
+id
+name
+price
+category
+
+# =============================================================================
+# PART 6: PARALLEL BACKFILL - EVEN SPLITS - inventory table (INT64 PK)
+# INT64 PK → even (numeric range-based) splits
+# databoost enabled → uses partition_query with DataBoost
+# num_rows_per_split=2 to force multiple splits with small data (PK range 1-5)
+# =============================================================================
+
+statement ok
+CREATE TABLE t_inventory (*) WITH (
+    backfill.parallelism = 3,
+    backfill.num_rows_per_split = 2,
+    spanner.databoost.enabled = 'true',
+    spanner.partition_query.parallelism = 4,
+)
+FROM spanner_source
+TABLE 'inventory';
+
+sleep 30s
+
+query IT
+select id, name from t_inventory order by id limit 10;
+----
+1 Bolt
+2 Nut
+3 Washer
+4 Screw
+5 Nail
+
+query I
+select count(*) from t_inventory;
+----
+5
+
+# Verify inventory schema was correctly discovered
+query T
+select column_name from information_schema.columns where table_name = 't_inventory' order by ordinal_position;
+----
+id
+name
+quantity
+
+# =============================================================================
+# PART 7: VERIFY BACKFILL MODES
+# Check that the correct backfill mode was used for each table.
+# =============================================================================
+
+# --- Verify parallel tables generated splits via rw_cdc_progress ---
+# Parallel tables (t_products, t_inventory) should have split_total_count > 0.
+# Non-parallel table (t_users) should have split_total_count = 0 or no entry.
+
+# t_products (parallel, uneven): must have splits
+query B
+SELECT p.split_total_count > 0 FROM rw_catalog.rw_cdc_progress p JOIN rw_catalog.rw_tables t ON p.job_id = t.id WHERE t.name = 't_products';
+----
+t
+
+# t_inventory (parallel, even): must have splits
+query B
+SELECT p.split_total_count > 0 FROM rw_catalog.rw_cdc_progress p JOIN rw_catalog.rw_tables t ON p.job_id = t.id WHERE t.name = 't_inventory';
+----
+t
+
+# t_users (non-parallel V1): should have 0 splits or no entry in rw_cdc_progress
+query I
+SELECT count(*) FROM rw_catalog.rw_cdc_progress p JOIN rw_catalog.rw_tables t ON p.job_id = t.id WHERE t.name = 't_users' AND p.split_total_count > 0;
+----
+0
+
+# --- Verify even vs uneven split mode via logs ---
+# The split mode is logged by get_parallel_cdc_splits.
+# "Using even splits" for INT64 PK, "Using uneven splits" for STRING PK.
+system ok
+grep -q "Using even splits" .risingwave/log/*.log
+
+system ok
+grep -q "Using uneven splits" .risingwave/log/*.log
+
+# --- Verify databoost config pass-through via logs ---
+# split_snapshot_read_inner logs "partition_query with databoost=true/false"
+system ok
+grep -q "databoost=true" .risingwave/log/*.log
+
+system ok
+grep -q "databoost=false" .risingwave/log/*.log
+
+# =============================================================================
+# PART 8: CDC STREAMING - INSERT/UPDATE/DELETE on users
+# Test CDC phase on users (non-parallel V1 table).
+# =============================================================================
+
+system ok
+e2e_test/source_inline/spanner_cdc/prepare-data.rs dml "INSERT INTO users (id, name, email, age) VALUES ('3', 'Charlie', 'charlie@example.com', 35), ('4', 'Diana', 'diana@example.com', 28)"
+
+sleep 10s
+
+query T
+select id from t_users order by id limit 10;
+----
+1
+2
+3
+4
+
+query I
+select count(*) from t_users;
+----
+4
+
+# Test UPDATE via CDC
+system ok
+e2e_test/source_inline/spanner_cdc/prepare-data.rs dml "UPDATE users SET age = 31 WHERE id = '1'"
+
+sleep 10s
+
+query I
+select age from t_users where id = '1';
+----
+31
+
+# Test DELETE via CDC
+system ok
+e2e_test/source_inline/spanner_cdc/prepare-data.rs dml "DELETE FROM users WHERE id = '2'"
+
+sleep 10s
+
+query I
+select count(*) from t_users;
+----
+3
+
+# =============================================================================
+# PART 9: CDC STREAMING ON PARALLEL TABLES (products + inventory)
+# Verifies that CDC events work for both parallel backfill modes.
+# =============================================================================
+
+# --- products (parallel, uneven, STRING PK) ---
+system ok
+e2e_test/source_inline/spanner_cdc/prepare-data.rs dml "INSERT INTO products (id, name, price, category) VALUES ('p4', 'Doohickey', 14.99, 'gadgets')"
+
+sleep 10s
+
+query I
+select count(*) from t_products;
+----
+4
+
+system ok
+e2e_test/source_inline/spanner_cdc/prepare-data.rs dml "UPDATE products SET price = 19.99 WHERE id = 'p1'"
+
+sleep 10s
+
+query T
+select price from t_products where id = 'p1';
+----
+19.99
+
+# --- inventory (parallel, even, INT64 PK) ---
+system ok
+e2e_test/source_inline/spanner_cdc/prepare-data.rs dml "INSERT INTO inventory (id, name, quantity) VALUES (6, 'Rivet', 175)"
+
+sleep 10s
+
+query I
+select count(*) from t_inventory;
+----
+6
+
+system ok
+e2e_test/source_inline/spanner_cdc/prepare-data.rs dml "UPDATE inventory SET quantity = 999 WHERE id = 1"
+
+sleep 10s
+
+query I
+select quantity from t_inventory where id = 1;
+----
+999
+
+# Verify cross-table isolation
+query I
+select count(*) from t_users;
+----
+3
+
+# =============================================================================
+# PART 10: NEW TABLE CREATED AFTER SOURCE EXISTS
+# The change stream uses FOR ALL, so it automatically captures new tables.
+# This tests that the shared source correctly picks up tables that were
+# created AFTER the source was already running.
+# =============================================================================
+
+# Create a new table in Spanner while the source is already running
+system ok
+e2e_test/source_inline/spanner_cdc/prepare-data.rs ddl "CREATE TABLE IF NOT EXISTS orders (id STRING(MAX) NOT NULL, product_id STRING(MAX), quantity INT64, status STRING(MAX)) PRIMARY KEY (id)"
+
+# Insert data into the new table
+system ok
+e2e_test/source_inline/spanner_cdc/prepare-data.rs dml "INSERT INTO orders (id, product_id, quantity, status) VALUES ('o1', 'p1', 2, 'pending'), ('o2', 'p3', 1, 'shipped')"
+
+# Create RW table from the same shared source for the new table
+statement ok
+CREATE TABLE t_orders (*) WITH (
+    backfill.parallelism = 3,
+    spanner.databoost.enabled = 'true',
+    spanner.partition_query.parallelism = 4,
+)
+FROM spanner_source
+TABLE 'orders';
+
+sleep 30s
+
+# Verify backfill captured the orders data
+query TT
+select id, status from t_orders order by id limit 10;
+----
+o1 pending
+o2 shipped
+
+query I
+select count(*) from t_orders;
+----
+2
+
+# Verify orders schema was correctly discovered
+query T
+select column_name from information_schema.columns where table_name = 't_orders' order by ordinal_position;
+----
+id
+product_id
+quantity
+status
+
+# Test CDC streaming on the new table
+system ok
+e2e_test/source_inline/spanner_cdc/prepare-data.rs dml "INSERT INTO orders (id, product_id, quantity, status) VALUES ('o3', 'p2', 5, 'pending')"
+
+system ok
+e2e_test/source_inline/spanner_cdc/prepare-data.rs dml "UPDATE orders SET status = 'delivered' WHERE id = 'o1'"
+
+sleep 10s
+
+query I
+select count(*) from t_orders;
+----
+3
+
+query T
+select status from t_orders where id = 'o1';
+----
+delivered
+
+# =============================================================================
+# PART 11: SCHEMA EVOLUTION - ADD SINGLE COLUMN
+# =============================================================================
+
+system ok
+e2e_test/source_inline/spanner_cdc/prepare-data.rs ddl "ALTER TABLE users ADD COLUMN city STRING(MAX)"
+
+system ok
+e2e_test/source_inline/spanner_cdc/prepare-data.rs dml "INSERT INTO users (id, name, email, age, city) VALUES ('5', 'Eve', 'eve@example.com', 32, 'SF'), ('6', 'Frank', 'frank@example.com', 40, 'NYC')"
+
+sleep 10s
+
+query T
+select column_name from information_schema.columns where table_name = 't_users' order by ordinal_position;
+----
+id
+name
+email
+age
+city
+
+query TT
+select id, city from t_users where id in ('5', '6') order by id;
+----
+5 SF
+6 NYC
+
+query I
+select count(*) from t_users;
+----
+5
+
+# Old data has NULL for new column
+query TT
+select id, city from t_users where id = '1' limit 1;
+----
+1 NULL
+
+# =============================================================================
+# PART 12: SCHEMA EVOLUTION - ADD MULTIPLE COLUMNS
+# =============================================================================
+
+system ok
+e2e_test/source_inline/spanner_cdc/prepare-data.rs ddl "ALTER TABLE users ADD COLUMN zipcode STRING(MAX)"
+
+system ok
+e2e_test/source_inline/spanner_cdc/prepare-data.rs ddl "ALTER TABLE users ADD COLUMN state STRING(MAX)"
+
+system ok
+e2e_test/source_inline/spanner_cdc/prepare-data.rs dml "INSERT INTO users (id, name, email, age, city, zipcode, state) VALUES ('7', 'Grace', 'grace@example.com', 29, 'Boston', '02101', 'MA')"
+
+sleep 10s
+
+query T
+select column_name from information_schema.columns where table_name = 't_users' order by ordinal_position;
+----
+id
+name
+email
+age
+city
+zipcode
+state
+
+query TTT
+select id, zipcode, state from t_users where id = '7';
+----
+7 02101 MA
+
+query I
+select count(*) from t_users;
+----
+6
+
+# =============================================================================
+# PART 13: RECOVERY - Verify all tables resume CDC after compute node restart
+# Runs after schema evolution so the recovered state includes schema-evolved
+# tables. The shared source must reconnect to Spanner partitions from saved
+# offsets and continue routing events to the correct per-table actors.
+# =============================================================================
+
+# Verify pre-recovery state across all four tables.
+query I
+select count(*) from t_users;
+----
+6
+
+query I
+select count(*) from t_products;
+----
+4
+
+query I
+select count(*) from t_inventory;
+----
+6
+
+query I
+select count(*) from t_orders;
+----
+3
+
+# Trigger cluster recovery - simulates compute node restart.
+# This forces a barrier checkpoint, then re-initialises all stream actors
+# from persisted state (including Spanner partition offsets).
+statement ok
+recover;
+
+sleep 20s
+
+# --- users (V1): verify CDC routing is restored, including schema-evolved columns ---
+system ok
+e2e_test/source_inline/spanner_cdc/prepare-data.rs dml "UPDATE users SET age = 99 WHERE id = '3'"
+
+sleep 10s
+
+query I
+select age from t_users where id = '3';
+----
+99
+
+# Count must be unchanged - recovery must not duplicate or lose rows.
+query I
+select count(*) from t_users;
+----
+6
+
+# --- products (parallel, uneven): verify INSERT and UPDATE flow through after recovery ---
+system ok
+e2e_test/source_inline/spanner_cdc/prepare-data.rs dml "INSERT INTO products (id, name, price, category) VALUES ('p5', 'Sprocket', 7.49, 'misc')"
+
+system ok
+e2e_test/source_inline/spanner_cdc/prepare-data.rs dml "UPDATE products SET price = 29.99 WHERE id = 'p2'"
+
+sleep 10s
+
+query T
+select name from t_products where id = 'p5';
+----
+Sprocket
+
+query T
+select price from t_products where id = 'p2';
+----
+29.99
+
+query I
+select count(*) from t_products;
+----
+5
+
+# --- inventory (parallel, even): verify INSERT and UPDATE flow through after recovery ---
+system ok
+e2e_test/source_inline/spanner_cdc/prepare-data.rs dml "INSERT INTO inventory (id, name, quantity) VALUES (7, 'Anchor', 50)"
+
+system ok
+e2e_test/source_inline/spanner_cdc/prepare-data.rs dml "UPDATE inventory SET quantity = 0 WHERE id = 5"
+
+sleep 10s
+
+query IT
+select id, name from t_inventory where id = 7;
+----
+7 Anchor
+
+query I
+select quantity from t_inventory where id = 5;
+----
+0
+
+query I
+select count(*) from t_inventory;
+----
+7
+
+# --- orders: verify INSERT and UPDATE flow through after recovery ---
+system ok
+e2e_test/source_inline/spanner_cdc/prepare-data.rs dml "INSERT INTO orders (id, product_id, quantity, status) VALUES ('o4', 'p5', 3, 'pending')"
+
+system ok
+e2e_test/source_inline/spanner_cdc/prepare-data.rs dml "UPDATE orders SET status = 'cancelled' WHERE id = 'o2'"
+
+sleep 10s
+
+query T
+select status from t_orders where id = 'o4';
+----
+pending
+
+query T
+select status from t_orders where id = 'o2';
+----
+cancelled
+
+query I
+select count(*) from t_orders;
+----
+4
+
+# --- cross-table isolation: changes to one table must not affect the others ---
+query I
+select count(*) from t_users;
+----
+6
+
+# =============================================================================
+# PART 14: FINAL VERIFICATION AND CLEANUP
+# =============================================================================
+
+query I
+select count(*) from t_users;
+----
+6
+
+query I
+select count(*) from t_products;
+----
+5
+
+query I
+select count(*) from t_inventory;
+----
+7
+
+query I
+select count(*) from t_orders;
+----
+4
+
+statement ok
+DROP TABLE t_orders;
+
+statement ok
+DROP TABLE t_inventory;
+
+statement ok
+DROP TABLE t_products;
+
+statement ok
+DROP TABLE t_users;
+
+statement ok
+DROP SOURCE spanner_source;
+
+system ok
+e2e_test/source_inline/spanner_cdc/prepare-data.rs cleanup
