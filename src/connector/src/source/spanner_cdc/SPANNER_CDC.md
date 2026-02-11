@@ -568,11 +568,20 @@ The e2e test suite (`e2e_test/source_inline/spanner_cdc/spanner_cdc.slt.serial`)
 
 ### Running Tests
 
-Tests require a real Spanner instance. Use the `spanner-real` risedev profile:
+Tests require a real Spanner instance. Set the Spanner coordinates
+via env vars before launching RisingWave; the connector and the e2e
+setup script (`prepare-data.rs`) read them via ADC and standard env
+discovery:
 
 ```bash
+export SPANNER_PROJECT="<your-gcp-project>"
+export SPANNER_INSTANCE="<your-spanner-instance>"
+export SPANNER_DATABASE="<your-database>"
+export GOOGLE_APPLICATION_CREDENTIALS="<path-to-service-account.json>"
+# or rely on `gcloud auth application-default login` and skip the export above
+
 ./risedev k
-./risedev d spanner-real
+./risedev d
 ./risedev slt 'e2e_test/source_inline/spanner_cdc/spanner_cdc.slt.serial'
 ```
 
