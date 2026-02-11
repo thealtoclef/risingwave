@@ -33,7 +33,7 @@ use risedev::{
     LakekeeperService, MetaNodeService, MinioService, MoatService, MySqlService, PostgresService,
     PrometheusService, PubsubService, PulsarService, RISEDEV_NAME, RedisService,
     SchemaRegistryService, ServiceConfig, SqlServerService, SqliteConfig, Task, TaskGroup,
-    TempoService, generate_risedev_env, preflight_check,
+    TempoService, generate_risedev_env_with_profile, preflight_check,
 };
 use sqlx::mysql::MySqlConnectOptions;
 use sqlx::postgres::PgConnectOptions;
@@ -282,6 +282,13 @@ fn task_main(
                     ctx.pb
                         .set_message(format!("pubsub {}:{}", c.address, c.port));
                 }
+
+                ServiceConfig::Spanner(c) => {
+                    let mut service = risedev::SpannerService::new(c.clone())?;
+                    service.execute(&mut ctx)?;
+                    ctx.pb
+                        .set_message(format!("spanner {}:{}", c.address, c.port));
+                }
                 ServiceConfig::Pulsar(c) => {
                     PulsarService::new(c.clone()).execute(&mut ctx)?;
                     let mut task = risedev::TcpReadyCheckTask::new(
@@ -504,7 +511,7 @@ fn main() -> Result<()> {
         services.len(),
         profile
     ));
-    let task_result = task_main(&mut manager, &services, env);
+    let task_result = task_main(&mut manager, &services, env.clone());
 
     match task_result {
         Ok(_) => {
@@ -537,7 +544,7 @@ fn main() -> Result<()> {
 
             fs_err::write(
                 Path::new(&env::var("PREFIX_CONFIG")?).join("risedev-env"),
-                generate_risedev_env(&services),
+                risedev::generate_risedev_env_with_profile(&services, &env),
             )?;
 
             println!("All services started successfully.");
