@@ -318,7 +318,7 @@ async fn parse_message_stream<P: ByteStreamSourceParser>(
                                 split_id = &*msg.split_id,
                                 offset = msg.offset,
                                 suppressed_count,
-                                "failed to parse message, skipping"
+                                "failed to parse message, stopping stream"
                             );
                         }
 
@@ -330,6 +330,11 @@ async fn parse_message_stream<P: ByteStreamSourceParser>(
                             context.source_name.clone(),
                             context.fragment_id.to_string(),
                         ]);
+
+                        // Fail fast: stop the stream on parse error to prevent
+                        // silent data loss. The source executor will retry from
+                        // the last checkpoint after a backoff period.
+                        return Err(error.into());
                     }
 
                     for chunk in chunk_builder.consume_ready_chunks() {
