@@ -1,0 +1,62 @@
+extend = "common.toml"
+
+[tasks.download-spanner]
+private = true
+category = "RiseDev - Components"
+dependencies = ["prepare"]
+condition = { env_set = [
+    "ENABLE_SPANNER",
+], files_not_exist = [
+    "${PREFIX_BIN}/gcloud/start-spanner-emulator.sh",
+] }
+description = "Install Google Cloud Spanner Emulator component and create startup script"
+script = '''
+#!/usr/bin/env bash
+set -e
+
+# Check if gcloud is installed (should be installed in setup)
+if ! command -v gcloud >/dev/null 2>&1; then
+    echo "ERROR: gcloud CLI is not installed"
+    exit 1
+fi
+
+echo "Verifying spanner emulator is available..."
+# Check if the emulator command is available
+if ! gcloud emulators spanner --help >/dev/null 2>&1; then
+    echo "ERROR: Spanner emulator is not available"
+    exit 1
+fi
+echo "✓ Spanner emulator is available"
+
+# Create startup script that uses system gcloud
+mkdir -p "${PREFIX_BIN}/gcloud"
+cat <<EOF > "${PREFIX_BIN}/gcloud/start-spanner-emulator.sh"
+#!/usr/bin/env bash
+set -e
+if [ \$# -lt 1 ]; then
+    echo "Usage: start-spanner-emulator.sh <port>"
+    exit 1
+fi
+GRPC_PORT=\$1
+REST_PORT=\$((\$1 + 10))
+
+# Start Spanner emulator using system gcloud
+exec gcloud emulators spanner start --host-port=127.0.0.1:\${GRPC_PORT} --rest-port=\${REST_PORT}
+EOF
+chmod +x "${PREFIX_BIN}/gcloud/start-spanner-emulator.sh"
+echo "✓ Spanner emulator setup complete"
+'''
+
+[tasks.remove-spanner]
+private = true
+dependencies = ["prepare"]
+condition = { env_set = ["ENABLE_SPANNER"], files_exist = ["${PREFIX_BIN}/gcloud/start-spanner-emulator.sh"] }
+script = '''
+#!/usr/bin/env bash
+set -e
+rm -f "${PREFIX_BIN}/gcloud/start-spanner-emulator.sh"
+# Remove the gcloud directory if it's empty
+if [ -d "${PREFIX_BIN}/gcloud" ] && [ -z "$(ls -A ${PREFIX_BIN}/gcloud 2>/dev/null)" ]; then
+    rmdir "${PREFIX_BIN}/gcloud" 2>/dev/null || true
+fi
+'''

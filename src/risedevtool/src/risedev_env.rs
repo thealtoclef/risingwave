@@ -23,7 +23,54 @@ use crate::{Application, HummockInMemoryStrategy, ServiceConfig, add_hummock_bac
 /// from the given service configurations to be used by future
 /// RiseDev commands, like `risedev ctl` or `risedev psql` ().
 pub fn generate_risedev_env(services: &Vec<ServiceConfig>) -> String {
+    generate_risedev_env_with_profile(services, &Vec::new())
+}
+
+/// Generate environment variables with profile-level env vars included.
+/// Profile env vars are written first, followed by service-specific env vars.
+pub fn generate_risedev_env_with_profile(services: &Vec<ServiceConfig>, profile_env: &Vec<String>) -> String {
     let mut env = String::new();
+
+    // Track Spanner-related env vars from profile
+    let mut spanner_project: Option<String> = None;
+    let mut spanner_instance: Option<String> = None;
+    let mut spanner_database: Option<String> = None;
+    let mut spanner_emulator_host: Option<String> = None;
+
+    // Write profile-level env vars first (these can be overridden by services)
+    // Also extract Spanner-related values for generating RISEDEV_SPANNER_WITH_OPTIONS_COMMON
+    for e in profile_env {
+        writeln!(env, "{e}").unwrap();
+        // Extract SPANNER_* values
+        if let Some((key, value)) = e.split_once('=') {
+            match key {
+                "SPANNER_PROJECT" => spanner_project = Some(value.to_string()),
+                "SPANNER_INSTANCE" => spanner_instance = Some(value.to_string()),
+                "SPANNER_DATABASE" => spanner_database = Some(value.to_string()),
+                "SPANNER_EMULATOR_HOST" => spanner_emulator_host = Some(value.to_string()),
+                _ => {}
+            }
+        }
+    }
+
+    // If profile has Spanner env vars but no Spanner service, generate RISEDEV_SPANNER_WITH_OPTIONS_COMMON
+    let has_spanner_service = services.iter().any(|s| matches!(s, ServiceConfig::Spanner(_)));
+    if spanner_project.is_some() && !has_spanner_service {
+        let project = spanner_project.unwrap_or_else(|| "test-project".to_string());
+        let instance = spanner_instance.unwrap_or_else(|| "test-instance".to_string());
+        let database = spanner_database.unwrap_or_else(|| "test-database".to_string());
+
+        if let Some(emulator_host) = spanner_emulator_host {
+            // Emulator mode
+            writeln!(env, r#"SPANNER_EMULATOR_HOST="{}""#, emulator_host).unwrap();
+            writeln!(env, r#"RISEDEV_SPANNER_WITH_OPTIONS_COMMON="connector='spanner-cdc',spanner.emulator_host='{}',spanner.project='{}',spanner.instance='{}',database.name='{}'""#,
+                emulator_host, project, instance, database).unwrap();
+        } else {
+            // Real Spanner mode - no emulator_host
+            writeln!(env, r#"RISEDEV_SPANNER_WITH_OPTIONS_COMMON="connector='spanner-cdc',spanner.project='{}',spanner.instance='{}',database.name='{}'""#,
+                project, instance, database).unwrap();
+        }
+    }
     for item in services {
         match item {
             ServiceConfig::ComputeNode(c) => {
@@ -122,6 +169,16 @@ pub fn generate_risedev_env(services: &Vec<ServiceConfig>) -> String {
                 let port = &c.port;
                 writeln!(env, r#"PUBSUB_EMULATOR_HOST="{address}:{port}""#,).unwrap();
                 writeln!(env, r#"RISEDEV_PUBSUB_WITH_OPTIONS_COMMON="connector='google_pubsub',pubsub.emulator_host='{address}:{port}'""#,).unwrap();
+            }
+            ServiceConfig::Spanner(c) => {
+                let address = &c.address;
+                let port = &c.port;
+                writeln!(env, r#"SPANNER_EMULATOR_HOST="{address}:{port}""#,).unwrap();
+                // Default values used by tests - can be overridden with real Spanner values
+                writeln!(env, r#"SPANNER_PROJECT="test-project""#,).unwrap();
+                writeln!(env, r#"SPANNER_INSTANCE="test-instance""#,).unwrap();
+                writeln!(env, r#"SPANNER_DATABASE="test-database""#,).unwrap();
+                writeln!(env, r#"RISEDEV_SPANNER_WITH_OPTIONS_COMMON="connector='spanner-cdc',spanner.emulator_host='{address}:{port}',spanner.project='test-project',spanner.instance='test-instance',database.name='test-database'""#,).unwrap();
             }
             ServiceConfig::Postgres(c) => {
                 let host = &c.address;
