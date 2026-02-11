@@ -59,6 +59,16 @@ profile:
       # To enable Confluent schema registry, uncomment the following line
       # - use: schema-registry
 
+  # Minimal profile for testing Spanner CDC source only
+  spanner-emulator:
+    env:
+      ENABLE_SPANNER: "true"
+    steps:
+      - use: meta-node
+      - use: compute-node
+      - use: frontend
+      - use: spanner
+
   default-v6:
     steps:
       - use: meta-node
@@ -830,6 +840,8 @@ profile:
         user-managed: true
         address: pubsub-emulator
         port: 8900
+        persist-data: true
+      - use: spanner
         persist-data: true
       - use: kafka
         user-managed: true
@@ -1707,6 +1719,16 @@ template:
     address: "127.0.0.1"
 
     port: 5980
+
+    persist-data: true
+
+  # Google Cloud Spanner emulator service
+  spanner:
+    id: spanner-${port}
+
+    address: "127.0.0.1"
+
+    port: 9010
 
     persist-data: true
 

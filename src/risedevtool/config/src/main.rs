@@ -61,6 +61,7 @@ pub enum Components {
     Hdfs,
     PrometheusAndGrafana,
     Pubsub,
+    Spanner,
     Redis,
     Tracing,
     RustComponents,
@@ -88,6 +89,7 @@ impl Components {
             Self::Hdfs => "[Component] Hummock: Hdfs Backend",
             Self::PrometheusAndGrafana => "[Component] Metrics: Prometheus + Grafana",
             Self::Pubsub => "[Component] Google Pubsub",
+            Self::Spanner => "[Component] Google Cloud Spanner Emulator",
             Self::Redis => "[Component] Redis",
             Self::BuildConnectorNode => "[Build] Build RisingWave Connector (Java)",
             Self::RustComponents => "[Build] Rust components",
@@ -131,6 +133,12 @@ Required if you want to view metrics."
             Self::Pubsub => {
                 "
 Required if you want to create source from Emulated Google Pub/sub.
+                "
+            }
+            Self::Spanner => {
+                "
+Required if you want to use the Spanner CDC source with the emulator.
+Requires gcloud CLI with the Spanner emulator component installed.
                 "
             }
             Self::RustComponents => {
@@ -244,6 +252,7 @@ This will download the ADBC Snowflake driver shared library (.so/.dylib)."
             "ENABLE_HDFS" => Some(Self::Hdfs),
             "ENABLE_PROMETHEUS_GRAFANA" => Some(Self::PrometheusAndGrafana),
             "ENABLE_PUBSUB" => Some(Self::Pubsub),
+            "ENABLE_SPANNER" => Some(Self::Spanner),
             "ENABLE_BUILD_RUST" => Some(Self::RustComponents),
             "USE_SYSTEM_RISINGWAVE" => Some(Self::UseSystem),
             "ENABLE_BUILD_DASHBOARD" => Some(Self::Dashboard),
@@ -272,6 +281,7 @@ This will download the ADBC Snowflake driver shared library (.so/.dylib)."
             Self::Hdfs => "ENABLE_HDFS",
             Self::PrometheusAndGrafana => "ENABLE_PROMETHEUS_GRAFANA",
             Self::Pubsub => "ENABLE_PUBSUB",
+            Self::Spanner => "ENABLE_SPANNER",
             Self::Redis => "ENABLE_REDIS",
             Self::RustComponents => "ENABLE_BUILD_RUST",
             Self::UseSystem => "USE_SYSTEM_RISINGWAVE",
