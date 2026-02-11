@@ -936,6 +936,7 @@ mod tests {
             ssl_mode: Default::default(),
             ssl_root_cert: None,
             encrypt: "false".to_owned(),
+            ..Default::default()
         };
 
         let table = PostgresExternalTable::connect(

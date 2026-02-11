@@ -120,6 +120,14 @@ impl<'a> MessageMeta<'a> {
                 );
                 Some(cdc_meta.full_table_name.as_str().into())
             }
+            SourceColumnType::Meta if let SourceMeta::SpannerCdc(spanner_cdc_meta) = self.source_meta => {
+                assert_eq!(
+                    desc.name.as_str(),
+                    CDC_TABLE_NAME_COLUMN_NAME,
+                    "unexpected cdc meta column name"
+                );
+                spanner_cdc_meta.extract_table_name()
+            }
 
             // For other cases, return `None`.
             SourceColumnType::Meta | SourceColumnType::Normal => return None,
@@ -285,6 +293,20 @@ async fn parse_message_stream<P: ByteStreamSourceParser>(
                         GLOBAL_SOURCE_METRICS
                             .direct_cdc_event_lag_latency
                             .with_guarded_label_values(&[&msg_meta.full_table_name])
+                    });
+                direct_cdc_event_lag_latency.observe(lag_ms as f64);
+            } else if let SourceMeta::SpannerCdc(msg_meta) = &msg.meta {
+                // Spanner CDC uses OffsetDateTime for commit_timestamp
+                let commit_ts_nanos = msg_meta.commit_timestamp.unix_timestamp_nanos();
+                let commit_ts_ms = (commit_ts_nanos / 1_000_000) as i64; // convert to milliseconds
+                let lag_ms = process_time_ms.saturating_sub(commit_ts_ms);
+                // report to prometheus
+                let direct_cdc_event_lag_latency = direct_cdc_event_lag_latency_metrics
+                    .entry(msg_meta.table_name.clone())
+                    .or_insert_with(|| {
+                        GLOBAL_SOURCE_METRICS
+                            .direct_cdc_event_lag_latency
+                            .with_guarded_label_values(&[&msg_meta.table_name])
                     });
                 direct_cdc_event_lag_latency.observe(lag_ms as f64);
             }

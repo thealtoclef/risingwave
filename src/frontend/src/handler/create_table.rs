@@ -961,6 +961,7 @@ fn derive_with_options_for_cdc_table(
     source_with_properties: &WithOptionsSecResolved,
     external_table_name: String,
 ) -> Result<WithOptionsSecResolved> {
+    use risingwave_connector::source::SPANNER_CDC_CONNECTOR;
     use source::cdc::{MYSQL_CDC_CONNECTOR, POSTGRES_CDC_CONNECTOR, SQL_SERVER_CDC_CONNECTOR};
     // we should remove the prefix from `full_table_name`
     let source_database_name: &str = source_with_properties
@@ -1045,6 +1046,10 @@ fn derive_with_options_for_cdc_table(
                 // insert 'schema.name' into connect properties
                 with_options.insert(SCHEMA_NAME_KEY.into(), schema_name.into());
                 with_options.insert(TABLE_NAME_KEY.into(), table_name.into());
+            }
+            SPANNER_CDC_CONNECTOR => {
+                // Spanner tables have no schema prefix; use external_table_name directly
+                with_options.insert(TABLE_NAME_KEY.into(), external_table_name.into());
             }
             _ => {
                 return Err(RwError::from(anyhow!(
