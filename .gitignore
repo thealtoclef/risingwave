@@ -93,5 +93,8 @@ e2e_test/iceberg/metastore_db
 .direnv/
 book/
 
+# Remote build config
+scripts/remote/.remote.env
+
 # Build caches
 .m2/
