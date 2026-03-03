@@ -211,6 +211,21 @@ pub(super) async fn create_table_if_not_exists_impl(
             None => None,
         };
 
+        // Build table properties from table.properties configuration
+        // Format: "key1=value1;key2=value2"
+        let mut table_properties = HashMap::new();
+        if let Some(props_str) = &config.common.table_properties {
+            for pair in props_str.split(';') {
+                let pair = pair.trim();
+                if pair.is_empty() {
+                    continue;
+                }
+                if let Some((key, value)) = pair.split_once('=') {
+                    table_properties.insert(key.trim().to_string(), value.trim().to_string());
+                }
+            }
+        }
+
         let sort_order = match &config.order_key {
             Some(order_key) => Some(build_sort_order(order_key, &iceberg_schema)?),
             None => None,
@@ -218,16 +233,20 @@ pub(super) async fn create_table_if_not_exists_impl(
 
         // Some JNI catalogs extract `format-version` from table properties, while
         // native Rust Glue rejects reserved properties before creating metadata.
-        let properties = if matches!(
+        // User-defined table properties are passed through in both cases.
+        let properties: HashMap<String, String> = if matches!(
             config.catalog_kind()?,
             IcebergCatalogKind::Glue(IcebergCatalogRuntime::NativeRust)
         ) {
-            HashMap::new()
+            HashMap::from_iter(table_properties)
         } else {
-            HashMap::from([(
-                TableProperties::PROPERTY_FORMAT_VERSION.to_owned(),
-                (config.format_version as u8).to_string(),
-            )])
+            HashMap::from_iter(
+                std::iter::once((
+                    TableProperties::PROPERTY_FORMAT_VERSION.to_owned(),
+                    (config.format_version as u8).to_string(),
+                ))
+                .chain(table_properties),
+            )
         };
 
         let table_creation_builder = TableCreation::builder()
