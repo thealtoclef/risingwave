@@ -42,6 +42,24 @@ select * from t for system_time as of '2222-12-10 11:48:06';
 statement ok
 DROP TABLE t;
 
+# Test table properties
+statement ok
+create table t_with_props(id int primary key, name varchar) with(table.properties = 'test_key=test_value;another_key=another_value', commit_checkpoint_interval = 1) engine = iceberg;
+
+statement ok
+insert into t_with_props values(1, 'test_props');
+
+statement ok
+FLUSH;
+
+query ?? retry 6 backoff 1s
+select * from t_with_props;
+----
+1 test_props
+
+statement ok
+DROP TABLE t_with_props;
+
 statement ok
 CREATE TABLE full_type_t (
 id bigint primary key,
