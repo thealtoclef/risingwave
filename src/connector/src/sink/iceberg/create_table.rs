@@ -98,12 +98,28 @@ pub(super) async fn create_table_if_not_exists_impl(
     param: &SinkParam,
 ) -> Result<()> {
     let catalog = config.create_catalog().await?;
+
+    // Build namespace properties from namespace.properties configuration
+    // Format: "key1=value1;key2=value2"
+    let mut namespace_properties = HashMap::new();
+    if let Some(props_str) = &config.common.namespace_properties {
+        for pair in props_str.split(';') {
+            let pair = pair.trim();
+            if pair.is_empty() {
+                continue;
+            }
+            if let Some((key, value)) = pair.split_once('=') {
+                namespace_properties.insert(key.trim().to_string(), value.trim().to_string());
+            }
+        }
+    }
+
     let table_id = config
         .full_table_name()
         .context("Unable to parse table name")?;
     let namespace = table_id.namespace().clone();
     let table_name = table_id.name().to_owned();
-    create_namespace_if_not_exists(catalog.as_ref(), &namespace).await?;
+    create_namespace_if_not_exists(catalog.as_ref(), &namespace, Some(namespace_properties)).await?;
 
     if !catalog
         .table_exists(&table_id)
@@ -258,6 +274,7 @@ pub(super) async fn create_table_if_not_exists_impl(
 async fn create_namespace_if_not_exists(
     catalog: &dyn Catalog,
     namespace: &NamespaceIdent,
+    namespace_properties: Option<HashMap<String, String>>,
 ) -> Result<()> {
     let mut namespaces = vec![namespace.clone()];
     let mut parent = namespace.parent();
@@ -266,6 +283,7 @@ async fn create_namespace_if_not_exists(
         namespaces.push(parent_namespace);
     }
 
+    let namespace_properties = namespace_properties.unwrap_or(HashMap::default());
     for namespace in namespaces.into_iter().rev() {
         if !catalog
             .namespace_exists(&namespace)
@@ -273,7 +291,7 @@ async fn create_namespace_if_not_exists(
             .map_err(|e| SinkError::Iceberg(anyhow!(e)))?
         {
             catalog
-                .create_namespace(&namespace, HashMap::default())
+                .create_namespace(&namespace, namespace_properties.clone())
                 .await
                 .map_err(|e| SinkError::Iceberg(anyhow!(e)))
                 .with_context(|| format!("failed to create iceberg namespace: {namespace}"))?;
