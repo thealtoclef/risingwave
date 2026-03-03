@@ -124,16 +124,26 @@ public class JniCatalogWrapper {
      * Create a namespace in the catalog.
      *
      * @param namespaceStr The namespace to create.
+     * @param props Properties for the namespace as key-value pairs.
      */
-    public void createNamespace(String namespaceStr) {
+    public void createNamespace(String namespaceStr, String[] props) {
+        checkArgument(
+                props.length % 2 == 0,
+                "props should be key-value pairs, but length is: " + props.length);
+
         Namespace namespace;
         if (namespaceStr == null) {
             namespace = Namespace.empty();
         } else {
             namespace = Namespace.of(namespaceStr);
         }
+
         if (catalog instanceof SupportsNamespaces) {
-            ((SupportsNamespaces) catalog).createNamespace(namespace);
+            HashMap<String, String> properties = new HashMap<>(props.length / 2);
+            for (int i = 0; i < props.length; i += 2) {
+                properties.put(props[i], props[i + 1]);
+            }
+            ((SupportsNamespaces) catalog).createNamespace(namespace, properties);
         }
     }
 

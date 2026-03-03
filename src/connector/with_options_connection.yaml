@@ -175,6 +175,14 @@ IcebergConnection:
       - `org.apache.iceberg.gcp.gcs.GCSFileIO` for Google Cloud Storage
       - `org.apache.iceberg.azure.adlsv2.ADLSFileIO` for Azure Data Lake Storage Gen2
     required: false
+  - name: namespace.properties
+    field_type: String
+    comments: |-
+      Namespace properties for creating Iceberg namespaces/schemas.
+      Format: "key1=value1;key2=value2"
+      Example for BigQuery: "location=gs://my-bucket/{namespace};gcp-region=us-east1"
+      The {namespace} placeholder will be replaced with the actual namespace name.
+    required: false
   - name: catalog.jdbc.user
     field_type: String
     required: false

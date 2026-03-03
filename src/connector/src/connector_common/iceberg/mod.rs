@@ -193,6 +193,13 @@ pub struct IcebergCommon {
     /// - `org.apache.iceberg.azure.adlsv2.ADLSFileIO` for Azure Data Lake Storage Gen2
     #[serde(rename = "catalog.io_impl")]
     pub catalog_io_impl: Option<String>,
+
+    /// Namespace properties for creating Iceberg namespaces/schemas.
+    /// Format: "key1=value1;key2=value2"
+    /// Example for BigQuery: "location=gs://my-bucket/{namespace};gcp-region=us-east1"
+    /// The {namespace} placeholder will be replaced with the actual namespace name.
+    #[serde(rename = "namespace.properties")]
+    pub namespace_properties: Option<String>,
 }
 
 // Matches iceberg::io::object_cache default size (32MB).

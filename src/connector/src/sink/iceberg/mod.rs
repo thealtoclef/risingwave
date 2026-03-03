@@ -763,8 +763,23 @@ async fn create_table_if_not_exists_impl(config: &IcebergConfig, param: &SinkPar
             .await
             .map_err(|e| SinkError::Iceberg(anyhow!(e)))?
         {
+            // Build namespace properties from namespace.properties configuration
+            // Format: "key1=value1;key2=value2"
+            let mut namespace_properties = HashMap::new();
+            if let Some(props_str) = &config.common.namespace_properties {
+                for pair in props_str.split(';') {
+                    let pair = pair.trim();
+                    if pair.is_empty() {
+                        continue;
+                    }
+                    if let Some((key, value)) = pair.split_once('=') {
+                        namespace_properties.insert(key.trim().to_string(), value.trim().to_string());
+                    }
+                }
+            }
+            
             catalog
-                .create_namespace(&namespace, HashMap::default())
+                .create_namespace(&namespace, namespace_properties)
                 .await
                 .map_err(|e| SinkError::Iceberg(anyhow!(e)))
                 .context("failed to create iceberg namespace")?;
@@ -3236,6 +3251,7 @@ mod test {
                 catalog_security: None,
                 gcp_auth_scopes: None,
                 catalog_io_impl: None,
+                namespace_properties: None,
             },
             table: IcebergTableIdentifier {
                 database_name: Some("demo_db".to_owned()),
