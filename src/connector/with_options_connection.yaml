@@ -182,6 +182,14 @@ IcebergConnection:
       Google Cloud Lakehouse Iceberg REST catalogs with credential vending require
       `org.apache.iceberg.gcp.gcs.GCSFileIO`.
     required: false
+  - name: namespace.properties
+    field_type: String
+    comments: |-
+      Namespace properties for creating Iceberg namespaces/schemas.
+      Format: "key1=value1;key2=value2"
+      Example for BigQuery: "location=gs://my-bucket/{namespace};gcp-region=us-east1"
+      The {namespace} placeholder will be replaced with the actual namespace name.
+    required: false
   - name: catalog.jdbc.user
     field_type: String
     required: false
