@@ -155,5 +155,11 @@
             <artifactId>iceberg-snowflake</artifactId>
             <version>${iceberg.version}</version>
         </dependency>
+        <!-- Google Cloud OAuth2 credentials for BigQuery/BigLake support -->
+        <dependency>
+            <groupId>com.google.auth</groupId>
+            <artifactId>google-auth-library-oauth2-http</artifactId>
+            <version>1.40.0</version>
+        </dependency>
     </dependencies>
 </project>
