@@ -196,16 +196,35 @@ pub(super) async fn create_table_if_not_exists_impl(
             None => None,
         };
 
+        // Build table properties from table.properties configuration
+        // Format: "key1=value1;key2=value2"
+        let mut table_properties = HashMap::new();
+        if let Some(props_str) = &config.common.table_properties {
+            for pair in props_str.split(';') {
+                let pair = pair.trim();
+                if pair.is_empty() {
+                    continue;
+                }
+                if let Some((key, value)) = pair.split_once('=') {
+                    table_properties.insert(key.trim().to_string(), value.trim().to_string());
+                }
+            }
+        }
+
         let sort_order = match &config.order_key {
             Some(order_key) => Some(build_sort_order(order_key, &iceberg_schema)?),
             None => None,
         };
 
         // Put format-version into table properties, because catalog like jdbc extract format-version from table properties.
-        let properties = HashMap::from([(
-            TableProperties::PROPERTY_FORMAT_VERSION.to_owned(),
-            (config.format_version as u8).to_string(),
-        )]);
+        // Then merge user-defined table properties into it.
+        let properties: HashMap<String, String> = HashMap::from_iter(
+            std::iter::once((
+                TableProperties::PROPERTY_FORMAT_VERSION.to_owned(),
+                (config.format_version as u8).to_string(),
+            ))
+            .chain(table_properties),
+        );
 
         let table_creation_builder = TableCreation::builder()
             .name(table_name)
