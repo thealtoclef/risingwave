@@ -897,7 +897,7 @@ async fn create_table_if_not_exists_impl(config: &IcebergConfig, param: &SinkPar
 
         // Put format-version into table properties, because catalog like jdbc extract format-version from table properties.
         // Then merge user-defined table properties into it.
-        let properties = HashMap::from_iter(
+        let properties: HashMap<String, String> = HashMap::from_iter(
             std::iter::once((
                 TableProperties::PROPERTY_FORMAT_VERSION.to_owned(),
                 (config.format_version as u8).to_string(),
