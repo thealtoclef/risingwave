@@ -340,19 +340,19 @@ pub fn mysql_type_to_rw_type(col_type: &ColumnType) -> ConnectorResult<DataType>
             }
         }
         // Unsigned integer family needs promotion to avoid overflow.
-        ColumnType::TinyInt(_) => DataType::Int16,
-        ColumnType::SmallInt(attr) => {
-            if attr.unsigned == Some(true) {
-                DataType::Int32
+        // [Cake]
+        ColumnType::TinyInt(attr) | ColumnType::SmallInt(attr) => {
+            if attr.unsigned.unwrap_or(false) {
+                DataType::Int32 // TINYINT/SMALLINT UNSIGNED -> INT32
             } else {
                 DataType::Int16
             }
         }
         ColumnType::Bool => DataType::Boolean,
-        ColumnType::MediumInt(_) => DataType::Int32,
-        ColumnType::Int(attr) => {
-            if attr.unsigned == Some(true) {
-                DataType::Int64
+        // [Cake]
+        ColumnType::MediumInt(attr) | ColumnType::Int(attr) => {
+            if attr.unsigned.unwrap_or(false) {
+                DataType::Int64 // MEDIUMINT/INT UNSIGNED -> BIGINT
             } else {
                 DataType::Int32
             }
