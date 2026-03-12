@@ -25,6 +25,7 @@ pub mod prelude {
     pub use crate::source::nats::NatsSplitEnumerator;
     pub use crate::source::nexmark::NexmarkSplitEnumerator;
     pub use crate::source::pulsar::PulsarSplitEnumerator;
+    pub use crate::source::spanner_cdc::SpannerCdcSplitEnumerator;
     pub use crate::source::test_source::TestSourceSplitEnumerator as TestSplitEnumerator;
     pub type AzblobSplitEnumerator =
         OpendalEnumerator<crate::source::filesystem::opendal_source::OpendalAzblob>;
@@ -57,6 +58,7 @@ pub mod mqtt;
 pub mod nats;
 pub mod nexmark;
 pub mod pulsar;
+pub mod spanner_cdc;
 pub mod utils;
 
 mod util;
@@ -71,6 +73,7 @@ pub use kafka::KAFKA_CONNECTOR;
 pub use kinesis::KINESIS_CONNECTOR;
 pub use mqtt::MQTT_CONNECTOR;
 pub use nats::NATS_CONNECTOR;
+pub use spanner_cdc::SPANNER_CDC_CONNECTOR;
 use utils::feature_gated_source_mod;
 
 pub use self::adbc_snowflake::ADBC_SNOWFLAKE_CONNECTOR;

@@ -191,6 +191,43 @@ impl PlainParser {
             }
         }
 
+        // Handle Spanner CDC messages (non-Debezium format)
+        if let Some(msg_meta) = writer.row_meta()
+            && let SourceMeta::SpannerCdc(cdc_meta) = msg_meta.source_meta
+            && let Some(data) = payload
+        {
+            match cdc_meta.msg_type {
+                CdcMessageType::Data | CdcMessageType::Heartbeat => {
+                    return self.parse_rows(key, Some(data), writer).await;
+                }
+                CdcMessageType::SchemaChange => {
+                    use crate::source::spanner_cdc::schema_track::parse_spanner_schema_change;
+
+                    return match parse_spanner_schema_change(&data) {
+                        Ok(schema_change) => Ok(ParseResult::SchemaChange(schema_change)),
+                        Err(err) => {
+                            let fail_info = format!(
+                                "Failed to parse Spanner CDC schema change: {}, source: {}",
+                                err,
+                                self.source_ctx.source_name
+                            );
+                            tracing::error!(error = %err.as_report(), "{}", fail_info);
+                            self.source_ctx.on_cdc_auto_schema_change_failure(
+                                self.source_ctx.source_id,
+                                "".to_owned(),
+                                "".to_owned(),
+                                "".to_owned(),
+                                fail_info,
+                            );
+                            Err(err)
+                        }
+                    };
+                }
+                // Spanner CDC does not use transaction metadata
+                _ => return self.parse_rows(key, Some(data), writer).await,
+            }
+        }
+
         // for non-cdc source messages
         self.parse_rows(key, payload, writer).await
     }

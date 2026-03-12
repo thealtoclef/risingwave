@@ -319,7 +319,7 @@ impl SourceStreamChunkRowWriter<'_> {
                 (&SourceColumnType::Meta, _)
                     if matches!(
                         &self.row_meta.map(|ele| ele.source_meta),
-                        &Some(SourceMeta::Kafka(_) | SourceMeta::DebeziumCdc(_))
+                        &Some(SourceMeta::Kafka(_) | SourceMeta::DebeziumCdc(_) | SourceMeta::SpannerCdc(_))
                     ) =>
                 {
                     // SourceColumnType is for CDC source only.
@@ -356,6 +356,8 @@ impl SourceStreamChunkRowWriter<'_> {
                                         col,
                                         desc.name.as_str(),
                                     )?))
+                                } else if let SourceMeta::SpannerCdc(spanner_cdc_meta) = row_meta.source_meta {
+                                    Ok(A::output_for(spanner_cdc_meta.extract_table_name()))
                                 } else {
                                     Err(AccessError::Uncategorized {
                                         message: "CDC metadata not found in the message".to_owned(),

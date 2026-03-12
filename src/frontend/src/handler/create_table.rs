@@ -977,8 +977,10 @@ pub(crate) fn gen_create_table_plan_for_cdc_table(
 fn derive_with_options_for_cdc_table(
     source_with_properties: &WithOptionsSecResolved,
     external_table_name: String,
+    table_with_options: &WithOptions,
 ) -> Result<(WithOptionsSecResolved, String)> {
     use source::cdc::{MYSQL_CDC_CONNECTOR, POSTGRES_CDC_CONNECTOR, SQL_SERVER_CDC_CONNECTOR};
+    use risingwave_connector::source::SPANNER_CDC_CONNECTOR;
     // we should remove the prefix from `full_table_name`
     let source_database_name: &str = source_with_properties
         .get("database.name")
@@ -1084,6 +1086,36 @@ fn derive_with_options_for_cdc_table(
                 // This ensures consistency with extract_table_name() in message.rs
                 let normalized_external_table_name = format!("{}.{}", schema_name, table_name);
                 return Ok((with_options, normalized_external_table_name));
+            }
+            SPANNER_CDC_CONNECTOR => {
+                let table_name = external_table_name.clone();
+
+                // Insert table name into connect properties
+                with_options.insert(TABLE_NAME_KEY.into(), table_name.into());
+
+                // For Spanner CDC, generate snapshot_ts at table creation time.
+                // This timestamp is used for consistent snapshot reads and CDC filtering.
+                // It must remain the same across all splits and all recoveries.
+                use risingwave_connector::source::cdc::external::SPANNER_SNAPSHOT_TS_KEY;
+                let snapshot_ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_micros() as i64;
+                with_options.insert(SPANNER_SNAPSHOT_TS_KEY.to_string(), snapshot_ts.to_string());
+
+                // Inject table-level Spanner CDC properties
+                use risingwave_connector::source::cdc::external::{
+                    SPANNER_DATABOOST_ENABLED_KEY, SPANNER_PARTITION_QUERY_PARALLELISM_KEY,
+                };
+                if let Some(parallelism) = table_with_options.get(SPANNER_PARTITION_QUERY_PARALLELISM_KEY) {
+                    with_options.insert(SPANNER_PARTITION_QUERY_PARALLELISM_KEY.to_string(), parallelism.clone());
+                }
+                if let Some(databoost) = table_with_options.get(SPANNER_DATABOOST_ENABLED_KEY) {
+                    with_options.insert(SPANNER_DATABOOST_ENABLED_KEY.to_string(), databoost.clone());
+                }
+
+                // Return original external_table_name unchanged for Spanner
+                return Ok((with_options, external_table_name));
             }
             _ => {
                 return Err(RwError::from(anyhow!(
@@ -1220,6 +1252,7 @@ pub(super) async fn handle_create_table_plan(
                 derive_with_options_for_cdc_table(
                     &source.with_properties,
                     cdc_table.external_table_name.clone(),
+                    &handler_args.with_options,
                 )?;
 
             let (columns, pk_names) = match wildcard_idx {
@@ -2556,6 +2589,7 @@ pub async fn generate_stream_graph_for_replace_table(
                 derive_with_options_for_cdc_table(
                     &source.with_properties,
                     cdc_table.external_table_name.clone(),
+                    &handler_args.with_options,
                 )?;
 
             let (column_catalogs, pk_names) = bind_cdc_table_schema(&columns, &constraints, true)?;
