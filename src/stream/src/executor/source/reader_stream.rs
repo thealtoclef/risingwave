@@ -27,8 +27,9 @@ use risingwave_connector::source::{
 };
 use thiserror_ext::AsReport;
 use tokio::sync::{mpsc, oneshot};
+use tokio_retry::Retry;
 
-use super::{apply_rate_limit, get_split_offset_col_idx};
+use super::{apply_rate_limit, get_split_offset_col_idx, get_infinite_backoff_strategy};
 use crate::common::rate_limit::limited_chunk_size;
 use crate::executor::prelude::*;
 
@@ -62,26 +63,28 @@ impl StreamReaderBuilder {
                     tracing::info!(
                         target: "auto_schema_change",
                         "recv a schema change event for tables: {:?}", table_ids);
-                    // TODO: retry on rpc error
                     if let Some(ref meta_client) = meta_client {
-                        match meta_client
-                            .auto_schema_change(schema_change.to_protobuf())
-                            .await
-                        {
+                        let proto = schema_change.to_protobuf();
+                        let result = Retry::spawn(
+                            get_infinite_backoff_strategy(),
+                            || async { meta_client.auto_schema_change(proto.clone()).await },
+                        )
+                        .await;
+                        match result {
                             Ok(_) => {
                                 tracing::info!(
                                     target: "auto_schema_change",
                                     "schema change success for tables: {:?}", table_ids);
-                                finish_tx.send(()).unwrap();
                             }
                             Err(e) => {
+                                // get_infinite_backoff_strategy retries forever, so this branch
+                                // is unreachable in practice, but kept for completeness.
                                 tracing::error!(
                                     target: "auto_schema_change",
                                     error = %e.as_report(), "schema change error");
-
-                                finish_tx.send(()).unwrap();
                             }
                         }
+                        finish_tx.send(()).unwrap();
                     }
                 }
             });
