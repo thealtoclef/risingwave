@@ -587,11 +587,22 @@ impl InflightDatabaseInfo {
         let job = self.jobs.get_mut(&job_id).expect("should exist");
         if let Some(tracker) = &mut job.cdc_table_backfill_tracker {
             let cdc_scan_fragment_id = tracker.cdc_scan_fragment_id();
-            let actors = job.fragment_infos[&cdc_scan_fragment_id]
-                .actors
-                .keys()
-                .copied()
-                .collect();
+            // After a replace_stream_job (e.g. schema evolution), the cdc_scan_fragment_id stored
+            // in the tracker refers to the old fragment which has already been removed from
+            // fragment_infos. Fall back to finding the CDC scan fragment by type.
+            let actors: HashSet<ActorId> = job
+                .fragment_infos
+                .get(&cdc_scan_fragment_id)
+                .or_else(|| {
+                    job.fragment_infos
+                        .values()
+                        .find(|f| f.fragment_type_mask.contains(FragmentTypeFlag::StreamCdcScan))
+                })
+                .map(|f| f.actors.keys().copied().collect())
+                .unwrap_or_default();
+            if actors.is_empty() {
+                return Ok(None);
+            }
             tracker.reassign_splits(actors).map(Some)
         } else {
             Ok(None)
