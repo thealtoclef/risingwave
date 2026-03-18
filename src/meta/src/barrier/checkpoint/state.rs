@@ -1458,6 +1458,11 @@ impl DatabaseCheckpointControl {
                 self.apply_simple_command(mutation, "ResetSource")
             }
 
+            Some(Command::ResetBackfill { table_id }) => {
+                let mutation = Some(Command::reset_backfill_to_mutation(table_id));
+                self.apply_simple_command(mutation, "ResetBackfill")
+            }
+
             Some(Command::ResumeBackfill { target }) => {
                 let mutation = Command::resume_backfill_to_mutation(&target, &self.database_info)?;
                 let (table_ids, node_actors) = self.collect_base_info();
