@@ -318,7 +318,13 @@ impl<S: StateStore> ParallelizedCdcBackfillExecutor<S> {
                                 if chunk.cardinality() == 0 {
                                     continue;
                                 }
-                                if let Some(filtered_chunk) = filter_stream_chunk(
+                                // When current_actor_bounds is None (e.g. after
+                                // ReplaceStreamJob with empty snapshot splits),
+                                // filter_stream_chunk returns None and silently
+                                // drops ALL data. Forward directly in this case.
+                                if current_actor_bounds.is_none() {
+                                    yield Message::Chunk(chunk);
+                                } else if let Some(filtered_chunk) = filter_stream_chunk(
                                     chunk,
                                     &current_actor_bounds,
                                     snapshot_split_column_index,
