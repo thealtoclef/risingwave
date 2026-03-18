@@ -69,6 +69,10 @@ pub struct TableSchemaChange {
     pub(crate) columns: Vec<ColumnCatalog>,
     pub(crate) change_type: TableChangeType,
     pub upstream_ddl: String,
+    /// Columns that require a full backfill re-run (e.g. expression default that
+    /// cannot be evaluated as a constant literal). The meta service checks whether
+    /// any of these columns are newly added to decide if re-backfill is needed.
+    pub rebackfill_columns: Vec<String>,
 }
 
 impl SchemaChangeEnvelope {
@@ -91,6 +95,7 @@ impl SchemaChangeEnvelope {
                     cdc_table_id: table_change.cdc_table_id.clone(),
                     columns,
                     upstream_ddl: table_change.upstream_ddl.clone(),
+                    rebackfill_columns: table_change.rebackfill_columns.clone(),
                 }
             })
             .collect();
