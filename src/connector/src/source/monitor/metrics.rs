@@ -77,6 +77,8 @@ pub struct EnumeratorMetrics {
     pub sqlserver_cdc_upstream_min_lsn: LabelGuardedIntGaugeVec,
     /// SQL Server CDC upstream maximum LSN
     pub sqlserver_cdc_upstream_max_lsn: LabelGuardedIntGaugeVec,
+    /// Spanner CDC change stream timestamp (microseconds since epoch)
+    pub spanner_cdc_change_stream_timestamp: LabelGuardedIntGaugeVec,
 }
 
 pub static GLOBAL_ENUMERATOR_METRICS: LazyLock<EnumeratorMetrics> =
@@ -148,6 +150,14 @@ impl EnumeratorMetrics {
         )
         .unwrap();
 
+        let spanner_cdc_change_stream_timestamp = register_guarded_int_gauge_vec_with_registry!(
+            "spanner_cdc_change_stream_timestamp",
+            "Spanner CDC change stream position (microseconds since epoch)",
+            &["source_id"],
+            registry,
+        )
+        .unwrap();
+
         EnumeratorMetrics {
             high_watermark,
             kafka_consumer_group_delete_failure_count,
@@ -157,6 +167,7 @@ impl EnumeratorMetrics {
             mysql_cdc_binlog_file_seq_max,
             sqlserver_cdc_upstream_min_lsn,
             sqlserver_cdc_upstream_max_lsn,
+            spanner_cdc_change_stream_timestamp,
         }
     }
 

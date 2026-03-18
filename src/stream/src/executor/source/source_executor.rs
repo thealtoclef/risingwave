@@ -492,6 +492,15 @@ impl<S: StateStore> SourceExecutor<S> {
                                 .set(lsn_u128_to_i64(lsn));
                         }
                     }
+                    SplitImpl::SpannerCdc(spanner_split) => {
+                        let ts_micros = spanner_split.offset_as_micros();
+                        if ts_micros > 0 {
+                            self.metrics
+                                .spanner_cdc_state_timestamp
+                                .with_guarded_label_values(&[&source_id])
+                                .set(ts_micros);
+                        }
+                    }
                     _ => {}
                 }
             }
