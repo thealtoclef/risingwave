@@ -37,6 +37,8 @@ pub struct EnumeratorMetrics {
     pub mysql_cdc_binlog_file_seq_min: LabelGuardedIntGaugeVec,
     /// MySQL CDC binlog file sequence number (max)
     pub mysql_cdc_binlog_file_seq_max: LabelGuardedIntGaugeVec,
+    /// Spanner CDC change stream timestamp (microseconds since epoch)
+    pub spanner_cdc_change_stream_timestamp: LabelGuardedIntGaugeVec,
 }
 
 pub static GLOBAL_ENUMERATOR_METRICS: LazyLock<EnumeratorMetrics> =
@@ -84,12 +86,21 @@ impl EnumeratorMetrics {
         )
         .unwrap();
 
+        let spanner_cdc_change_stream_timestamp = register_guarded_int_gauge_vec_with_registry!(
+            "spanner_cdc_change_stream_timestamp",
+            "Spanner CDC change stream position (microseconds since epoch)",
+            &["source_id"],
+            registry,
+        )
+        .unwrap();
+
         EnumeratorMetrics {
             high_watermark,
             pg_cdc_confirmed_flush_lsn,
             pg_cdc_upstream_max_lsn,
             mysql_cdc_binlog_file_seq_min,
             mysql_cdc_binlog_file_seq_max,
+            spanner_cdc_change_stream_timestamp,
         }
     }
 
