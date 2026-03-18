@@ -156,6 +156,7 @@ pub enum DdlCommand {
     CreateNonSharedSource(Source),
     DropSource(SourceId, DropMode),
     ResetSource(SourceId),
+    ResetBackfill(TableId),
     CreateFunction(Function),
     DropFunction(FunctionId, DropMode),
     CreateView(View, HashSet<ObjectId>),
@@ -207,6 +208,7 @@ impl DdlCommand {
             DdlCommand::CreateNonSharedSource(source) => Left(source.name.clone()),
             DdlCommand::DropSource(id, _) => Right(id.as_object_id()),
             DdlCommand::ResetSource(id) => Right(id.as_object_id()),
+            DdlCommand::ResetBackfill(id) => Right(id.as_object_id()),
             DdlCommand::CreateFunction(function) => Left(function.name.clone()),
             DdlCommand::DropFunction(id, _) => Right(id.as_object_id()),
             DdlCommand::CreateView(view, _) => Left(view.name.clone()),
@@ -266,6 +268,7 @@ impl DdlCommand {
             | DdlCommand::ReplaceStreamJob(_)
             | DdlCommand::AlterNonSharedSource(_)
             | DdlCommand::ResetSource(_)
+            | DdlCommand::ResetBackfill(_)
             | DdlCommand::CreateSubscription(_) => false,
         }
     }
@@ -438,6 +441,7 @@ impl DdlController {
                     ctrl.drop_source(source_id, drop_mode).await
                 }
                 DdlCommand::ResetSource(source_id) => ctrl.reset_source(source_id).await,
+                DdlCommand::ResetBackfill(table_id) => ctrl.reset_backfill(table_id).await,
                 DdlCommand::CreateFunction(function) => ctrl.create_function(function).await,
                 DdlCommand::DropFunction(function_id, drop_mode) => {
                     ctrl.drop_function(function_id, drop_mode).await
@@ -689,6 +693,31 @@ impl DdlController {
             .await?;
 
         // RESET SOURCE doesn't modify catalog, so return the current catalog version
+        let version = self
+            .metadata_manager
+            .catalog_controller
+            .notify_frontend_trivial()
+            .await;
+        Ok(version)
+    }
+
+    /// Reset the CDC backfill state for the given table, triggering a full re-snapshot.
+    /// Called after `auto_schema_change` when a new column has an expression default.
+    async fn reset_backfill(&self, table_id: TableId) -> MetaResult<NotificationVersion> {
+        tracing::info!(table_id = %table_id, "resetting CDC backfill state for re-snapshot");
+
+        let database_id = self
+            .metadata_manager
+            .catalog_controller
+            .get_object_database_id(table_id)
+            .await?;
+
+        self.stream_manager
+            .barrier_scheduler
+            .run_command(database_id, Command::ResetBackfill { table_id })
+            .await?;
+
+        // ResetBackfill doesn't modify catalog, return the current catalog version
         let version = self
             .metadata_manager
             .catalog_controller

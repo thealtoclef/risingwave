@@ -131,6 +131,13 @@ impl<S: StateStore> CdcBackfillState<S> {
         Ok(())
     }
 
+    /// Reset all backfill state to initial so the executor re-enters the InitialBackfill phase.
+    /// Called when a `ResetBackfill` barrier mutation is received after a schema change that
+    /// added a column with an expression default.
+    pub async fn reset_for_rebackfill(&mut self) -> StreamExecutorResult<()> {
+        self.mutate_state(None, None, 0, false).await
+    }
+
     /// Persist the state to storage
     pub async fn commit_state(&mut self, new_epoch: EpochPair) -> StreamExecutorResult<()> {
         self.state_table

@@ -553,6 +553,13 @@ pub enum Command {
         source_id: SourceId,
     },
 
+    /// `ResetBackfill` command resets the CDC backfill state so the executor re-runs the full
+    /// initial snapshot. Triggered after a schema change adds a column with an expression default
+    /// whose value cannot be derived from the DDL event alone.
+    ResetBackfill {
+        table_id: TableId,
+    },
+
     /// `ResumeBackfill` command generates a `StartFragmentBackfill` barrier to force backfill
     /// to resume for troubleshooting.
     ResumeBackfill {
@@ -648,6 +655,7 @@ impl std::fmt::Display for Command {
                 table_id, associated_source_id
             ),
             Command::ResetSource { source_id } => write!(f, "ResetSource: {source_id}"),
+            Command::ResetBackfill { table_id } => write!(f, "ResetBackfill: {table_id}"),
             Command::ResumeBackfill { target } => match target {
                 ResumeBackfillTarget::Job(job_id) => {
                     write!(f, "ResumeBackfill: job={job_id}")
@@ -1422,6 +1430,13 @@ impl Command {
     pub(super) fn reset_source_to_mutation(source_id: SourceId) -> Mutation {
         Mutation::ResetSource(risingwave_pb::stream_plan::ResetSourceMutation {
             source_id: source_id.as_raw_id(),
+        })
+    }
+
+    /// Build the `ResetBackfill` mutation.
+    pub(super) fn reset_backfill_to_mutation(table_id: TableId) -> Mutation {
+        Mutation::ResetBackfill(risingwave_pb::stream_plan::ResetBackfillMutation {
+            table_ids: vec![table_id.as_raw_id()],
         })
     }
 
