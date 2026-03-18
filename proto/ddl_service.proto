@@ -664,6 +664,10 @@ message TableSchemaChange {
   string cdc_table_id = 2;
   repeated plan_common.ColumnCatalog columns = 3;
   string upstream_ddl = 4;
+  // Columns that require a full backfill re-run (e.g. expression default that
+  // cannot be evaluated as a constant literal). The meta service checks whether
+  // any of these columns are newly added to decide if re-backfill is needed.
+  repeated string rebackfill_columns = 5;
 }
 
 message SchemaChangeEnvelope {
@@ -674,7 +678,10 @@ message AutoSchemaChangeRequest {
   SchemaChangeEnvelope schema_change = 1;
 }
 
-message AutoSchemaChangeResponse {}
+message AutoSchemaChangeResponse {
+  // True when at least one table change requires a full backfill re-run.
+  bool need_rebackfill = 1;
+}
 
 message AlterDatabaseParamRequest {
   uint32 database_id = 1;
