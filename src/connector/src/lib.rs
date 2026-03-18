@@ -86,6 +86,17 @@ where
     })
 }
 
+pub(crate) fn deserialize_i64_from_string_opt<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
+where
+    D: de::Deserializer<'de>,
+{
+    let opt: Option<String> = serde::Deserialize::deserialize(deserializer)?;
+    match opt {
+        Some(s) => s.parse::<i64>().map(Some).map_err(serde::de::Error::custom),
+        None => Ok(None),
+    }
+}
+
 pub(crate) fn deserialize_optional_string_seq_from_string<'de, D>(
     deserializer: D,
 ) -> std::result::Result<Option<Vec<String>>, D::Error>

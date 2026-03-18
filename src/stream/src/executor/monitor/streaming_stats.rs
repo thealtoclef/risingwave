@@ -223,6 +223,9 @@ pub struct StreamingMetrics {
     pub mysql_cdc_state_binlog_file_seq: LabelGuardedIntGaugeVec,
     pub mysql_cdc_state_binlog_position: LabelGuardedIntGaugeVec,
 
+    // Spanner CDC timestamp monitoring
+    pub spanner_cdc_state_timestamp: LabelGuardedIntGaugeVec,
+
     // Gap Fill
     pub gap_fill_generated_rows_count: RelabeledGuardedIntCounterVec,
 
@@ -340,6 +343,14 @@ impl StreamingMetrics {
         let mysql_cdc_state_binlog_position = register_guarded_int_gauge_vec_with_registry!(
             "stream_mysql_cdc_state_binlog_position",
             "Current binlog position stored in MySQL CDC state table",
+            &["source_id"],
+            registry,
+        )
+        .unwrap();
+
+        let spanner_cdc_state_timestamp = register_guarded_int_gauge_vec_with_registry!(
+            "stream_spanner_cdc_state_timestamp",
+            "Current change stream timestamp (microseconds) stored in Spanner CDC state table",
             &["source_id"],
             registry,
         )
@@ -1398,6 +1409,7 @@ impl StreamingMetrics {
             pg_cdc_jni_commit_offset_lsn,
             mysql_cdc_state_binlog_file_seq,
             mysql_cdc_state_binlog_position,
+            spanner_cdc_state_timestamp,
             gap_fill_generated_rows_count,
             state_table_iter_count,
             state_table_get_count,
