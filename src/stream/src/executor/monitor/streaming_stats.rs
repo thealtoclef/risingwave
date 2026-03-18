@@ -228,6 +228,9 @@ pub struct StreamingMetrics {
     pub sqlserver_cdc_state_commit_lsn: LabelGuardedIntGaugeVec,
     pub sqlserver_cdc_jni_commit_offset_lsn: LabelGuardedIntGaugeVec,
 
+    // Spanner CDC timestamp monitoring
+    pub spanner_cdc_state_timestamp: LabelGuardedIntGaugeVec,
+
     // Gap Fill
     pub gap_fill_generated_rows_count: RelabeledGuardedIntCounterVec,
 
@@ -369,6 +372,14 @@ impl StreamingMetrics {
         let sqlserver_cdc_jni_commit_offset_lsn = register_guarded_int_gauge_vec_with_registry!(
             "stream_sqlserver_cdc_jni_commit_offset_lsn",
             "LSN value when JNI commit offset is called for SQL Server CDC",
+            &["source_id"],
+            registry,
+        )
+        .unwrap();
+
+        let spanner_cdc_state_timestamp = register_guarded_int_gauge_vec_with_registry!(
+            "stream_spanner_cdc_state_timestamp",
+            "Current change stream timestamp (microseconds) stored in Spanner CDC state table",
             &["source_id"],
             registry,
         )
@@ -1430,6 +1441,7 @@ impl StreamingMetrics {
             sqlserver_cdc_state_change_lsn,
             sqlserver_cdc_state_commit_lsn,
             sqlserver_cdc_jni_commit_offset_lsn,
+            spanner_cdc_state_timestamp,
             gap_fill_generated_rows_count,
             state_table_iter_count,
             state_table_get_count,
