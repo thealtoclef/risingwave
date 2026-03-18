@@ -164,6 +164,10 @@ pub trait WithPropertiesExt: Get + GetKeyIter + Sized {
         self.is_cdc_connector() && ExternalCdcTableType::from_properties(self).can_backfill()
     }
 
+    fn is_debezium_cdc_connector(&self) -> bool {
+        self.is_cdc_connector() && !ExternalCdcTableType::from_properties(self).non_debezium()
+    }
+
     fn enable_transaction_metadata(&self) -> bool {
         ExternalCdcTableType::from_properties(self).enable_transaction_metadata()
     }

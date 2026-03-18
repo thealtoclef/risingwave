@@ -1419,6 +1419,111 @@ PulsarProperties:
     field_type: bool
     required: false
     default: Default::default
+SpannerCdcProperties:
+  fields:
+  - name: spanner.project
+    field_type: String
+    comments: Google Cloud project ID
+    required: true
+  - name: spanner.instance
+    field_type: String
+    comments: Spanner instance ID
+    required: true
+  - name: database.name
+    field_type: String
+    comments: Spanner database name (uses standard `database.name` key for consistency with other CDC sources)
+    required: true
+  - name: spanner.change_stream.name
+    field_type: String
+    comments: Name of the change stream to read from
+    required: true
+  - name: table.name
+    field_type: String
+    comments: |-
+      Table name to filter change records (optional for shared source)
+      When creating a table FROM a source, this specifies which upstream table to track
+    required: false
+  - name: spanner.heartbeat_interval
+    field_type: String
+    comments: 'Heartbeat interval for partition health monitoring (default: 3s)'
+    required: true
+  - name: spanner.credentials
+    field_type: String
+    comments: |-
+      GCP credentials JSON string
+      See: https://developers.google.com/workspace/guides/create-credentials#create_credentials_for_a_service_account
+    required: false
+  - name: spanner.credentials_path
+    field_type: String
+    comments: |-
+      Path to GCP service account credentials file
+      Alternative to `spanner.credentials` for file-based credentials
+      See: https://cloud.google.com/docs/authentication/provide-credentials-adc
+    required: false
+  - name: spanner.emulator_host
+    field_type: String
+    comments: Use Spanner emulator for testing
+    required: false
+  - name: spanner.change_stream.max_concurrent_partitions
+    field_type: u32
+    comments: |-
+      Maximum concurrent change stream partition queries per reader (default: 5).
+
+      The shared reader reads from multiple partitions concurrently.
+      The default of 5 provides a balance between throughput and resource usage.
+
+      Spanner enforces a hard limit on total concurrent change-stream queries per database.
+      Adjust this value based on your partition count and available query budget.
+    required: false
+  - name: spanner.buffer_size
+    field_type: usize
+    comments: 'Buffer size for prefetching messages (default: 1024)'
+    required: false
+  - name: spanner.retry_attempts
+    field_type: u32
+    comments: 'Retry attempts for transient failures (default: 3)'
+    required: false
+  - name: spanner.retry_backoff_ms
+    field_type: u64
+    comments: 'Retry backoff in milliseconds (default: 1000)'
+    required: false
+  - name: spanner.retry_backoff_max_delay_ms
+    field_type: u64
+    comments: 'Retry backoff max delay in milliseconds (default: 10000)'
+    required: false
+  - name: spanner.retry_backoff_factor
+    field_type: u64
+    comments: 'Retry backoff factor (default: 2, meaning double each time)'
+    required: false
+  - name: auto.schema.change
+    field_type: String
+    comments: |-
+      Auto schema change flag - user-provided option for automatic schema evolution.
+      This is parsed and validated at CREATE SOURCE time.
+      We skip it here as it's handled by the framework, not the connector itself.
+    required: false
+    default: Default::default
+  - name: spanner.snapshot_ts
+    field_type: String
+    comments: |-
+      Snapshot timestamp for Spanner CDC (set by frontend at table creation).
+      This is stored in connect_properties and used by compute for consistent reads.
+    required: false
+    default: Default::default
+  - name: spanner.partition_query.parallelism
+    field_type: String
+    comments: |-
+      Partition query parallelism for Spanner CDC backfill (set by frontend at table creation).
+      This is stored in connect_properties and used by compute for parallel execution.
+    required: false
+    default: Default::default
+  - name: spanner.databoost.enabled
+    field_type: String
+    comments: |-
+      Enable databoost for Spanner CDC backfill (set by frontend at table creation).
+      This is stored in connect_properties and used by compute for databoost execution.
+    required: false
+    default: Default::default
 TestSourceProperties:
   fields:
   - name: properties
