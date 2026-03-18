@@ -36,31 +36,6 @@ use crate::source::cdc::external::mysql::{
 use crate::source::cdc::external::postgres::{pg_type_to_rw_type, type_name_to_pg_type};
 use crate::source::{ConnectorProperties, SourceColumnDesc};
 
-/// Checks if a given default value expression is a BIGSERIAL default.
-///
-/// Normally, all unsupported expressions should fail in `from_text` parsing.
-/// However, we make a special exception for `nextval()` function because:
-/// 1. When users set a column as BIGSERIAL (usually as primary key), PostgreSQL automatically generates
-///    a default value expression like `nextval('sequence_name'::regclass)`
-/// 2. This is a very common scenario in real-world usage
-/// 3. For existing columns with `nextval()` default, we skip parsing the default value
-///    to avoid schema change failures
-///
-/// TODO: In the future, if we can distinguish between newly added columns and existing columns,
-/// we should modify this logic to:
-/// - Skip default value parsing for existing columns with `nextval()`
-/// - Report error for newly added columns with `nextval()` (since they should be handled differently)
-fn is_bigserial_default(default_value_expression: &str) -> bool {
-    if default_value_expression.trim().is_empty() {
-        return false;
-    }
-
-    let expr = default_value_expression.trim();
-
-    // Return true if it is a `nextval()` function (bigserial default).
-    expr.starts_with("nextval(")
-}
-
 // Example of Debezium JSON value:
 // {
 //     "payload":
@@ -224,6 +199,7 @@ pub fn parse_schema_change(
             }
 
             let mut column_descs: Vec<ColumnDesc> = vec![];
+            let mut rebackfill_columns: Vec<String> = vec![];
             if let Some(table) = jsonb.access_object_field("table")
                 && let Some(columns) = table.access_object_field("columns")
             {
@@ -293,77 +269,69 @@ pub fn parse_schema_change(
                     let column_desc = match col.access_object_field("defaultValueExpression") {
                         Some(default_val_expr_str) if !default_val_expr_str.is_jsonb_null() => {
                             let default_val_expr_str = default_val_expr_str.as_str().unwrap();
-                            // Only process constant default values
-                            if is_bigserial_default(default_val_expr_str) {
-                                tracing::warn!(target: "auto_schema_change",
-                                    "Ignoring unsupported BIGSERIAL default value expression: {}", default_val_expr_str);
+                            let value_text: Option<String>;
+                            match *connector_props {
+                                ConnectorProperties::PostgresCdc(_) => {
+                                    // default value of non-number data type will be stored as
+                                    // "'value'::type"
+                                    match default_val_expr_str
+                                        .split("::")
+                                        .map(|s| s.trim_matches('\''))
+                                        .next()
+                                    {
+                                        None => {
+                                            value_text = None;
+                                        }
+                                        Some(val_text) => {
+                                            value_text = Some(val_text.to_owned());
+                                        }
+                                    }
+                                }
+                                ConnectorProperties::MysqlCdc(_) => {
+                                    // mysql timestamp is mapped to timestamptz, we use UTC timezone to
+                                    // interpret its value
+                                    if data_type == DataType::Timestamptz {
+                                        value_text = Some(timestamp_val_to_timestamptz(default_val_expr_str).map_err(|err| {
+                                            tracing::error!(target: "auto_schema_change", error=%err.as_report(), "failed to convert timestamp value to timestamptz");
+                                            AccessError::TypeError {
+                                                expected: "timestamp in YYYY-MM-DD HH:MM:SS".into(),
+                                                got: data_type.to_string(),
+                                                value: default_val_expr_str.to_owned(),
+                                            }
+                                        })?);
+                                    } else {
+                                        value_text = Some(default_val_expr_str.to_owned());
+                                    }
+                                }
+                                _ => {
+                                    unreachable!("connector doesn't support schema change")
+                                }
+                            }
+
+                            let snapshot_value: Datum = if let Some(value_text) = value_text {
+                                match ScalarImpl::from_text(value_text.as_str(), &data_type) {
+                                    Ok(val) => Some(val),
+                                    Err(err) => {
+                                        tracing::warn!(target: "auto_schema_change", error=%err.as_report(),
+                                            "failed to parse default value '{}' as {}, column '{}' marked for re-backfill check",
+                                            value_text, data_type, name);
+                                        rebackfill_columns.push(name.clone());
+                                        None
+                                    }
+                                }
+                            } else {
+                                None
+                            };
+
+                            if snapshot_value.is_none() {
                                 ColumnDesc::named(name, ColumnId::placeholder(), data_type)
                             } else {
-                                let value_text: Option<String>;
-                                match *connector_props {
-                                    ConnectorProperties::PostgresCdc(_) => {
-                                        // default value of non-number data type will be stored as
-                                        // "'value'::type"
-                                        match default_val_expr_str
-                                            .split("::")
-                                            .map(|s| s.trim_matches('\''))
-                                            .next()
-                                        {
-                                            None => {
-                                                value_text = None;
-                                            }
-                                            Some(val_text) => {
-                                                value_text = Some(val_text.to_owned());
-                                            }
-                                        }
-                                    }
-                                    ConnectorProperties::MysqlCdc(_) => {
-                                        // mysql timestamp is mapped to timestamptz, we use UTC timezone to
-                                        // interpret its value
-                                        if data_type == DataType::Timestamptz {
-                                            value_text = Some(timestamp_val_to_timestamptz(default_val_expr_str).map_err(|err| {
-                                                tracing::error!(target: "auto_schema_change", error=%err.as_report(), "failed to convert timestamp value to timestamptz");
-                                                AccessError::TypeError {
-                                                    expected: "timestamp in YYYY-MM-DD HH:MM:SS".into(),
-                                                    got: data_type.to_string(),
-                                                    value: default_val_expr_str.to_owned(),
-                                                }
-                                            })?);
-                                        } else {
-                                            value_text = Some(default_val_expr_str.to_owned());
-                                        }
-                                    }
-                                    _ => {
-                                        unreachable!("connector doesn't support schema change")
-                                    }
-                                }
-
-                                let snapshot_value: Datum = if let Some(value_text) = value_text {
-                                    Some(ScalarImpl::from_text(value_text.as_str(), &data_type).map_err(
-                                        |err| {
-                                            tracing::error!(target: "auto_schema_change", error=%err.as_report(), "failed to parse default value expression");
-                                            AccessError::TypeError {
-                                                expected: "constant expression".into(),
-                                                got: data_type.to_string(),
-                                                value: value_text,
-                                            }
-                                        },
-                                    )?)
-                                } else {
-                                    None
-                                };
-
-                                if snapshot_value.is_none() {
-                                    tracing::warn!(target: "auto_schema_change", "failed to parse default value expression: {}", default_val_expr_str);
-                                    ColumnDesc::named(name, ColumnId::placeholder(), data_type)
-                                } else {
-                                    ColumnDesc::named_with_default_value(
-                                        name,
-                                        ColumnId::placeholder(),
-                                        data_type,
-                                        snapshot_value,
-                                    )
-                                }
+                                ColumnDesc::named_with_default_value(
+                                    name,
+                                    ColumnId::placeholder(),
+                                    data_type,
+                                    snapshot_value,
+                                )
                             }
                         }
                         _ => ColumnDesc::named(name, ColumnId::placeholder(), data_type),
@@ -385,6 +353,7 @@ pub fn parse_schema_change(
                     .collect_vec(),
                 change_type: ty.as_str().into(),
                 upstream_ddl: upstream_ddl.clone(),
+                rebackfill_columns,
             });
         }
 
