@@ -211,7 +211,15 @@ message BarrierMutation {
     ResetSourceMutation reset_source = 18;
     // Inject specific offsets into source splits (UNSAFE)
     InjectSourceOffsetsMutation inject_source_offsets = 19;
+    // Reset CDC backfill state so the executor re-runs the full initial snapshot.
+    // Triggered after a schema change adds a column with an expression default.
+    ResetBackfillMutation reset_backfill = 20;
   }
+}
+
+message ResetBackfillMutation {
+  // IDs of the RisingWave tables whose backfill state should be reset.
+  repeated uint32 table_ids = 1;
 }
 
 message Barrier {

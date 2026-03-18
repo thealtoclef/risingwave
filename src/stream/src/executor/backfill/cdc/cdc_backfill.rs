@@ -935,6 +935,25 @@ impl<S: StateStore> CdcBackfillExecutor<S> {
             // downstream
             if let Some(msg) = mapping_message(msg?, &self.output_indices) {
                 if let Message::Barrier(barrier) = &msg {
+                    // Check if we need to reset the backfill state and re-run the full snapshot.
+                    // This is triggered when a schema change adds a column with an expression
+                    // default that cannot be evaluated as a constant literal.
+                    if let Some(crate::executor::Mutation::ResetBackfill(m)) =
+                        barrier.mutation.as_deref()
+                        && m.table_ids.contains(&table_id.as_raw_id())
+                    {
+                        tracing::info!(
+                            %table_id,
+                            upstream_table_name,
+                            "Received ResetBackfill mutation, resetting CDC backfill state for re-snapshot"
+                        );
+                        state_impl.reset_for_rebackfill().await?;
+                        state_impl.commit_state(barrier.epoch).await?;
+                        yield msg;
+                        // Return so execute_inner is re-called from the top,
+                        // which will re-enter the InitialBackfill phase.
+                        return Ok(());
+                    }
                     // commit state just to bump the epoch of state table
                     state_impl.commit_state(barrier.epoch).await?;
                 }

@@ -1363,6 +1363,7 @@ impl DdlService for DdlServiceImpl {
             ));
         };
 
+        let mut need_rebackfill = false;
         for table_change in schema_change.table_changes {
             for c in &table_change.columns {
                 let c = ColumnCatalog::from(c.clone());
@@ -1517,6 +1518,43 @@ impl DdlService for DdlServiceImpl {
                                         ])
                                         .inc();
                                     latency_timer.observe_duration();
+
+                                    // If any *newly added* column is in the rebackfill_columns list,
+                                    // trigger a full re-backfill so pre-existing rows get the correct
+                                    // values from upstream. We filter against original_columns to avoid
+                                    // false positives from existing columns with expression defaults
+                                    // (e.g. BIGSERIAL nextval()) that are included in every schema change
+                                    // message but do not require re-backfill.
+                                    let original_col_names: HashSet<&str> = original_columns
+                                        .iter()
+                                        .map(|(name, _)| name.as_str())
+                                        .collect();
+                                    let needs_rebackfill = table_change
+                                        .rebackfill_columns
+                                        .iter()
+                                        .any(|col| !original_col_names.contains(col.as_str()));
+                                    if needs_rebackfill {
+                                        need_rebackfill = true;
+                                        let rw_table_id = table.id;
+                                        tracing::info!(
+                                            target: "auto_schema_change",
+                                            table_id = %table.id,
+                                            rebackfill_columns = ?table_change.rebackfill_columns,
+                                            "Triggering CDC backfill reset: newly added column requires upstream values"
+                                        );
+                                        if let Err(e) = self
+                                            .ddl_controller
+                                            .run_command(DdlCommand::ResetBackfill(rw_table_id))
+                                            .await
+                                        {
+                                            tracing::error!(
+                                                target: "auto_schema_change",
+                                                error = %e.as_report(),
+                                                table_id = %table.id,
+                                                "Failed to reset backfill after schema change"
+                                            );
+                                        }
+                                    }
                                 }
                                 Err(e) => {
                                     tracing::error!(
@@ -1566,7 +1604,7 @@ impl DdlService for DdlServiceImpl {
             }
         }
 
-        Ok(Response::new(AutoSchemaChangeResponse {}))
+        Ok(Response::new(AutoSchemaChangeResponse { need_rebackfill }))
     }
 
     async fn alter_swap_rename(

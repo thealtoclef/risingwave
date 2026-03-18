@@ -332,6 +332,7 @@ pub async fn parse_schema_change(
             }
 
             let mut column_descs: Vec<ColumnDesc> = vec![];
+            let mut rebackfill_columns: Vec<String> = vec![];
             if let Some(table) = jsonb.access_object_field("table")
                 && let Some(columns) = table.access_object_field("columns")
             {
@@ -528,23 +529,20 @@ pub async fn parse_schema_change(
                                 }
                             }
 
-                            let snapshot_value: Datum = value_text.and_then(|value_text| {
-                                ScalarImpl::from_text(value_text.as_str(), &data_type)
-                                    .inspect_err(|err| {
-                                        tracing::warn!(
-                                            target: "auto_schema_change",
-                                            error = %err.as_report(),
-                                            column = %name,
-                                            data_type = %data_type,
-                                            default_value_expression = default_val_expr_str,
-                                            upstream_ddl = %upstream_ddl,
-                                            "non-constant default expression, column added without default. \
-                                             If this column is not newly added by this schema change, it is safe to ignore this warning. \
-                                             If this column is newly added by this schema change, existing rows will be NULL in this column — consider using COALESCE in queries to provide a fallback value."
-                                        );
-                                    })
-                                    .ok()
-                            });
+                            let snapshot_value: Datum = if let Some(value_text) = value_text {
+                                match ScalarImpl::from_text(value_text.as_str(), &data_type) {
+                                    Ok(val) => Some(val),
+                                    Err(err) => {
+                                        tracing::warn!(target: "auto_schema_change", error=%err.as_report(),
+                                            "failed to parse default value '{}' as {}, column '{}' marked for re-backfill check",
+                                            value_text, data_type, name);
+                                        rebackfill_columns.push(name.clone());
+                                        None
+                                    }
+                                }
+                            } else {
+                                None
+                            };
 
                             if snapshot_value.is_none() {
                                 ColumnDesc::named(name, ColumnId::placeholder(), data_type)
@@ -576,6 +574,7 @@ pub async fn parse_schema_change(
                     .collect_vec(),
                 change_type: ty.as_str().into(),
                 upstream_ddl: upstream_ddl.clone(),
+                rebackfill_columns,
             });
         }
 
