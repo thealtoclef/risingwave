@@ -265,6 +265,9 @@ for_all_wrapped_id_fields! (
             schema_id: SchemaId,
             owner_id: UserId,
         }
+        CreateIcebergTableRequest {
+            dependencies: ObjectId,
+        }
         CreateMaterializedViewRequest {
             dependencies: ObjectId,
             owner_id: UserId,

@@ -897,8 +897,25 @@ where
                         .into_tuple()
                         .all(db)
                         .await?;
-                    details.extend(sources.into_iter().map(|(schema_name, view_name)| {
-                        format!("source {}.{} depends on it", schema_name, view_name)
+                    // Skip iceberg internal source for iceberg engine tables
+                    // (same pattern as iceberg sink above).
+                    if object_type == ObjectType::Table {
+                        let engine = Table::find_by_id(object_id.as_table_id())
+                            .select_only()
+                            .column(table::Column::Engine)
+                            .into_tuple::<table::Engine>()
+                            .one(db)
+                            .await?;
+                        if engine == Some(table::Engine::Iceberg)
+                            && sources
+                                .iter()
+                                .all(|(_, name)| name.starts_with(ICEBERG_SOURCE_PREFIX))
+                        {
+                            continue;
+                        }
+                    }
+                    details.extend(sources.into_iter().map(|(schema_name, source_name)| {
+                        format!("source {}.{} depends on it", schema_name, source_name)
                     }));
                 }
                 ObjectType::Connection => {

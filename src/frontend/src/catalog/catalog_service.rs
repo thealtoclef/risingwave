@@ -305,6 +305,7 @@ pub trait CatalogWriter: Send + Sync {
         sink_job_info: PbSinkJobInfo,
         iceberg_source: PbSource,
         if_not_exists: bool,
+        dependencies: HashSet<ObjectId>,
     ) -> Result<()>;
 
     async fn wait(&self, job_id: Option<JobId>) -> Result<()>;
@@ -841,12 +842,14 @@ impl CatalogWriter for CatalogWriterImpl {
         sink_job_info: PbSinkJobInfo,
         iceberg_source: PbSource,
         if_not_exists: bool,
+        dependencies: HashSet<ObjectId>,
     ) -> Result<()> {
         let version = Box::pin(self.meta_client.create_iceberg_table(
             table_job_info,
             sink_job_info,
             iceberg_source,
             if_not_exists,
+            dependencies,
         ))
         .await?;
         self.wait_version(version).await
