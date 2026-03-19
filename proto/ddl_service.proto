@@ -258,6 +258,8 @@ message CreateIcebergTableRequest {
   catalog.Source iceberg_source = 3;
 
   bool if_not_exists = 5;
+  // The list of object IDs that this iceberg table depends on (e.g., shared CDC source).
+  repeated uint32 dependencies = 6;
 }
 
 message CreateIcebergTableResponse {

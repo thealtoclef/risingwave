@@ -824,6 +824,7 @@ impl CatalogWriter for MockCatalogWriter {
         _sink_job_info: PbSinkJobInfo,
         _iceberg_source: PbSource,
         _if_not_exists: bool,
+        _dependencies: HashSet<ObjectId>,
     ) -> Result<()> {
         todo!()
     }
