@@ -284,6 +284,15 @@ impl CatalogController {
         // check if it belongs to iceberg table
         if let Some(table_id) = iceberg_table_id {
             // 1. finish iceberg table job.
+            // Register dependency: iceberg source depends on its table.
+            ObjectDependency::insert(object_dependency::ActiveModel {
+                oid: Set(table_id.as_object_id()),
+                used_by: Set(source_id.as_object_id()),
+                ..Default::default()
+            })
+            .exec(&txn)
+            .await?;
+
             let table_notifications = self
                 .finish_streaming_job_inner(&txn, table_id.as_job_id())
                 .await?;

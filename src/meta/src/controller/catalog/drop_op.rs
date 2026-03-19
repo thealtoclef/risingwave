@@ -67,8 +67,9 @@ impl CatalogController {
                     }
                     assert!(
                         objects.iter().all(|obj| obj.obj_type == ObjectType::Index
-                            || obj.obj_type == ObjectType::Sink),
-                        "only index and iceberg sink could be dropped in restrict mode"
+                            || obj.obj_type == ObjectType::Sink
+                            || obj.obj_type == ObjectType::Source),
+                        "only index, iceberg sink and iceberg source could be dropped in restrict mode"
                     );
                     for obj in &objects {
                         check_object_refer_for_drop(obj.obj_type, obj.oid, &txn).await?;
