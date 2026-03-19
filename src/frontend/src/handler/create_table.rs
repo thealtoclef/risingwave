@@ -27,7 +27,7 @@ use prost::Message as _;
 use risingwave_common::catalog::{
     CdcTableDesc, ColumnCatalog, ColumnDesc, ConflictBehavior, DEFAULT_SCHEMA_NAME, Engine,
     ICEBERG_SINK_PREFIX, ICEBERG_SOURCE_PREFIX, RISINGWAVE_ICEBERG_ROW_ID, ROW_ID_COLUMN_NAME,
-    TableId,
+    TableId, ObjectId,
 };
 use risingwave_common::config::MetaBackend;
 use risingwave_common::global_jvm::Jvm;
@@ -1683,6 +1683,7 @@ pub async fn handle_create_table(
                 table_name,
                 job_type,
                 if_not_exists,
+                dependencies,
             ))
             .await;
             session.drop_staging_table(&hummock_table_name);
@@ -1711,6 +1712,7 @@ pub async fn create_iceberg_engine_table(
     table_name: ObjectName,
     job_type: PbTableJobType,
     if_not_exists: bool,
+    dependencies: HashSet<ObjectId>,
 ) -> Result<()> {
     let rw_db_name = session
         .env()
@@ -2576,6 +2578,7 @@ pub async fn create_iceberg_engine_table(
             },
             iceberg_source_catalog.to_prost(),
             if_not_exists,
+            dependencies,
         ),
         &session,
         "CREATE TABLE",
