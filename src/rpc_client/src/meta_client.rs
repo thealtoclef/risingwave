@@ -2018,12 +2018,14 @@ impl MetaClient {
         sink_job_info: PbSinkJobInfo,
         iceberg_source: PbSource,
         if_not_exists: bool,
+        dependencies: HashSet<ObjectId>,
     ) -> Result<WaitVersion> {
         let request = CreateIcebergTableRequest {
             table_info: Some(table_job_info),
             sink_info: Some(sink_job_info),
             iceberg_source: Some(iceberg_source),
             if_not_exists,
+            dependencies: dependencies.into_iter().collect(),
         };
 
         let resp = Box::pin(self.inner.create_iceberg_table(request)).await?;

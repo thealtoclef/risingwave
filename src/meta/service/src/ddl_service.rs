@@ -1702,6 +1702,7 @@ impl DdlService for DdlServiceImpl {
             sink_info,
             iceberg_source,
             if_not_exists,
+            dependencies,
         } = req;
 
         // 1. create table job
@@ -1743,7 +1744,7 @@ impl DdlService for DdlServiceImpl {
             .run_command(DdlCommand::CreateStreamingJob {
                 stream_job,
                 fragment_graph,
-                dependencies: HashSet::new(),
+                dependencies: dependencies.into_iter().collect(),
                 resource_type: Self::default_streaming_job_resource_type(),
                 if_not_exists,
                 refresh_interval_sec: None,

@@ -69,8 +69,9 @@ impl CatalogController {
                     }
                     assert!(
                         objects.iter().all(|obj| obj.obj_type == ObjectType::Index
-                            || obj.obj_type == ObjectType::Sink),
-                        "only index and iceberg sink could be dropped in restrict mode"
+                            || obj.obj_type == ObjectType::Sink
+                            || obj.obj_type == ObjectType::Source),
+                        "only index, iceberg sink and iceberg source could be dropped in restrict mode"
                     );
                     for obj in &objects {
                         check_object_refer_for_drop(obj.obj_type, obj.oid, &txn).await?;
@@ -183,7 +184,7 @@ impl CatalogController {
 
         // 1. Detect when an Iceberg table is part of the dependencies.
         // 2. Drop database with iceberg tables in it is not supported.
-        if object_type != ObjectType::Table || drop_database {
+        if drop_database {
             for obj in &removed_objects {
                 // if the obj is iceberg engine table, bail out
                 if obj.obj_type == ObjectType::Table {
