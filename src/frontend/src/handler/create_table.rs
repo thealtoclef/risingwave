@@ -1730,7 +1730,19 @@ pub async fn create_iceberg_engine_table(
     let iceberg_database_name = rw_schema_name.clone();
     let iceberg_table_name = table_name.0.last().unwrap().real_value();
 
-    let iceberg_engine_connection: String = session.config().iceberg_engine_connection();
+    // Resolve iceberg engine connection: WITH clause takes precedence over session variable.
+    // Resolve to "schema.name" format expected by downstream code.
+    let iceberg_engine_connection: String = if let Some(conn_ref) =
+        handler_args.with_options.connection_ref().get("connection")
+    {
+        let (schema_name, connection_name) = Binder::resolve_schema_qualified_name(
+            &session.database(),
+            &conn_ref.connection_name,
+        )?;
+        format!("{}.{}", schema_name.unwrap_or_else(|| DEFAULT_SCHEMA_NAME.to_owned()), connection_name)
+    } else {
+        session.config().iceberg_engine_connection()
+    };
     let sink_decouple = session.config().sink_decouple();
     if matches!(sink_decouple, SinkDecouple::Disable) {
         bail!(
@@ -1740,7 +1752,7 @@ pub async fn create_iceberg_engine_table(
 
     let mut connection_ref = BTreeMap::new();
     let with_common = if iceberg_engine_connection.is_empty() {
-        bail!("to use iceberg engine table, the variable `iceberg_engine_connection` must be set.");
+        bail!("to use iceberg engine table, please either set the session variable `iceberg_engine_connection` or specify `connection` in the WITH clause.");
     } else {
         let parts: Vec<&str> = iceberg_engine_connection.split('.').collect();
         assert_eq!(parts.len(), 2);
