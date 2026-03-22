@@ -225,6 +225,7 @@ pub struct StreamingMetrics {
 
     // Spanner CDC timestamp monitoring
     pub spanner_cdc_state_timestamp: LabelGuardedIntGaugeVec,
+    pub spanner_cdc_commit_timestamp: LabelGuardedIntGaugeVec,
 
     // Gap Fill
     pub gap_fill_generated_rows_count: RelabeledGuardedIntCounterVec,
@@ -351,6 +352,14 @@ impl StreamingMetrics {
         let spanner_cdc_state_timestamp = register_guarded_int_gauge_vec_with_registry!(
             "stream_spanner_cdc_state_timestamp",
             "Current change stream timestamp (microseconds) stored in Spanner CDC state table",
+            &["source_id"],
+            registry,
+        )
+        .unwrap();
+
+        let spanner_cdc_commit_timestamp = register_guarded_int_gauge_vec_with_registry!(
+            "stream_spanner_cdc_commit_timestamp",
+            "Spanner CDC timestamp reported after epoch commit succeeds (microseconds since epoch)",
             &["source_id"],
             registry,
         )
@@ -1410,6 +1419,7 @@ impl StreamingMetrics {
             mysql_cdc_state_binlog_file_seq,
             mysql_cdc_state_binlog_position,
             spanner_cdc_state_timestamp,
+            spanner_cdc_commit_timestamp,
             gap_fill_generated_rows_count,
             state_table_iter_count,
             state_table_get_count,

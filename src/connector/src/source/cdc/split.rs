@@ -448,3 +448,10 @@ pub fn extract_postgres_lsn_from_offset_str(offset_str: &str) -> Option<u64> {
     let lsn = source_offset.get("lsn")?;
     lsn.as_u64()
 }
+
+pub fn extract_spanner_timestamp_from_offset_str(offset_str: &str) -> Option<i64> {
+    let offset = serde_json::from_str::<serde_json::Value>(offset_str).ok()?;
+    let spanner = offset.get("Spanner")?;
+    let ts = spanner.get("timestamp")?;
+    ts.as_i64()
+}

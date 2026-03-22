@@ -37,7 +37,7 @@ pub struct EnumeratorMetrics {
     pub mysql_cdc_binlog_file_seq_min: LabelGuardedIntGaugeVec,
     /// MySQL CDC binlog file sequence number (max)
     pub mysql_cdc_binlog_file_seq_max: LabelGuardedIntGaugeVec,
-    /// Spanner CDC change stream timestamp (microseconds since epoch)
+    /// Spanner CDC change stream timestamp — upstream current position (microseconds since epoch)
     pub spanner_cdc_change_stream_timestamp: LabelGuardedIntGaugeVec,
 }
 

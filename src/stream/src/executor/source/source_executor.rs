@@ -27,7 +27,7 @@ use risingwave_common::system_param::reader::SystemParamsRead;
 use risingwave_common::types::JsonbVal;
 use risingwave_common::util::epoch::{Epoch, EpochPair};
 use risingwave_connector::parser::schema_change::SchemaChangeEnvelope;
-use risingwave_connector::source::cdc::split::extract_postgres_lsn_from_offset_str;
+use risingwave_connector::source::cdc::split::{extract_postgres_lsn_from_offset_str, extract_spanner_timestamp_from_offset_str};
 use risingwave_connector::source::reader::desc::{SourceDesc, SourceDescBuilder};
 use risingwave_connector::source::reader::reader::SourceReader;
 use risingwave_connector::source::{
@@ -1275,7 +1275,7 @@ impl<S: StateStore> WaitCheckpointWorker<S> {
                         Ok(()) => {
                             tracing::debug!(epoch = epoch.0, "wait epoch success");
 
-                            // Run task with callback to record LSN after successful commit
+                            // Run task with callback to record offset after successful commit
                             task.run_with_on_commit_success(|source_id: u64, offset| {
                                 if let Some(lsn_value) =
                                     extract_postgres_lsn_from_offset_str(offset)
@@ -1284,6 +1284,14 @@ impl<S: StateStore> WaitCheckpointWorker<S> {
                                         .pg_cdc_jni_commit_offset_lsn
                                         .with_guarded_label_values(&[&source_id.to_string()])
                                         .set(lsn_value as i64);
+                                }
+                                if let Some(ts_micros) =
+                                    extract_spanner_timestamp_from_offset_str(offset)
+                                {
+                                    self.metrics
+                                        .spanner_cdc_commit_timestamp
+                                        .with_guarded_label_values(&[&source_id.to_string()])
+                                        .set(ts_micros);
                                 }
                             })
                             .await;
