@@ -1522,10 +1522,22 @@ impl DdlController {
             .collect();
 
         for sink in removed_iceberg_table_sinks {
-            let sink_param = SinkParam::try_from_sink_catalog(sink.into())
-                .expect("Iceberg sink should be valid");
-            let iceberg_sink =
-                IcebergSink::try_from(sink_param).expect("Iceberg sink should be valid");
+            // Best-effort cleanup: a sink whose secrets or config can no longer be resolved
+            // leaves its Iceberg table in place instead of crashing meta.
+            let sink_id = sink.id;
+            let iceberg_sink = match SinkParam::try_from_sink_catalog(sink.into())
+                .and_then(IcebergSink::try_from)
+            {
+                Ok(iceberg_sink) => iceberg_sink,
+                Err(err) => {
+                    tracing::warn!(
+                        %sink_id,
+                        error = %err.as_report(),
+                        "skip dropping iceberg table for dropped sink: invalid sink config",
+                    );
+                    continue;
+                }
+            };
             if let Ok(iceberg_catalog) = iceberg_sink.config.create_catalog().await {
                 let table_identifier = iceberg_sink.config.full_table_name().unwrap();
                 tracing::info!(

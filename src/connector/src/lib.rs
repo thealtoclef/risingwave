@@ -65,6 +65,8 @@ mod with_options_test;
 
 pub const AUTO_SCHEMA_CHANGE_KEY: &str = "auto.schema.change";
 pub const SINK_CREATE_TABLE_IF_NOT_EXISTS_KEY: &str = "create_table_if_not_exists";
+/// When set to `true` on an Iceberg sink, `DROP SINK` also drops the table from the Iceberg catalog.
+pub const SINK_DROP_TABLE_ON_SINK_DROP_KEY: &str = "drop_table_on_sink_drop";
 pub const SINK_TARGET_TABLE_NAME: &str = "table.name";
 pub const SINK_INTERMEDIATE_TABLE_NAME: &str = "intermediate.table.name";
 
