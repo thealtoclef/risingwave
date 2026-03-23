@@ -396,6 +396,10 @@ pub struct IcebergConfig {
     #[serde(default, deserialize_with = "deserialize_bool_from_string")]
     pub create_table_if_not_exists: bool,
 
+    /// When true, dropping the sink also removes the Iceberg table from the external catalog.
+    #[serde(default, deserialize_with = "deserialize_bool_from_string")]
+    pub drop_table_on_sink_drop: bool,
+
     /// Whether it is `exactly_once`, the default is true.
     #[serde(default = "default_some_true")]
     #[serde_as(as = "Option<DisplayFromStr>")]
@@ -3345,6 +3349,7 @@ mod test {
                 ICEBERG_DEFAULT_COMMIT_CHECKPOINT_SIZE_THRESHOLD_MB,
             ),
             create_table_if_not_exists: false,
+            drop_table_on_sink_drop: false,
             is_exactly_once: Some(true),
             commit_retry_num: 8,
             enable_compaction: true,
