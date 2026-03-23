@@ -13,6 +13,10 @@
 // limitations under the License.
 
 use risingwave_common::catalog::{ICEBERG_SINK_PREFIX, ICEBERG_SOURCE_PREFIX};
+use risingwave_connector::SINK_DROP_TABLE_ON_SINK_DROP_KEY;
+use risingwave_connector::sink::CONNECTOR_TYPE_KEY;
+use risingwave_connector::sink::iceberg::ICEBERG_SINK;
+use risingwave_meta_model::Property;
 use risingwave_pb::catalog::PbTable;
 use risingwave_pb::catalog::subscription::PbSubscriptionState;
 use risingwave_pb::telemetry::PbTelemetryDatabaseObject;
@@ -209,14 +213,14 @@ impl CatalogController {
 
         let removed_iceberg_table_sinks: Vec<PbSink> = Sink::find()
             .find_also_related(Object)
-            .filter(
-                sink::Column::SinkId
-                    .is_in(removed_object_ids.clone())
-                    .and(sink::Column::Name.like(format!("{}%", ICEBERG_SINK_PREFIX))),
-            )
+            .filter(sink::Column::SinkId.is_in(removed_object_ids.clone()))
             .all(&txn)
             .await?
             .into_iter()
+            .filter(|(sink, obj)| {
+                obj.is_some()
+                    && should_drop_iceberg_table_for_removed_sink(&sink.name, &sink.properties)
+            })
             .map(|(sink, obj)| ObjectModel(sink, obj.unwrap(), None).into())
             .collect();
 
@@ -467,6 +471,25 @@ impl CatalogController {
         txn.commit().await?;
         Ok(())
     }
+}
+
+/// Whether meta should call Iceberg catalog `drop_table` when this sink is removed.
+fn should_drop_iceberg_table_for_removed_sink(sink_name: &str, properties: &Property) -> bool {
+    if sink_name.starts_with(ICEBERG_SINK_PREFIX) {
+        return true;
+    }
+    let props = properties.inner_ref();
+    let is_iceberg = props
+        .get(CONNECTOR_TYPE_KEY)
+        .map(|c| c.eq_ignore_ascii_case(ICEBERG_SINK))
+        .unwrap_or(false);
+    if !is_iceberg {
+        return false;
+    }
+    props
+        .get(SINK_DROP_TABLE_ON_SINK_DROP_KEY)
+        .map(|v| v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
 }
 
 async fn report_drop_object(
