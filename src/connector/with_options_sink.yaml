@@ -680,6 +680,11 @@ IcebergConfig:
     field_type: bool
     required: false
     default: Default::default
+  - name: drop_table_on_sink_drop
+    field_type: bool
+    comments: When true, dropping the sink also removes the Iceberg table from the external catalog.
+    required: false
+    default: Default::default
   - name: is_exactly_once
     field_type: bool
     comments: Whether it is `exactly_once`, the default is true.
