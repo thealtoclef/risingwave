@@ -854,6 +854,7 @@ mod tests {
             ..Default::default()
         };
         let field = Field {
+            description: None,
             data_type: Some(data_type),
             name: "".to_owned(),
         };

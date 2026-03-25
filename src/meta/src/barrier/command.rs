@@ -1673,17 +1673,18 @@ impl Command {
                                     .original_sink
                                     .columns
                                     .iter()
-                                    .map(|col| PbField {
-                                        data_type: Some(
-                                            col.column_desc
-                                                .as_ref()
-                                                .unwrap()
-                                                .column_type
-                                                .as_ref()
-                                                .unwrap()
-                                                .clone(),
-                                        ),
-                                        name: col.column_desc.as_ref().unwrap().name.clone(),
+                                    .map(|col| {
+                                        let desc = col.column_desc.as_ref().unwrap();
+                                        PbField {
+                                            data_type: Some(
+                                                desc.column_type
+                                                    .as_ref()
+                                                    .unwrap()
+                                                    .clone(),
+                                            ),
+                                            name: desc.name.clone(),
+                                            description: desc.description.clone(),
+                                        }
                                     })
                                     .collect(),
                                 op: Some(op),
