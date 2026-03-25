@@ -141,6 +141,7 @@ impl Source {
                         &Field {
                             name: "file_path".to_owned(),
                             data_type: DataType::Varchar,
+                            description: None,
                         },
                         0,
                     ),
@@ -151,6 +152,7 @@ impl Source {
                         &Field {
                             name: "file_scan_task".to_owned(),
                             data_type: DataType::Jsonb,
+                            description: None,
                         },
                         1,
                     ),
@@ -164,6 +166,7 @@ impl Source {
                         &Field {
                             name: "batch_task_id".to_owned(),
                             data_type: DataType::Varchar,
+                            description: None,
                         },
                         0,
                     ),
@@ -174,6 +177,7 @@ impl Source {
                         &Field {
                             name: "batch_task_info".to_owned(),
                             data_type: DataType::Jsonb,
+                            description: None,
                         },
                         1,
                     ),
@@ -187,6 +191,7 @@ impl Source {
                         &Field {
                             name: "filename".to_owned(),
                             data_type: DataType::Varchar,
+                            description: None,
                         },
                         0,
                     ),
@@ -198,6 +203,7 @@ impl Source {
                         &Field {
                             name: "last_edit_time".to_owned(),
                             data_type: DataType::Timestamptz,
+                            description: None,
                         },
                         1,
                     ),
@@ -208,6 +214,7 @@ impl Source {
                         &Field {
                             name: "file_size".to_owned(),
                             data_type: DataType::Int64,
+                            description: None,
                         },
                         2,
                     ),
@@ -329,10 +336,12 @@ impl Source {
         let key = Field {
             data_type: DataType::Varchar,
             name: "partition_id".to_owned(),
+            description: None,
         };
         let value = Field {
             data_type: DataType::Jsonb,
             name: "offset_info".to_owned(),
+            description: None,
         };
 
         let ordered_col_idx = builder.add_column(&key);
