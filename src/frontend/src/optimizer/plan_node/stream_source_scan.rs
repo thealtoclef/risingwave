@@ -88,10 +88,12 @@ impl StreamSourceScan {
         let key = Field {
             data_type: DataType::Varchar,
             name: Self::PARTITION_ID_COLUMN_NAME.to_owned(),
+            description: None,
         };
         let value = Field {
             data_type: DataType::Jsonb,
             name: Self::BACKFILL_PROGRESS_COLUMN_NAME.to_owned(),
+            description: None,
         };
 
         let ordered_col_idx = builder.add_column(&key);

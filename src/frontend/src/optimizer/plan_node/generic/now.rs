@@ -58,6 +58,7 @@ impl GenericPlanNode for Now {
             } else {
                 "ts"
             }),
+            description: None,
         }])
     }
 

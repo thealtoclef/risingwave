@@ -217,7 +217,9 @@ impl ColumnDesc {
     }
 
     pub fn from_field_with_column_id(field: &Field, id: i32) -> Self {
-        Self::named(&field.name, ColumnId::new(id), field.data_type.clone())
+        let mut desc = Self::named(&field.name, ColumnId::new(id), field.data_type.clone());
+        desc.description = field.description.clone();
+        desc
     }
 
     pub fn from_field_without_column_id(field: &Field) -> Self {

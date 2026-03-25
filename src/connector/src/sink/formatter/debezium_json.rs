@@ -363,14 +363,17 @@ mod tests {
 
         let schema = Schema::new(vec![
             Field {
+                description: None,
                 data_type: DataType::Int32,
                 name: "v1".into(),
             },
             Field {
+                description: None,
                 data_type: DataType::Float32,
                 name: "v2".into(),
             },
             Field {
+                description: None,
                 data_type: StructType::new(vec![
                     ("v4", DataType::Int32),
                     ("v5", DataType::Float32),

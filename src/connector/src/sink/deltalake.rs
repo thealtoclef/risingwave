@@ -822,10 +822,12 @@ mod tests {
 
         let schema = Schema::new(vec![
             Field {
+                description: None,
                 data_type: DataType::Int32,
                 name: "id".into(),
             },
             Field {
+                description: None,
                 data_type: DataType::Varchar,
                 name: "name".into(),
             },
@@ -893,10 +895,12 @@ mod tests {
 
         let schema = Schema::new(vec![
             Field {
+                description: None,
                 data_type: DataType::Int32,
                 name: "id".into(),
             },
             Field {
+                description: None,
                 data_type: DataType::Varchar,
                 name: "name".into(),
             },

@@ -166,7 +166,9 @@ pub struct FieldTestDisplay<'a>(pub &'a Field);
 
 impl std::fmt::Debug for FieldTestDisplay<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let Field { data_type, name } = &self.0;
+        let Field {
+            data_type, name, ..
+        } = &self.0;
 
         write!(f, "{name}: {:#?}", DataTypeTestDisplay(data_type))?;
 
