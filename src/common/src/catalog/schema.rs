@@ -29,6 +29,9 @@ pub struct Field {
     #[educe(PartialEq(ignore))]
     #[educe(Hash(ignore))]
     pub name: String,
+    #[educe(PartialEq(ignore))]
+    #[educe(Hash(ignore))]
+    pub description: Option<String>,
 }
 
 impl Field {
@@ -36,6 +39,7 @@ impl Field {
         Self {
             data_type,
             name: name.into(),
+            description: None,
         }
     }
 }
@@ -51,6 +55,7 @@ impl Field {
         PbField {
             data_type: Some(self.data_type.to_protobuf()),
             name: self.name.clone(),
+            description: self.description.clone(),
         }
     }
 
@@ -58,6 +63,7 @@ impl Field {
         Field {
             data_type: DataType::from(pb.data_type.as_ref().unwrap()),
             name: pb.name.clone(),
+            description: pb.description.clone(),
         }
     }
 }
@@ -67,6 +73,7 @@ impl From<&ColumnDesc> for Field {
         Self {
             data_type: desc.data_type.clone(),
             name: desc.name.clone(),
+            description: desc.description.clone(),
         }
     }
 }
@@ -76,6 +83,7 @@ impl From<ColumnDesc> for Field {
         Self {
             data_type: column_desc.data_type,
             name: column_desc.name,
+            description: column_desc.description,
         }
     }
 }
@@ -85,6 +93,7 @@ impl From<&PbColumnDesc> for Field {
         Self {
             data_type: pb_column_desc.column_type.as_ref().unwrap().into(),
             name: pb_column_desc.name.clone(),
+            description: pb_column_desc.description.clone(),
         }
     }
 }
@@ -236,6 +245,7 @@ impl Field {
         Self {
             data_type,
             name: name.into(),
+            description: None,
         }
     }
 
@@ -243,6 +253,7 @@ impl Field {
         Self {
             data_type,
             name: String::new(),
+            description: None,
         }
     }
 
@@ -254,6 +265,7 @@ impl Field {
         Self {
             data_type: desc.data_type.clone(),
             name: format!("{}.{}", table_name, desc.name),
+            description: desc.description.clone(),
         }
     }
 }
@@ -263,6 +275,7 @@ impl From<&PbField> for Field {
         Self {
             data_type: DataType::from(prost_field.get_data_type().expect("data type not found")),
             name: prost_field.get_name().clone(),
+            description: prost_field.description.clone(),
         }
     }
 }
