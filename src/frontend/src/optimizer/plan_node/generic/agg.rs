@@ -690,6 +690,7 @@ impl Agg<StreamPlanRef> {
                     table_builder.add_column(&Field {
                         data_type: DataType::Int64,
                         name: format!("count_for_agg_call_{}", call_index),
+                        description: None,
                     });
                 }
                 table_builder
