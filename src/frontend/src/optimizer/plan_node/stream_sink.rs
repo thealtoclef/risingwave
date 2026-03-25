@@ -302,6 +302,20 @@ impl StreamSink {
 
         let mut emit_pk_extension_notice: Option<String> = None;
         let mut columns = derive_columns(input.schema(), out_names, &user_cols)?;
+
+        // Propagate column descriptions from the upstream table to sink columns.
+        if let Some(upstream_table) = &auto_refresh_schema_from_table {
+            for col in &mut columns {
+                if let Some(upstream_col) = upstream_table
+                    .columns()
+                    .iter()
+                    .find(|c| c.column_desc.name == col.column_desc.name)
+                {
+                    col.column_desc.description =
+                        upstream_col.column_desc.description.clone();
+                }
+            }
+        }
         let (pk, _) = derive_pk(
             input.clone(),
             user_distributed_by.clone(),

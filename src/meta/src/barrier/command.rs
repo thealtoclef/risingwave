@@ -829,6 +829,7 @@ fn sink_original_schema_fields(columns: &[PbColumnCatalog]) -> Vec<PbField> {
                         .clone(),
                 ),
                 name: column_desc.name.clone(),
+                description: column_desc.description.clone(),
             }
         })
         .collect()
