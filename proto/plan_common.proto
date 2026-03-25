@@ -14,6 +14,9 @@ option optimize_for = SPEED;
 message Field {
   data.DataType data_type = 1;
   string name = 2;
+  // Optional column description/comment, propagated from source databases
+  // and used to set Iceberg field doc strings.
+  optional string description = 3;
 }
 
 enum ColumnDescVersion {

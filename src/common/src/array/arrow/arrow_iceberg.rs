@@ -13,7 +13,6 @@
 // limitations under the License.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::ops::Div;
 use std::sync::{Arc, LazyLock};
 
@@ -238,11 +237,29 @@ impl IcebergCreateTableArrowConvert {
         ToArrow::to_arrow_field(self, name, data_type)
     }
 
+    /// Create an Arrow field with an optional doc string.
+    /// The `"doc"` metadata key is read by iceberg-rust's `arrow_schema_to_schema`
+    /// to populate `NestedField.doc` in the Iceberg table schema.
+    pub fn to_arrow_field_with_doc(
+        &self,
+        name: &str,
+        data_type: &DataType,
+        doc: Option<&str>,
+    ) -> Result<arrow_schema::Field, ArrayError> {
+        let mut field = self.to_arrow_field(name, data_type)?;
+        if let Some(doc) = doc {
+            let mut metadata = field.metadata().clone();
+            metadata.insert("doc".to_owned(), doc.to_owned());
+            field.set_metadata(metadata);
+        }
+        Ok(field)
+    }
+
     fn add_field_id(&self, arrow_field: &mut arrow_schema::Field) {
         *self.next_field_id.borrow_mut() += 1;
         let field_id = *self.next_field_id.borrow();
 
-        let mut metadata = HashMap::new();
+        let mut metadata = arrow_field.metadata().clone();
         // for iceberg-rust
         metadata.insert("PARQUET:field_id".to_owned(), field_id.to_string());
         arrow_field.set_metadata(metadata);

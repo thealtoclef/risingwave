@@ -2328,6 +2328,7 @@ mod tests {
                     ..Default::default()
                 }),
                 name: "col_v1".into(),
+                description: None,
             }],
             op: Some(SinkSchemachangeOp::AddColumns(PbSinkAddColumnsOp {
                 fields: vec![PbField {
@@ -2336,6 +2337,7 @@ mod tests {
                         ..Default::default()
                     }),
                     name: "new_col".into(),
+                    description: None,
                 }],
             })),
         };
