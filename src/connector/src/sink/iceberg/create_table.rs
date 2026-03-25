@@ -121,7 +121,11 @@ pub(super) async fn create_table_if_not_exists_impl(
             .iter()
             .map(|column| {
                 Ok(iceberg_create_table_arrow_convert
-                    .to_arrow_field(&column.name, &column.data_type)
+                    .to_arrow_field_with_doc(
+                        &column.name,
+                        &column.data_type,
+                        column.description.as_deref(),
+                    )
                     .map_err(|e| SinkError::Iceberg(anyhow!(e)))
                     .context(format!(
                         "failed to convert {}: {} to arrow type",

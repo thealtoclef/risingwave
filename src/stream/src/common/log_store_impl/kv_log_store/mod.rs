@@ -2239,12 +2239,19 @@ mod tests {
                             .clone(),
                     ),
                     name: col.column_desc.as_ref().unwrap().name.clone(),
+                    description: col
+                        .column_desc
+                        .as_ref()
+                        .unwrap()
+                        .description
+                        .clone(),
                 })
                 .collect(),
             op: Some(PbSchemaChangeOp::AddColumns(PbSinkAddColumnsOp {
                 fields: vec![PbField {
                     data_type: Some(DataType::Int32.to_protobuf()),
                     name: "new_col".to_owned(),
+                    description: None,
                 }],
             })),
         };
@@ -2355,6 +2362,7 @@ mod tests {
                 .columns
                 .iter()
                 .map(|col| PbField {
+                    description: None,
                     data_type: Some(
                         col.column_desc
                             .as_ref()
@@ -2371,6 +2379,7 @@ mod tests {
                 risingwave_pb::stream_plan::sink_schema_change::PbOp::AddColumns(
                     PbSinkAddColumnsOp {
                         fields: vec![PbField {
+                            description: None,
                             data_type: Some(DataType::Int32.to_protobuf()),
                             name: "age".to_owned(),
                         }],
