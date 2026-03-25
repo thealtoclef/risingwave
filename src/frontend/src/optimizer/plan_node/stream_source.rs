@@ -71,6 +71,7 @@ impl StreamSource {
             builder.add_column(&Field {
                 data_type: DataType::Int64,
                 name: "last_snapshot".to_owned(),
+                description: None,
             });
             builder.build(vec![], 0)
         }

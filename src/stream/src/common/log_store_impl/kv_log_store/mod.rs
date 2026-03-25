@@ -2239,12 +2239,19 @@ mod tests {
                             .clone(),
                     ),
                     name: col.column_desc.as_ref().unwrap().name.clone(),
+                    description: col
+                        .column_desc
+                        .as_ref()
+                        .unwrap()
+                        .description
+                        .clone(),
                 })
                 .collect(),
             op: Some(PbSchemaChangeOp::AddColumns(PbSinkAddColumnsOp {
                 fields: vec![PbField {
                     data_type: Some(DataType::Int32.to_protobuf()),
                     name: "new_col".to_owned(),
+                    description: None,
                 }],
             })),
         };
