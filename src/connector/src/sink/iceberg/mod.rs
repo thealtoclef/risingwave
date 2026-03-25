@@ -838,7 +838,11 @@ async fn create_table_if_not_exists_impl(config: &IcebergConfig, param: &SinkPar
             .iter()
             .map(|column| {
                 Ok(iceberg_create_table_arrow_convert
-                    .to_arrow_field(&column.name, &column.data_type)
+                    .to_arrow_field_with_doc(
+                        &column.name,
+                        &column.data_type,
+                        column.description.as_deref(),
+                    )
                     .map_err(|e| SinkError::Iceberg(anyhow!(e)))
                     .context(format!(
                         "failed to convert {}: {} to arrow type",
@@ -2773,11 +2777,15 @@ impl IcebergSinkCommitter {
                 })?;
 
             // Create NestedField with the next available field ID
-            let nested_field = Arc::new(NestedField::optional(
+            let mut nested_field = NestedField::optional(
                 next_field_id,
                 &field.name,
                 iceberg_type,
-            ));
+            );
+            if let Some(doc) = &field.description {
+                nested_field = nested_field.with_doc(doc);
+            }
+            let nested_field = Arc::new(nested_field);
 
             new_fields.push(nested_field);
             tracing::info!("Prepared field '{}' with ID {}", field.name, next_field_id);
