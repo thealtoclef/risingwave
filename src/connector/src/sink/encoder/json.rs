@@ -523,6 +523,7 @@ mod tests {
     #[test]
     fn test_to_json_basic_type() {
         let mock_field = Field {
+            description: None,
             data_type: DataType::Boolean,
             name: Default::default(),
         };
@@ -538,6 +539,7 @@ mod tests {
 
         let boolean_value = datum_to_json_object(
             &Field {
+                description: None,
                 data_type: DataType::Boolean,
                 ..mock_field.clone()
             },
@@ -549,6 +551,7 @@ mod tests {
 
         let int16_value = datum_to_json_object(
             &Field {
+                description: None,
                 data_type: DataType::Int16,
                 ..mock_field.clone()
             },
@@ -560,6 +563,7 @@ mod tests {
 
         let int64_value = datum_to_json_object(
             &Field {
+                description: None,
                 data_type: DataType::Int64,
                 ..mock_field.clone()
             },
@@ -574,6 +578,7 @@ mod tests {
 
         let serial_value = datum_to_json_object(
             &Field {
+                description: None,
                 data_type: DataType::Serial,
                 ..mock_field.clone()
             },
@@ -632,6 +637,7 @@ mod tests {
         let tstz_inner = "2018-01-26T18:30:09.453Z".parse().unwrap();
         let tstz_value = datum_to_json_object(
             &Field {
+                description: None,
                 data_type: DataType::Timestamptz,
                 ..mock_field.clone()
             },
@@ -653,6 +659,7 @@ mod tests {
         let tstz_inner = "2018-01-26T18:30:09.453Z".parse().unwrap();
         let tstz_value = datum_to_json_object(
             &Field {
+                description: None,
                 data_type: DataType::Timestamptz,
                 ..mock_field.clone()
             },
@@ -672,6 +679,7 @@ mod tests {
         };
         let ts_value = datum_to_json_object(
             &Field {
+                description: None,
                 data_type: DataType::Timestamp,
                 ..mock_field.clone()
             },
@@ -686,6 +694,7 @@ mod tests {
 
         let ts_value = datum_to_json_object(
             &Field {
+                description: None,
                 data_type: DataType::Timestamp,
                 ..mock_field.clone()
             },
@@ -701,6 +710,7 @@ mod tests {
         // Represents the number of milliseconds past midnigh, org.apache.kafka.connect.data.Time
         let time_value = datum_to_json_object(
             &Field {
+                description: None,
                 data_type: DataType::Time,
                 ..mock_field.clone()
             },
@@ -715,6 +725,7 @@ mod tests {
 
         let interval_value = datum_to_json_object(
             &Field {
+                description: None,
                 data_type: DataType::Interval,
                 ..mock_field.clone()
             },
@@ -739,6 +750,7 @@ mod tests {
         };
         let decimal = datum_to_json_object(
             &Field {
+                description: None,
                 data_type: DataType::Decimal,
                 name: "aaa".to_owned(),
             },
@@ -750,6 +762,7 @@ mod tests {
 
         let date_value = datum_to_json_object(
             &Field {
+                description: None,
                 data_type: DataType::Date,
                 ..mock_field.clone()
             },
@@ -769,6 +782,7 @@ mod tests {
         };
         let date_value = datum_to_json_object(
             &Field {
+                description: None,
                 data_type: DataType::Date,
                 ..mock_field.clone()
             },
@@ -788,6 +802,7 @@ mod tests {
         };
         let date_value = datum_to_json_object(
             &Field {
+                description: None,
                 data_type: DataType::Date,
                 ..mock_field.clone()
             },
@@ -805,6 +820,7 @@ mod tests {
 
         let interval_value = datum_to_json_object(
             &Field {
+                description: None,
                 data_type: DataType::Struct(StructType::new(vec![
                     ("v3", DataType::Int32),
                     ("v2", DataType::Int32),
@@ -828,6 +844,7 @@ mod tests {
         };
         let json_value = datum_to_json_object(
             &Field {
+                description: None,
                 data_type: DataType::Jsonb,
                 ..mock_field
             },
@@ -842,42 +859,52 @@ mod tests {
     fn test_generate_json_converter_schema() {
         let fields = vec![
             Field {
+                description: None,
                 data_type: DataType::Boolean,
                 name: "v1".into(),
             },
             Field {
+                description: None,
                 data_type: DataType::Int16,
                 name: "v2".into(),
             },
             Field {
+                description: None,
                 data_type: DataType::Int32,
                 name: "v3".into(),
             },
             Field {
+                description: None,
                 data_type: DataType::Float32,
                 name: "v4".into(),
             },
             Field {
+                description: None,
                 data_type: DataType::Decimal,
                 name: "v5".into(),
             },
             Field {
+                description: None,
                 data_type: DataType::Date,
                 name: "v6".into(),
             },
             Field {
+                description: None,
                 data_type: DataType::Varchar,
                 name: "v7".into(),
             },
             Field {
+                description: None,
                 data_type: DataType::Time,
                 name: "v8".into(),
             },
             Field {
+                description: None,
                 data_type: DataType::Interval,
                 name: "v9".into(),
             },
             Field {
+                description: None,
                 data_type: DataType::Struct(StructType::new(vec![
                     ("a", DataType::Timestamp),
                     ("b", DataType::Timestamptz),
@@ -892,6 +919,7 @@ mod tests {
                 name: "v10".into(),
             },
             Field {
+                description: None,
                 data_type: DataType::list(DataType::list(DataType::Struct(StructType::new(vec![
                     ("aa", DataType::Int64),
                     ("bb", DataType::Float64),
@@ -899,14 +927,17 @@ mod tests {
                 name: "v11".into(),
             },
             Field {
+                description: None,
                 data_type: DataType::Jsonb,
                 name: "12".into(),
             },
             Field {
+                description: None,
                 data_type: DataType::Serial,
                 name: "13".into(),
             },
             Field {
+                description: None,
                 data_type: DataType::Int256,
                 name: "14".into(),
             },
