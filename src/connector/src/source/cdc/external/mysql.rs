@@ -185,6 +185,12 @@ impl MySqlExternalTable {
                 ColumnDesc::named(col_name.clone(), ColumnId::placeholder(), data_type)
             };
 
+            // Propagate column comment from MySQL source
+            let mut column_desc = column_desc;
+            if !col.comment.is_empty() {
+                column_desc.description = Some(col.comment.clone());
+            }
+
             column_descs.push(column_desc);
             if matches!(col.key, ColumnKey::Primary) {
                 pk_names.push(col_name);
