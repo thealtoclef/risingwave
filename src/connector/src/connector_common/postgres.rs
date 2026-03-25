@@ -201,6 +201,39 @@ impl PostgresExternalTable {
         Ok(pk_columns)
     }
 
+    /// Discover column comments from PostgreSQL system catalog.
+    async fn discover_column_comments(
+        connection: &PgPool,
+        schema_name: &str,
+        table_name: &str,
+    ) -> ConnectorResult<HashMap<String, String>> {
+        let rows = sqlx::query(
+            "SELECT a.attname AS column_name, col_description(c.oid, a.attnum) AS comment \
+             FROM pg_class c \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             JOIN pg_attribute a ON a.attrelid = c.oid \
+             WHERE n.nspname = $1 AND c.relname = $2 \
+             AND a.attnum > 0 AND NOT a.attisdropped \
+             AND col_description(c.oid, a.attnum) IS NOT NULL",
+        )
+        .bind(schema_name)
+        .bind(table_name)
+        .fetch_all(connection)
+        .await
+        .context("Failed to discover column comments")?;
+
+        let comments = rows
+            .into_iter()
+            .map(|row| {
+                (
+                    row.get::<String, _>("column_name"),
+                    row.get::<String, _>("comment"),
+                )
+            })
+            .collect();
+        Ok(comments)
+    }
+
     /// Discover schema with workaround for primary key discovery
     /// This method uses direct PostgreSQL system table queries for primary keys
     /// to avoid permission issues when querying `information_schema.table_constraints`
@@ -214,7 +247,11 @@ impl PostgresExternalTable {
         table: &str,
         ssl_mode: &SslMode,
         ssl_root_cert: &Option<String>,
-    ) -> ConnectorResult<(Vec<sea_schema::postgres::def::ColumnInfo>, Vec<String>)> {
+    ) -> ConnectorResult<(
+        Vec<sea_schema::postgres::def::ColumnInfo>,
+        Vec<String>,
+        HashMap<String, String>,
+    )> {
         let mut options = PgConnectOptions::new()
             .username(username)
             .password(password)
@@ -279,7 +316,10 @@ impl PostgresExternalTable {
         // Use direct system table query for primary key discovery
         let pk_columns = Self::discover_primary_key(&connection, schema, table).await?;
 
-        Ok((columns, pk_columns))
+        // Discover column comments from pg_description
+        let comments = Self::discover_column_comments(&connection, schema, table).await?;
+
+        Ok((columns, pk_columns, comments))
     }
 
     async fn discover_schema(
@@ -343,7 +383,7 @@ impl PostgresExternalTable {
     ) -> ConnectorResult<Self> {
         tracing::debug!("connect to postgres external table");
 
-        let (columns, pk_names) = Self::discover_pk_and_full_columns(
+        let (columns, pk_names, comments) = Self::discover_pk_and_full_columns(
             username,
             password,
             host,
@@ -384,6 +424,12 @@ impl PostgresExternalTable {
             } else {
                 ColumnDesc::named(col.name.clone(), ColumnId::placeholder(), rw_data_type)
             };
+            // Propagate column comment from PostgreSQL source
+            let mut column_desc = column_desc;
+            if let Some(comment) = comments.get(&col.name) {
+                column_desc.description = Some(comment.clone());
+            }
+
             column_descs.push(column_desc);
         }
 
