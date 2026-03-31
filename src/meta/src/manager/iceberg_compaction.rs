@@ -464,14 +464,33 @@ impl IcebergCompactionManager {
     ) -> Vec<IcebergCompactionHandle> {
         let now = Instant::now();
 
-        // Collect all sink_ids to check
-        let sink_ids: Vec<SinkId> = {
+        // Identify sinks that need the real snapshot count from the catalog.
+        // A sink needs the catalog only if at least one of its triggers could fire:
+        //   1. Early trigger condition is configured (trigger_snapshot_count != usize::MAX)
+        //   2. Time-based trigger interval has elapsed (time_ready = true)
+        // All other sinks are skipped — passing snapshot_count = 0 to should_trigger()
+        // is safe: when time_ready = false, `time_ready && has_snapshots` is always false
+        // regardless of has_snapshots; when trigger_snapshot_count = usize::MAX,
+        // `snapshot_ready = 0 >= usize::MAX` is always false.
+        let needs_catalog_check: Vec<SinkId> = {
             let guard = self.inner.read();
-            guard.sink_schedules.keys().cloned().collect()
+            guard
+                .sink_schedules
+                .iter()
+                .filter(|(_, track)| match &track.state {
+                    CompactionTrackState::Processing => false,
+                    CompactionTrackState::Idle { next_compaction_time } => {
+                        let time_ready = now >= *next_compaction_time;
+                        let has_early_trigger = track.trigger_snapshot_count != usize::MAX;
+                        time_ready || has_early_trigger
+                    }
+                })
+                .map(|(&sink_id, _)| sink_id)
+                .collect()
         };
 
-        // Fetch snapshot counts for all sinks in parallel
-        let snapshot_count_futures = sink_ids
+        // Fetch snapshot counts in parallel, only for sinks that need it
+        let snapshot_count_futures = needs_catalog_check
             .iter()
             .map(|sink_id| async move {
                 let count = self.get_pending_snapshot_count(*sink_id).await?;
@@ -491,10 +510,8 @@ impl IcebergCompactionManager {
         // Collect all triggerable tasks with their priority info
         let mut candidates = Vec::new();
         for (sink_id, track) in &guard.sink_schedules {
-            // Skip sinks that failed to get snapshot count
-            let Some(&snapshot_count) = snapshot_counts.get(sink_id) else {
-                continue;
-            };
+            // Use real snapshot count if fetched; 0 otherwise (neither trigger can fire).
+            let snapshot_count = snapshot_counts.get(sink_id).copied().unwrap_or(0);
             if track.should_trigger(now, snapshot_count) {
                 // Extract next_time from Idle state (triggerable means Idle)
                 if let CompactionTrackState::Idle {
