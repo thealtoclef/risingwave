@@ -572,7 +572,9 @@ pub(crate) fn gen_create_table_plan(
     }
 
     let (_, secret_refs, connection_refs) = context.with_options().clone().into_parts();
-    if !secret_refs.is_empty() || !connection_refs.is_empty() {
+    // For iceberg engine tables, a connection ref in the WITH clause is allowed and consumed
+    // by create_iceberg_engine_table. For all other engines, refs are invalid here.
+    if !secret_refs.is_empty() || (props.engine != Engine::Iceberg && !connection_refs.is_empty()) {
         return Err(crate::error::ErrorCode::InvalidParameterValue("Secret reference and Connection reference are not allowed in options when creating table without external source".to_owned()).into());
     }
 
