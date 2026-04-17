@@ -186,6 +186,12 @@ pub const COMPACTION_SMALL_FILES_THRESHOLD_MB: &str = "compaction.small_files_th
 
 pub const COMPACTION_DELETE_FILES_COUNT_THRESHOLD: &str = "compaction.delete_files_count_threshold";
 
+pub const ENABLE_MANIFEST_REWRITE: &str = "enable_manifest_rewrite";
+pub const MANIFEST_REWRITE_TARGET_SIZE_MB: &str = "manifest_rewrite_target_size_mb";
+pub const MANIFEST_REWRITE_MIN_COUNT_TO_MERGE: &str = "manifest_rewrite_min_count_to_merge";
+pub const DEFAULT_MANIFEST_REWRITE_TARGET_SIZE_MB: u64 = 8;
+pub const DEFAULT_MANIFEST_REWRITE_MIN_COUNT_TO_MERGE: usize = 2;
+
 pub const COMPACTION_TRIGGER_SNAPSHOT_COUNT: &str = "compaction.trigger_snapshot_count";
 
 pub const COMPACTION_TARGET_FILE_SIZE_MB: &str = "compaction.target_file_size_mb";
@@ -222,6 +228,14 @@ fn default_true() -> bool {
 
 fn default_some_true() -> Option<bool> {
     Some(true)
+}
+
+fn default_manifest_rewrite_target_size_mb() -> Option<u64> {
+    Some(DEFAULT_MANIFEST_REWRITE_TARGET_SIZE_MB)
+}
+
+fn default_manifest_rewrite_min_count_to_merge() -> Option<usize> {
+    Some(DEFAULT_MANIFEST_REWRITE_MIN_COUNT_TO_MERGE)
 }
 
 fn parse_format_version_str(value: &str) -> std::result::Result<FormatVersion, String> {
@@ -522,6 +536,35 @@ pub struct IcebergConfig {
     #[serde_as(as = "Option<DisplayFromStr>")]
     #[with_option(allow_alter_on_fly)]
     pub write_parquet_max_row_group_rows: Option<usize>,
+
+    /// Whether to enable periodic manifest rewrites for this iceberg sink.
+    #[serde(
+        rename = "enable_manifest_rewrite",
+        default,
+        deserialize_with = "deserialize_bool_from_string"
+    )]
+    #[with_option(allow_alter_on_fly)]
+    pub enable_manifest_rewrite: bool,
+
+    /// Manifest files smaller than this size (MB) are candidates for rewriting.
+    /// Default is 8 MB.
+    #[serde(
+        rename = "manifest_rewrite_target_size_mb",
+        default = "default_manifest_rewrite_target_size_mb"
+    )]
+    #[serde_as(as = "Option<DisplayFromStr>")]
+    #[with_option(allow_alter_on_fly)]
+    pub manifest_rewrite_target_size_mb: Option<u64>,
+
+    /// Skip the rewrite if fewer than this many manifests match the size predicate.
+    /// Default is 2.
+    #[serde(
+        rename = "manifest_rewrite_min_count_to_merge",
+        default = "default_manifest_rewrite_min_count_to_merge"
+    )]
+    #[serde_as(as = "Option<DisplayFromStr>")]
+    #[with_option(allow_alter_on_fly)]
+    pub manifest_rewrite_min_count_to_merge: Option<usize>,
 }
 
 impl EnforceSecret for IcebergConfig {
@@ -3377,6 +3420,9 @@ mod test {
             compaction_type: None,
             write_parquet_compression: None,
             write_parquet_max_row_group_rows: None,
+            enable_manifest_rewrite: false,
+            manifest_rewrite_target_size_mb: Some(DEFAULT_MANIFEST_REWRITE_TARGET_SIZE_MB),
+            manifest_rewrite_min_count_to_merge: Some(DEFAULT_MANIFEST_REWRITE_MIN_COUNT_TO_MERGE),
         };
 
         assert_eq!(iceberg_config, expected_iceberg_config);
@@ -3991,4 +4037,5 @@ mod test {
         let config = result.unwrap();
         assert_eq!(config.write_mode, IcebergWriteMode::CopyOnWrite);
     }
+
 }
