@@ -26,9 +26,12 @@ use crate::connector_common::{IcebergCommon, IcebergTableIdentifier};
 use crate::sink::decouple_checkpoint_log_sink::ICEBERG_DEFAULT_COMMIT_CHECKPOINT_INTERVAL;
 use crate::sink::iceberg::{
     COMPACTION_INTERVAL_SEC, COMPACTION_MAX_SNAPSHOTS_NUM,
-    COMPACTION_WRITE_PARQUET_MAX_ROW_GROUP_BYTES, CompactionType, ENABLE_COMPACTION,
-    ENABLE_SNAPSHOT_EXPIRATION, ICEBERG_DEFAULT_WRITE_PARQUET_MAX_ROW_GROUP_BYTES, IcebergConfig,
-    IcebergOrderKeyField, IcebergWriteMode, ORDER_KEY, SNAPSHOT_EXPIRATION_CLEAR_EXPIRED_FILES,
+    COMPACTION_WRITE_PARQUET_MAX_ROW_GROUP_BYTES, CompactionType,
+    DEFAULT_MANIFEST_REWRITE_MIN_COUNT_TO_MERGE, DEFAULT_MANIFEST_REWRITE_TARGET_SIZE_MB,
+    DEFAULT_ORPHAN_FILE_MIN_AGE_MS, ENABLE_ORPHAN_FILE_REMOVAL, ENABLE_COMPACTION, ENABLE_SNAPSHOT_EXPIRATION,
+    ICEBERG_DEFAULT_WRITE_PARQUET_MAX_ROW_GROUP_BYTES, IcebergConfig, IcebergOrderKeyField,
+    IcebergWriteMode, ORDER_KEY, ORPHAN_FILE_DELETE_CONCURRENCY, ORPHAN_FILE_DRY_RUN,
+    ORPHAN_FILE_LOAD_CONCURRENCY, ORPHAN_FILE_MIN_AGE_MILLIS, SNAPSHOT_EXPIRATION_CLEAR_EXPIRED_FILES,
     SNAPSHOT_EXPIRATION_CLEAR_EXPIRED_META_DATA, SNAPSHOT_EXPIRATION_MAX_AGE_MILLIS,
     SNAPSHOT_EXPIRATION_RETAIN_LAST, WRITE_MODE, parse_order_key_exprs, validate_order_key_columns,
 };
@@ -337,6 +340,14 @@ fn test_parse_iceberg_config() {
             write_parquet_max_row_group_rows: None,
             write_parquet_max_row_group_bytes: None,
             enable_pk_index: false,
+            enable_manifest_rewrite: false,
+            manifest_rewrite_target_size_mb: Some(DEFAULT_MANIFEST_REWRITE_TARGET_SIZE_MB),
+            manifest_rewrite_min_count_to_merge: Some(DEFAULT_MANIFEST_REWRITE_MIN_COUNT_TO_MERGE),
+            enable_orphan_file_removal: false,
+            orphan_file_min_age_millis: None,
+            orphan_file_dry_run: false,
+            orphan_file_load_concurrency: None,
+            orphan_file_delete_concurrency: None,
         };
 
     assert_eq!(iceberg_config, expected_iceberg_config);
@@ -652,6 +663,14 @@ fn test_config_constants_consistency() {
         "compaction.write_parquet_max_row_group_bytes"
     );
     assert_eq!(ORDER_KEY, "order_key");
+    assert_eq!(ENABLE_ORPHAN_FILE_REMOVAL, "enable_orphan_file_removal");
+    assert_eq!(ORPHAN_FILE_MIN_AGE_MILLIS, "orphan_file_min_age_millis");
+    assert_eq!(ORPHAN_FILE_DRY_RUN, "orphan_file_dry_run");
+    assert_eq!(ORPHAN_FILE_LOAD_CONCURRENCY, "orphan_file_load_concurrency");
+    assert_eq!(
+        ORPHAN_FILE_DELETE_CONCURRENCY,
+        "orphan_file_delete_concurrency"
+    );
 }
 
 /// Test parsing all compaction.* prefix configs and their default values.
@@ -908,4 +927,79 @@ fn test_upsert_accepts_copy_on_write() {
     assert!(result.is_ok());
     let config = result.unwrap();
     assert_eq!(config.write_mode, IcebergWriteMode::CopyOnWrite);
+}
+
+#[test]
+fn test_parse_orphan_file_removal_config() {
+    let values: BTreeMap<String, String> = [
+        ("connector", "iceberg"),
+        ("type", "append-only"),
+        ("force_append_only", "true"),
+        ("warehouse.path", "s3://iceberg"),
+        ("s3.endpoint", "http://127.0.0.1:9301"),
+        ("s3.access.key", "test"),
+        ("s3.secret.key", "test"),
+        ("s3.region", "us-east-1"),
+        ("catalog.type", "storage"),
+        ("catalog.name", "demo"),
+        ("database.name", "test_db"),
+        ("table.name", "test_table"),
+        ("enable_orphan_file_removal", "true"),
+        ("orphan_file_min_age_millis", "3600000"),
+        ("orphan_file_dry_run", "true"),
+        ("orphan_file_load_concurrency", "32"),
+        ("orphan_file_delete_concurrency", "20"),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_owned(), v.to_owned()))
+    .collect();
+
+    let config = IcebergConfig::from_btreemap(values).unwrap();
+    assert!(config.enable_orphan_file_removal);
+    assert_eq!(config.orphan_file_min_age_millis, Some(3_600_000));
+    assert!(config.orphan_file_dry_run);
+    assert_eq!(config.orphan_file_load_concurrency, Some(32));
+    assert_eq!(config.orphan_file_delete_concurrency, Some(20));
+
+    // Helper returns `now - configured_min_age`.
+    let now: i64 = 10_000_000_000;
+    assert_eq!(
+        config.orphan_file_older_than_ms(now),
+        now - 3_600_000,
+    );
+}
+
+#[test]
+fn test_orphan_file_removal_defaults() {
+    let values: BTreeMap<String, String> = [
+        ("connector", "iceberg"),
+        ("type", "append-only"),
+        ("force_append_only", "true"),
+        ("warehouse.path", "s3://iceberg"),
+        ("s3.endpoint", "http://127.0.0.1:9301"),
+        ("s3.access.key", "test"),
+        ("s3.secret.key", "test"),
+        ("s3.region", "us-east-1"),
+        ("catalog.type", "storage"),
+        ("catalog.name", "demo"),
+        ("database.name", "test_db"),
+        ("table.name", "test_table"),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_owned(), v.to_owned()))
+    .collect();
+
+    let config = IcebergConfig::from_btreemap(values).unwrap();
+    assert!(!config.enable_orphan_file_removal);
+    assert_eq!(config.orphan_file_min_age_millis, None);
+    assert!(!config.orphan_file_dry_run);
+    assert_eq!(config.orphan_file_load_concurrency, None);
+    assert_eq!(config.orphan_file_delete_concurrency, None);
+
+    // Helper falls back to the 7-day default when the knob is unset.
+    let now: i64 = 10_000_000_000;
+    assert_eq!(
+        config.orphan_file_older_than_ms(now),
+        now - DEFAULT_ORPHAN_FILE_MIN_AGE_MS,
+    );
 }
