@@ -255,6 +255,12 @@ pub struct StorageConfig {
         default = "default::storage::iceberg_compaction_pending_parallelism_budget_multiplier"
     )]
     pub iceberg_compaction_pending_parallelism_budget_multiplier: f32,
+    /// Enable prefetching entire data files before compacting them.
+    /// Reduces GCS API calls from D×(1+N) to D per compaction cycle by downloading
+    /// each file with a single HTTP GET instead of N+1 range GETs.
+    /// Trades higher memory usage (one full file per concurrent task) for fewer API calls.
+    #[serde(default = "default::storage::iceberg_compaction_enable_prefetch")]
+    pub iceberg_compaction_enable_prefetch: bool,
 
     #[serde(default = "default::storage::iceberg_compaction_target_binpack_group_size_mb")]
     pub iceberg_compaction_target_binpack_group_size_mb: Option<u64>,
@@ -1133,6 +1139,10 @@ pub mod default {
 
         pub fn iceberg_compaction_pending_parallelism_budget_multiplier() -> f32 {
             4.0
+        }
+
+        pub fn iceberg_compaction_enable_prefetch() -> bool {
+            false
         }
 
         pub fn iceberg_compaction_target_binpack_group_size_mb() -> Option<u64> {
