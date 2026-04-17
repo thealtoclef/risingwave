@@ -261,6 +261,12 @@ pub struct StorageConfig {
         deserialize_with = "deserialize_iceberg_compaction_pull_interval_ms"
     )]
     pub iceberg_compaction_pull_interval_ms: u64,
+    /// Enable prefetching entire data files before compacting them.
+    /// Reduces GCS API calls from D×(1+N) to D per compaction cycle by downloading
+    /// each file with a single HTTP GET instead of N+1 range GETs.
+    /// Trades higher memory usage (one full file per concurrent task) for fewer API calls.
+    #[serde(default = "default::storage::iceberg_compaction_enable_prefetch")]
+    pub iceberg_compaction_enable_prefetch: bool,
 
     #[serde(default = "default::storage::iceberg_compaction_target_binpack_group_size_mb")]
     pub iceberg_compaction_target_binpack_group_size_mb: Option<u64>,
@@ -1168,6 +1174,10 @@ pub mod default {
 
         pub fn iceberg_compaction_pull_interval_ms() -> u64 {
             5000
+        }
+
+        pub fn iceberg_compaction_enable_prefetch() -> bool {
+            false
         }
 
         pub fn iceberg_compaction_target_binpack_group_size_mb() -> Option<u64> {
