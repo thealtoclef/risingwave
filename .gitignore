@@ -99,3 +99,5 @@ book/
 
 # Code agent temporary files
 docs/superpowers
+.sisyphus/
+.full-review/

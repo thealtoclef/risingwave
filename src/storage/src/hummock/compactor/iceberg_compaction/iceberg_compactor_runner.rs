@@ -33,6 +33,7 @@ use parquet_58::file::properties::WriterProperties;
 use risingwave_common::config::storage::default::storage::{
     iceberg_compaction_enable_heuristic_output_parallelism,
     iceberg_compaction_max_concurrent_closes,
+    iceberg_compaction_enable_prefetch,
 };
 use risingwave_common::monitor::GLOBAL_METRICS_REGISTRY;
 use risingwave_connector::sink::iceberg::{
@@ -75,6 +76,8 @@ pub struct IcebergCompactorRunnerConfig {
     pub enable_heuristic_output_parallelism: bool,
     #[builder(default = "iceberg_compaction_max_concurrent_closes()")]
     pub max_concurrent_closes: usize,
+    #[builder(default = "iceberg_compaction_enable_prefetch()")]
+    pub enable_prefetch: bool,
     #[builder]
     pub target_binpack_group_size_mb: Option<u64>,
     #[builder]
@@ -261,6 +264,7 @@ impl IcebergCompactionPlanRunner {
             .write_parquet_properties(write_parquet_properties)
             .target_file_size_bytes(iceberg_config.target_file_size_mb() * 1024 * 1024)
             .max_concurrent_closes(config.max_concurrent_closes)
+            .enable_prefetch(config.enable_prefetch)
             .build()
             .map_err(|e| {
                 HummockError::compaction_executor(
