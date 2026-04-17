@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::anyhow;
-use iceberg::spec::Operation;
+use iceberg::spec::{DataFile, FormatVersion, ManifestContentType, ManifestFile, Operation, MAIN_BRANCH};
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use itertools::Itertools;
 use parking_lot::RwLock;
@@ -25,7 +25,9 @@ use risingwave_common::id::WorkerId;
 use risingwave_connector::connector_common::IcebergSinkCompactionUpdate;
 use risingwave_connector::sink::catalog::{SinkCatalog, SinkId};
 use risingwave_connector::sink::iceberg::{
-    CompactionType, IcebergConfig, commit_branch, should_enable_iceberg_cow,
+    CompactionType, DEFAULT_MANIFEST_REWRITE_MIN_COUNT_TO_MERGE,
+    DEFAULT_MANIFEST_REWRITE_TARGET_SIZE_MB, IcebergConfig, commit_branch,
+    should_enable_iceberg_cow,
 };
 use risingwave_connector::sink::{SinkError, SinkParam};
 use risingwave_pb::iceberg_compaction::iceberg_compaction_task::TaskType;
@@ -831,6 +833,11 @@ impl IcebergCompactionManager {
         tracing::info!("Starting GC operations for {} tables", sink_ids.len());
 
         for sink_id in sink_ids {
+            // Rewrite manifests first so that the newly consolidated manifest list
+            // is what snapshot expiration sees (avoids unnecessary manifest churn).
+            if let Err(e) = self.check_and_rewrite_manifests(sink_id).await {
+                tracing::error!(error = ?e.as_report(), "Failed to rewrite manifests for sink {}", sink_id);
+            }
             if let Err(e) = self.check_and_expire_snapshots(sink_id).await {
                 tracing::error!(error = ?e.as_report(), "Failed to perform GC for sink {}", sink_id);
             }
@@ -986,6 +993,94 @@ impl IcebergCompactionManager {
             table_name = iceberg_config.full_table_name()?.to_string(),
             %sink_id,
             "Expired snapshots for iceberg table",
+        );
+
+        Ok(())
+    }
+
+    pub async fn check_and_rewrite_manifests(&self, sink_id: SinkId) -> MetaResult<()> {
+        let iceberg_config = self.load_iceberg_config(sink_id).await?;
+        if !iceberg_config.enable_manifest_rewrite {
+            return Ok(());
+        }
+
+        let catalog = iceberg_config.create_catalog().await?;
+        let table = catalog
+            .load_table(&iceberg_config.full_table_name()?)
+            .await
+            .map_err(|e| SinkError::Iceberg(e.into()))?;
+
+        // Library rejects V3+ tables (row lineage) — skip silently so the GC loop continues.
+        if table.metadata().format_version() >= FormatVersion::V3 {
+            tracing::warn!(
+                %sink_id,
+                format_version = ?table.metadata().format_version(),
+                "skipping manifest rewrite: format version >= V3 (row lineage) is not supported",
+            );
+            return Ok(());
+        }
+
+        let target_mb = iceberg_config
+            .manifest_rewrite_target_size_mb
+            .unwrap_or(DEFAULT_MANIFEST_REWRITE_TARGET_SIZE_MB);
+        let target_bytes: i64 = (target_mb * 1024 * 1024) as i64;
+        let min_count = iceberg_config
+            .manifest_rewrite_min_count_to_merge
+            .unwrap_or(DEFAULT_MANIFEST_REWRITE_MIN_COUNT_TO_MERGE);
+
+        // Pre-flight: count candidate data manifests under the size threshold.
+        // This avoids object-storage I/O when there is nothing to rewrite.
+        let Some(snapshot) = table.metadata().snapshot_for_ref(MAIN_BRANCH) else {
+            return Ok(());
+        };
+        let manifest_list = snapshot
+            .load_manifest_list(table.file_io(), table.metadata())
+            .await
+            .map_err(|e| SinkError::Iceberg(e.into()))?;
+        let matching = manifest_list
+            .entries()
+            .iter()
+            .filter(|m| {
+                m.content == ManifestContentType::Data && m.manifest_length < target_bytes
+            })
+            .count();
+        if matching < min_count {
+            tracing::debug!(
+                %sink_id,
+                matching,
+                min_count,
+                "skipping manifest rewrite: not enough small manifests",
+            );
+            return Ok(());
+        }
+
+        tracing::info!(
+            catalog_name = iceberg_config.catalog_name(),
+            table_name = iceberg_config.full_table_name()?.to_string(),
+            %sink_id,
+            target_mb,
+            matching_manifests = matching,
+            "triggering manifest rewrite",
+        );
+
+        let txn = Transaction::new(&table);
+        let action = txn
+            .rewrite_manifests()
+            .rewrite_if(Box::new(move |m: &ManifestFile| {
+                m.manifest_length < target_bytes
+            }))
+            .cluster_by(Box::new(|_d: &DataFile| "default".to_string()));
+
+        let txn = action.apply(txn).map_err(|e| SinkError::Iceberg(e.into()))?;
+        txn.commit(catalog.as_ref())
+            .await
+            .map_err(|e| SinkError::Iceberg(e.into()))?;
+
+        tracing::info!(
+            catalog_name = iceberg_config.catalog_name(),
+            table_name = iceberg_config.full_table_name()?.to_string(),
+            %sink_id,
+            "manifest rewrite committed",
         );
 
         Ok(())

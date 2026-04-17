@@ -26,7 +26,8 @@ use crate::connector_common::{IcebergCommon, IcebergTableIdentifier};
 use crate::sink::decouple_checkpoint_log_sink::ICEBERG_DEFAULT_COMMIT_CHECKPOINT_INTERVAL;
 use crate::sink::iceberg::{
     COMMIT_CHECKPOINT_SIZE_THRESHOLD_MB, COMPACTION_INTERVAL_SEC, COMPACTION_MAX_SNAPSHOTS_NUM,
-    COMPACTION_WRITE_PARQUET_MAX_ROW_GROUP_BYTES, CompactionType, ENABLE_COMPACTION,
+    COMPACTION_WRITE_PARQUET_MAX_ROW_GROUP_BYTES, CompactionType,
+    DEFAULT_MANIFEST_REWRITE_MIN_COUNT_TO_MERGE, DEFAULT_MANIFEST_REWRITE_TARGET_SIZE_MB, ENABLE_COMPACTION,
     ENABLE_SNAPSHOT_EXPIRATION, ICEBERG_DEFAULT_COMMIT_CHECKPOINT_SIZE_THRESHOLD_MB,
     ICEBERG_DEFAULT_WRITE_PARQUET_MAX_ROW_GROUP_BYTES, IcebergConfig, IcebergOrderKeyField,
     IcebergWriteMode, ORDER_KEY, SNAPSHOT_EXPIRATION_CLEAR_EXPIRED_FILES,
@@ -341,6 +342,9 @@ fn test_parse_iceberg_config() {
             write_parquet_max_row_group_rows: None,
             write_parquet_max_row_group_bytes: None,
             enable_pk_index: false,
+            enable_manifest_rewrite: false,
+            manifest_rewrite_target_size_mb: Some(DEFAULT_MANIFEST_REWRITE_TARGET_SIZE_MB),
+            manifest_rewrite_min_count_to_merge: Some(DEFAULT_MANIFEST_REWRITE_MIN_COUNT_TO_MERGE),
         };
 
     assert_eq!(iceberg_config, expected_iceberg_config);
