@@ -17,6 +17,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::anyhow;
+use iceberg::actions::RemoveOrphanFilesAction;
 use iceberg::spec::{DataFile, FormatVersion, ManifestContentType, ManifestFile, Operation, MAIN_BRANCH};
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use itertools::Itertools;
@@ -841,6 +842,12 @@ impl IcebergCompactionManager {
             if let Err(e) = self.check_and_expire_snapshots(sink_id).await {
                 tracing::error!(error = ?e.as_report(), "Failed to perform GC for sink {}", sink_id);
             }
+            // Orphan-file removal runs last: snapshot expiration with
+            // `snapshot_expiration_clear_expired_files = false` is the primary
+            // producer of orphans, so the reachable set is most accurate here.
+            if let Err(e) = self.check_and_remove_orphan_files(sink_id).await {
+                tracing::error!(error = ?e.as_report(), "Failed to remove orphan files for sink {}", sink_id);
+            }
         }
 
         tracing::info!("GC operations completed");
@@ -1081,6 +1088,68 @@ impl IcebergCompactionManager {
             table_name = iceberg_config.full_table_name()?.to_string(),
             %sink_id,
             "manifest rewrite committed",
+        );
+
+        Ok(())
+    }
+
+    /// Scans the table's object-storage location and deletes files that are not
+    /// referenced by any current snapshot/metadata and are older than the
+    /// configured minimum age. Runs only when `enable_orphan_file_removal` is
+    /// set on the sink.
+    ///
+    /// Safety: files without a modification timestamp are skipped by the
+    /// upstream action to avoid deleting in-flight writes. The per-sink
+    /// `orphan_file_min_age_millis` knob (default 7 days) is the primary guard
+    /// against racing concurrent operations.
+    pub async fn check_and_remove_orphan_files(&self, sink_id: SinkId) -> MetaResult<()> {
+        let iceberg_config = self.load_iceberg_config(sink_id).await?;
+        if !iceberg_config.enable_orphan_file_removal {
+            return Ok(());
+        }
+
+        let catalog = iceberg_config.create_catalog().await?;
+        let table = catalog
+            .load_table(&iceberg_config.full_table_name()?)
+            .await
+            .map_err(|e| SinkError::Iceberg(e.into()))?;
+
+        let now = chrono::Utc::now().timestamp_millis();
+        let older_than_ms = iceberg_config.orphan_file_older_than_ms(now);
+
+        tracing::info!(
+            catalog_name = iceberg_config.catalog_name(),
+            table_name = iceberg_config.full_table_name()?.to_string(),
+            %sink_id,
+            older_than_ms,
+            dry_run = iceberg_config.orphan_file_dry_run,
+            load_concurrency = ?iceberg_config.orphan_file_load_concurrency,
+            delete_concurrency = ?iceberg_config.orphan_file_delete_concurrency,
+            "try trigger orphan file removal",
+        );
+
+        let mut action = RemoveOrphanFilesAction::new(table)
+            .older_than_ms(older_than_ms)
+            .dry_run(iceberg_config.orphan_file_dry_run);
+        if let Some(c) = iceberg_config.orphan_file_load_concurrency {
+            action = action.load_concurrency(c);
+        }
+        if let Some(c) = iceberg_config.orphan_file_delete_concurrency {
+            action = action.delete_concurrency(c);
+        }
+
+        let paths = action
+            .execute()
+            .await
+            .map_err(|e| SinkError::Iceberg(e.into()))?;
+
+        tracing::info!(
+            catalog_name = iceberg_config.catalog_name(),
+            table_name = iceberg_config.full_table_name()?.to_string(),
+            %sink_id,
+            file_count = paths.len(),
+            dry_run = iceberg_config.orphan_file_dry_run,
+            "Removed orphan files for iceberg table",
         );
 
         Ok(())

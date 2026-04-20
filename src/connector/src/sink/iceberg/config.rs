@@ -137,6 +137,15 @@ pub const MANIFEST_REWRITE_MIN_COUNT_TO_MERGE: &str = "manifest_rewrite_min_coun
 pub const DEFAULT_MANIFEST_REWRITE_TARGET_SIZE_MB: u64 = 8;
 pub const DEFAULT_MANIFEST_REWRITE_MIN_COUNT_TO_MERGE: usize = 2;
 
+pub const ENABLE_ORPHAN_FILE_REMOVAL: &str = "enable_orphan_file_removal";
+pub const ORPHAN_FILE_MIN_AGE_MILLIS: &str = "orphan_file_min_age_millis";
+pub const ORPHAN_FILE_DRY_RUN: &str = "orphan_file_dry_run";
+pub const ORPHAN_FILE_LOAD_CONCURRENCY: &str = "orphan_file_load_concurrency";
+pub const ORPHAN_FILE_DELETE_CONCURRENCY: &str = "orphan_file_delete_concurrency";
+/// Default minimum age (7 days) before an unreferenced file is treated as an orphan.
+/// Matches the upstream iceberg-rust `RemoveOrphanFilesAction` default.
+pub const DEFAULT_ORPHAN_FILE_MIN_AGE_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+
 pub(super) const PARQUET_CREATED_BY: &str =
     concat!("risingwave version ", env!("CARGO_PKG_VERSION"));
 
@@ -518,6 +527,51 @@ pub struct IcebergConfig {
     #[serde_as(as = "Option<DisplayFromStr>")]
     #[with_option(allow_alter_on_fly)]
     pub manifest_rewrite_min_count_to_merge: Option<usize>,
+
+    /// Whether to enable periodic removal of orphan files for this iceberg sink.
+    /// Orphan files are files under the table location that are not referenced
+    /// by any current snapshot or metadata (e.g., left behind by failed writes
+    /// or aborted compactions).
+    #[serde(
+        rename = "enable_orphan_file_removal",
+        default,
+        deserialize_with = "deserialize_bool_from_string"
+    )]
+    #[with_option(allow_alter_on_fly)]
+    pub enable_orphan_file_removal: bool,
+
+    /// Minimum age (in milliseconds) before an unreferenced file is treated as
+    /// an orphan. Files newer than this threshold are never deleted. Defaults
+    /// to 7 days to protect in-flight writes and concurrent compactions.
+    #[serde(rename = "orphan_file_min_age_millis", default)]
+    #[serde_as(as = "Option<DisplayFromStr>")]
+    #[with_option(allow_alter_on_fly)]
+    pub orphan_file_min_age_millis: Option<i64>,
+
+    /// Dry-run mode: identify orphan files and log them without deleting.
+    /// Useful when first enabling the feature to audit what would be removed.
+    #[serde(
+        rename = "orphan_file_dry_run",
+        default,
+        deserialize_with = "deserialize_bool_from_string"
+    )]
+    #[with_option(allow_alter_on_fly)]
+    pub orphan_file_dry_run: bool,
+
+    /// Override for the parallelism used when loading manifest lists and
+    /// manifests during orphan scanning. Leaves the library default (16) in
+    /// place when unset.
+    #[serde(rename = "orphan_file_load_concurrency", default)]
+    #[serde_as(as = "Option<DisplayFromStr>")]
+    #[with_option(allow_alter_on_fly)]
+    pub orphan_file_load_concurrency: Option<usize>,
+
+    /// Override for the parallelism used when deleting orphan files. Leaves the
+    /// library default (10) in place when unset.
+    #[serde(rename = "orphan_file_delete_concurrency", default)]
+    #[serde_as(as = "Option<DisplayFromStr>")]
+    #[with_option(allow_alter_on_fly)]
+    pub orphan_file_delete_concurrency: Option<usize>,
 }
 
 impl EnforceSecret for IcebergConfig {
@@ -697,6 +751,17 @@ impl IcebergConfig {
     pub fn snapshot_expiration_timestamp_ms(&self, current_time_ms: i64) -> Option<i64> {
         self.snapshot_expiration_max_age_millis
             .map(|max_age_millis| current_time_ms - max_age_millis)
+    }
+
+    /// Absolute epoch-millisecond cutoff used by orphan-file removal: files with
+    /// a `last_modified_ms` strictly older than this value are candidates for
+    /// deletion. Falls back to [`DEFAULT_ORPHAN_FILE_MIN_AGE_MS`] (7 days) when
+    /// `orphan_file_min_age_millis` is not configured.
+    pub fn orphan_file_older_than_ms(&self, current_time_ms: i64) -> i64 {
+        current_time_ms
+            - self
+                .orphan_file_min_age_millis
+                .unwrap_or(DEFAULT_ORPHAN_FILE_MIN_AGE_MS)
     }
 
     pub fn trigger_snapshot_count(&self) -> usize {
