@@ -490,13 +490,6 @@ pub struct IcebergConfig {
     )]
     pub enable_pk_index: bool,
 
-    /// Maximum number of rows in a Parquet row group
-    /// Default is 122880 (from developer config)
-    #[serde(rename = "compaction.write_parquet_max_row_group_rows", default)]
-    #[serde_as(as = "Option<DisplayFromStr>")]
-    #[with_option(allow_alter_on_fly)]
-    pub write_parquet_max_row_group_rows: Option<usize>,
-
     /// Whether to enable periodic manifest rewrites for this iceberg sink.
     #[serde(
         rename = "enable_manifest_rewrite",
