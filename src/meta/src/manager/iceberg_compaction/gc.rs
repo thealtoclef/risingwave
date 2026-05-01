@@ -116,8 +116,28 @@ impl IcebergCompactionManager {
                 None => default_snapshot_expiration_timestamp_ms,
             };
 
+        // Apply retain_max upper bound: if snapshot count exceeds retain_max,
+        // compute a more aggressive cutoff so that at most retain_max remain.
+        let expiration_cutoff_ms =
+            if let Some(retain_max) = iceberg_config.snapshot_expiration_retain_max {
+                let retain_max = retain_max as usize;
+                if snapshots.len() > retain_max {
+                    // iceberg-rust's expire_older_than retains snapshots with
+                    // timestamp >= cutoff (inclusive). To keep at most retain_max,
+                    // the cutoff must point to the snapshot just before the first
+                    // one we want to keep, so index (len - retain_max - 1).
+                    let count_based_cutoff =
+                        snapshots[snapshots.len() - retain_max - 1].timestamp_ms();
+                    std::cmp::max(snapshot_expiration_timestamp_ms, count_based_cutoff)
+                } else {
+                    snapshot_expiration_timestamp_ms
+                }
+            } else {
+                snapshot_expiration_timestamp_ms
+            };
+
         if snapshots.is_empty()
-            || snapshots.first().unwrap().timestamp_ms() > snapshot_expiration_timestamp_ms
+            || snapshots.first().unwrap().timestamp_ms() > expiration_cutoff_ms
         {
             return Ok(());
         }
@@ -129,6 +149,7 @@ impl IcebergCompactionManager {
             snapshots_len = snapshots.len(),
             snapshot_expiration_timestamp_ms = snapshot_expiration_timestamp_ms,
             snapshot_expiration_retain_last = ?iceberg_config.snapshot_expiration_retain_last,
+            snapshot_expiration_retain_max = ?iceberg_config.snapshot_expiration_retain_max,
             clear_expired_files = ?iceberg_config.snapshot_expiration_clear_expired_files,
             clear_expired_meta_data = ?iceberg_config.snapshot_expiration_clear_expired_meta_data,
             "try trigger snapshots expiration",
@@ -138,7 +159,7 @@ impl IcebergCompactionManager {
 
         let mut expired_snapshots = txn
             .expire_snapshot()
-            .expire_older_than(snapshot_expiration_timestamp_ms)
+            .expire_older_than(expiration_cutoff_ms)
             .clear_expire_files(iceberg_config.snapshot_expiration_clear_expired_files)
             .clear_expired_meta_data(iceberg_config.snapshot_expiration_clear_expired_meta_data);
 
