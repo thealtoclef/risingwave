@@ -104,6 +104,7 @@ pub const ENABLE_SNAPSHOT_EXPIRATION: &str = "enable_snapshot_expiration";
 pub const WRITE_MODE: &str = "write_mode";
 pub const FORMAT_VERSION: &str = "format_version";
 pub const SNAPSHOT_EXPIRATION_RETAIN_LAST: &str = "snapshot_expiration_retain_last";
+pub const SNAPSHOT_EXPIRATION_RETAIN_MAX: &str = "snapshot_expiration_retain_max";
 pub const SNAPSHOT_EXPIRATION_MAX_AGE_MILLIS: &str = "snapshot_expiration_max_age_millis";
 pub const SNAPSHOT_EXPIRATION_CLEAR_EXPIRED_FILES: &str = "snapshot_expiration_clear_expired_files";
 pub const SNAPSHOT_EXPIRATION_CLEAR_EXPIRED_META_DATA: &str =
@@ -407,6 +408,13 @@ pub struct IcebergConfig {
     #[with_option(allow_alter_on_fly)]
     pub snapshot_expiration_retain_last: Option<i32>,
 
+    /// The maximum number of snapshots to retain. If set, snapshots exceeding
+    /// this count will be expired even if they haven't reached the age threshold.
+    #[serde(rename = "snapshot_expiration_retain_max", default)]
+    #[serde_as(as = "Option<DisplayFromStr>")]
+    #[with_option(allow_alter_on_fly)]
+    pub snapshot_expiration_retain_max: Option<i32>,
+
     #[serde(
         rename = "snapshot_expiration_clear_expired_files",
         default = "default_true",
@@ -693,6 +701,17 @@ impl IcebergConfig {
             tracing::warn!(
                 "`compaction.write_parquet_max_row_group_rows` is deprecated and ignored; use `compaction.write_parquet_max_row_group_bytes` instead"
             );
+        }
+
+        if let (Some(retain_last), Some(retain_max)) =
+            (config.snapshot_expiration_retain_last, config.snapshot_expiration_retain_max)
+        {
+            if retain_last >= retain_max {
+                return Err(SinkError::Config(anyhow!(
+                    "`snapshot_expiration_retain_last` ({}) must be less than `snapshot_expiration_retain_max` ({})",
+                    retain_last, retain_max
+                )));
+            }
         }
 
         Ok(config)
