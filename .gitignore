@@ -100,3 +100,6 @@ book/
 # Code agent temporary files
 docs/superpowers
 .context/
+.sisyphus/
+.full-review/
+.omc/

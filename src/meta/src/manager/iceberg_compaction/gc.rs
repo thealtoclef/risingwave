@@ -129,6 +129,35 @@ fn snapshot_expiration_cutoff_ms(iceberg_config: &IcebergConfig, now: i64) -> i6
         .unwrap_or(now - MAX_SNAPSHOT_AGE_MS_DEFAULT)
 }
 
+/// Compute the `expire_older_than` cutoff. iceberg-rust keeps every snapshot whose
+/// `timestamp_ms >= cutoff`, so the cutoff is the timestamp of the oldest snapshot to keep.
+///
+/// - `time_cutoff_ms`: the age-based cutoff.
+/// - `retain_max`: if more snapshots exist, move the cutoff forward so at most `retain_max`
+///   remain. A non-positive value keeps its previous effect: `0` keeps one, negatives are
+///   ignored.
+/// - `gc_watermark_ms`: a running compaction still needs snapshots from its watermark on, so the
+///   cutoff never passes it, even when `retain_max` asks for more.
+/// - `sorted_snapshot_timestamps_ms`: all snapshot timestamps, ascending.
+fn snapshot_expiration_effective_cutoff_ms(
+    time_cutoff_ms: i64,
+    retain_max: Option<i32>,
+    gc_watermark_ms: Option<i64>,
+    sorted_snapshot_timestamps_ms: &[i64],
+) -> i64 {
+    let mut cutoff_ms = time_cutoff_ms;
+    if let Some(retain_max) = retain_max.and_then(|n| usize::try_from(n).ok())
+        && sorted_snapshot_timestamps_ms.len() > retain_max.max(1)
+    {
+        let first_kept = sorted_snapshot_timestamps_ms.len() - retain_max.max(1);
+        cutoff_ms = cutoff_ms.max(sorted_snapshot_timestamps_ms[first_kept]);
+    }
+    if let Some(gc_watermark_ms) = gc_watermark_ms {
+        cutoff_ms = cutoff_ms.min(gc_watermark_ms);
+    }
+    cutoff_ms
+}
+
 impl IcebergCompactionManager {
     pub fn gc_loop(manager: Arc<Self>, interval_sec: u64) -> (JoinHandle<()>, Sender<()>) {
         assert!(
@@ -225,8 +254,8 @@ impl IcebergCompactionManager {
                 .map(|snapshot| snapshot.cloned())
         };
 
-        let mut snapshot_expiration_timestamp_ms =
-            snapshot_expiration_cutoff_ms(&iceberg_config, now);
+        let snapshot_expiration_timestamp_ms = snapshot_expiration_cutoff_ms(&iceberg_config, now);
+        let mut gc_watermark_timestamp_ms = None;
 
         // Outer `None` means no active compaction task. Inner `None` means an
         // active task exists without a safe snapshot watermark, so GC skips.
@@ -244,8 +273,7 @@ impl IcebergCompactionManager {
             Some(Some(snapshot)) => {
                 // A running compaction task may still need snapshots up to its
                 // captured watermark, so GC must not expire newer snapshots.
-                snapshot_expiration_timestamp_ms =
-                    snapshot_expiration_timestamp_ms.min(snapshot.timestamp_ms);
+                gc_watermark_timestamp_ms = Some(snapshot.timestamp_ms);
                 tracing::info!(
                     catalog_name = iceberg_config.catalog_name(),
                     table_name = iceberg_config.full_table_name()?.to_string(),
@@ -253,7 +281,8 @@ impl IcebergCompactionManager {
                     gc_watermark_branch = %snapshot.branch,
                     gc_watermark_snapshot_id = snapshot.snapshot_id,
                     gc_watermark_timestamp_ms = snapshot.timestamp_ms,
-                    protected_snapshot_expiration_timestamp_ms = snapshot_expiration_timestamp_ms,
+                    protected_snapshot_expiration_timestamp_ms =
+                        snapshot_expiration_timestamp_ms.min(snapshot.timestamp_ms),
                     "Protect snapshots expiration with iceberg compaction GC watermark",
                 );
             }
@@ -266,11 +295,21 @@ impl IcebergCompactionManager {
             .map_err(|e| SinkError::Iceberg(e.into()))?;
 
         let metadata = table.metadata();
-        let mut snapshots = metadata.snapshots().collect_vec();
-        snapshots.sort_by_key(|s| s.timestamp_ms());
+        let mut snapshot_timestamps_ms =
+            metadata.snapshots().map(|s| s.timestamp_ms()).collect_vec();
+        snapshot_timestamps_ms.sort_unstable();
 
-        if snapshots.is_empty()
-            || snapshots.first().unwrap().timestamp_ms() > snapshot_expiration_timestamp_ms
+        let expiration_cutoff_ms = snapshot_expiration_effective_cutoff_ms(
+            snapshot_expiration_timestamp_ms,
+            iceberg_config.snapshot_expiration_retain_max,
+            gc_watermark_timestamp_ms,
+            &snapshot_timestamps_ms,
+        );
+
+        // Nothing is older than the cutoff, so nothing can expire.
+        if snapshot_timestamps_ms
+            .first()
+            .is_none_or(|&oldest| oldest >= expiration_cutoff_ms)
         {
             return Ok(());
         }
@@ -279,9 +318,12 @@ impl IcebergCompactionManager {
             catalog_name = iceberg_config.catalog_name(),
             table_name = iceberg_config.full_table_name()?.to_string(),
             %sink_id,
-            snapshots_len = snapshots.len(),
+            snapshots_len = snapshot_timestamps_ms.len(),
             snapshot_expiration_timestamp_ms = snapshot_expiration_timestamp_ms,
+            expiration_cutoff_ms = expiration_cutoff_ms,
+            gc_watermark_timestamp_ms = ?gc_watermark_timestamp_ms,
             snapshot_expiration_retain_last = ?iceberg_config.snapshot_expiration_retain_last,
+            snapshot_expiration_retain_max = ?iceberg_config.snapshot_expiration_retain_max,
             clear_expired_files = ?iceberg_config.snapshot_expiration_clear_expired_files,
             clear_expired_meta_data = ?iceberg_config.snapshot_expiration_clear_expired_meta_data,
             "try trigger snapshots expiration",
@@ -291,7 +333,7 @@ impl IcebergCompactionManager {
 
         let mut expired_snapshots = txn
             .expire_snapshot()
-            .expire_older_than(snapshot_expiration_timestamp_ms)
+            .expire_older_than(expiration_cutoff_ms)
             .clear_expire_files(iceberg_config.snapshot_expiration_clear_expired_files)
             .clear_expired_meta_data(iceberg_config.snapshot_expiration_clear_expired_meta_data);
 
@@ -483,6 +525,72 @@ impl IcebergCompactionManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Snapshots whose `timestamp_ms >= cutoff`, i.e. what iceberg-rust keeps.
+    fn kept(timestamps: &[i64], cutoff: i64) -> Vec<i64> {
+        timestamps
+            .iter()
+            .copied()
+            .filter(|&t| t >= cutoff)
+            .collect()
+    }
+
+    #[test]
+    fn test_snapshot_expiration_cutoff_without_retain_max_uses_age() {
+        let ts = [10, 20, 30, 40, 50];
+        assert_eq!(
+            snapshot_expiration_effective_cutoff_ms(25, None, None, &ts),
+            25
+        );
+        assert_eq!(kept(&ts, 25), vec![30, 40, 50]);
+    }
+
+    #[test]
+    fn test_snapshot_expiration_cutoff_retain_max_keeps_exactly_retain_max() {
+        let ts = [10, 20, 30, 40, 50];
+        // The age cutoff alone would keep all 5 snapshots.
+        let cutoff = snapshot_expiration_effective_cutoff_ms(0, Some(2), None, &ts);
+        assert_eq!(kept(&ts, cutoff), vec![40, 50]);
+        // Within the limit, the age cutoff is unchanged.
+        assert_eq!(
+            snapshot_expiration_effective_cutoff_ms(0, Some(5), None, &ts),
+            0
+        );
+        // A stricter age cutoff still wins.
+        assert_eq!(
+            snapshot_expiration_effective_cutoff_ms(45, Some(3), None, &ts),
+            45
+        );
+    }
+
+    #[test]
+    fn test_snapshot_expiration_cutoff_never_passes_compaction_watermark() {
+        let ts = [10, 20, 30, 40, 50];
+        // `retain_max = 1` alone would expire everything but 50, but a running compaction
+        // captured snapshot 20, so snapshots from 20 on must be kept.
+        let cutoff = snapshot_expiration_effective_cutoff_ms(0, Some(1), Some(20), &ts);
+        assert_eq!(kept(&ts, cutoff), vec![20, 30, 40, 50]);
+        // The watermark also bounds the age cutoff.
+        assert_eq!(
+            snapshot_expiration_effective_cutoff_ms(35, None, Some(20), &ts),
+            20
+        );
+    }
+
+    #[test]
+    fn test_snapshot_expiration_cutoff_non_positive_retain_max() {
+        let ts = [10, 20, 30];
+        let cutoff = snapshot_expiration_effective_cutoff_ms(0, Some(0), None, &ts);
+        assert_eq!(kept(&ts, cutoff), vec![30]);
+        assert_eq!(
+            snapshot_expiration_effective_cutoff_ms(0, Some(-1), None, &ts),
+            0
+        );
+        assert_eq!(
+            snapshot_expiration_effective_cutoff_ms(0, Some(1), None, &[]),
+            0
+        );
+    }
 
     fn manifest(
         path: &str,

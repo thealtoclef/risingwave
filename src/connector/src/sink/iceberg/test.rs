@@ -389,6 +389,7 @@ fn test_parse_iceberg_config() {
             format_version: FormatVersion::V2,
             snapshot_expiration_max_age_millis: None,
             snapshot_expiration_retain_last: None,
+            snapshot_expiration_retain_max: None,
             snapshot_expiration_clear_expired_files: true,
             snapshot_expiration_clear_expired_meta_data: true,
             enable_manifest_rewrite: false,

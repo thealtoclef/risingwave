@@ -26,6 +26,7 @@ pub const ICEBERG_ENGINE_OPTION_KEYS: &[&str] = &[
     "format_version",
     "snapshot_expiration_max_age_millis",
     "snapshot_expiration_retain_last",
+    "snapshot_expiration_retain_max",
     "snapshot_expiration_clear_expired_files",
     "snapshot_expiration_clear_expired_meta_data",
     "enable_manifest_rewrite",
