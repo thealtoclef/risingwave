@@ -108,8 +108,8 @@ use risingwave_connector::sink::iceberg::{
     ICEBERG_WRITE_MODE_COPY_ON_WRITE, ICEBERG_WRITE_MODE_MERGE_ON_READ, IcebergSink,
     IcebergWriteMode, ORDER_KEY, SNAPSHOT_EXPIRATION_CLEAR_EXPIRED_FILES,
     SNAPSHOT_EXPIRATION_CLEAR_EXPIRED_META_DATA, SNAPSHOT_EXPIRATION_MAX_AGE_MILLIS,
-    SNAPSHOT_EXPIRATION_RETAIN_LAST, WRITE_MODE, parse_partition_by_exprs,
-    validate_order_key_columns,
+    SNAPSHOT_EXPIRATION_RETAIN_LAST, SNAPSHOT_EXPIRATION_RETAIN_MAX, WRITE_MODE,
+    parse_partition_by_exprs, validate_order_key_columns,
 };
 use risingwave_pb::ddl_service::create_iceberg_table_request::{PbSinkJobInfo, PbTableJobInfo};
 
@@ -2067,6 +2067,19 @@ pub async fn create_iceberg_engine_table(
             source
                 .as_mut()
                 .map(|x| x.with_properties.remove(SNAPSHOT_EXPIRATION_RETAIN_LAST));
+        }
+
+        if let Some(snapshot_expiration_retain_max) = handler_args
+            .with_options
+            .get(SNAPSHOT_EXPIRATION_RETAIN_MAX)
+        {
+            sink_with.insert(
+                SNAPSHOT_EXPIRATION_RETAIN_MAX.to_owned(),
+                snapshot_expiration_retain_max.to_owned(),
+            );
+            source
+                .as_mut()
+                .map(|x| x.with_properties.remove(SNAPSHOT_EXPIRATION_RETAIN_MAX));
         }
 
         if let Some(snapshot_expiration_max_age) = handler_args

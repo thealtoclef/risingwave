@@ -761,6 +761,12 @@ IcebergConfig:
     required: false
     default: Default::default
     allow_alter_on_fly: true
+  - name: snapshot_expiration_retain_max
+    field_type: i32
+    comments: The maximum number of snapshots to retain. Snapshots exceeding this count will be expired even if they haven't reached the age threshold.
+    required: false
+    default: Default::default
+    allow_alter_on_fly: true
   - name: snapshot_expiration_clear_expired_files
     field_type: bool
     required: false
