@@ -38,6 +38,7 @@ use crate::sink::iceberg::{
     DEFAULT_MANIFEST_REWRITE_MIN_COUNT_TO_MERGE, DEFAULT_MANIFEST_REWRITE_TARGET_SIZE_MB,
     DEFAULT_ORPHAN_FILE_MIN_AGE_MS, ENABLE_ORPHAN_FILE_REMOVAL, ORPHAN_FILE_DELETE_CONCURRENCY,
     ORPHAN_FILE_DRY_RUN, ORPHAN_FILE_LOAD_CONCURRENCY, ORPHAN_FILE_MIN_AGE_MILLIS,
+    SNAPSHOT_EXPIRATION_RETAIN_MAX
 };
 
 pub const DEFAULT_ICEBERG_COMPACTION_INTERVAL: u64 = 3600; // 1 hour
@@ -390,6 +391,7 @@ fn test_parse_iceberg_config() {
             format_version: FormatVersion::V2,
             snapshot_expiration_max_age_millis: None,
             snapshot_expiration_retain_last: None,
+            snapshot_expiration_retain_max: None,
             snapshot_expiration_clear_expired_files: true,
             snapshot_expiration_clear_expired_meta_data: true,
             max_snapshots_num_before_compaction: Some(DEFAULT_COMPACTION_MAX_SNAPSHOTS_NUM),
@@ -706,6 +708,10 @@ fn test_config_constants_consistency() {
     assert_eq!(
         SNAPSHOT_EXPIRATION_RETAIN_LAST,
         "snapshot_expiration_retain_last"
+    );
+    assert_eq!(
+        SNAPSHOT_EXPIRATION_RETAIN_MAX,
+        "snapshot_expiration_retain_max"
     );
     assert_eq!(
         SNAPSHOT_EXPIRATION_MAX_AGE_MILLIS,
