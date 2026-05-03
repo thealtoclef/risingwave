@@ -92,7 +92,7 @@ google-cloud-googleapis = { package = "gcloud-googleapis", version = "1", featur
     "spanner",
 ], optional = true }
 google-cloud-pubsub = { package = "gcloud-pubsub", version = "1.5" }
-google-cloud-spanner = { package = "gcloud-spanner", version = "1" }
+google-cloud-spanner = { package = "gcloud-spanner", version = "1.8" }
 iceberg = { workspace = true }
 iceberg-catalog-glue = { workspace = true }
 iceberg-catalog-rest = { workspace = true }
