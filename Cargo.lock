@@ -5986,14 +5986,14 @@ dependencies = [
 
 [[package]]
 name = "gcloud-longrunning"
-version = "1.3.0"
+version = "1.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f11006b348e317ba5c5472958b8168f4e4e4aa6b83aa2a2546f06b1350f5e49d"
+checksum = "43ccb50f1b67e61775a2a620b6c09de051e724f1aaf02d6c5b366fd60e7ac59e"
 dependencies = [
  "gcloud-gax",
  "gcloud-googleapis",
  "prost 0.14.3",
- "tonic 0.14.2",
+ "tonic",
 ]
 
 [[package]]
@@ -6027,9 +6027,9 @@ dependencies = [
 
 [[package]]
 name = "gcloud-spanner"
-version = "1.4.1"
+version = "1.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ba9e27ca6f1062d59d1212a948de08397fc69e51ac78ce3baaff1cf945bc6bc1"
+checksum = "cb649ff005bd20f4b87bde577380c0060b944b2ccaaebd842d9219c85051453d"
 dependencies = [
  "base64 0.22.1",
  "bigdecimal 0.4.10",
@@ -6038,6 +6038,7 @@ dependencies = [
  "gcloud-googleapis",
  "gcloud-longrunning",
  "parking_lot 0.12.5",
+ "prost 0.14.3",
  "prost-types 0.14.3",
  "thiserror 2.0.17",
  "time",
@@ -12023,6 +12024,7 @@ dependencies = [
  "openssl",
  "parking_lot 0.12.5",
  "parquet",
+ "parse-display",
  "paste",
  "pg_bigdecimal",
  "phf 0.13.1",
