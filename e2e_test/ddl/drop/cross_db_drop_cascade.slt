@@ -1,0 +1,439 @@
+# Tests for `DROP ... CASCADE` across databases.
+#
+# These exercise the path where a table/MV/schema/database in one database is
+# referenced by objects (typically materialized views) in another database. The
+# cascade should remove all dependents across databases, drive a separate
+# barrier-driven streaming-job teardown for each database, and notify all
+# frontends so their catalogs converge.
+#
+# Notes:
+# - A session cannot drop the database it is connected to, so cleanup uses a
+#   separate `connection cleanup` to drop test databases.
+# - Cross-database MVs require an explicit subscription on the upstream table
+#   or MV; the subscription itself is also cascade-dropped along with the
+#   upstream object.
+
+statement ok
+SET RW_IMPLICIT_FLUSH TO true;
+
+# Defensive cleanup in case a previous failed run left state behind.
+statement ok
+drop database if exists cross_drop_db_a;
+
+statement ok
+drop database if exists cross_drop_db_b;
+
+statement ok
+drop database if exists cross_drop_db_c;
+
+# ---------------------------------------------------------------------------
+# Test 1: DROP TABLE ... CASCADE removes a cross-db MV (and its subscription)
+# ---------------------------------------------------------------------------
+
+statement ok
+create database cross_drop_db_a;
+
+statement ok
+create database cross_drop_db_b;
+
+statement ok
+set database to cross_drop_db_a;
+
+statement ok
+create table t1 (v1 int, v2 int);
+
+statement ok
+insert into t1 values (1, 10), (2, 20), (3, 30);
+
+statement ok
+create subscription sub_t1 from t1 with (retention = '1D');
+
+statement ok
+set database to cross_drop_db_b;
+
+statement ok
+create materialized view mv_b as select v1, v2 from cross_drop_db_a.public.t1;
+
+query II rowsort
+select v1, v2 from mv_b;
+----
+1 10
+2 20
+3 30
+
+# DROP TABLE without CASCADE must still error when there are dependents.
+statement ok
+set database to cross_drop_db_a;
+
+statement error
+drop table t1;
+
+# DROP TABLE ... CASCADE should succeed and remove the cross-db MV in db_b
+# along with the subscription in db_a.
+statement ok
+drop table t1 cascade;
+
+query I
+select count(*) from rw_tables where name = 't1';
+----
+0
+
+query I
+select count(*) from rw_subscriptions where name = 'sub_t1';
+----
+0
+
+statement ok
+set database to cross_drop_db_b;
+
+query I
+select count(*) from rw_materialized_views where name = 'mv_b';
+----
+0
+
+connection cleanup
+statement ok
+drop database cross_drop_db_a;
+
+connection cleanup
+statement ok
+drop database cross_drop_db_b;
+
+# ---------------------------------------------------------------------------
+# Test 2: DROP TABLE ... CASCADE with multiple cross-db dependents
+# ---------------------------------------------------------------------------
+
+statement ok
+create database cross_drop_db_a;
+
+statement ok
+create database cross_drop_db_b;
+
+statement ok
+create database cross_drop_db_c;
+
+statement ok
+set database to cross_drop_db_a;
+
+statement ok
+create table t1 (v1 int);
+
+statement ok
+insert into t1 values (1), (2), (3);
+
+statement ok
+create subscription sub_t1 from t1 with (retention = '1D');
+
+statement ok
+set database to cross_drop_db_b;
+
+statement ok
+create materialized view mv_b as select v1 from cross_drop_db_a.public.t1;
+
+statement ok
+set database to cross_drop_db_c;
+
+statement ok
+create materialized view mv_c as select v1 + 100 as v from cross_drop_db_a.public.t1;
+
+statement ok
+set database to cross_drop_db_a;
+
+statement ok
+drop table t1 cascade;
+
+query I
+select count(*) from rw_tables where name = 't1';
+----
+0
+
+statement ok
+set database to cross_drop_db_b;
+
+query I
+select count(*) from rw_materialized_views where name = 'mv_b';
+----
+0
+
+statement ok
+set database to cross_drop_db_c;
+
+query I
+select count(*) from rw_materialized_views where name = 'mv_c';
+----
+0
+
+connection cleanup
+statement ok
+drop database cross_drop_db_a;
+
+connection cleanup
+statement ok
+drop database cross_drop_db_b;
+
+connection cleanup
+statement ok
+drop database cross_drop_db_c;
+
+# ---------------------------------------------------------------------------
+# Test 3: DROP MATERIALIZED VIEW ... CASCADE removes a cross-db MV that
+# depends on it (chained cross-db cascade)
+# ---------------------------------------------------------------------------
+
+statement ok
+create database cross_drop_db_a;
+
+statement ok
+create database cross_drop_db_b;
+
+statement ok
+set database to cross_drop_db_a;
+
+statement ok
+create table t1 (v1 int);
+
+statement ok
+insert into t1 values (1), (2), (3);
+
+statement ok
+create materialized view mv_a as select v1, v1 * 2 as v2 from t1;
+
+statement ok
+create subscription sub_mv_a from mv_a with (retention = '1D');
+
+statement ok
+set database to cross_drop_db_b;
+
+statement ok
+create materialized view mv_b as select v1, v2 from cross_drop_db_a.public.mv_a;
+
+query II rowsort
+select v1, v2 from mv_b;
+----
+1 2
+2 4
+3 6
+
+statement ok
+set database to cross_drop_db_a;
+
+statement ok
+drop materialized view mv_a cascade;
+
+query I
+select count(*) from rw_materialized_views where name = 'mv_a';
+----
+0
+
+statement ok
+set database to cross_drop_db_b;
+
+query I
+select count(*) from rw_materialized_views where name = 'mv_b';
+----
+0
+
+statement ok
+set database to cross_drop_db_a;
+
+statement ok
+drop table t1;
+
+connection cleanup
+statement ok
+drop database cross_drop_db_a;
+
+connection cleanup
+statement ok
+drop database cross_drop_db_b;
+
+# ---------------------------------------------------------------------------
+# Test 4: DROP SCHEMA ... CASCADE with cross-db dependent
+# ---------------------------------------------------------------------------
+
+statement ok
+create database cross_drop_db_a;
+
+statement ok
+create database cross_drop_db_b;
+
+statement ok
+set database to cross_drop_db_a;
+
+statement ok
+create schema schema_x;
+
+statement ok
+create table schema_x.t1 (v1 int);
+
+statement ok
+insert into schema_x.t1 values (1), (2);
+
+statement ok
+create subscription schema_x.sub_t1 from schema_x.t1 with (retention = '1D');
+
+statement ok
+set database to cross_drop_db_b;
+
+statement ok
+create materialized view mv_b as select v1 from cross_drop_db_a.schema_x.t1;
+
+statement ok
+set database to cross_drop_db_a;
+
+statement ok
+drop schema schema_x cascade;
+
+query I
+select count(*) from rw_schemas where name = 'schema_x';
+----
+0
+
+statement ok
+set database to cross_drop_db_b;
+
+query I
+select count(*) from rw_materialized_views where name = 'mv_b';
+----
+0
+
+connection cleanup
+statement ok
+drop database cross_drop_db_a;
+
+connection cleanup
+statement ok
+drop database cross_drop_db_b;
+
+# ---------------------------------------------------------------------------
+# Test 5: DROP DATABASE with cross-db dependent
+# DROP DATABASE always cascades; the cross-db dependent in the other database
+# must also be removed and a separate session must observe the deletion.
+# ---------------------------------------------------------------------------
+
+statement ok
+create database cross_drop_db_a;
+
+statement ok
+create database cross_drop_db_b;
+
+statement ok
+set database to cross_drop_db_a;
+
+statement ok
+create table t1 (v1 int);
+
+statement ok
+insert into t1 values (1), (2);
+
+statement ok
+create subscription sub_t1 from t1 with (retention = '1D');
+
+statement ok
+set database to cross_drop_db_b;
+
+statement ok
+create materialized view mv_b as select v1 from cross_drop_db_a.public.t1;
+
+# Drop the upstream database from a separate connection (we cannot drop the
+# database we are currently connected to).
+connection other_conn
+statement ok
+drop database cross_drop_db_a;
+
+connection other_conn
+query I
+select count(*) from rw_databases where name = 'cross_drop_db_a';
+----
+0
+
+# Open a fresh session on db_b and verify the cross-db MV was also removed.
+connection verify_conn
+statement ok
+set database to cross_drop_db_b;
+
+connection verify_conn
+query I
+select count(*) from rw_materialized_views where name = 'mv_b';
+----
+0
+
+connection cleanup
+statement ok
+drop database cross_drop_db_b;
+
+# ---------------------------------------------------------------------------
+# Test 6: After a cross-db cascade, re-creating the same objects works
+# cleanly with no leftover catalog or streaming state.
+# ---------------------------------------------------------------------------
+
+statement ok
+create database cross_drop_db_a;
+
+statement ok
+create database cross_drop_db_b;
+
+statement ok
+set database to cross_drop_db_a;
+
+statement ok
+create table t1 (v1 int);
+
+statement ok
+insert into t1 values (1);
+
+statement ok
+create subscription sub_t1 from t1 with (retention = '1D');
+
+statement ok
+set database to cross_drop_db_b;
+
+statement ok
+create materialized view mv_b as select v1 from cross_drop_db_a.public.t1;
+
+query I
+select count(*) from mv_b;
+----
+1
+
+statement ok
+set database to cross_drop_db_a;
+
+statement ok
+drop table t1 cascade;
+
+# Re-create the same objects with the same names.
+statement ok
+create table t1 (v1 int);
+
+statement ok
+insert into t1 values (42);
+
+statement ok
+create subscription sub_t1 from t1 with (retention = '1D');
+
+statement ok
+set database to cross_drop_db_b;
+
+statement ok
+create materialized view mv_b as select v1 from cross_drop_db_a.public.t1;
+
+query I
+select v1 from mv_b;
+----
+42
+
+# Cleanup.
+statement ok
+set database to cross_drop_db_a;
+
+statement ok
+drop table t1 cascade;
+
+connection cleanup
+statement ok
+drop database cross_drop_db_a;
+
+connection cleanup
+statement ok
+drop database cross_drop_db_b;
