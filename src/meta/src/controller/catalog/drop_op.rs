@@ -335,19 +335,69 @@ impl CatalogController {
             .map(|obj| (obj.oid, obj))
             .collect();
 
-        // TODO: Support drop cascade for cross-database query.
-        for obj in removed_objects.values() {
-            if let Some(obj_database_id) = obj.database_id
-                && obj_database_id != database_id
-            {
-                return Err(MetaError::permission_denied(format!(
-                    "Referenced by other objects in database {obj_database_id}, please drop them manually"
-                )));
+        // Partition streaming jobs by database so the stream manager can be driven once per
+        // database (each database has its own barrier context). Every streaming job must have a
+        // corresponding object in removed_objects with a non-None database_id by construction:
+        // removed_streaming_job_ids was filtered from removed_object_ids, and streaming jobs
+        // always live in some database.
+        let mut primary_streaming_job_ids: Vec<JobId> = Vec::new();
+        let mut cross_db_job_map: HashMap<DatabaseId, Vec<JobId>> = HashMap::new();
+        for &job_id in &removed_streaming_job_ids {
+            let obj_id: ObjectId = job_id.into();
+            let obj_database_id = removed_objects
+                .get(&obj_id)
+                .unwrap_or_else(|| {
+                    panic!("streaming job {job_id} not found in removed_objects")
+                })
+                .database_id
+                .unwrap_or_else(|| {
+                    panic!("streaming job {job_id} has no database_id")
+                });
+            if obj_database_id == database_id {
+                primary_streaming_job_ids.push(job_id);
+            } else {
+                cross_db_job_map
+                    .entry(obj_database_id)
+                    .or_default()
+                    .push(job_id);
             }
         }
 
+        // Split state table IDs by database. The BelongsToJobId query above (lines ~291-311)
+        // already fetched internal tables for ALL streaming jobs (primary + cross-db) and added
+        // them to removed_objects, so all table IDs appear in removed_state_table_ids. We separate
+        // them here so each database's stream manager receives only its own tables.
+        // Every state table must have a corresponding object in removed_objects with a non-None
+        // database_id (state tables always live in some database).
+        let mut cross_db_state_table_ids: HashMap<DatabaseId, Vec<TableId>> = HashMap::new();
+        let primary_state_table_ids: HashSet<TableId> = removed_state_table_ids
+            .into_iter()
+            .filter(|&table_id| {
+                let obj_database_id = removed_objects
+                    .get(&table_id.as_object_id())
+                    .unwrap_or_else(|| {
+                        panic!("state table {table_id} not found in removed_objects")
+                    })
+                    .database_id
+                    .unwrap_or_else(|| {
+                        panic!("state table {table_id} has no database_id")
+                    });
+                if obj_database_id == database_id {
+                    true
+                } else {
+                    cross_db_state_table_ids
+                        .entry(obj_database_id)
+                        .or_default()
+                        .push(table_id);
+                    false
+                }
+            })
+            .collect();
+        let removed_state_table_ids = primary_state_table_ids;
+
+        // Collect fragments for primary-database streaming jobs.
         let (removed_source_fragments, removed_sink_fragments, removed_fragments) =
-            get_fragments_for_jobs(&txn, removed_streaming_job_ids.clone()).await?;
+            get_fragments_for_jobs(&txn, primary_streaming_job_ids.clone()).await?;
 
         let sink_target_fragments = fetch_target_fragments(&txn, removed_sink_fragments).await?;
         let mut removed_sink_fragment_by_targets = HashMap::new();
@@ -365,6 +415,54 @@ impl CatalogController {
                     .push(sink_fragment);
             }
         }
+
+        // Collect fragments and state tables for each cross-database that has cascade-dropped jobs.
+        // Cross-db internal state tables are already in removed_objects (via the BelongsToJobId
+        // query above) and in cross_db_state_table_ids, so no extra DB query is needed.
+        let mut cross_db_contexts: Vec<CrossDatabaseReleaseContext> = Vec::new();
+        for (cross_db_id, job_ids) in cross_db_job_map {
+            let (cross_source_frags, cross_sink_frags, cross_all_frags) =
+                get_fragments_for_jobs(&txn, job_ids.clone()).await?;
+
+            let cross_sink_targets = fetch_target_fragments(&txn, cross_sink_frags).await?;
+            let mut cross_sink_frag_by_targets: HashMap<FragmentId, Vec<FragmentId>> =
+                HashMap::new();
+            for (sink_frag, target_frags) in cross_sink_targets {
+                assert!(
+                    target_frags.len() <= 1,
+                    "sink should have at most one downstream fragment"
+                );
+                if let Some(target) = target_frags.first()
+                    && !cross_all_frags.contains(target)
+                {
+                    cross_sink_frag_by_targets
+                        .entry(*target)
+                        .or_insert_with(Vec::new)
+                        .push(sink_frag);
+                }
+            }
+
+            let cross_state_table_ids =
+                cross_db_state_table_ids.remove(&cross_db_id).unwrap_or_default();
+
+            cross_db_contexts.push(CrossDatabaseReleaseContext {
+                database_id: cross_db_id,
+                removed_streaming_job_ids: job_ids,
+                removed_state_table_ids: cross_state_table_ids,
+                removed_source_fragments: cross_source_frags,
+                removed_fragments: cross_all_frags,
+                removed_sink_fragment_by_targets: cross_sink_frag_by_targets,
+            });
+        }
+
+        // All cross-db state tables must have been claimed by a corresponding streaming job above.
+        // If this fails, some database has state tables to clean up but no streaming job to drive
+        // the cleanup — those tables would be orphaned by hummock.
+        debug_assert!(
+            cross_db_state_table_ids.is_empty(),
+            "cross-db state tables without a corresponding streaming job: {:?}",
+            cross_db_state_table_ids
+        );
 
         // Find affect users with privileges on all this objects.
         let updated_user_ids: Vec<UserId> = UserPrivilege::find()
@@ -412,15 +510,31 @@ impl CatalogController {
 
         let version = match object_type {
             ObjectType::Database => {
-                // TODO: Notify objects in other databases when the cross-database query is supported.
-                self.notify_frontend(
-                    NotificationOperation::Delete,
-                    NotificationInfo::Database(PbDatabase {
-                        id: database_id,
-                        ..Default::default()
-                    }),
-                )
-                .await
+                // Notify deletion of the dropped database.
+                let db_version = self
+                    .notify_frontend(
+                        NotificationOperation::Delete,
+                        NotificationInfo::Database(PbDatabase {
+                            id: database_id,
+                            ..Default::default()
+                        }),
+                    )
+                    .await;
+
+                // Also notify objects in other databases that were cascade-dropped (e.g. cross-db
+                // MVs that depended on tables in the dropped database). Frontends hold a full
+                // multi-database catalog so they will route each deletion to the right database.
+                let cross_db_objs: Vec<PartialObject> = removed_objects
+                    .into_values()
+                    .filter(|obj| obj.database_id.is_some_and(|db_id| db_id != database_id))
+                    .collect();
+                if cross_db_objs.is_empty() {
+                    db_version
+                } else {
+                    let relation_group = build_object_group_for_delete(cross_db_objs);
+                    self.notify_frontend(NotificationOperation::Delete, relation_group)
+                        .await
+                }
             }
             ObjectType::Schema => {
                 let (schema_obj, mut to_notify_objs): (Vec<_>, Vec<_>) = removed_objects
@@ -447,7 +561,7 @@ impl CatalogController {
         Ok((
             ReleaseContext {
                 database_id,
-                removed_streaming_job_ids,
+                removed_streaming_job_ids: primary_streaming_job_ids,
                 removed_state_table_ids: removed_state_table_ids.into_iter().collect(),
                 removed_source_ids: removed_source_ids.into_iter().collect(),
                 removed_secret_ids,
@@ -457,6 +571,7 @@ impl CatalogController {
                 removed_iceberg_table_sinks,
                 removed_iceberg_sink_ids,
                 removed_iceberg_pk_index_sink_ids,
+                cross_db_contexts,
             },
             version,
         ))
