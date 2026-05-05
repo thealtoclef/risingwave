@@ -14,6 +14,7 @@
 
 #[cfg(test)]
 mod tests {
+    use risingwave_common::catalog::DEFAULT_SCHEMA_NAME;
     use risingwave_meta_model::table::HandleConflictBehavior;
     use risingwave_pb::catalog::StreamSourceInfo;
     use risingwave_pb::catalog::subscription::SubscriptionState;
@@ -408,6 +409,241 @@ mod tests {
                 .one(db)
                 .await?
                 .is_none()
+        );
+
+        Ok(())
+    }
+
+    /// Cross-database `DROP ... CASCADE` should propagate the cascade into
+    /// dependents that live in other databases. Previously this was rejected
+    /// with `Referenced by other objects in database <id>`. This test exercises
+    /// the catalog-level path: create a view in database B that depends on a
+    /// view in database A, then drop the view in A with CASCADE — both should
+    /// be removed.
+    #[tokio::test]
+    async fn test_drop_view_cascade_across_databases() -> MetaResult<()> {
+        let mgr = CatalogController::new(MetaSrvEnv::for_test().await).await?;
+
+        // Create the upstream view in the default test database/schema.
+        let upstream_view = PbView {
+            schema_id: TEST_SCHEMA_ID,
+            database_id: TEST_DATABASE_ID,
+            name: "cross_db_upstream_view".to_owned(),
+            owner: TEST_OWNER_ID as _,
+            sql: "CREATE VIEW cross_db_upstream_view AS SELECT 1".to_owned(),
+            ..Default::default()
+        };
+        mgr.create_view(upstream_view, HashSet::new()).await?;
+        let upstream_view_id: ViewId = View::find()
+            .select_only()
+            .column(view::Column::ViewId)
+            .filter(view::Column::Name.eq("cross_db_upstream_view"))
+            .into_tuple()
+            .one(&mgr.inner.read().await.db)
+            .await?
+            .unwrap();
+
+        // Create a second database; this also creates its default `public` schema.
+        let pb_other_db = PbDatabase {
+            name: "cross_db_other".to_owned(),
+            owner: TEST_OWNER_ID as _,
+            ..Default::default()
+        };
+        let (_, other_db) = mgr.create_database(pb_other_db).await?;
+        let other_database_id: DatabaseId = other_db.database_id;
+        let other_schema_id: SchemaId = Schema::find()
+            .select_only()
+            .column(schema::Column::SchemaId)
+            .inner_join(Object)
+            .filter(object::Column::DatabaseId.eq(other_database_id))
+            .filter(schema::Column::Name.eq(DEFAULT_SCHEMA_NAME))
+            .into_tuple()
+            .one(&mgr.inner.read().await.db)
+            .await?
+            .unwrap();
+
+        // Create the downstream view in the other database, declaring a
+        // dependency on the upstream view (cross-database reference).
+        let downstream_view = PbView {
+            schema_id: other_schema_id,
+            database_id: other_database_id,
+            name: "cross_db_downstream_view".to_owned(),
+            owner: TEST_OWNER_ID as _,
+            sql: "CREATE VIEW cross_db_downstream_view AS SELECT * FROM cross_db_upstream_view"
+                .to_owned(),
+            ..Default::default()
+        };
+        mgr.create_view(
+            downstream_view,
+            HashSet::from([upstream_view_id.as_object_id()]),
+        )
+        .await?;
+        let downstream_view_id: ViewId = View::find()
+            .select_only()
+            .column(view::Column::ViewId)
+            .filter(view::Column::Name.eq("cross_db_downstream_view"))
+            .into_tuple()
+            .one(&mgr.inner.read().await.db)
+            .await?
+            .unwrap();
+
+        // Sanity check: dependency was recorded.
+        let dependency_count: u64 = ObjectDependency::find()
+            .filter(object_dependency::Column::Oid.eq(upstream_view_id.as_object_id()))
+            .filter(object_dependency::Column::UsedBy.eq(downstream_view_id.as_object_id()))
+            .count(&mgr.inner.read().await.db)
+            .await?;
+        assert_eq!(dependency_count, 1);
+
+        // Drop the upstream view with CASCADE. Before this change the call
+        // failed with "Referenced by other objects in database X"; with the
+        // fix it must succeed and also remove the downstream view in the
+        // other database.
+        mgr.drop_object(ObjectType::View, upstream_view_id, DropMode::Cascade)
+            .await?;
+
+        // Verify the cascade in a scoped read-lock block; the lock must be
+        // released before we call any other `mgr` method (which acquires a
+        // write lock), otherwise the test deadlocks.
+        {
+            let inner = mgr.inner.read().await;
+            let db = &inner.db;
+            assert!(
+                View::find_by_id(upstream_view_id).one(db).await?.is_none(),
+                "upstream view should be removed"
+            );
+            assert!(
+                View::find_by_id(downstream_view_id).one(db).await?.is_none(),
+                "cross-database downstream view should also be removed"
+            );
+            assert!(
+                Object::find_by_id(downstream_view_id.as_object_id())
+                    .one(db)
+                    .await?
+                    .is_none(),
+                "downstream view's object row should be removed"
+            );
+            let remaining_dep: u64 = ObjectDependency::find()
+                .filter(object_dependency::Column::Oid.eq(upstream_view_id.as_object_id()))
+                .count(db)
+                .await?;
+            assert_eq!(remaining_dep, 0, "dependency row should be cleaned up");
+
+            // The other database itself should still exist (only its dependent view was dropped).
+            assert!(
+                Database::find_by_id(other_database_id)
+                    .one(db)
+                    .await?
+                    .is_some(),
+                "the other database should still exist after CASCADE"
+            );
+        }
+
+        // Cleanup: drop the other database (also exercises DROP DATABASE
+        // cascade with no remaining cross-db dependents).
+        mgr.drop_object(
+            ObjectType::Database,
+            other_database_id,
+            DropMode::Cascade,
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    /// `DROP DATABASE` always cascades. When the dropped database has objects
+    /// referenced by objects in another database, the cross-db dependents
+    /// must be removed too. This previously failed with the same permission-
+    /// denied error.
+    #[tokio::test]
+    async fn test_drop_database_cascade_with_cross_db_dependent() -> MetaResult<()> {
+        let mgr = CatalogController::new(MetaSrvEnv::for_test().await).await?;
+
+        // Create the upstream database and a view inside it.
+        let pb_upstream_db = PbDatabase {
+            name: "cross_db_drop_upstream".to_owned(),
+            owner: TEST_OWNER_ID as _,
+            ..Default::default()
+        };
+        let (_, upstream_db) = mgr.create_database(pb_upstream_db).await?;
+        let upstream_database_id: DatabaseId = upstream_db.database_id;
+        let upstream_schema_id: SchemaId = Schema::find()
+            .select_only()
+            .column(schema::Column::SchemaId)
+            .inner_join(Object)
+            .filter(object::Column::DatabaseId.eq(upstream_database_id))
+            .filter(schema::Column::Name.eq(DEFAULT_SCHEMA_NAME))
+            .into_tuple()
+            .one(&mgr.inner.read().await.db)
+            .await?
+            .unwrap();
+
+        let upstream_view = PbView {
+            schema_id: upstream_schema_id,
+            database_id: upstream_database_id,
+            name: "v_upstream".to_owned(),
+            owner: TEST_OWNER_ID as _,
+            sql: "CREATE VIEW v_upstream AS SELECT 1".to_owned(),
+            ..Default::default()
+        };
+        mgr.create_view(upstream_view, HashSet::new()).await?;
+        let upstream_view_id: ViewId = View::find()
+            .select_only()
+            .column(view::Column::ViewId)
+            .filter(view::Column::Name.eq("v_upstream"))
+            .into_tuple()
+            .one(&mgr.inner.read().await.db)
+            .await?
+            .unwrap();
+
+        // Create a downstream view in the default test database that
+        // references the upstream view (cross-database reference).
+        let downstream_view = PbView {
+            schema_id: TEST_SCHEMA_ID,
+            database_id: TEST_DATABASE_ID,
+            name: "v_downstream_in_other_db".to_owned(),
+            owner: TEST_OWNER_ID as _,
+            sql: "CREATE VIEW v_downstream_in_other_db AS SELECT * FROM v_upstream".to_owned(),
+            ..Default::default()
+        };
+        mgr.create_view(
+            downstream_view,
+            HashSet::from([upstream_view_id.as_object_id()]),
+        )
+        .await?;
+        let downstream_view_id: ViewId = View::find()
+            .select_only()
+            .column(view::Column::ViewId)
+            .filter(view::Column::Name.eq("v_downstream_in_other_db"))
+            .into_tuple()
+            .one(&mgr.inner.read().await.db)
+            .await?
+            .unwrap();
+
+        // Drop the upstream database. The downstream view in the other
+        // database must be cascade-dropped too.
+        mgr.drop_object(
+            ObjectType::Database,
+            upstream_database_id,
+            DropMode::Cascade,
+        )
+        .await?;
+
+        let db = &mgr.inner.read().await.db;
+        assert!(
+            Database::find_by_id(upstream_database_id)
+                .one(db)
+                .await?
+                .is_none(),
+            "upstream database should be removed"
+        );
+        assert!(
+            View::find_by_id(upstream_view_id).one(db).await?.is_none(),
+            "upstream view should be removed"
+        );
+        assert!(
+            View::find_by_id(downstream_view_id).one(db).await?.is_none(),
+            "cross-database downstream view should also be removed"
         );
 
         Ok(())

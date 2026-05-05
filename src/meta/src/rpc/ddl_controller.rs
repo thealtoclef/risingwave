@@ -1490,16 +1490,51 @@ impl DdlController {
             removed_iceberg_table_sinks,
             removed_iceberg_sink_ids,
             removed_iceberg_pk_index_sink_ids,
+            cross_db_contexts,
         } = release_ctx;
 
-        // Notify serving module about deleted fragments so it can clean up serving vnode mappings.
-        // This is driven by the fragment model deletion (cascade from Object::delete_many),
-        // decoupled from the barrier-driven streaming mapping notifications.
+        // Notify serving module about deleted fragments (primary + cross-db) so it can clean up
+        // serving vnode mappings. This is driven by the fragment model deletion (cascade from
+        // Object::delete_many), decoupled from the barrier-driven streaming mapping notifications.
         self.env
             .notification_manager_ref()
             .notify_serving_fragment_mapping_delete(
-                removed_fragments.iter().map(|id| *id as _).collect(),
+                removed_fragments
+                    .iter()
+                    .map(|id| *id as _)
+                    .chain(cross_db_contexts.iter().flat_map(|ctx| {
+                        ctx.removed_fragments.iter().map(|id| *id as _)
+                    }))
+                    .collect(),
             );
+
+        // Drive streaming job cleanup for cross-databases first. They are downstream consumers
+        // of the primary database's dropped objects, so tearing them down before the primary
+        // jobs avoids spurious upstream-disconnect errors during the teardown window. Each
+        // database has its own barrier context, so drop_streaming_jobs must be called once per
+        // database.
+        for cross_ctx in cross_db_contexts {
+            self.stream_manager
+                .drop_streaming_jobs(
+                    cross_ctx.database_id,
+                    cross_ctx.removed_streaming_job_ids,
+                    cross_ctx.removed_state_table_ids,
+                    cross_ctx
+                        .removed_sink_fragment_by_targets
+                        .into_iter()
+                        .map(|(target, sinks)| {
+                            (target as _, sinks.into_iter().map(|id| id as _).collect())
+                        })
+                        .collect(),
+                )
+                .await;
+
+            self.source_manager
+                .apply_source_change(SourceChange::DropMv {
+                    dropped_source_fragments: cross_ctx.removed_source_fragments,
+                })
+                .await;
+        }
 
         self.stream_manager
             .drop_streaming_jobs(

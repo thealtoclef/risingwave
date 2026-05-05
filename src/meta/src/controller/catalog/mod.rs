@@ -120,6 +120,22 @@ pub struct DropTableConnectorContext {
     pub(crate) to_remove_source_id: SourceId,
 }
 
+/// Per-database cleanup context for cross-database cascade drops.
+///
+/// When a `DROP ... CASCADE` touches objects in a database other than the one being dropped,
+/// a separate `CrossDatabaseReleaseContext` is produced for each such database. The stream
+/// manager must be driven once per database because each database has its own barrier context.
+#[derive(Clone, Default, Debug)]
+pub struct CrossDatabaseReleaseContext {
+    pub(crate) database_id: DatabaseId,
+    pub(crate) removed_streaming_job_ids: Vec<JobId>,
+    pub(crate) removed_state_table_ids: Vec<TableId>,
+    /// Source fragments to unregister from the source manager.
+    pub(crate) removed_source_fragments: HashMap<SourceId, BTreeSet<FragmentId>>,
+    pub(crate) removed_fragments: HashSet<FragmentId>,
+    pub(crate) removed_sink_fragment_by_targets: HashMap<FragmentId, Vec<FragmentId>>,
+}
+
 #[derive(Clone, Default, Debug)]
 pub struct ReleaseContext {
     pub(crate) database_id: DatabaseId,
@@ -151,6 +167,9 @@ pub struct ReleaseContext {
     /// owned by `IcebergPkIndexSinkManager`. Filtered via `is_iceberg_pk_index_sink` on
     /// the sink properties so user-created pk-index sinks (any name) are included.
     pub(crate) removed_iceberg_pk_index_sink_ids: Vec<SinkId>,
+
+    /// Cleanup contexts for objects cascade-dropped into other databases.
+    pub(crate) cross_db_contexts: Vec<CrossDatabaseReleaseContext>,
 }
 
 #[derive(Default)]
