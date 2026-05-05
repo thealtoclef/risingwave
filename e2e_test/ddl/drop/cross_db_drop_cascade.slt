@@ -6,14 +6,28 @@
 # barrier-driven streaming-job teardown for each database, and notify all
 # frontends so their catalogs converge.
 #
-# Note: a session cannot drop the database it is connected to, so cleanup uses
-# a separate `connection cleanup` to drop test databases.
+# Notes:
+# - A session cannot drop the database it is connected to, so cleanup uses a
+#   separate `connection cleanup` to drop test databases.
+# - Cross-database MVs require an explicit subscription on the upstream table
+#   or MV; the subscription itself is also cascade-dropped along with the
+#   upstream object.
 
 statement ok
 SET RW_IMPLICIT_FLUSH TO true;
 
+# Defensive cleanup in case a previous failed run left state behind.
+statement ok
+drop database if exists cross_drop_db_a;
+
+statement ok
+drop database if exists cross_drop_db_b;
+
+statement ok
+drop database if exists cross_drop_db_c;
+
 # ---------------------------------------------------------------------------
-# Test 1: DROP TABLE ... CASCADE removes a cross-db MV
+# Test 1: DROP TABLE ... CASCADE removes a cross-db MV (and its subscription)
 # ---------------------------------------------------------------------------
 
 statement ok
@@ -30,6 +44,9 @@ create table t1 (v1 int, v2 int);
 
 statement ok
 insert into t1 values (1, 10), (2, 20), (3, 30);
+
+statement ok
+create subscription sub_t1 from t1 with (retention = '1D');
 
 statement ok
 set database to cross_drop_db_b;
@@ -51,12 +68,18 @@ set database to cross_drop_db_a;
 statement error
 drop table t1;
 
-# DROP TABLE ... CASCADE should succeed and remove the cross-db MV in db_b.
+# DROP TABLE ... CASCADE should succeed and remove the cross-db MV in db_b
+# along with the subscription in db_a.
 statement ok
 drop table t1 cascade;
 
 query I
 select count(*) from rw_tables where name = 't1';
+----
+0
+
+query I
+select count(*) from rw_subscriptions where name = 'sub_t1';
 ----
 0
 
@@ -97,6 +120,9 @@ create table t1 (v1 int);
 
 statement ok
 insert into t1 values (1), (2), (3);
+
+statement ok
+create subscription sub_t1 from t1 with (retention = '1D');
 
 statement ok
 set database to cross_drop_db_b;
@@ -173,6 +199,9 @@ statement ok
 create materialized view mv_a as select v1, v1 * 2 as v2 from t1;
 
 statement ok
+create subscription sub_mv_a from mv_a with (retention = '1D');
+
+statement ok
 set database to cross_drop_db_b;
 
 statement ok
@@ -241,6 +270,9 @@ statement ok
 insert into schema_x.t1 values (1), (2);
 
 statement ok
+create subscription schema_x.sub_t1 from schema_x.t1 with (retention = '1D');
+
+statement ok
 set database to cross_drop_db_b;
 
 statement ok
@@ -293,6 +325,9 @@ create table t1 (v1 int);
 
 statement ok
 insert into t1 values (1), (2);
+
+statement ok
+create subscription sub_t1 from t1 with (retention = '1D');
 
 statement ok
 set database to cross_drop_db_b;
@@ -348,6 +383,9 @@ statement ok
 insert into t1 values (1);
 
 statement ok
+create subscription sub_t1 from t1 with (retention = '1D');
+
+statement ok
 set database to cross_drop_db_b;
 
 statement ok
@@ -370,6 +408,9 @@ create table t1 (v1 int);
 
 statement ok
 insert into t1 values (42);
+
+statement ok
+create subscription sub_t1 from t1 with (retention = '1D');
 
 statement ok
 set database to cross_drop_db_b;
