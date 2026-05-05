@@ -450,36 +450,42 @@ mod tests {
         mgr.drop_object(ObjectType::View, upstream_view_id, DropMode::Cascade)
             .await?;
 
-        let db = &mgr.inner.read().await.db;
-        assert!(
-            View::find_by_id(upstream_view_id).one(db).await?.is_none(),
-            "upstream view should be removed"
-        );
-        assert!(
-            View::find_by_id(downstream_view_id).one(db).await?.is_none(),
-            "cross-database downstream view should also be removed"
-        );
-        assert!(
-            Object::find_by_id(downstream_view_id.as_object_id())
-                .one(db)
-                .await?
-                .is_none(),
-            "downstream view's object row should be removed"
-        );
-        let remaining_dep: u64 = ObjectDependency::find()
-            .filter(object_dependency::Column::Oid.eq(upstream_view_id.as_object_id()))
-            .count(db)
-            .await?;
-        assert_eq!(remaining_dep, 0, "dependency row should be cleaned up");
+        // Verify the cascade in a scoped read-lock block; the lock must be
+        // released before we call any other `mgr` method (which acquires a
+        // write lock), otherwise the test deadlocks.
+        {
+            let inner = mgr.inner.read().await;
+            let db = &inner.db;
+            assert!(
+                View::find_by_id(upstream_view_id).one(db).await?.is_none(),
+                "upstream view should be removed"
+            );
+            assert!(
+                View::find_by_id(downstream_view_id).one(db).await?.is_none(),
+                "cross-database downstream view should also be removed"
+            );
+            assert!(
+                Object::find_by_id(downstream_view_id.as_object_id())
+                    .one(db)
+                    .await?
+                    .is_none(),
+                "downstream view's object row should be removed"
+            );
+            let remaining_dep: u64 = ObjectDependency::find()
+                .filter(object_dependency::Column::Oid.eq(upstream_view_id.as_object_id()))
+                .count(db)
+                .await?;
+            assert_eq!(remaining_dep, 0, "dependency row should be cleaned up");
 
-        // The other database itself should still exist (only its dependent view was dropped).
-        assert!(
-            Database::find_by_id(other_database_id)
-                .one(db)
-                .await?
-                .is_some(),
-            "the other database should still exist after CASCADE"
-        );
+            // The other database itself should still exist (only its dependent view was dropped).
+            assert!(
+                Database::find_by_id(other_database_id)
+                    .one(db)
+                    .await?
+                    .is_some(),
+                "the other database should still exist after CASCADE"
+            );
+        }
 
         // Cleanup: drop the other database (also exercises DROP DATABASE
         // cascade with no remaining cross-db dependents).
