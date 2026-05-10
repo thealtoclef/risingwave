@@ -14,7 +14,7 @@
 
 use risingwave_common::bitmap::Bitmap;
 use risingwave_pb::connector_service::coordinate_response::{
-    self, CommitResponse, StartCoordinationResponse,
+    self, BarrierReportResponse, CommitResponse, StartCoordinationResponse,
 };
 use risingwave_pb::connector_service::{
     CoordinateRequest, CoordinateResponse, PbSinkParam, coordinate_request,
@@ -208,10 +208,32 @@ impl MockSinkCoordinationRpcClient {
                             .await
                             .map_err(|e| Status::from_error(Box::new(e)))?;
                     }
+                    Some(CoordinateRequest {
+                        msg:
+                            Some(coordinate_request::Msg::BarrierReport(
+                                coordinate_request::BarrierReportRequest { epoch, .. },
+                            )),
+                    }) => {
+                        // Mock never asks the writer to commit on size; force-commit triggers
+                        // (interval / vnode update / stop / schema change) flow through
+                        // CommitRequest, which is handled above.
+                        response_tx_clone
+                            .clone()
+                            .send(Ok(CoordinateResponse {
+                                msg: Some(coordinate_response::Msg::BarrierReportResponse(
+                                    BarrierReportResponse {
+                                        epoch,
+                                        commit_next_barrier: false,
+                                    },
+                                )),
+                            }))
+                            .await
+                            .map_err(|e| Status::from_error(Box::new(e)))?;
+                    }
                     msg => {
                         return Err::<ReceiverStream<CoordinateResponse>, tonic::Status>(
                             Status::invalid_argument(format!(
-                                "expected CoordinateRequest::CommitRequest , get {:?}",
+                                "expected CoordinateRequest::CommitRequest or BarrierReport, get {:?}",
                                 msg
                             )),
                         );

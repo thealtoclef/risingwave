@@ -18,7 +18,7 @@ use anyhow::anyhow;
 use futures::{Stream, TryStreamExt};
 use risingwave_common::bitmap::Bitmap;
 use risingwave_pb::connector_service::coordinate_request::{
-    CommitRequest, StartCoordinationRequest, UpdateVnodeBitmapRequest,
+    BarrierReportRequest, CommitRequest, StartCoordinationRequest, UpdateVnodeBitmapRequest,
 };
 use risingwave_pb::connector_service::coordinate_response::StartCoordinationResponse;
 use risingwave_pb::connector_service::{
@@ -90,6 +90,34 @@ impl CoordinatorStreamHandle {
                     })),
             } => Ok((stream_handle, log_store_rewind_start_epoch)),
             msg => Err(anyhow!("should get start response but get {:?}", msg).into()),
+        }
+    }
+
+    /// Report uncommitted bytes to the coordinator without committing. Returns whether the
+    /// coordinator wants this writer (and all aligned peers) to commit at the next checkpoint
+    /// barrier — i.e., the aggregate has crossed the snapshot threshold.
+    pub async fn report_barrier(
+        &mut self,
+        epoch: u64,
+        uncommitted_bytes: u64,
+    ) -> anyhow::Result<bool> {
+        self.send_request(CoordinateRequest {
+            msg: Some(coordinate_request::Msg::BarrierReport(
+                BarrierReportRequest {
+                    epoch,
+                    uncommitted_bytes,
+                },
+            )),
+        })
+        .await?;
+        match self.next_response().await? {
+            CoordinateResponse {
+                msg: Some(coordinate_response::Msg::BarrierReportResponse(resp)),
+            } => Ok(resp.commit_next_barrier),
+            msg => Err(anyhow!(
+                "should get BarrierReportResponse but get {:?}",
+                msg
+            )),
         }
     }
 

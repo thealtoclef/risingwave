@@ -1,0 +1,92 @@
+# Regression test for the parallelism > 1 alignment hang fix.
+#
+# Before the fix: with size-threshold-driven commits and parallelism > 1, writers
+# would cross the threshold at different epochs (hash skew or byte-size variance),
+# the meta coordinator's per-epoch alignment would never fill, and writers parked
+# forever on commit.await. Data never landed in iceberg.
+#
+# After the fix: the coordinator centrally sums per-writer uncommitted bytes and
+# decides commit-vs-accumulate once. This test sets a large interval so commits
+# can ONLY be driven by the size threshold — without the fix, this would hang.
+
+statement ok
+set sink_decouple = true;
+
+statement ok
+set streaming_parallelism=4;
+
+statement ok
+CREATE TABLE t_parallel (id bigint primary key, payload varchar);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_parallel AS SELECT * FROM t_parallel;
+
+# commit_checkpoint_size_threshold_mb=1 makes the threshold easy to cross with
+# a few KB of data; commit_checkpoint_interval=1000 is large enough that the
+# size threshold is the only realistic commit trigger within the test window.
+statement ok
+CREATE SINK sink_parallel AS select * from mv_parallel WITH (
+    connector = 'iceberg',
+    type = 'append-only',
+    force_append_only = 'true',
+    database.name = 'demo_db',
+    table.name = 'parallel_size_threshold',
+    catalog.name = 'demo',
+    catalog.type = 'storage',
+    warehouse.path = 's3a://icebergdata/demo',
+    s3.endpoint = 'http://127.0.0.1:9301',
+    s3.region = 'us-east-1',
+    s3.access.key = 'hummockadmin',
+    s3.secret.key = 'hummockadmin',
+    create_table_if_not_exists = 'true',
+    commit_checkpoint_interval = 1000,
+    commit_checkpoint_size_threshold_mb = 1
+);
+
+# Insert ~5MB of data spread across 5000 rows. With parallelism=4 each writer
+# accumulates ~1.25MB of in-memory bytes — together comfortably above the 1MB
+# coordinator threshold. With the fix the coordinator commits within a few
+# barriers; without the fix the sink hangs.
+statement ok
+INSERT INTO t_parallel
+SELECT
+    i AS id,
+    repeat('x', 1024) AS payload
+FROM generate_series(1, 5000) AS i;
+
+statement ok
+FLUSH;
+
+sleep 60s
+
+statement ok
+CREATE SOURCE iceberg_parallel WITH (
+    connector = 'iceberg',
+    database.name = 'demo_db',
+    table.name = 'parallel_size_threshold',
+    catalog.name = 'demo',
+    catalog.type = 'storage',
+    warehouse.path = 's3a://icebergdata/demo',
+    s3.endpoint = 'http://127.0.0.1:9301',
+    s3.region = 'us-east-1',
+    s3.access.key = 'hummockadmin',
+    s3.secret.key = 'hummockadmin'
+);
+
+# All 5000 rows must have landed in iceberg.
+query I
+SELECT count(*) FROM iceberg_parallel;
+----
+5000
+
+statement ok
+DROP SINK sink_parallel;
+
+statement ok
+DROP MATERIALIZED VIEW mv_parallel;
+
+statement ok
+DROP TABLE t_parallel;
+
+statement ok
+DROP SOURCE iceberg_parallel;

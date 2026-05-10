@@ -72,13 +72,13 @@ impl<W: SinkWriter<CommitMetadata = Option<SinkMetadata>>> CoordinatedLogSinker<
 fn should_commit_on_checkpoint_barrier(
     current_checkpoint: u64,
     commit_checkpoint_interval: NonZeroU64,
-    writer_requires_commit: bool,
+    coordinator_requested_commit: bool,
     vnode_bitmap_updated: bool,
     is_stop: bool,
     has_schema_change: bool,
 ) -> bool {
     current_checkpoint >= commit_checkpoint_interval.get()
-        || writer_requires_commit
+        || coordinator_requested_commit
         || vnode_bitmap_updated
         || is_stop
         || has_schema_change
@@ -160,6 +160,10 @@ impl<W: SinkWriter<CommitMetadata = Option<SinkMetadata>>> LogSinker for Coordin
         let mut state = LogConsumerState::Uninitialized;
 
         let mut current_checkpoint: u64 = 0;
+        // Set by the coordinator's BarrierReportResponse on the previous checkpoint barrier
+        // when the aggregate uncommitted bytes have crossed the snapshot threshold. We close
+        // the iceberg writer and send a CommitRequest at the next checkpoint barrier.
+        let mut commit_next_barrier = false;
         let commit_checkpoint_interval = self.commit_checkpoint_interval;
         let sink_writer_metrics = self.sink_writer_metrics;
 
@@ -219,7 +223,7 @@ impl<W: SinkWriter<CommitMetadata = Option<SinkMetadata>>> LogSinker for Coordin
                         if should_commit_on_checkpoint_barrier(
                             current_checkpoint,
                             commit_checkpoint_interval,
-                            sink_writer.should_commit_on_checkpoint(),
+                            commit_next_barrier,
                             new_vnode_bitmap.is_some(),
                             is_stop,
                             schema_change.is_some(),
@@ -251,6 +255,7 @@ impl<W: SinkWriter<CommitMetadata = Option<SinkMetadata>>> LogSinker for Coordin
                                 .observe(start_time.elapsed().as_secs_f64());
 
                             current_checkpoint = 0;
+                            commit_next_barrier = false;
                             if let Some(new_vnode_bitmap) = new_vnode_bitmap {
                                 let epoch = coordinator_stream_handle
                                     .update_vnode_bitmap(&new_vnode_bitmap)
@@ -274,10 +279,20 @@ impl<W: SinkWriter<CommitMetadata = Option<SinkMetadata>>> LogSinker for Coordin
                             }
                             log_reader.truncate(TruncateOffset::Barrier { epoch })?;
                         } else {
+                            // Did not commit this checkpoint barrier. Keep the writer open
+                            // (barrier(false)), report current uncommitted bytes to the
+                            // coordinator, and capture the piggybacked decision for the next
+                            // checkpoint barrier.
                             let metadata = sink_writer.barrier(false).await?;
                             if let Some(metadata) = metadata {
-                                warn!(?metadata, "get metadata on non-checkpoint barrier");
+                                warn!(
+                                    ?metadata,
+                                    "unexpected metadata returned from barrier(false) on accumulate"
+                                );
                             }
+                            commit_next_barrier = coordinator_stream_handle
+                                .report_barrier(epoch, sink_writer.uncommitted_bytes())
+                                .await?;
                         }
                     } else {
                         let metadata = sink_writer.barrier(false).await?;
@@ -319,7 +334,7 @@ mod tests {
     }
 
     #[test]
-    fn test_should_commit_on_checkpoint_barrier_for_writer_request() {
+    fn test_should_commit_on_checkpoint_barrier_for_coordinator_requested_commit() {
         assert!(should_commit_on_checkpoint_barrier(
             1,
             NonZeroU64::new(60).unwrap(),

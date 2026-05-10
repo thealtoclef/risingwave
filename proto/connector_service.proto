@@ -243,12 +243,21 @@ message CoordinateRequest {
     common.Buffer vnode_bitmap = 1;
   }
 
+  // Per-checkpoint-barrier report from a writer that did not locally trigger a
+  // commit. Lets the coordinator aggregate uncommitted byte counts across all
+  // writers and centrally decide whether to commit at the next barrier.
+  message BarrierReportRequest {
+    uint64 epoch = 1;
+    uint64 uncommitted_bytes = 2;
+  }
+
   oneof msg {
     StartCoordinationRequest start_request = 1;
     CommitRequest commit_request = 2;
     UpdateVnodeBitmapRequest update_vnode_request = 3;
     bool stop = 4;
     uint64 align_initial_epoch_request = 5;
+    BarrierReportRequest barrier_report = 6;
   }
 }
 
@@ -261,11 +270,21 @@ message CoordinateResponse {
     uint64 epoch = 1;
   }
 
+  // Reply to BarrierReportRequest. commit_next_barrier=true tells the writer
+  // that the aggregate uncommitted bytes have crossed the snapshot threshold;
+  // the writer must close its files and send CommitRequest at the next
+  // checkpoint barrier.
+  message BarrierReportResponse {
+    uint64 epoch = 1;
+    bool commit_next_barrier = 2;
+  }
+
   oneof msg {
     StartCoordinationResponse start_response = 1;
     CommitResponse commit_response = 2;
     bool stopped = 3;
     uint64 align_initial_epoch_response = 4;
+    BarrierReportResponse barrier_report_response = 5;
   }
 }
 

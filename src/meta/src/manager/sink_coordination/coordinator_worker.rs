@@ -29,8 +29,13 @@ use risingwave_common::bitmap::Bitmap;
 use risingwave_connector::connector_common::IcebergSinkCompactionUpdate;
 use risingwave_connector::dispatch_sink;
 use risingwave_connector::sink::catalog::SinkId;
+use risingwave_connector::sink::iceberg::{
+    COMMIT_CHECKPOINT_SIZE_THRESHOLD_MB, ICEBERG_DEFAULT_COMMIT_CHECKPOINT_SIZE_THRESHOLD_MB,
+    ICEBERG_SINK,
+};
 use risingwave_connector::sink::{
-    Sink, SinkCommitCoordinator, SinkCommittedEpochSubscriber, SinkError, SinkParam, build_sink,
+    CONNECTOR_TYPE_KEY, Sink, SinkCommitCoordinator, SinkCommittedEpochSubscriber, SinkError,
+    SinkParam, build_sink,
 };
 use risingwave_meta_model::pending_sink_state::SinkState;
 use risingwave_pb::connector_service::{SinkMetadata, coordinate_request};
@@ -42,7 +47,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::time::sleep;
 use tokio_retry::strategy::{ExponentialBackoff, jitter};
 use tonic::Status;
-use tracing::{error, warn};
+use tracing::{debug, error, warn};
 
 use crate::manager::sink_coordination::exactly_once_util::{
     clean_aborted_records, commit_and_prune_epoch, list_sink_states_ordered_by_epoch,
@@ -72,6 +77,7 @@ type HandleId = usize;
 struct AligningRequests<R> {
     requests: Vec<R>,
     handle_ids: HashSet<HandleId>,
+    handle_ids_in_order: Vec<HandleId>,
     committed_bitmap: Option<Bitmap>, // lazy-initialized on first request
 }
 
@@ -103,6 +109,7 @@ impl<R> AligningRequests<R> {
         }
         *committed_bitmap |= vnode_bitmap;
         self.requests.push(request);
+        self.handle_ids_in_order.push(handle_id);
         assert!(self.handle_ids.insert(handle_id));
         Ok(())
     }
@@ -333,6 +340,33 @@ impl CoordinationHandleManager {
         Ok(())
     }
 
+    fn ack_barrier_report(
+        &mut self,
+        epoch: u64,
+        commit_next_barrier: bool,
+        handle_ids: impl IntoIterator<Item = HandleId>,
+    ) -> anyhow::Result<()> {
+        for handle_id in handle_ids {
+            let handle = self.writer_handles.get_mut(&handle_id).ok_or_else(|| {
+                anyhow!(
+                    "fail to find handle for {} when ack barrier report on epoch {}",
+                    handle_id,
+                    epoch
+                )
+            })?;
+            handle
+                .ack_barrier_report(epoch, commit_next_barrier)
+                .map_err(|_| {
+                    anyhow!(
+                        "fail to ack barrier report on epoch {} for handle {}",
+                        epoch,
+                        handle_id
+                    )
+                })?;
+        }
+        Ok(())
+    }
+
     async fn next_request_inner(
         writer_handles: &mut HashMap<HandleId, SinkWriterCoordinationHandle>,
     ) -> anyhow::Result<(HandleId, coordinate_request::Msg)> {
@@ -357,6 +391,10 @@ enum CoordinationHandleManagerEvent {
         metadata: SinkMetadata,
         schema_change: Option<PbSinkSchemaChange>,
     },
+    BarrierReport {
+        epoch: u64,
+        uncommitted_bytes: u64,
+    },
     AlignInitialEpoch(u64),
 }
 
@@ -367,6 +405,7 @@ impl CoordinationHandleManagerEvent {
             CoordinationHandleManagerEvent::UpdateVnodeBitmap => "UpdateVnodeBitmap",
             CoordinationHandleManagerEvent::Stop => "Stop",
             CoordinationHandleManagerEvent::CommitRequest { .. } => "CommitRequest",
+            CoordinationHandleManagerEvent::BarrierReport { .. } => "BarrierReport",
             CoordinationHandleManagerEvent::AlignInitialEpoch(_) => "AlignInitialEpoch",
         }
     }
@@ -393,6 +432,12 @@ impl CoordinationHandleManager {
                             epoch: request.epoch,
                             metadata: request.metadata.ok_or_else(|| anyhow!("empty sink metadata"))?,
                             schema_change: request.schema_change,
+                        }
+                    }
+                    coordinate_request::Msg::BarrierReport(request) => {
+                        CoordinationHandleManagerEvent::BarrierReport {
+                            epoch: request.epoch,
+                            uncommitted_bytes: request.uncommitted_bytes,
                         }
                     }
                     coordinate_request::Msg::AlignInitialEpochRequest(epoch) => {
@@ -479,6 +524,13 @@ impl CoordinationHandleManager {
                         handle_id
                     );
                 }
+                CoordinationHandleManagerEvent::BarrierReport { epoch, .. } => {
+                    bail!(
+                        "receive barrier report on epoch {} from handle {} during alter parallelism",
+                        epoch,
+                        handle_id
+                    );
+                }
                 CoordinationHandleManagerEvent::AlignInitialEpoch(epoch) => {
                     bail!(
                         "receive AlignInitialEpoch on epoch {} from handle {} during alter parallelism",
@@ -511,6 +563,50 @@ pub struct CoordinatorWorker {
 enum CoordinatorWorkerEvent {
     HandleManagerEvent(HandleId, CoordinationHandleManagerEvent),
     ReadyToCommit(u64, Option<Vec<u8>>, Option<PbSinkSchemaChange>),
+}
+
+/// Per-writer message accumulated for an epoch's alignment.
+///
+/// At any given epoch, each writer either:
+///   - sent a `Commit` (locally forced by interval / vnode update / stop / schema change /
+///     piggybacked decision from the coordinator's previous response), or
+///   - sent a `Report` carrying its current uncommitted byte count (the writer would otherwise
+///     buffer past this checkpoint).
+///
+/// When the alignment bitmap fills, the coordinator decides: commit if any writer is forced or
+/// the aggregate bytes crossed the threshold; otherwise discard the epoch as accumulate.
+#[derive(Debug)]
+enum WriterReport {
+    Report {
+        uncommitted_bytes: u64,
+    },
+    Commit {
+        metadata: SinkMetadata,
+        schema_change: Option<PbSinkSchemaChange>,
+    },
+}
+
+impl WriterReport {
+    fn is_commit(&self) -> bool {
+        matches!(self, WriterReport::Commit { .. })
+    }
+}
+
+/// Read the iceberg-specific snapshot threshold (per-snapshot total, in bytes) from a sink param.
+/// Returns `None` for non-iceberg sinks or when the user disabled the threshold (set to 0).
+fn commit_checkpoint_size_threshold_bytes(param: &SinkParam) -> Option<u64> {
+    let connector = param.properties.get(CONNECTOR_TYPE_KEY)?;
+    if !connector.eq_ignore_ascii_case(ICEBERG_SINK) {
+        return None;
+    }
+    let mb = match param.properties.get(COMMIT_CHECKPOINT_SIZE_THRESHOLD_MB) {
+        Some(s) => s.parse::<u64>().ok()?,
+        None => ICEBERG_DEFAULT_COMMIT_CHECKPOINT_SIZE_THRESHOLD_MB,
+    };
+    if mb == 0 {
+        return None;
+    }
+    Some(mb.saturating_mul(1024 * 1024))
 }
 
 impl CoordinatorWorker {
@@ -675,11 +771,12 @@ impl CoordinatorWorker {
         self.try_handle_init_requests(&running_handles, &mut two_phase_handler)
             .await?;
 
-        let mut pending_epochs: BTreeMap<u64, AligningRequests<_>> = BTreeMap::new();
+        let mut pending_epochs: BTreeMap<u64, AligningRequests<WriterReport>> = BTreeMap::new();
         let mut pending_new_handles = vec![];
+        let threshold_bytes = commit_checkpoint_size_threshold_bytes(&self.handle_manager.param);
         loop {
             let event = self.next_event(&mut two_phase_handler).await?;
-            let (handle_id, epoch, commit_request) = match event {
+            let (handle_id, epoch, writer_report) = match event {
                 CoordinatorWorkerEvent::HandleManagerEvent(handle_id, event) => match event {
                     CoordinationHandleManagerEvent::NewHandle => {
                         pending_new_handles.push(handle_id);
@@ -709,7 +806,22 @@ impl CoordinatorWorker {
                         epoch,
                         metadata,
                         schema_change,
-                    } => (handle_id, epoch, (metadata, schema_change)),
+                    } => (
+                        handle_id,
+                        epoch,
+                        WriterReport::Commit {
+                            metadata,
+                            schema_change,
+                        },
+                    ),
+                    CoordinationHandleManagerEvent::BarrierReport {
+                        epoch,
+                        uncommitted_bytes,
+                    } => (
+                        handle_id,
+                        epoch,
+                        WriterReport::Report { uncommitted_bytes },
+                    ),
                     CoordinationHandleManagerEvent::AlignInitialEpoch(_) => {
                         bail!("receive AlignInitialEpoch after initialization")
                     }
@@ -781,104 +893,195 @@ impl CoordinatorWorker {
             };
             if !running_handles.contains(&handle_id) {
                 bail!(
-                    "receiving commit request from non-running handle {}, running handles: {:?}",
+                    "receiving writer report from non-running handle {}, running handles: {:?}",
                     handle_id,
                     running_handles
                 );
             }
             pending_epochs.entry(epoch).or_default().add_new_request(
                 handle_id,
-                commit_request,
+                writer_report,
                 self.handle_manager.vnode_bitmap(handle_id),
             )?;
-            if pending_epochs
+            if !pending_epochs
                 .first_key_value()
                 .expect("non-empty")
                 .1
                 .aligned()
             {
-                let (epoch, commit_requests) = pending_epochs.pop_first().expect("non-empty");
-                let mut metadatas = Vec::with_capacity(commit_requests.requests.len());
-                let mut requests = commit_requests.requests.into_iter();
-                let (first_metadata, first_schema_change) = requests.next().expect("non-empty");
-                metadatas.push(first_metadata);
-                for (metadata, schema_change) in requests {
-                    if first_schema_change != schema_change {
-                        return Err(anyhow!(
-                            "got different schema change {:?} to prev schema change {:?}",
-                            schema_change,
-                            first_schema_change
-                        ));
-                    }
-                    metadatas.push(metadata);
-                }
+                continue;
+            }
 
-                match &mut coordinator {
-                    SinkCommitCoordinator::SinglePhase(coordinator) => {
-                        if !metadatas.is_empty() {
-                            let start_time = Instant::now();
-                            run_future_with_periodic_fn(
-                                coordinator.commit_data(epoch, metadatas).instrument_await(
-                                    Self::commit_span("single_phase_commit_data", sink_id, epoch),
-                                ),
-                                Duration::from_secs(5),
-                                || {
-                                    warn!(
-                                        elapsed = ?start_time.elapsed(),
-                                        %sink_id,
-                                        "committing"
-                                    );
-                                },
-                            )
-                            .await
-                            .map_err(|e| anyhow!(e))?;
-                        }
-                        if first_schema_change.is_some() {
-                            persist_pre_commit_metadata(
-                                &db,
-                                sink_id as _,
-                                epoch,
-                                None,
-                                first_schema_change.as_ref(),
-                            )
-                            .await?;
-                            two_phase_handler.push_new_item(epoch, None, first_schema_change);
-                        } else {
-                            self.prev_committed_epoch = Some(epoch);
-                        }
-                    }
-                    SinkCommitCoordinator::TwoPhase(coordinator) => {
-                        let commit_metadata = coordinator
-                            .pre_commit(epoch, metadatas, first_schema_change.clone())
-                            .instrument_await(Self::commit_span(
-                                "two_phase_pre_commit",
-                                sink_id,
-                                epoch,
-                            ))
-                            .await?;
-                        if commit_metadata.is_some() || first_schema_change.is_some() {
-                            persist_pre_commit_metadata(
-                                &db,
-                                sink_id as _,
-                                epoch,
-                                commit_metadata.clone(),
-                                first_schema_change.as_ref(),
-                            )
-                            .await?;
-                            two_phase_handler.push_new_item(
-                                epoch,
-                                commit_metadata,
-                                first_schema_change,
-                            );
-                        } else {
-                            // No data to commit and no schema change.
-                            self.prev_committed_epoch = Some(epoch);
-                        }
-                    }
-                }
+            let (aligned_epoch, aligned_requests) =
+                pending_epochs.pop_first().expect("non-empty");
 
+            // If any writer was forced to commit (interval / vnode update / stop / schema
+            // change / piggybacked decision from a previous epoch), the whole epoch is a
+            // commit. Otherwise compare aggregate bytes against the snapshot threshold.
+            let force_commit = aligned_requests
+                .requests
+                .iter()
+                .any(|r| r.is_commit());
+            let total_bytes: u64 = aligned_requests
+                .requests
+                .iter()
+                .map(|r| match r {
+                    WriterReport::Report { uncommitted_bytes } => *uncommitted_bytes,
+                    WriterReport::Commit { .. } => 0,
+                })
+                .sum();
+            let threshold_crossed = threshold_bytes
+                .map(|t| total_bytes >= t)
+                .unwrap_or(false);
+
+            debug!(
+                %sink_id,
+                epoch = aligned_epoch,
+                total_bytes,
+                threshold_bytes = ?threshold_bytes,
+                force_commit,
+                threshold_crossed,
+                writer_count = aligned_requests.handle_ids.len(),
+                "sink coordinator alignment decision"
+            );
+
+            if !force_commit && !threshold_crossed {
+                // Accumulate: keep iceberg writers open across the epoch boundary. Do NOT
+                // advance prev_committed_epoch; do NOT push to TwoPhaseCommitHandler. The
+                // log store must rewind here on recovery.
+                let commit_next_barrier = false;
                 self.handle_manager
-                    .ack_commit(epoch, commit_requests.handle_ids)?;
+                    .ack_barrier_report(aligned_epoch, commit_next_barrier, aligned_requests.handle_ids)?;
+                continue;
+            }
+
+            // Commit path. Forced writers carry metadata; report-only writers (if any) do
+            // not contribute data files for this epoch, but they must be told to commit at
+            // their next barrier so they rejoin the alignment cycle.
+            let AligningRequests {
+                requests: aligned_request_vec,
+                handle_ids_in_order,
+                ..
+            } = aligned_requests;
+            let mut metadatas = Vec::new();
+            let mut first_schema_change: Option<Option<PbSinkSchemaChange>> = None;
+            let mut commit_handle_ids = HashSet::new();
+            let mut report_handle_ids = HashSet::new();
+            for (req, handle_id) in aligned_request_vec.into_iter().zip(handle_ids_in_order) {
+                match req {
+                    WriterReport::Commit {
+                        metadata,
+                        schema_change,
+                    } => {
+                        match &first_schema_change {
+                            None => first_schema_change = Some(schema_change.clone()),
+                            Some(prev) => {
+                                if prev != &schema_change {
+                                    return Err(anyhow!(
+                                        "got different schema change {:?} to prev schema change {:?}",
+                                        schema_change,
+                                        prev
+                                    ));
+                                }
+                            }
+                        }
+                        metadatas.push(metadata);
+                        commit_handle_ids.insert(handle_id);
+                    }
+                    WriterReport::Report { .. } => {
+                        report_handle_ids.insert(handle_id);
+                    }
+                }
+            }
+            // If no Commit was present, this is the threshold-crossed-on-reports path. We
+            // tell every writer to commit at the next barrier; nothing to commit now.
+            if metadatas.is_empty() && first_schema_change.is_none() {
+                debug_assert!(threshold_crossed && !force_commit);
+                let commit_next_barrier = true;
+                self.handle_manager
+                    .ack_barrier_report(aligned_epoch, commit_next_barrier, report_handle_ids)?;
+                continue;
+            }
+
+            let first_schema_change = first_schema_change.unwrap_or(None);
+
+            match &mut coordinator {
+                SinkCommitCoordinator::SinglePhase(coordinator) => {
+                    if !metadatas.is_empty() {
+                        let start_time = Instant::now();
+                        run_future_with_periodic_fn(
+                            coordinator
+                                .commit_data(aligned_epoch, metadatas)
+                                .instrument_await(Self::commit_span(
+                                    "single_phase_commit_data",
+                                    sink_id,
+                                    aligned_epoch,
+                                )),
+                            Duration::from_secs(5),
+                            || {
+                                warn!(
+                                    elapsed = ?start_time.elapsed(),
+                                    %sink_id,
+                                    "committing"
+                                );
+                            },
+                        )
+                        .await
+                        .map_err(|e| anyhow!(e))?;
+                    }
+                    if first_schema_change.is_some() {
+                        persist_pre_commit_metadata(
+                            &db,
+                            sink_id as _,
+                            aligned_epoch,
+                            None,
+                            first_schema_change.as_ref(),
+                        )
+                        .await?;
+                        two_phase_handler.push_new_item(
+                            aligned_epoch,
+                            None,
+                            first_schema_change,
+                        );
+                    } else {
+                        self.prev_committed_epoch = Some(aligned_epoch);
+                    }
+                }
+                SinkCommitCoordinator::TwoPhase(coordinator) => {
+                    let commit_metadata = coordinator
+                        .pre_commit(aligned_epoch, metadatas, first_schema_change.clone())
+                        .instrument_await(Self::commit_span(
+                            "two_phase_pre_commit",
+                            sink_id,
+                            aligned_epoch,
+                        ))
+                        .await?;
+                    if commit_metadata.is_some() || first_schema_change.is_some() {
+                        persist_pre_commit_metadata(
+                            &db,
+                            sink_id as _,
+                            aligned_epoch,
+                            commit_metadata.clone(),
+                            first_schema_change.as_ref(),
+                        )
+                        .await?;
+                        two_phase_handler.push_new_item(
+                            aligned_epoch,
+                            commit_metadata,
+                            first_schema_change,
+                        );
+                    } else {
+                        self.prev_committed_epoch = Some(aligned_epoch);
+                    }
+                }
+            }
+
+            self.handle_manager
+                .ack_commit(aligned_epoch, commit_handle_ids)?;
+            if !report_handle_ids.is_empty() {
+                let commit_next_barrier = true;
+                self.handle_manager
+                    .ack_barrier_report(aligned_epoch, commit_next_barrier, report_handle_ids)?;
             }
         }
     }
@@ -946,5 +1149,100 @@ impl CoordinatorWorker {
 
     fn commit_span(stage: &str, sink_id: SinkId, epoch: u64) -> await_tree::Span {
         await_tree::span!("sink_coord_{stage} (sink_id {sink_id}, epoch {epoch})").long_running()
+    }
+}
+
+#[cfg(test)]
+mod helper_tests {
+    use risingwave_connector::sink::SinkParam;
+    use risingwave_connector::sink::catalog::{SinkId, SinkType};
+
+    use super::commit_checkpoint_size_threshold_bytes;
+
+    fn make_param(properties: &[(&str, &str)]) -> SinkParam {
+        SinkParam {
+            sink_id: SinkId::from(1),
+            sink_name: "test".into(),
+            properties: properties
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect(),
+            columns: vec![],
+            downstream_pk: None,
+            sink_type: SinkType::AppendOnly,
+            ignore_delete: false,
+            format_desc: None,
+            db_name: "test".into(),
+            sink_from_name: "test".into(),
+        }
+    }
+
+    #[test]
+    fn non_iceberg_sink_returns_none() {
+        let param = make_param(&[("connector", "kafka")]);
+        assert_eq!(commit_checkpoint_size_threshold_bytes(&param), None);
+    }
+
+    #[test]
+    fn missing_connector_returns_none() {
+        let param = make_param(&[]);
+        assert_eq!(commit_checkpoint_size_threshold_bytes(&param), None);
+    }
+
+    #[test]
+    fn iceberg_default_threshold_is_128mb() {
+        let param = make_param(&[("connector", "iceberg")]);
+        assert_eq!(
+            commit_checkpoint_size_threshold_bytes(&param),
+            Some(128 * 1024 * 1024)
+        );
+    }
+
+    #[test]
+    fn iceberg_explicit_threshold_is_used() {
+        let param = make_param(&[
+            ("connector", "iceberg"),
+            ("commit_checkpoint_size_threshold_mb", "64"),
+        ]);
+        assert_eq!(
+            commit_checkpoint_size_threshold_bytes(&param),
+            Some(64 * 1024 * 1024)
+        );
+    }
+
+    #[test]
+    fn iceberg_zero_threshold_disables() {
+        let param = make_param(&[
+            ("connector", "iceberg"),
+            ("commit_checkpoint_size_threshold_mb", "0"),
+        ]);
+        assert_eq!(commit_checkpoint_size_threshold_bytes(&param), None);
+    }
+
+    #[test]
+    fn iceberg_unparseable_threshold_returns_none() {
+        let param = make_param(&[
+            ("connector", "iceberg"),
+            ("commit_checkpoint_size_threshold_mb", "notanumber"),
+        ]);
+        assert_eq!(commit_checkpoint_size_threshold_bytes(&param), None);
+    }
+
+    #[test]
+    fn connector_match_is_case_insensitive() {
+        let param = make_param(&[("connector", "ICEBERG")]);
+        assert_eq!(
+            commit_checkpoint_size_threshold_bytes(&param),
+            Some(128 * 1024 * 1024)
+        );
+    }
+
+    #[test]
+    fn connector_value_with_whitespace_does_not_match() {
+        // Documents current behavior: eq_ignore_ascii_case does not trim. SQL property
+        // values are trimmed by the parser before reaching SinkParam, so this case is
+        // unreachable in practice, but the test fixes the contract.
+        let param = make_param(&[("connector", " iceberg ")]);
+        assert_eq!(commit_checkpoint_size_threshold_bytes(&param), None);
     }
 }

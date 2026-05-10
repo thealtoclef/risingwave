@@ -2339,4 +2339,194 @@ mod tests {
             assert_eq!(rows[0].4, Some(schema_change.clone()));
         }
     }
+
+    /// Regression test for the parallelism>1 alignment bug.
+    ///
+    /// Two writers report uncommitted bytes for the same epoch via `report_barrier`. The
+    /// coordinator must:
+    ///   - return `commit_next_barrier=false` while the aggregate is below threshold (no
+    ///     commit fires);
+    ///   - return `commit_next_barrier=true` once the aggregate crosses threshold (still no
+    ///     commit fires — the commit happens at the *next* checkpoint barrier);
+    ///   - actually commit when each writer follows up with a `CommitRequest`.
+    ///
+    /// Before the fix, writers below threshold never sent anything for an epoch and the
+    /// coordinator's BTreeMap front never aligned, so the writer that did cross the
+    /// threshold parked on `coordinator.commit().await` forever.
+    #[tokio::test]
+    async fn test_barrier_report_threshold_alignment() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let db = prepare_db_backend().await;
+
+        // 1 MB threshold; ensure the sink looks iceberg-shaped to the coordinator's helper.
+        let mut properties = std::collections::BTreeMap::new();
+        properties.insert("connector".to_owned(), "iceberg".to_owned());
+        properties.insert(
+            "commit_checkpoint_size_threshold_mb".to_owned(),
+            "1".to_owned(),
+        );
+
+        let param = SinkParam {
+            sink_id: SinkId::from(1),
+            sink_name: "test".into(),
+            properties,
+            columns: vec![],
+            downstream_pk: None,
+            sink_type: SinkType::AppendOnly,
+            ignore_delete: false,
+            format_desc: None,
+            db_name: "test".into(),
+            sink_from_name: "test".into(),
+        };
+
+        let mut all_vnode = (0..VirtualNode::COUNT_FOR_TEST).collect_vec();
+        all_vnode.shuffle(&mut rand::rng());
+        let (first, second) = all_vnode.split_at(VirtualNode::COUNT_FOR_TEST / 2);
+        let build_bitmap = |indexes: &[usize]| {
+            let mut builder = BitmapBuilder::zeroed(VirtualNode::COUNT_FOR_TEST);
+            for i in indexes {
+                builder.set(*i, true);
+            }
+            builder.finish()
+        };
+        let vnode1 = build_bitmap(first);
+        let vnode2 = build_bitmap(second);
+
+        let commit_count = Arc::new(AtomicUsize::new(0));
+        let mock_subscriber: SinkCommittedEpochSubscriber = {
+            Arc::new(move |_sink_id: SinkId| {
+                let (_sender, receiver) = unbounded_channel();
+                async move { Ok((1, receiver)) }.boxed()
+            })
+        };
+
+        let (manager, (_join_handle, _stop_tx)) =
+            SinkCoordinatorManager::start_worker_with_spawn_worker({
+                let expected_param = param.clone();
+                let db = db.clone();
+                let commit_count = commit_count.clone();
+                move |param, new_writer_rx| {
+                    let expected_param = expected_param.clone();
+                    let db = db.clone();
+                    let commit_count = commit_count.clone();
+                    tokio::spawn({
+                        let subscriber = mock_subscriber.clone();
+                        async move {
+                            assert_eq!(param, expected_param);
+                            CoordinatorWorker::execute_coordinator(
+                                db,
+                                param.clone(),
+                                new_writer_rx,
+                                MockSinglePhaseCoordinator::new_coordinator(
+                                    commit_count,
+                                    move |_epoch, _metadata, count: &mut Arc<AtomicUsize>| {
+                                        count.fetch_add(1, Ordering::SeqCst);
+                                        Ok(())
+                                    },
+                                ),
+                                subscriber.clone(),
+                            )
+                            .await;
+                        }
+                    })
+                }
+            });
+
+        let build_client = |vnode| async {
+            CoordinatorStreamHandle::new_with_init_stream(param.to_proto(), vnode, |rx| async {
+                Ok(tonic::Response::new(
+                    manager
+                        .handle_new_request(ReceiverStream::new(rx).map(Ok).boxed())
+                        .await
+                        .unwrap()
+                        .boxed(),
+                ))
+            })
+            .await
+            .unwrap()
+            .0
+        };
+
+        let (mut client1, mut client2) =
+            join(build_client(vnode1), pin!(build_client(vnode2))).await;
+
+        let _ = try_join(
+            client1.align_initial_epoch(100),
+            client2.align_initial_epoch(100),
+        )
+        .await
+        .unwrap();
+
+        // Phase 1: both writers report well below threshold. Total = 200 KB < 1 MB.
+        // Need both reports to align; the first one to arrive blocks waiting for the second.
+        {
+            let mut report1 = pin!(client1.report_barrier(101, 100 * 1024));
+            assert!(
+                poll_fn(|cx| Poll::Ready(report1.as_mut().poll(cx)))
+                    .await
+                    .is_pending(),
+                "report1 must not return until the second writer also reports for epoch 101"
+            );
+            let (decision1, decision2) =
+                join(report1, client2.report_barrier(101, 100 * 1024)).await;
+            assert_eq!(decision1.unwrap(), false, "below-threshold => no commit yet");
+            assert_eq!(decision2.unwrap(), false, "below-threshold => no commit yet");
+        }
+        assert_eq!(
+            commit_count.load(Ordering::SeqCst),
+            0,
+            "no commit must have fired during accumulate phase"
+        );
+
+        // Phase 2: both writers cross threshold. Total = 2 MB >= 1 MB.
+        let (decision1, decision2) = try_join(
+            client1.report_barrier(102, 1024 * 1024),
+            client2.report_barrier(102, 1024 * 1024),
+        )
+        .await
+        .unwrap();
+        assert!(
+            decision1,
+            "above-threshold => coordinator must request commit on next barrier"
+        );
+        assert!(
+            decision2,
+            "above-threshold => coordinator must request commit on next barrier"
+        );
+        assert_eq!(
+            commit_count.load(Ordering::SeqCst),
+            0,
+            "still no commit yet — happens at the next barrier"
+        );
+
+        // Phase 3: each writer follows up with an actual CommitRequest.
+        try_join(
+            client1.commit(
+                103,
+                SinkMetadata {
+                    metadata: Some(Metadata::Serialized(SerializedMetadata {
+                        metadata: vec![1u8],
+                    })),
+                },
+                None,
+            ),
+            client2.commit(
+                103,
+                SinkMetadata {
+                    metadata: Some(Metadata::Serialized(SerializedMetadata {
+                        metadata: vec![2u8],
+                    })),
+                },
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            commit_count.load(Ordering::SeqCst),
+            1,
+            "commit must fire exactly once after both writers send CommitRequest"
+        );
+    }
 }

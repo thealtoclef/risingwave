@@ -19,7 +19,7 @@ use futures::{TryStreamExt, ready};
 use risingwave_common::bitmap::Bitmap;
 use risingwave_connector::sink::SinkParam;
 use risingwave_pb::connector_service::coordinate_response::{
-    CommitResponse, StartCoordinationResponse,
+    BarrierReportResponse, CommitResponse, StartCoordinationResponse,
 };
 use risingwave_pb::connector_service::{
     CoordinateResponse, coordinate_request, coordinate_response,
@@ -102,6 +102,28 @@ impl SinkWriterCoordinationHandle {
             .map_err(|_| anyhow!("fail to send commit response of epoch {}", epoch))
     }
 
+    pub(super) fn ack_barrier_report(
+        &mut self,
+        epoch: u64,
+        commit_next_barrier: bool,
+    ) -> anyhow::Result<()> {
+        self.response_tx
+            .send(Ok(CoordinateResponse {
+                msg: Some(coordinate_response::Msg::BarrierReportResponse(
+                    BarrierReportResponse {
+                        epoch,
+                        commit_next_barrier,
+                    },
+                )),
+            }))
+            .map_err(|_| {
+                anyhow!(
+                    "fail to send barrier report response of epoch {}",
+                    epoch
+                )
+            })
+    }
+
     pub(super) fn stop(&mut self) -> anyhow::Result<()> {
         self.response_tx
             .send(Ok(CoordinateResponse {
@@ -145,6 +167,18 @@ impl SinkWriterCoordinationHandle {
                             .ok_or_else(|| anyhow!("empty vnode bitmap"))?,
                     );
                     self.vnode_bitmap = bitmap;
+                }
+                coordinate_request::Msg::BarrierReport(request) => {
+                    if let Some(prev_epoch) = self.prev_epoch
+                        && request.epoch < prev_epoch
+                    {
+                        return Poll::Ready(Err(anyhow!(
+                            "invalid barrier report epoch {}, prev_epoch {}",
+                            request.epoch,
+                            prev_epoch
+                        )));
+                    }
+                    self.prev_epoch = Some(request.epoch);
                 }
             };
             request
