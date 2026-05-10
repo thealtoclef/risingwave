@@ -81,6 +81,18 @@ struct AligningRequests<R> {
     committed_bitmap: Option<Bitmap>, // lazy-initialized on first request
 }
 
+// Derive adds an `R: Default` bound which WriterReport doesn't satisfy.
+impl Default for AligningRequests<WriterReport> {
+    fn default() -> Self {
+        Self {
+            requests: Vec::new(),
+            handle_ids: HashSet::new(),
+            handle_ids_in_order: Vec::new(),
+            committed_bitmap: None,
+        }
+    }
+}
+
 impl<R> AligningRequests<R> {
     fn add_new_request(
         &mut self,

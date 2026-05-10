@@ -237,7 +237,6 @@ pub struct IcebergSinkWriterInner {
     // For chunk with extra partition column, we should remove this column before write.
     // This project index vec is used to avoid create project idx each time.
     project_idx_vec: ProjectIdxVec,
-    commit_checkpoint_size_threshold_bytes: Option<u64>,
     uncommitted_write_bytes: u64,
 }
 
@@ -399,7 +398,6 @@ impl IcebergSinkWriterInner {
                     ProjectIdxVec::None
                 }
             },
-            commit_checkpoint_size_threshold_bytes: config.commit_checkpoint_size_threshold_bytes(),
             uncommitted_write_bytes: 0,
         })
     }
@@ -589,7 +587,6 @@ impl IcebergSinkWriterInner {
                     ProjectIdxVec::None
                 }
             },
-            commit_checkpoint_size_threshold_bytes: config.commit_checkpoint_size_threshold_bytes(),
             uncommitted_write_bytes: 0,
         })
     }
