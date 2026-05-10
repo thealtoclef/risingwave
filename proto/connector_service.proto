@@ -233,22 +233,22 @@ message CoordinateRequest {
     SinkParam param = 2;
   }
 
+  // Sent at every checkpoint barrier. When the writer locally decides to
+  // commit (interval, schema change, vnode update, stop, or piggybacked
+  // signal from the coordinator), `metadata` is set and `uncommitted_bytes`
+  // is 0. Otherwise the writer reports its current buffered byte count via
+  // `uncommitted_bytes`, leaves its iceberg writer open across the epoch,
+  // and lets the coordinator decide whether to commit at the next barrier
+  // (see CommitResponse.commit_next_barrier).
   message CommitRequest {
     uint64 epoch = 1;
     SinkMetadata metadata = 2;
     stream_plan.SinkSchemaChange schema_change = 3;
+    uint64 uncommitted_bytes = 4;
   }
 
   message UpdateVnodeBitmapRequest {
     common.Buffer vnode_bitmap = 1;
-  }
-
-  // Per-checkpoint-barrier report from a writer that did not locally trigger a
-  // commit. Lets the coordinator aggregate uncommitted byte counts across all
-  // writers and centrally decide whether to commit at the next barrier.
-  message BarrierReportRequest {
-    uint64 epoch = 1;
-    uint64 uncommitted_bytes = 2;
   }
 
   oneof msg {
@@ -257,7 +257,6 @@ message CoordinateRequest {
     UpdateVnodeBitmapRequest update_vnode_request = 3;
     bool stop = 4;
     uint64 align_initial_epoch_request = 5;
-    BarrierReportRequest barrier_report = 6;
   }
 }
 
@@ -266,15 +265,14 @@ message CoordinateResponse {
     optional uint64 log_store_rewind_start_epoch = 1;
   }
 
+  // Reply to CommitRequest.
+  //   - On a real commit (CommitRequest carried metadata): epoch echoes the
+  //     committed epoch; commit_next_barrier is unset/false.
+  //   - On a barrier report (CommitRequest carried no metadata):
+  //     commit_next_barrier=true tells the writer the aggregate uncommitted
+  //     bytes have crossed the snapshot threshold and it must close its files
+  //     and send a real CommitRequest at the next checkpoint barrier.
   message CommitResponse {
-    uint64 epoch = 1;
-  }
-
-  // Reply to BarrierReportRequest. commit_next_barrier=true tells the writer
-  // that the aggregate uncommitted bytes have crossed the snapshot threshold;
-  // the writer must close its files and send CommitRequest at the next
-  // checkpoint barrier.
-  message BarrierReportResponse {
     uint64 epoch = 1;
     bool commit_next_barrier = 2;
   }
@@ -284,7 +282,6 @@ message CoordinateResponse {
     CommitResponse commit_response = 2;
     bool stopped = 3;
     uint64 align_initial_epoch_response = 4;
-    BarrierReportResponse barrier_report_response = 5;
   }
 }
 

@@ -19,7 +19,7 @@ use futures::{TryStreamExt, ready};
 use risingwave_common::bitmap::Bitmap;
 use risingwave_connector::sink::SinkParam;
 use risingwave_pb::connector_service::coordinate_response::{
-    BarrierReportResponse, CommitResponse, StartCoordinationResponse,
+    CommitResponse, StartCoordinationResponse,
 };
 use risingwave_pb::connector_service::{
     CoordinateResponse, coordinate_request, coordinate_response,
@@ -97,11 +97,15 @@ impl SinkWriterCoordinationHandle {
             .send(Ok(CoordinateResponse {
                 msg: Some(coordinate_response::Msg::CommitResponse(CommitResponse {
                     epoch,
+                    commit_next_barrier: false,
                 })),
             }))
             .map_err(|_| anyhow!("fail to send commit response of epoch {}", epoch))
     }
 
+    /// Reply to a `CommitRequest` that carried no metadata (a barrier report).
+    /// `commit_next_barrier=true` tells the writer to close its files and send a real
+    /// commit at the next checkpoint barrier.
     pub(super) fn ack_barrier_report(
         &mut self,
         epoch: u64,
@@ -109,19 +113,12 @@ impl SinkWriterCoordinationHandle {
     ) -> anyhow::Result<()> {
         self.response_tx
             .send(Ok(CoordinateResponse {
-                msg: Some(coordinate_response::Msg::BarrierReportResponse(
-                    BarrierReportResponse {
-                        epoch,
-                        commit_next_barrier,
-                    },
-                )),
+                msg: Some(coordinate_response::Msg::CommitResponse(CommitResponse {
+                    epoch,
+                    commit_next_barrier,
+                })),
             }))
-            .map_err(|_| {
-                anyhow!(
-                    "fail to send barrier report response of epoch {}",
-                    epoch
-                )
-            })
+            .map_err(|_| anyhow!("fail to send barrier report response of epoch {}", epoch))
     }
 
     pub(super) fn stop(&mut self) -> anyhow::Result<()> {
@@ -145,6 +142,9 @@ impl SinkWriterCoordinationHandle {
                 | coordinate_request::Msg::Stop(_)
                 | coordinate_request::Msg::AlignInitialEpochRequest(_) => {}
                 coordinate_request::Msg::CommitRequest(request) => {
+                    // CommitRequest with metadata=Some is a real commit; with metadata=None
+                    // it's a barrier report carrying only `uncommitted_bytes`. Both advance
+                    // prev_epoch.
                     if let Some(prev_epoch) = self.prev_epoch
                         && request.epoch < prev_epoch
                     {
@@ -154,9 +154,11 @@ impl SinkWriterCoordinationHandle {
                             prev_epoch
                         )));
                     }
-                    if request.metadata.is_none() {
-                        return Poll::Ready(Err(anyhow!("empty commit metadata")));
-                    };
+                    if request.metadata.is_none() && request.schema_change.is_some() {
+                        return Poll::Ready(Err(anyhow!(
+                            "barrier report cannot carry schema change"
+                        )));
+                    }
                     self.prev_epoch = Some(request.epoch);
                 }
                 coordinate_request::Msg::UpdateVnodeRequest(request) => {
@@ -167,18 +169,6 @@ impl SinkWriterCoordinationHandle {
                             .ok_or_else(|| anyhow!("empty vnode bitmap"))?,
                     );
                     self.vnode_bitmap = bitmap;
-                }
-                coordinate_request::Msg::BarrierReport(request) => {
-                    if let Some(prev_epoch) = self.prev_epoch
-                        && request.epoch < prev_epoch
-                    {
-                        return Poll::Ready(Err(anyhow!(
-                            "invalid barrier report epoch {}, prev_epoch {}",
-                            request.epoch,
-                            prev_epoch
-                        )));
-                    }
-                    self.prev_epoch = Some(request.epoch);
                 }
             };
             request

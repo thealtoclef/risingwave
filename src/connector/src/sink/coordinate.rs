@@ -160,7 +160,7 @@ impl<W: SinkWriter<CommitMetadata = Option<SinkMetadata>>> LogSinker for Coordin
         let mut state = LogConsumerState::Uninitialized;
 
         let mut current_checkpoint: u64 = 0;
-        // Set by the coordinator's BarrierReportResponse on the previous checkpoint barrier
+        // Set by the coordinator's CommitResponse to a barrier-report on the previous barrier
         // when the aggregate uncommitted bytes have crossed the snapshot threshold. We close
         // the iceberg writer and send a CommitRequest at the next checkpoint barrier.
         let mut commit_next_barrier = false;

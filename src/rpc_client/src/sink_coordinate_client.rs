@@ -18,7 +18,7 @@ use anyhow::anyhow;
 use futures::{Stream, TryStreamExt};
 use risingwave_common::bitmap::Bitmap;
 use risingwave_pb::connector_service::coordinate_request::{
-    BarrierReportRequest, CommitRequest, StartCoordinationRequest, UpdateVnodeBitmapRequest,
+    CommitRequest, StartCoordinationRequest, UpdateVnodeBitmapRequest,
 };
 use risingwave_pb::connector_service::coordinate_response::StartCoordinationResponse;
 use risingwave_pb::connector_service::{
@@ -96,26 +96,29 @@ impl CoordinatorStreamHandle {
     /// Report uncommitted bytes to the coordinator without committing. Returns whether the
     /// coordinator wants this writer (and all aligned peers) to commit at the next checkpoint
     /// barrier — i.e., the aggregate has crossed the snapshot threshold.
+    ///
+    /// Wire-format-wise this is a `CommitRequest` with `metadata=None`; the server discriminates
+    /// by `metadata.is_some()`.
     pub async fn report_barrier(
         &mut self,
         epoch: u64,
         uncommitted_bytes: u64,
     ) -> anyhow::Result<bool> {
         self.send_request(CoordinateRequest {
-            msg: Some(coordinate_request::Msg::BarrierReport(
-                BarrierReportRequest {
-                    epoch,
-                    uncommitted_bytes,
-                },
-            )),
+            msg: Some(coordinate_request::Msg::CommitRequest(CommitRequest {
+                epoch,
+                metadata: None,
+                schema_change: None,
+                uncommitted_bytes,
+            })),
         })
         .await?;
         match self.next_response().await? {
             CoordinateResponse {
-                msg: Some(coordinate_response::Msg::BarrierReportResponse(resp)),
+                msg: Some(coordinate_response::Msg::CommitResponse(resp)),
             } => Ok(resp.commit_next_barrier),
             msg => Err(anyhow!(
-                "should get BarrierReportResponse but get {:?}",
+                "should get CommitResponse for barrier report but got {:?}",
                 msg
             )),
         }
@@ -132,6 +135,7 @@ impl CoordinatorStreamHandle {
                 epoch,
                 metadata: Some(metadata),
                 schema_change,
+                uncommitted_bytes: 0,
             })),
         })
         .await?;

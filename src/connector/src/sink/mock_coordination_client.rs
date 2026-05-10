@@ -14,7 +14,7 @@
 
 use risingwave_common::bitmap::Bitmap;
 use risingwave_pb::connector_service::coordinate_response::{
-    self, BarrierReportResponse, CommitResponse, StartCoordinationResponse,
+    self, CommitResponse, StartCoordinationResponse,
 };
 use risingwave_pb::connector_service::{
     CoordinateRequest, CoordinateResponse, PbSinkParam, coordinate_request,
@@ -160,17 +160,36 @@ impl MockSinkCoordinationRpcClient {
                                     epoch,
                                     metadata,
                                     schema_change,
+                                    uncommitted_bytes: _,
                                 },
                             )),
                     }) => {
+                        // CommitRequest with metadata=None is a barrier report — the mock
+                        // can't aggregate bytes across writers, so it always replies
+                        // commit_next_barrier=false. Force-commit triggers (interval /
+                        // vnode update / stop / schema change) carry metadata and run the
+                        // mock's commit path below.
+                        let Some(metadata) = metadata else {
+                            response_tx_clone
+                                .clone()
+                                .send(Ok(CoordinateResponse {
+                                    msg: Some(coordinate_response::Msg::CommitResponse(
+                                        CommitResponse {
+                                            epoch,
+                                            commit_next_barrier: false,
+                                        },
+                                    )),
+                                }))
+                                .await
+                                .map_err(|e| Status::from_error(Box::new(e)))?;
+                            continue;
+                        };
                         let result: Result<(), SinkError> = try {
                             let mut guard = mock_coordinator_committer.lock().await;
                             match &mut *guard {
                                 SinkCommitCoordinator::SinglePhase(coordinator) => {
                                     coordinator.init().await?;
-                                    coordinator
-                                        .commit_data(epoch, vec![metadata.unwrap()])
-                                        .await?;
+                                    coordinator.commit_data(epoch, vec![metadata]).await?;
                                     if let Some(schema_change) = schema_change {
                                         coordinator
                                             .commit_schema_change(epoch, schema_change)
@@ -182,7 +201,7 @@ impl MockSinkCoordinationRpcClient {
                                     let metadata = coordinator
                                         .pre_commit(
                                             epoch,
-                                            vec![metadata.unwrap()],
+                                            vec![metadata],
                                             schema_change.clone(),
                                         )
                                         .await?;
@@ -202,26 +221,7 @@ impl MockSinkCoordinationRpcClient {
                             .clone()
                             .send(Ok(CoordinateResponse {
                                 msg: Some(coordinate_response::Msg::CommitResponse(
-                                    CommitResponse { epoch },
-                                )),
-                            }))
-                            .await
-                            .map_err(|e| Status::from_error(Box::new(e)))?;
-                    }
-                    Some(CoordinateRequest {
-                        msg:
-                            Some(coordinate_request::Msg::BarrierReport(
-                                coordinate_request::BarrierReportRequest { epoch, .. },
-                            )),
-                    }) => {
-                        // Mock never asks the writer to commit on size; force-commit triggers
-                        // (interval / vnode update / stop / schema change) flow through
-                        // CommitRequest, which is handled above.
-                        response_tx_clone
-                            .clone()
-                            .send(Ok(CoordinateResponse {
-                                msg: Some(coordinate_response::Msg::BarrierReportResponse(
-                                    BarrierReportResponse {
+                                    CommitResponse {
                                         epoch,
                                         commit_next_barrier: false,
                                     },
@@ -233,7 +233,7 @@ impl MockSinkCoordinationRpcClient {
                     msg => {
                         return Err::<ReceiverStream<CoordinateResponse>, tonic::Status>(
                             Status::invalid_argument(format!(
-                                "expected CoordinateRequest::CommitRequest or BarrierReport, get {:?}",
+                                "expected CoordinateRequest::CommitRequest, get {:?}",
                                 msg
                             )),
                         );
