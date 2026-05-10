@@ -655,10 +655,12 @@ mod tests {
     fn test_create_insert_sql() {
         let schema = Schema::new(vec![
             Field {
+                description: None,
                 data_type: DataType::Int32,
                 name: "a".to_owned(),
             },
             Field {
+                description: None,
                 data_type: DataType::Int32,
                 name: "b".to_owned(),
             },
@@ -676,10 +678,12 @@ mod tests {
     fn test_create_delete_sql() {
         let schema = Schema::new(vec![
             Field {
+                description: None,
                 data_type: DataType::Int32,
                 name: "a".to_owned(),
             },
             Field {
+                description: None,
                 data_type: DataType::Int32,
                 name: "b".to_owned(),
             },
@@ -703,10 +707,12 @@ mod tests {
     fn test_create_upsert_sql() {
         let schema = Schema::new(vec![
             Field {
+                description: None,
                 data_type: DataType::Int32,
                 name: "a".to_owned(),
             },
             Field {
+                description: None,
                 data_type: DataType::Int32,
                 name: "b".to_owned(),
             },
@@ -727,10 +733,12 @@ mod tests {
     fn test_create_upsert_sql_all_columns_are_primary_keys() {
         let schema = Schema::new(vec![
             Field {
+                description: None,
                 data_type: DataType::Int32,
                 name: "user_id".to_owned(),
             },
             Field {
+                description: None,
                 data_type: DataType::Int32,
                 name: "client_id".to_owned(),
             },

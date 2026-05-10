@@ -433,7 +433,7 @@ mod tests {
     use risingwave_pb::stream_plan::{PbSinkAddColumnsOp, PbSinkSchemaChange};
     use risingwave_rpc_client::CoordinatorStreamHandle;
     use sea_orm::{ConnectionTrait, Database, DatabaseConnection};
-    use tokio::sync::mpsc::unbounded_channel;
+    use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
     use tokio_stream::wrappers::ReceiverStream;
 
     use crate::manager::sink_coordination::SinkCoordinatorManager;
@@ -2394,10 +2394,18 @@ mod tests {
         let vnode2 = build_bitmap(second);
 
         let commit_count = Arc::new(AtomicUsize::new(0));
+        let sender = Arc::new(tokio::sync::Mutex::new(None::<UnboundedSender<u64>>));
         let mock_subscriber: SinkCommittedEpochSubscriber = {
+            let captured_sender = sender.clone();
             Arc::new(move |_sink_id: SinkId| {
-                let (_sender, receiver) = unbounded_channel();
-                async move { Ok((1, receiver)) }.boxed()
+                let (sender, receiver) = unbounded_channel();
+                let captured_sender = captured_sender.clone();
+                async move {
+                    let mut guard = captured_sender.lock().await;
+                    *guard = Some(sender);
+                    Ok((1, receiver))
+                }
+                .boxed()
             })
         };
 
