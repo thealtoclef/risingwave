@@ -293,6 +293,13 @@ impl IcebergSinkWriter {
             unique_column_ids,
         })
     }
+
+    pub fn buffered_bytes(&self) -> u64 {
+        match self {
+            Self::Initialized(inner) => inner.uncommitted_write_bytes,
+            Self::Created(_) => 0,
+        }
+    }
 }
 
 impl IcebergSinkWriterInner {

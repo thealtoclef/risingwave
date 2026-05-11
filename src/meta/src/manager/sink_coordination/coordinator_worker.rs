@@ -357,6 +357,10 @@ enum CoordinationHandleManagerEvent {
         metadata: SinkMetadata,
         schema_change: Option<PbSinkSchemaChange>,
     },
+    ReportBytes {
+        epoch: u64,
+        buffered_bytes: u64,
+    },
     AlignInitialEpoch(u64),
 }
 
@@ -367,6 +371,7 @@ impl CoordinationHandleManagerEvent {
             CoordinationHandleManagerEvent::UpdateVnodeBitmap => "UpdateVnodeBitmap",
             CoordinationHandleManagerEvent::Stop => "Stop",
             CoordinationHandleManagerEvent::CommitRequest { .. } => "CommitRequest",
+            CoordinationHandleManagerEvent::ReportBytes { .. } => "ReportBytes",
             CoordinationHandleManagerEvent::AlignInitialEpoch(_) => "AlignInitialEpoch",
         }
     }
@@ -393,6 +398,12 @@ impl CoordinationHandleManager {
                             epoch: request.epoch,
                             metadata: request.metadata.ok_or_else(|| anyhow!("empty sink metadata"))?,
                             schema_change: request.schema_change,
+                        }
+                    }
+                    coordinate_request::Msg::ReportBytesRequest(request) => {
+                        CoordinationHandleManagerEvent::ReportBytes {
+                            epoch: request.epoch,
+                            buffered_bytes: request.buffered_bytes,
                         }
                     }
                     coordinate_request::Msg::AlignInitialEpochRequest(epoch) => {
@@ -475,6 +486,13 @@ impl CoordinationHandleManager {
                 CoordinationHandleManagerEvent::CommitRequest { epoch, .. } => {
                     bail!(
                         "receive commit request on epoch {} from handle {} during alter parallelism",
+                        epoch,
+                        handle_id
+                    );
+                }
+                CoordinationHandleManagerEvent::ReportBytes { epoch, .. } => {
+                    bail!(
+                        "receive ReportBytes on epoch {} from handle {} during alter parallelism",
                         epoch,
                         handle_id
                     );
@@ -675,7 +693,13 @@ impl CoordinatorWorker {
         self.try_handle_init_requests(&running_handles, &mut two_phase_handler)
             .await?;
 
+        let commit_checkpoint_size_threshold_bytes: Option<u64> =
+            self.handle_manager.param.properties.get("commit_checkpoint_size_threshold_mb")
+                .and_then(|v| v.parse::<u64>().ok())
+                .map(|mb| mb.saturating_mul(1024 * 1024));
+
         let mut pending_epochs: BTreeMap<u64, AligningRequests<_>> = BTreeMap::new();
+        let mut pending_byte_reports: BTreeMap<u64, AligningRequests<u64>> = BTreeMap::new();
         let mut pending_new_handles = vec![];
         loop {
             let event = self.next_event(&mut two_phase_handler).await?;
@@ -712,6 +736,48 @@ impl CoordinatorWorker {
                     } => (handle_id, epoch, (metadata, schema_change)),
                     CoordinationHandleManagerEvent::AlignInitialEpoch(_) => {
                         bail!("receive AlignInitialEpoch after initialization")
+                    }
+                    CoordinationHandleManagerEvent::ReportBytes {
+                        epoch,
+                        buffered_bytes,
+                    } => {
+                        if !running_handles.contains(&handle_id) {
+                            bail!(
+                                "receiving report bytes from non-running handle {}, running handles: {:?}",
+                                handle_id,
+                                running_handles
+                            );
+                        }
+                        pending_byte_reports
+                            .entry(epoch)
+                            .or_default()
+                            .add_new_request(
+                                handle_id,
+                                buffered_bytes,
+                                self.handle_manager.vnode_bitmap(handle_id),
+                            )?;
+                        if pending_byte_reports
+                            .first_key_value()
+                            .expect("non-empty")
+                            .1
+                            .aligned()
+                        {
+                            let (report_epoch, reports) =
+                                pending_byte_reports.pop_first().expect("non-empty");
+                            let total_bytes: u64 = reports.requests.iter().sum();
+                            let should_commit =
+                                commit_checkpoint_size_threshold_bytes.is_some_and(|threshold| {
+                                    total_bytes > 0 && total_bytes >= threshold
+                                });
+                            for hid in reports.handle_ids {
+                                self.handle_manager.send_report_bytes_response(
+                                    hid,
+                                    report_epoch,
+                                    should_commit,
+                                )?;
+                            }
+                        }
+                        continue;
                     }
                 },
                 CoordinatorWorkerEvent::ReadyToCommit(epoch, metadata, schema_change) => {
