@@ -863,15 +863,14 @@ public class PgOutputMessageDecoder extends AbstractMessageDecoder {
     }
 
     /**
-     * Parses a Postgres text array representation into a Java List of the
-     * appropriate element type. The upstream Debezium resolveValue() loses
-     * array type context when recursing from array types (e.g. _float4) to
-     * their parent element types (e.g. float4). This method handles the
+     * Parses a Postgres text array representation into a Java List of the appropriate element type.
+     * The upstream Debezium resolveValue() loses array type context when recursing from array types
+     * (e.g. _float4) to their parent element types (e.g. float4). This method handles the
      * conversion directly.
      *
      * @param rawValue the raw text array (e.g. "{1.5,2.3,NULL}")
-     * @param arrayType the PostgresType for the array (e.g. _float4);
-     *        must have {@code isArrayType() == true}
+     * @param arrayType the PostgresType for the array (e.g. _float4); must have {@code
+     *     isArrayType() == true}
      * @param columnName the column name for logging
      * @return a List of boxed Java objects, or null if parsing fails
      */
@@ -889,9 +888,7 @@ public class PgOutputMessageDecoder extends AbstractMessageDecoder {
         }
 
         if (!trimmed.startsWith("{") || !trimmed.endsWith("}")) {
-            LOGGER.warn(
-                    "Malformed Postgres text array for column '{}': {}",
-                    columnName, rawValue);
+            LOGGER.warn("Malformed Postgres text array for column '{}': {}", columnName, rawValue);
             return null;
         }
 
@@ -902,14 +899,12 @@ public class PgOutputMessageDecoder extends AbstractMessageDecoder {
             elements = splitArrayElements(inner);
         } catch (Exception e) {
             LOGGER.warn(
-                    "Failed to parse array elements for column '{}': {}",
-                    columnName, rawValue, e);
+                    "Failed to parse array elements for column '{}': {}", columnName, rawValue, e);
             return null;
         }
 
         PostgresType elementType = arrayType.getElementType();
-        String elementTypeName =
-                elementType != null ? elementType.getName().toLowerCase() : "text";
+        String elementTypeName = elementType != null ? elementType.getName().toLowerCase() : "text";
 
         List<Object> result = new ArrayList<>(elements.size());
         for (String elem : elements) {
@@ -919,9 +914,8 @@ public class PgOutputMessageDecoder extends AbstractMessageDecoder {
     }
 
     /**
-     * Splits the inner content of a Postgres text array into individual
-     * elements, respecting double-quoted strings, escape sequences, and
-     * nested braces.
+     * Splits the inner content of a Postgres text array into individual elements, respecting
+     * double-quoted strings, escape sequences, and nested braces.
      */
     private static List<String> splitArrayElements(String inner) {
         List<String> result = new ArrayList<>();
@@ -960,8 +954,8 @@ public class PgOutputMessageDecoder extends AbstractMessageDecoder {
     }
 
     /**
-     * Converts a single Postgres text array element string to the
-     * appropriate boxed Java type based on the element type name.
+     * Converts a single Postgres text array element string to the appropriate boxed Java type based
+     * on the element type name.
      */
     private static Object parseArrayElement(
             String rawElement, String elementTypeName, String columnName) {
@@ -1010,7 +1004,10 @@ public class PgOutputMessageDecoder extends AbstractMessageDecoder {
             LOGGER.warn(
                     "Failed to parse array element '{}' as type '{}' for column '{}', "
                             + "returning as string",
-                    element, elementTypeName, columnName, e);
+                    element,
+                    elementTypeName,
+                    columnName,
+                    e);
             return element;
         }
     }
