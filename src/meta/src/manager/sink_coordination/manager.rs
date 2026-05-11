@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::pin::pin;
 use std::sync::Arc;
 
@@ -404,6 +404,7 @@ impl ManagerWorker {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::future::{Future, poll_fn};
     use std::pin::pin;
     use std::sync::Arc;

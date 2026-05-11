@@ -220,10 +220,14 @@ impl<W: SinkWriter<CommitMetadata = Option<SinkMetadata>>> LogSinker for Coordin
                     };
                     if is_checkpoint {
                         current_checkpoint += 1;
-                        let is_forced = current_checkpoint >= commit_checkpoint_interval.get()
-                            || new_vnode_bitmap.is_some()
-                            || is_stop
-                            || schema_change.is_some();
+                        let is_forced = should_commit_on_checkpoint_barrier(
+                            current_checkpoint,
+                            commit_checkpoint_interval,
+                            false, // size-based decision is now made by the coordinator
+                            new_vnode_bitmap.is_some(),
+                            is_stop,
+                            schema_change.is_some(),
+                        );
 
                         if is_forced {
                             let start_time = Instant::now();

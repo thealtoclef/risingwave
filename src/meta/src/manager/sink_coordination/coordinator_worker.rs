@@ -333,6 +333,31 @@ impl CoordinationHandleManager {
         Ok(())
     }
 
+    fn send_report_bytes_response(
+        &mut self,
+        epoch: u64,
+        should_commit: bool,
+        handle_ids: impl IntoIterator<Item = HandleId>,
+    ) -> anyhow::Result<()> {
+        for handle_id in handle_ids {
+            let handle = self.writer_handles.get_mut(&handle_id).ok_or_else(|| {
+                anyhow!(
+                    "fail to find handle for {} when sending report bytes response on epoch {}",
+                    handle_id,
+                    epoch
+                )
+            })?;
+            handle.send_report_bytes_response(epoch, should_commit).map_err(|_| {
+                anyhow!(
+                    "fail to send report bytes response on epoch {} for handle {}",
+                    epoch,
+                    handle_id
+                )
+            })?;
+        }
+        Ok(())
+    }
+
     async fn next_request_inner(
         writer_handles: &mut HashMap<HandleId, SinkWriterCoordinationHandle>,
     ) -> anyhow::Result<(HandleId, coordinate_request::Msg)> {
@@ -769,13 +794,11 @@ impl CoordinatorWorker {
                                 commit_checkpoint_size_threshold_bytes.is_some_and(|threshold| {
                                     total_bytes > 0 && total_bytes >= threshold
                                 });
-                            for hid in reports.handle_ids {
-                                self.handle_manager.send_report_bytes_response(
-                                    hid,
-                                    report_epoch,
-                                    should_commit,
-                                )?;
-                            }
+                            self.handle_manager.send_report_bytes_response(
+                                report_epoch,
+                                should_commit,
+                                reports.handle_ids,
+                            )?;
                         }
                         continue;
                     }
