@@ -237,6 +237,7 @@ pub struct IcebergSinkWriterInner {
     // For chunk with extra partition column, we should remove this column before write.
     // This project index vec is used to avoid create project idx each time.
     project_idx_vec: ProjectIdxVec,
+    uncommitted_write_bytes: u64,
 }
 
 enum IcebergWriterDispatch {
@@ -403,6 +404,7 @@ impl IcebergSinkWriterInner {
                     ProjectIdxVec::None
                 }
             },
+            uncommitted_write_bytes: 0,
         })
     }
 
@@ -591,6 +593,7 @@ impl IcebergSinkWriterInner {
                     ProjectIdxVec::None
                 }
             },
+            uncommitted_write_bytes: 0,
         })
     }
 }
@@ -722,13 +725,6 @@ impl SinkWriter for IcebergSinkWriter {
             .map_err(|err| SinkError::Iceberg(anyhow!(err)))?;
         inner.metrics.write_bytes.inc_by(write_batch_size as _);
         Ok(())
-    }
-
-    fn should_commit_on_checkpoint(&self) -> bool {
-        match self {
-            Self::Initialized(inner) => inner.should_commit_on_checkpoint(),
-            Self::Created(_) => false,
-        }
     }
 
     fn buffered_bytes(&self) -> u64 {

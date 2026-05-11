@@ -341,6 +341,13 @@ pub struct IcebergConfig {
     #[with_option(allow_alter_on_fly)]
     pub commit_checkpoint_interval: u64,
 
+    /// Commit on the next checkpoint barrier after total buffered write size across all
+    /// writers exceeds this threshold. The decision is made by the coordinator, not by
+    /// individual writers. Opt-in — no default.
+    #[serde(default)]
+    #[serde_as(as = "Option<DisplayFromStr>")]
+    #[with_option(allow_alter_on_fly)]
+    pub commit_checkpoint_size_threshold_mb: Option<u64>,
     #[serde(default, deserialize_with = "deserialize_bool_from_string")]
     pub create_table_if_not_exists: bool,
 
