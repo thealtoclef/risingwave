@@ -450,7 +450,10 @@ fn versions_are_newer_or_equal(
 /// TOAST column handling for CDC tables with TOAST columns.
 mod toast {
     use risingwave_common::row::Row as _;
-    use risingwave_common::types::{DEBEZIUM_UNAVAILABLE_VALUE, DEBEZIUM_UNAVAILABLE_VECTOR_ELEM};
+    use risingwave_common::types::{
+        DEBEZIUM_UNAVAILABLE_FLOAT32_ELEM, DEBEZIUM_UNAVAILABLE_FLOAT64_ELEM,
+        DEBEZIUM_UNAVAILABLE_VALUE, DEBEZIUM_UNAVAILABLE_VECTOR_ELEM,
+    };
 
     use super::*;
 
@@ -498,6 +501,16 @@ mod toast {
                     && slice
                         .iter()
                         .all(|f| f.0 == DEBEZIUM_UNAVAILABLE_VECTOR_ELEM)
+            }
+            Some(risingwave_common::types::ScalarRefImpl::Float32(val)) => {
+                // Floating-point array TOAST sentinel: the JSON parser materialises a
+                // single-element list holding `f32::MAX` for an unchanged-TOAST `real[]`.
+                // A real `real[]` containing exactly `f32::MAX` is effectively impossible.
+                val.0 == DEBEZIUM_UNAVAILABLE_FLOAT32_ELEM
+            }
+            Some(risingwave_common::types::ScalarRefImpl::Float64(val)) => {
+                // Same as above for `double precision[]` (`f64::MAX`).
+                val.0 == DEBEZIUM_UNAVAILABLE_FLOAT64_ELEM
             }
             Some(risingwave_common::types::ScalarRefImpl::List(list_ref)) => {
                 // For list type, check if it contains exactly one element with the unavailable value

@@ -256,8 +256,11 @@ impl<S: StateStore, SD: ValueRowSerde> MaterializeExecutor<S, SD> {
                     // - varchar (DataType::Varchar)
                     // - bytea (DataType::Bytea)
                     // - pgvector (DataType::Vector)
-                    // - One-dimensional arrays of the above types (DataType::List)
-                    //   Note: Some array types may not be fully supported yet, see issue  https://github.com/risingwavelabs/risingwave/issues/22916 for details.
+                    // - One-dimensional arrays of the above types, plus real[]/double precision[]
+                    //   (DataType::List). Integer/decimal/temporal arrays have no impossible
+                    //   sentinel value and fall back to null under REPLICA IDENTITY DEFAULT; use
+                    //   REPLICA IDENTITY FULL for full-fidelity TOAST on those. See issue
+                    //   https://github.com/risingwavelabs/risingwave/issues/22916 for details.
 
                     // For details on how TOAST values are handled, see comments in `is_debezium_unavailable_value`.
                     DataType::Varchar

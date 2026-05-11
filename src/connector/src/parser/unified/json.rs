@@ -22,6 +22,7 @@ use risingwave_common::array::{Finite32, ListValue, StructValue};
 use risingwave_common::cast::{i64_to_timestamp, i64_to_timestamptz, str_to_bytea};
 use risingwave_common::log::LogSuppressor;
 use risingwave_common::types::{
+    DEBEZIUM_UNAVAILABLE_FLOAT32_ELEM, DEBEZIUM_UNAVAILABLE_FLOAT64_ELEM, DEBEZIUM_UNAVAILABLE_JSON,
     DEBEZIUM_UNAVAILABLE_VALUE, DataType, Date, Decimal, Int256, Interval, JsonbVal, ScalarImpl,
     Time, Timestamp, Timestamptz, ToOwnedDatum, VectorVal, debezium_unavailable_vector,
 };
@@ -676,6 +677,42 @@ impl JsonParseOptions {
                 builder.finish()
             })
             .into(),
+            // ---- List from Postgres text array (via `PgArrayToStringConverter`) -----
+            // The converter registers an OPTIONAL STRING schema for all Postgres array columns,
+            // so values arrive here as the text array format "{1.5,2.3,NULL}" or, for an unchanged
+            // TOAST'd column, as the placeholder string.
+            (DataType::List(list_type), ValueType::String) => {
+                let s = value.as_str().unwrap();
+                if self.handle_toast_columns && s == DEBEZIUM_UNAVAILABLE_VALUE {
+                    // Emit a single-element sentinel list that `is_debezium_unavailable_value` in
+                    // the materialize cache detects and replaces with the previous value. Element
+                    // types that can carry the signal: string-compatible types hold the placeholder
+                    // string; floating-point types hold the magic `f32::MAX`/`f64::MAX` element
+                    // (mirroring the pgvector sentinel). Integer/decimal/temporal arrays have no
+                    // impossible value to reserve, so they fall back to null — use
+                    // `REPLICA IDENTITY FULL` for full-fidelity TOAST on those
+                    // (risingwavelabs/risingwave#22916).
+                    let sentinel = match list_type.elem() {
+                        DataType::Varchar => ScalarImpl::Utf8(DEBEZIUM_UNAVAILABLE_VALUE.into()),
+                        DataType::Jsonb => ScalarImpl::Jsonb(DEBEZIUM_UNAVAILABLE_JSON.clone()),
+                        DataType::Bytea => {
+                            ScalarImpl::Bytea(DEBEZIUM_UNAVAILABLE_VALUE.as_bytes().into())
+                        }
+                        DataType::Float32 => {
+                            ScalarImpl::Float32(DEBEZIUM_UNAVAILABLE_FLOAT32_ELEM.into())
+                        }
+                        DataType::Float64 => {
+                            ScalarImpl::Float64(DEBEZIUM_UNAVAILABLE_FLOAT64_ELEM.into())
+                        }
+                        _ => return Ok(DatumCow::NULL),
+                    };
+                    ListValue::from_datum_iter(list_type.elem(), [Some(sentinel)]).into()
+                } else {
+                    ListValue::from_str(s, type_expected)
+                        .map_err(|_| create_error())?
+                        .into()
+                }
+            }
             // ---- Vector -----
             (DataType::Vector(size), ValueType::Array) => {
                 let array = value.as_array().unwrap();

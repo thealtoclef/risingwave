@@ -122,6 +122,15 @@ pub static DEBEZIUM_UNAVAILABLE_JSON: std::sync::LazyLock<JsonbVal> =
 /// having all elements simultaneously equal to `f32::MAX` is effectively impossible.
 pub const DEBEZIUM_UNAVAILABLE_VECTOR_ELEM: f32 = f32::MAX;
 
+/// Magic element values used to build the Debezium unchanged-TOAST sentinel for floating-point
+/// array columns (`real[]`, `double precision[]`). A string placeholder cannot be embedded in a
+/// numeric list, so we encode the sentinel as a single-element list holding this value. `f32::MAX`
+/// / `f64::MAX` are valid floats (so they pass `check_datum_type`) yet effectively never appear in
+/// real data, mirroring the pgvector sentinel. Integer arrays have no such impossible value, so
+/// they are not covered — use `REPLICA IDENTITY FULL` for full-fidelity TOAST on those columns.
+pub const DEBEZIUM_UNAVAILABLE_FLOAT32_ELEM: f32 = f32::MAX;
+pub const DEBEZIUM_UNAVAILABLE_FLOAT64_ELEM: f64 = f64::MAX;
+
 /// Build a sentinel `VectorVal` of the given dimension to represent Debezium's
 /// unchanged-TOAST placeholder. The dimension must match the column's declared
 /// `vector(N)` size so it passes `check_datum_type` on the way through the
