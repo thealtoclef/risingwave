@@ -516,14 +516,17 @@ mod tests {
         // Create a schema with test columns
         let schema = Schema::new(vec![
             Field {
+                description: None,
                 data_type: DataType::Int32,
                 name: "id".to_owned(),
             },
             Field {
+                description: None,
                 data_type: DataType::Varchar,
                 name: "name".to_owned(),
             },
             Field {
+                description: None,
                 data_type: DataType::Varchar,
                 name: "email".to_owned(),
             },
@@ -589,14 +592,17 @@ mod tests {
         // Create a schema with test columns
         let schema = Schema::new(vec![
             Field {
+                description: None,
                 data_type: DataType::Int32,
                 name: "id".to_owned(),
             },
             Field {
+                description: None,
                 data_type: DataType::Varchar,
                 name: "name".to_owned(),
             },
             Field {
+                description: None,
                 data_type: DataType::Varchar,
                 name: "email".to_owned(),
             },
@@ -663,14 +669,17 @@ mod tests {
         // Create a schema with test columns
         let schema = Schema::new(vec![
             Field {
+                description: None,
                 data_type: DataType::Int32,
                 name: "id".to_owned(),
             },
             Field {
+                description: None,
                 data_type: DataType::Varchar,
                 name: "name".to_owned(),
             },
             Field {
+                description: None,
                 data_type: DataType::Varchar,
                 name: "email".to_owned(),
             },
