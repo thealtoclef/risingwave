@@ -897,7 +897,7 @@ mod tests {
 
         let metadata = [
             [vec![1u8, 2u8], vec![3u8, 4u8]],
-            [vec![5u8, 6u8]],
+            [vec![5u8, 6u8], vec![]],
         ];
         let sender = Arc::new(tokio::sync::Mutex::new(None));
         let mock_subscriber: SinkCommittedEpochSubscriber = {
@@ -960,10 +960,13 @@ mod tests {
                                             }
                                             2 => {
                                                 // After both writers get should_commit=true
-                                                // for epoch3
+                                                // for epoch3. Both writers send metadata,
+                                                // though client2 sends an empty one.
+                                                // After sorting, vec![] comes before vec![5u8, 6u8]
                                                 assert_eq!(epoch, epoch3);
-                                                assert_eq!(1, metadata_list.len());
-                                                assert_eq!(metadata[1][0], metadata_list[0]);
+                                                assert_eq!(2, metadata_list.len());
+                                                assert_eq!(metadata[1][1], metadata_list[0]);
+                                                assert_eq!(metadata[1][0], metadata_list[1]);
                                             }
                                             _ => unreachable!(),
                                         }
@@ -1103,7 +1106,7 @@ mod tests {
                     epoch3,
                     SinkMetadata {
                         metadata: Some(Metadata::Serialized(SerializedMetadata {
-                            metadata: vec![],
+                            metadata: metadata[1][1].clone(),
                         })),
                     },
                     None,
