@@ -724,6 +724,19 @@ impl SinkWriter for IcebergSinkWriter {
         Ok(())
     }
 
+    fn should_commit_on_checkpoint(&self) -> bool {
+        match self {
+            Self::Initialized(inner) => inner.should_commit_on_checkpoint(),
+            Self::Created(_) => false,
+        }
+    }
+
+    fn buffered_bytes(&self) -> u64 {
+        match self {
+            Self::Initialized(inner) => inner.uncommitted_write_bytes,
+            Self::Created(_) => 0,
+        }
+    }
     /// Receive a barrier and mark the end of current epoch. When `is_checkpoint` is true, the sink
     /// writer should commit the current epoch.
     async fn barrier(&mut self, is_checkpoint: bool) -> Result<Option<SinkMetadata>> {
