@@ -2229,7 +2229,6 @@ mod tests {
                 .columns
                 .iter()
                 .map(|col| PbField {
-                    description: None,
                     data_type: Some(
                         col.column_desc
                             .as_ref()
