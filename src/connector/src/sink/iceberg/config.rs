@@ -102,6 +102,7 @@ pub const ENABLE_COMPACTION: &str = "enable_compaction";
 pub const COMPACTION_INTERVAL_SEC: &str = "compaction_interval_sec";
 pub const ENABLE_SNAPSHOT_EXPIRATION: &str = "enable_snapshot_expiration";
 pub const WRITE_MODE: &str = "write_mode";
+pub const COMMIT_CHECKPOINT_SIZE_THRESHOLD_MB: &str = "commit_checkpoint_size_threshold_mb";
 pub const FORMAT_VERSION: &str = "format_version";
 pub const SNAPSHOT_EXPIRATION_RETAIN_LAST: &str = "snapshot_expiration_retain_last";
 pub const SNAPSHOT_EXPIRATION_RETAIN_MAX: &str = "snapshot_expiration_retain_max";
