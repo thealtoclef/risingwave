@@ -2229,6 +2229,7 @@ mod tests {
                 .columns
                 .iter()
                 .map(|col| PbField {
+                    description: None,
                     data_type: Some(
                         col.column_desc
                             .as_ref()
@@ -2362,6 +2363,7 @@ mod tests {
                 .columns
                 .iter()
                 .map(|col| PbField {
+                    description: None,
                     data_type: Some(
                         col.column_desc
                             .as_ref()
@@ -2378,6 +2380,7 @@ mod tests {
                 risingwave_pb::stream_plan::sink_schema_change::PbOp::AddColumns(
                     PbSinkAddColumnsOp {
                         fields: vec![PbField {
+                            description: None,
                             data_type: Some(DataType::Int32.to_protobuf()),
                             name: "age".to_owned(),
                         }],
