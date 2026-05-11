@@ -630,10 +630,12 @@ mod test {
     async fn test_write() {
         let schema = Schema::new(vec![
             Field {
+                description: None,
                 data_type: DataType::Int32,
                 name: "id".to_owned(),
             },
             Field {
+                description: None,
                 data_type: DataType::Varchar,
                 name: "name".to_owned(),
             },
@@ -699,10 +701,12 @@ mod test {
     async fn test_format_write() {
         let schema = Schema::new(vec![
             Field {
+                description: None,
                 data_type: DataType::Int32,
                 name: "id".to_owned(),
             },
             Field {
+                description: None,
                 data_type: DataType::Varchar,
                 name: "name".to_owned(),
             },
