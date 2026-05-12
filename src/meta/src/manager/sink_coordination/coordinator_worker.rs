@@ -68,11 +68,18 @@ async fn run_future_with_periodic_fn<F: Future>(
 
 type HandleId = usize;
 
-#[derive(Default)]
 struct AligningRequests<R> {
-    requests: Vec<R>,
-    handle_ids: HashSet<HandleId>,
+    requests: Vec<(HandleId, Bitmap, R)>,
     committed_bitmap: Option<Bitmap>, // lazy-initialized on first request
+}
+
+impl<R> Default for AligningRequests<R> {
+    fn default() -> Self {
+        Self {
+            requests: Vec::default(),
+            committed_bitmap: None,
+        }
+    }
 }
 
 impl<R> AligningRequests<R> {
@@ -97,18 +104,60 @@ impl<R> AligningRequests<R> {
                 check_bitmap.iter_ones().collect_vec(),
                 vnode_bitmap,
                 committed_bitmap,
-                self.requests,
+                self.requests.iter().map(|(_, _, r)| r).collect::<Vec<_>>(),
                 request
             ));
         }
         *committed_bitmap |= vnode_bitmap;
-        self.requests.push(request);
-        assert!(self.handle_ids.insert(handle_id));
+        assert!(
+            !self.requests.iter().any(|(hid, _, _)| *hid == handle_id),
+            "handle {handle_id} already has a pending request for this epoch"
+        );
+        self.requests.push((handle_id, vnode_bitmap.clone(), request));
         Ok(())
     }
 
     fn aligned(&self) -> bool {
         self.committed_bitmap.as_ref().is_some_and(|b| b.all())
+    }
+
+    fn handle_ids(&self) -> impl Iterator<Item = HandleId> + '_ {
+        self.requests.iter().map(|(hid, _, _)| *hid)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.requests.is_empty()
+    }
+
+    fn recompute_committed_bitmap(&mut self) {
+        self.committed_bitmap = if self.requests.is_empty() {
+            None
+        } else {
+            let mut bitmap = self.requests[0].1.clone();
+            for (_, b, _) in &self.requests[1..] {
+                bitmap |= b;
+            }
+            Some(bitmap)
+        };
+    }
+
+    /// Remove handles that are no longer in `running_handle_ids`, update
+    /// vnode bitmaps for handles that remain (since `alter_parallelisms` may
+    /// have reassigned vnodes), and recompute the committed bitmap.
+    fn sync_with_running_handles(
+        &mut self,
+        get_vnode_bitmap: impl Fn(HandleId) -> Option<Bitmap>,
+    ) {
+        // Update bitmaps for handles that are still alive.
+        for (hid, bitmap, _) in &mut self.requests {
+            if let Some(current) = get_vnode_bitmap(*hid) {
+                *bitmap = current;
+            }
+        }
+        // Remove entries for handles that are no longer running.
+        self.requests
+            .retain(|(hid, _, _)| get_vnode_bitmap(*hid).is_some());
+        self.recompute_committed_bitmap();
     }
 }
 
@@ -477,7 +526,7 @@ impl CoordinationHandleManager {
                 unexpected_event
             ));
         }
-        Ok(init_requests.handle_ids)
+        Ok(init_requests.handle_ids().collect())
     }
 
     async fn alter_parallelisms(
@@ -491,7 +540,7 @@ impl CoordinationHandleManager {
         let mut remaining_handles: HashSet<_> = self
             .writer_handles
             .keys()
-            .filter(|handle_id| !requests.handle_ids.contains(handle_id))
+            .filter(|handle_id| !requests.handle_ids().any(|h| h == *handle_id))
             .cloned()
             .collect();
         while !remaining_handles.is_empty() || !requests.aligned() {
@@ -531,7 +580,7 @@ impl CoordinationHandleManager {
                 }
             }
         }
-        Ok(requests.handle_ids)
+        Ok(requests.handle_ids().collect())
     }
 }
 
@@ -665,6 +714,7 @@ impl CoordinatorWorker {
             let aligned_initial_epoch = align_requests
                 .requests
                 .into_iter()
+                .map(|(_, _, epoch)| epoch)
                 .max()
                 .expect("non-empty");
             self.handle_manager
@@ -741,6 +791,24 @@ impl CoordinatorWorker {
                             .await?;
                         self.try_handle_init_requests(&running_handles, &mut two_phase_handler)
                             .await?;
+                        pending_epochs.retain(|_, align_req| {
+                            align_req.sync_with_running_handles(|hid| {
+                                self.handle_manager
+                                    .writer_handles
+                                    .get(&hid)
+                                    .map(|h| h.vnode_bitmap().clone())
+                            });
+                            !align_req.is_empty()
+                        });
+                        pending_byte_reports.retain(|_, align_req| {
+                            align_req.sync_with_running_handles(|hid| {
+                                self.handle_manager
+                                    .writer_handles
+                                    .get(&hid)
+                                    .map(|h| h.vnode_bitmap().clone())
+                            });
+                            !align_req.is_empty()
+                        });
                         continue;
                     }
                     CoordinationHandleManagerEvent::Stop => {
@@ -751,7 +819,24 @@ impl CoordinatorWorker {
                             .await?;
                         self.try_handle_init_requests(&running_handles, &mut two_phase_handler)
                             .await?;
-
+                        pending_epochs.retain(|_, align_req| {
+                            align_req.sync_with_running_handles(|hid| {
+                                self.handle_manager
+                                    .writer_handles
+                                    .get(&hid)
+                                    .map(|h| h.vnode_bitmap().clone())
+                            });
+                            !align_req.is_empty()
+                        });
+                        pending_byte_reports.retain(|_, align_req| {
+                            align_req.sync_with_running_handles(|hid| {
+                                self.handle_manager
+                                    .writer_handles
+                                    .get(&hid)
+                                    .map(|h| h.vnode_bitmap().clone())
+                            });
+                            !align_req.is_empty()
+                        });
                         continue;
                     }
                     CoordinationHandleManagerEvent::CommitRequest {
@@ -789,7 +874,7 @@ impl CoordinatorWorker {
                         {
                             let (report_epoch, reports) =
                                 pending_byte_reports.pop_first().expect("non-empty");
-                            let total_bytes: u64 = reports.requests.iter().sum();
+                            let total_bytes: u64 = reports.requests.iter().map(|(_, _, b)| *b).sum();
                             let should_commit =
                                 commit_checkpoint_size_threshold_bytes.is_some_and(|threshold| {
                                     total_bytes > 0 && total_bytes >= threshold
@@ -797,7 +882,7 @@ impl CoordinatorWorker {
                             self.handle_manager.send_report_bytes_response(
                                 report_epoch,
                                 should_commit,
-                                reports.handle_ids,
+                                reports.handle_ids(),
                             )?;
                         }
                         continue;
@@ -889,9 +974,10 @@ impl CoordinatorWorker {
                 let (epoch, commit_requests) = pending_epochs.pop_first().expect("non-empty");
                 let mut metadatas = Vec::with_capacity(commit_requests.requests.len());
                 let mut requests = commit_requests.requests.into_iter();
-                let (first_metadata, first_schema_change) = requests.next().expect("non-empty");
+                let (_, _, (first_metadata, first_schema_change)) =
+                    requests.next().expect("non-empty");
                 metadatas.push(first_metadata);
-                for (metadata, schema_change) in requests {
+                for (_, _, (metadata, schema_change)) in requests {
                     if first_schema_change != schema_change {
                         return Err(anyhow!(
                             "got different schema change {:?} to prev schema change {:?}",
@@ -967,7 +1053,7 @@ impl CoordinatorWorker {
                 }
 
                 self.handle_manager
-                    .ack_commit(epoch, commit_requests.handle_ids)?;
+                    .ack_commit(epoch, commit_requests.handle_ids())?;
             }
         }
     }
