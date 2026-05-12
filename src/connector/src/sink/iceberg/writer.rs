@@ -237,6 +237,7 @@ pub struct IcebergSinkWriterInner {
     // For chunk with extra partition column, we should remove this column before write.
     // This project index vec is used to avoid create project idx each time.
     project_idx_vec: ProjectIdxVec,
+    uncommitted_write_bytes: u64,
 }
 
 enum IcebergWriterDispatch {
@@ -292,6 +293,13 @@ impl IcebergSinkWriter {
             writer_param,
             unique_column_ids,
         })
+    }
+
+    pub fn buffered_bytes(&self) -> u64 {
+        match self {
+            Self::Initialized(inner) => inner.uncommitted_write_bytes,
+            Self::Created(_) => 0,
+        }
     }
 }
 
@@ -396,6 +404,7 @@ impl IcebergSinkWriterInner {
                     ProjectIdxVec::None
                 }
             },
+            uncommitted_write_bytes: 0,
         })
     }
 
@@ -584,6 +593,7 @@ impl IcebergSinkWriterInner {
                     ProjectIdxVec::None
                 }
             },
+            uncommitted_write_bytes: 0,
         })
     }
 }
@@ -713,10 +723,17 @@ impl SinkWriter for IcebergSinkWriter {
             .instrument_await("iceberg_write")
             .await
             .map_err(|err| SinkError::Iceberg(anyhow!(err)))?;
+        inner.uncommitted_write_bytes += write_batch_size as u64;
         inner.metrics.write_bytes.inc_by(write_batch_size as _);
         Ok(())
     }
 
+    fn buffered_bytes(&self) -> u64 {
+        match self {
+            Self::Initialized(inner) => inner.uncommitted_write_bytes,
+            Self::Created(_) => 0,
+        }
+    }
     /// Receive a barrier and mark the end of current epoch. When `is_checkpoint` is true, the sink
     /// writer should commit the current epoch.
     async fn barrier(&mut self, is_checkpoint: bool) -> Result<Option<SinkMetadata>> {
@@ -779,6 +796,7 @@ impl SinkWriter for IcebergSinkWriter {
 
         match close_result {
             Some(Ok(result)) => {
+                inner.uncommitted_write_bytes = 0;
                 let format_version = inner.table.metadata().format_version();
                 let partition_type = inner.table.metadata().default_partition_type();
                 let data_files = result

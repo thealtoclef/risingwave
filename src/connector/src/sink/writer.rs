@@ -42,6 +42,10 @@ pub trait SinkWriter: Send + 'static {
     /// writer should commit the current epoch.
     async fn barrier(&mut self, is_checkpoint: bool) -> Result<Self::CommitMetadata>;
 
+    /// Return the number of uncommitted write bytes buffered by this writer.
+    fn buffered_bytes(&self) -> u64 {
+        0
+    }
     /// Clean up
     async fn abort(&mut self) -> Result<()> {
         Ok(())

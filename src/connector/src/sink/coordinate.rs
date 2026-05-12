@@ -36,6 +36,7 @@ pub struct CoordinatedLogSinker<W: SinkWriter<CommitMetadata = Option<SinkMetada
     param: SinkParam,
     vnode_bitmap: Bitmap,
     commit_checkpoint_interval: NonZeroU64,
+    commit_checkpoint_size_threshold_bytes: Option<u64>,
     sink_writer_metrics: SinkWriterMetrics,
 }
 
@@ -46,6 +47,10 @@ impl<W: SinkWriter<CommitMetadata = Option<SinkMetadata>>> CoordinatedLogSinker<
         writer: W,
         commit_checkpoint_interval: NonZeroU64,
     ) -> Result<Self> {
+        let commit_checkpoint_size_threshold_bytes =
+            param.properties.get("commit_checkpoint_size_threshold_mb")
+                .and_then(|v| v.parse::<u64>().ok())
+                .map(|mb| mb.saturating_mul(1024 * 1024));
         Ok(Self {
             writer,
             sink_coordinate_client: writer_param
@@ -64,6 +69,7 @@ impl<W: SinkWriter<CommitMetadata = Option<SinkMetadata>>> CoordinatedLogSinker<
                 })?
                 .clone(),
             commit_checkpoint_interval,
+            commit_checkpoint_size_threshold_bytes,
             sink_writer_metrics: SinkWriterMetrics::new(writer_param),
         })
     }
@@ -214,13 +220,15 @@ impl<W: SinkWriter<CommitMetadata = Option<SinkMetadata>>> LogSinker for Coordin
                     };
                     if is_checkpoint {
                         current_checkpoint += 1;
-                        if should_commit_on_checkpoint_barrier(
+                        let is_forced = should_commit_on_checkpoint_barrier(
                             current_checkpoint,
                             commit_checkpoint_interval,
                             new_vnode_bitmap.is_some(),
                             is_stop,
                             schema_change.is_some(),
-                        ) {
+                        );
+
+                        if is_forced {
                             let start_time = Instant::now();
                             let metadata = sink_writer.barrier(true).await?;
                             let metadata = metadata.ok_or_else(|| {
@@ -270,6 +278,37 @@ impl<W: SinkWriter<CommitMetadata = Option<SinkMetadata>>> LogSinker for Coordin
                                 return pending().await;
                             }
                             log_reader.truncate(TruncateOffset::Barrier { epoch })?;
+                        } else if self.commit_checkpoint_size_threshold_bytes.is_some() {
+                            // Phase 1: Ask coordinator whether to commit based on total bytes
+                            let buffered_bytes = sink_writer.buffered_bytes();
+                            let should_commit = coordinator_stream_handle
+                                .report_bytes(epoch, buffered_bytes)
+                                .await?;
+
+                            if should_commit {
+                                // Phase 2: Flush and commit
+                                let start_time = Instant::now();
+                                let metadata = sink_writer.barrier(true).await?;
+                                let metadata = metadata.ok_or_else(|| {
+                                    SinkError::Coordinator(anyhow!(
+                                        "should get metadata on checkpoint barrier"
+                                    ))
+                                })?;
+                                coordinator_stream_handle
+                                    .commit(epoch, metadata, None)
+                                    .await?;
+                                sink_writer_metrics
+                                    .sink_commit_duration
+                                    .observe(start_time.elapsed().as_secs_f64());
+
+                                current_checkpoint = 0;
+                                log_reader.truncate(TruncateOffset::Barrier { epoch })?;
+                            } else {
+                                let metadata = sink_writer.barrier(false).await?;
+                                if let Some(metadata) = metadata {
+                                    warn!(?metadata, "get metadata on non-checkpoint barrier");
+                                }
+                            }
                         } else {
                             let metadata = sink_writer.barrier(false).await?;
                             if let Some(metadata) = metadata {
