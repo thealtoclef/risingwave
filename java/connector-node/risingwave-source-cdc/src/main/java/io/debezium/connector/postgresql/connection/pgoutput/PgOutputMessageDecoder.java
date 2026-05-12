@@ -1086,6 +1086,29 @@ public class PgOutputMessageDecoder extends AbstractMessageDecoder {
                         new UnchangedToastedReplicationMessageColumn(
                                 columnName, columnType, typeExpression, optional) {
                             @Override
+                            public Object getValue(
+                                    PgConnectionSupplier connection,
+                                    boolean includeUnknownDatatypes) {
+                                // For array types in the TOAST path, the upstream
+                                // UnchangedToastedPlaceholder maps the generic
+                                // UNCHANGED_TOAST_VALUE marker to a String (line 42),
+                                // which leaks through PostgresValueConverter
+                                // .handleUnknownData() and fails Struct.put() for
+                                // ARRAY schemas with:
+                                //   DataException: Invalid Java object for schema
+                                //   with type ARRAY: class java.lang.String
+                                //
+                                // Return null to bypass this entirely. The
+                                // PostgresValueConverter.convertArray() fallback
+                                // produces Collections.emptyList() for non-optional
+                                // array columns, which is a safe default.
+                                if (columnType != null && columnType.isArrayType()) {
+                                    return null;
+                                }
+                                return super.getValue(connection, includeUnknownDatatypes);
+                            }
+
+                            @Override
                             public String toString() {
                                 return columnName
                                         + "("
