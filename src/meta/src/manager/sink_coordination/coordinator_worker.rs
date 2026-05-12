@@ -540,7 +540,7 @@ impl CoordinationHandleManager {
         let mut remaining_handles: HashSet<_> = self
             .writer_handles
             .keys()
-            .filter(|handle_id| !requests.handle_ids().any(|h| h == *handle_id))
+            .filter(|handle_id| !requests.handle_ids().any(|h| h == **handle_id))
             .cloned()
             .collect();
         while !remaining_handles.is_empty() || !requests.aligned() {
@@ -973,6 +973,7 @@ impl CoordinatorWorker {
             {
                 let (epoch, commit_requests) = pending_epochs.pop_first().expect("non-empty");
                 let mut metadatas = Vec::with_capacity(commit_requests.requests.len());
+                let handle_ids: Vec<HandleId> = commit_requests.handle_ids().collect();
                 let mut requests = commit_requests.requests.into_iter();
                 let (_, _, (first_metadata, first_schema_change)) =
                     requests.next().expect("non-empty");
@@ -1053,7 +1054,7 @@ impl CoordinatorWorker {
                 }
 
                 self.handle_manager
-                    .ack_commit(epoch, commit_requests.handle_ids())?;
+                    .ack_commit(epoch, handle_ids)?;
             }
         }
     }
