@@ -5913,7 +5913,28 @@ checksum = "b43924e3df02cb3b846ca66a7ee58e8c13eb2556d0308c71f6154083f6980365"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
- "gcloud-metadata",
+ "gcloud-metadata 1.0.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "home",
+ "jsonwebtoken 10.3.0",
+ "reqwest 0.13.2",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.17",
+ "time",
+ "token-source",
+ "tokio",
+ "tracing",
+ "urlencoding",
+]
+
+[[package]]
+name = "gcloud-auth"
+version = "1.3.0"
+source = "git+https://github.com/tuantran0910/yoshidan-google-cloud-rust.git?rev=eba83476ba37caceeca205898599c09ed655c9e9#eba83476ba37caceeca205898599c09ed655c9e9"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "gcloud-metadata 1.0.2 (git+https://github.com/tuantran0910/yoshidan-google-cloud-rust.git?rev=eba83476ba37caceeca205898599c09ed655c9e9)",
  "home",
  "jsonwebtoken 10.3.0",
  "reqwest 0.13.2",
@@ -5940,9 +5961,9 @@ dependencies = [
  "backon",
  "base64 0.22.1",
  "bigdecimal 0.4.10",
- "gcloud-auth",
- "gcloud-gax",
- "gcloud-googleapis",
+ "gcloud-auth 1.3.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "gcloud-gax 1.4.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "gcloud-googleapis 1.3.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "num-bigint",
  "prost-types 0.14.3",
  "reqwest 0.13.2",
@@ -5973,6 +5994,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "gcloud-gax"
+version = "1.4.0"
+source = "git+https://github.com/tuantran0910/yoshidan-google-cloud-rust.git?rev=eba83476ba37caceeca205898599c09ed655c9e9#eba83476ba37caceeca205898599c09ed655c9e9"
+dependencies = [
+ "http 1.4.0",
+ "thiserror 2.0.17",
+ "token-source",
+ "tokio",
+ "tokio-retry2",
+ "tonic",
+ "tower",
+ "tracing",
+]
+
+[[package]]
 name = "gcloud-googleapis"
 version = "1.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5985,13 +6021,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "gcloud-googleapis"
+version = "1.3.0"
+source = "git+https://github.com/tuantran0910/yoshidan-google-cloud-rust.git?rev=eba83476ba37caceeca205898599c09ed655c9e9#eba83476ba37caceeca205898599c09ed655c9e9"
+dependencies = [
+ "prost 0.14.3",
+ "prost-types 0.14.3",
+ "tonic",
+ "tonic-prost",
+]
+
+[[package]]
 name = "gcloud-longrunning"
 version = "1.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "43ccb50f1b67e61775a2a620b6c09de051e724f1aaf02d6c5b366fd60e7ac59e"
+source = "git+https://github.com/tuantran0910/yoshidan-google-cloud-rust.git?rev=eba83476ba37caceeca205898599c09ed655c9e9#eba83476ba37caceeca205898599c09ed655c9e9"
 dependencies = [
- "gcloud-gax",
- "gcloud-googleapis",
+ "gcloud-gax 1.4.0 (git+https://github.com/tuantran0910/yoshidan-google-cloud-rust.git?rev=eba83476ba37caceeca205898599c09ed655c9e9)",
+ "gcloud-googleapis 1.3.0 (git+https://github.com/tuantran0910/yoshidan-google-cloud-rust.git?rev=eba83476ba37caceeca205898599c09ed655c9e9)",
  "prost 0.14.3",
  "tonic",
 ]
@@ -6008,6 +6054,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "gcloud-metadata"
+version = "1.0.2"
+source = "git+https://github.com/tuantran0910/yoshidan-google-cloud-rust.git?rev=eba83476ba37caceeca205898599c09ed655c9e9#eba83476ba37caceeca205898599c09ed655c9e9"
+dependencies = [
+ "reqwest 0.13.2",
+ "thiserror 2.0.17",
+ "tokio",
+]
+
+[[package]]
 name = "gcloud-pubsub"
 version = "1.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6015,9 +6071,9 @@ checksum = "66741b5f02bb0a4e30f35efee3155679f29d8c78336b0ed491ed5ba2c6e80fe4"
 dependencies = [
  "async-channel 2.5.0",
  "async-stream",
- "gcloud-auth",
- "gcloud-gax",
- "gcloud-googleapis",
+ "gcloud-auth 1.3.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "gcloud-gax 1.4.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "gcloud-googleapis 1.3.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "prost-types 0.14.3",
  "thiserror 2.0.17",
  "token-source",
@@ -6028,14 +6084,13 @@ dependencies = [
 [[package]]
 name = "gcloud-spanner"
 version = "1.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cb649ff005bd20f4b87bde577380c0060b944b2ccaaebd842d9219c85051453d"
+source = "git+https://github.com/tuantran0910/yoshidan-google-cloud-rust.git?rev=eba83476ba37caceeca205898599c09ed655c9e9#eba83476ba37caceeca205898599c09ed655c9e9"
 dependencies = [
  "base64 0.22.1",
  "bigdecimal 0.4.10",
- "gcloud-auth",
- "gcloud-gax",
- "gcloud-googleapis",
+ "gcloud-auth 1.3.0 (git+https://github.com/tuantran0910/yoshidan-google-cloud-rust.git?rev=eba83476ba37caceeca205898599c09ed655c9e9)",
+ "gcloud-gax 1.4.0 (git+https://github.com/tuantran0910/yoshidan-google-cloud-rust.git?rev=eba83476ba37caceeca205898599c09ed655c9e9)",
+ "gcloud-googleapis 1.3.0 (git+https://github.com/tuantran0910/yoshidan-google-cloud-rust.git?rev=eba83476ba37caceeca205898599c09ed655c9e9)",
  "gcloud-longrunning",
  "parking_lot 0.12.5",
  "prost 0.14.3",
@@ -9484,13 +9539,38 @@ dependencies = [
 
 [[package]]
 name = "parse-display"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "287d8d3ebdce117b8539f59411e4ed9ec226e0a4153c7f55495c6070d68e6f72"
+dependencies = [
+ "parse-display-derive 0.10.0",
+ "regex",
+ "regex-syntax",
+]
+
+[[package]]
+name = "parse-display"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e78deb158fb1d73b29efb4b7e9b9860b78059c670de06bd28df8d0b458ded0eb"
 dependencies = [
- "parse-display-derive",
+ "parse-display-derive 0.11.0",
  "regex",
  "regex-syntax",
+]
+
+[[package]]
+name = "parse-display-derive"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7fc048687be30d79502dea2f623d052f3a074012c6eac41726b7ab17213616b1"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "regex",
+ "regex-syntax",
+ "structmeta",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -11649,7 +11729,7 @@ dependencies = [
  "opentelemetry",
  "opentelemetry_sdk",
  "parking_lot 0.12.5",
- "parse-display",
+ "parse-display 0.11.0",
  "paste",
  "pin-project-lite",
  "postgres-types",
@@ -11997,8 +12077,8 @@ dependencies = [
  "futures",
  "futures-async-stream",
  "gcloud-bigquery",
- "gcloud-gax",
- "gcloud-googleapis",
+ "gcloud-gax 1.4.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "gcloud-googleapis 1.3.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "gcloud-pubsub",
  "gcloud-spanner",
  "gcp-bigquery-client",
@@ -12024,7 +12104,7 @@ dependencies = [
  "openssl",
  "parking_lot 0.12.5",
  "parquet",
- "parse-display",
+ "parse-display 0.10.0",
  "paste",
  "pg_bigdecimal",
  "phf 0.13.1",
@@ -12236,7 +12316,7 @@ dependencies = [
  "linkme",
  "madsim-tokio",
  "num-traits",
- "parse-display",
+ "parse-display 0.11.0",
  "paste",
  "prometheus",
  "risingwave_common",
@@ -12366,7 +12446,7 @@ dependencies = [
  "mysql_common",
  "num-integer",
  "parking_lot 0.12.5",
- "parse-display",
+ "parse-display 0.11.0",
  "paste",
  "percent-encoding",
  "petgraph 0.8.3",
