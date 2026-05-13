@@ -91,7 +91,9 @@ google-cloud-googleapis = { package = "gcloud-googleapis", version = "1", featur
     "spanner",
 ], optional = true }
 google-cloud-pubsub = { package = "gcloud-pubsub", version = "1.5" }
-google-cloud-spanner = { package = "gcloud-spanner", version = "1.8" }
+# google-cloud-spanner = { package = "gcloud-spanner", version = "1.8" }
+# https://github.com/yoshidan/google-cloud-rust/pull/439
+google-cloud-spanner = { package = "gcloud-spanner", git = "https://github.com/tuantran0910/yoshidan-google-cloud-rust.git", rev = "eba83476ba37caceeca205898599c09ed655c9e9" }
 iceberg = { workspace = true }
 iceberg-catalog-glue = { workspace = true }
 iceberg-catalog-rest = { workspace = true }
