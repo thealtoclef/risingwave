@@ -1114,7 +1114,12 @@ impl<C: GlobalBarrierWorkerContext> GlobalBarrierWorker<C> {
                                     unreachable!("no barrier collected event on initializing")
                                 }
                                 PartialGraphEvent::Reset(_) => {
-                                    unreachable!("no partial graph reset on initializing")
+                                    let (database_id, _) = from_partial_graph_id(partial_graph_id);
+                                    assert!(failed_databases.contains_key(&database_id));
+                                    // The reset is expected after a previously reported bootstrap
+                                    // failure. The failure path has already moved the database into
+                                    // `failed_databases`, so only the terminal reset completion is
+                                    // left to drain here.
                                 }
                                 PartialGraphEvent::Error(worker_id) => {
                                     let (database_id, _) = from_partial_graph_id(partial_graph_id);
