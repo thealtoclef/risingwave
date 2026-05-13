@@ -32,7 +32,9 @@ use risingwave_pb::common::{HostAddress, PbWorkerType, WorkerNode, worker_node};
 use risingwave_pb::hummock::HummockVersionStats;
 use risingwave_pb::stream_plan::PbStreamNode;
 use risingwave_pb::stream_service::streaming_control_stream_request::{PbInitRequest, Request};
-use risingwave_pb::stream_service::streaming_control_stream_response::Response;
+use risingwave_pb::stream_service::streaming_control_stream_response::{
+    ReportPartialGraphFailureResponse, ResetPartialGraphResponse, Response,
+};
 use risingwave_pb::stream_service::{
     BarrierCompleteResponse, StreamingControlStreamRequest, StreamingControlStreamResponse,
 };
@@ -61,7 +63,7 @@ use crate::model::{FragmentDownstreamRelation, FragmentId};
 
 enum ContextRequest {
     AbortAndMarkBlocked(RecoveryReason),
-    MarkReady,
+    MarkReady(HashSet<DatabaseId>),
     ReloadRuntimeInfo(oneshot::Sender<BarrierWorkerRuntimeInfoSnapshot>),
     NewControlStream(WorkerNode, oneshot::Sender<StreamingControlHandle>),
 }
@@ -88,11 +90,13 @@ impl GlobalBarrierWorkerContext for MockBarrierWorkerContext {
     }
 
     fn mark_ready(&self, options: MarkReadyOptions) {
-        let MarkReadyOptions::Global { blocked_databases } = options else {
-            unreachable!()
+        let blocked_databases = match options {
+            MarkReadyOptions::Global { blocked_databases } => blocked_databases,
+            MarkReadyOptions::Database(_) => HashSet::new(),
         };
-        assert!(blocked_databases.is_empty());
-        self.0.send(ContextRequest::MarkReady).unwrap();
+        self.0
+            .send(ContextRequest::MarkReady(blocked_databases))
+            .unwrap();
     }
 
     async fn post_collect_command(&self, _command: PostCollectCommand) -> MetaResult<()> {
@@ -401,9 +405,10 @@ async fn test_barrier_manager_worker_crash_no_early_commit() {
         (partial_graph_id, initial_epoch)
     );
 
-    let ContextRequest::MarkReady = rx.recv().await.unwrap() else {
+    let ContextRequest::MarkReady(blocked_databases) = rx.recv().await.unwrap() else {
         unreachable!()
     };
+    assert!(blocked_databases.is_empty());
 
     // correctly collect from worker1
     let Request::InjectBarrier(init_inject_request) =
@@ -456,4 +461,351 @@ async fn test_barrier_manager_worker_crash_no_early_commit() {
     else {
         unreachable!()
     };
+}
+
+#[tokio::test]
+async fn test_bootstrap_recovery_partial_graph_reset_after_failure() {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let context = Arc::new(MockBarrierWorkerContext(tx));
+    let env = MetaSrvEnv::for_test_opts(MetaOpts::test(true), |_| {}).await;
+    let (_request_tx, request_rx) = mpsc::unbounded_channel();
+    let mut worker = GlobalBarrierWorker::new_inner(env, request_rx, context).await;
+
+    let recovery_handle = tokio::spawn(async move {
+        worker.recovery(false, RecoveryReason::Bootstrap).await;
+    });
+
+    let ContextRequest::AbortAndMarkBlocked(RecoveryReason::Bootstrap) = rx.recv().await.unwrap()
+    else {
+        unreachable!()
+    };
+    let ContextRequest::ReloadRuntimeInfo(tx) = rx.recv().await.unwrap() else {
+        unreachable!()
+    };
+
+    let failed_database_id = DatabaseId::new(233);
+    let pending_database_id = DatabaseId::new(236);
+    let job_id1 = JobId::new(234);
+    let job_id2 = JobId::new(235);
+    let job_id3 = JobId::new(237);
+    let job_id4 = JobId::new(238);
+    let worker_node = |id: u32, resource_group: &str| WorkerNode {
+        id: id.into(),
+        r#type: PbWorkerType::ComputeNode as i32,
+        host: Some(HostAddress {
+            host: format!("host{}", id),
+            port: 0,
+        }),
+        state: worker_node::State::Running as i32,
+        property: Some(worker_node::Property {
+            is_streaming: true,
+            is_serving: true,
+            internal_rpc_host_addr: "".to_owned(),
+            parallelism: 1,
+            resource_group: Some(resource_group.to_owned()),
+            is_iceberg_compactor: false,
+        }),
+        transactional_id: None,
+        resource: None,
+        started_at: None,
+    };
+    let worker1_group = "rg-a";
+    let worker2_group = "rg-b";
+    let worker1 = worker_node(1, worker1_group);
+    let worker2 = worker_node(2, worker2_group);
+    let table1 = TableId::new(1);
+    let table2 = TableId::new(2);
+    let table3 = TableId::new(3);
+    let table4 = TableId::new(4);
+    let fragment1 = FragmentId::new(101);
+    let fragment2 = FragmentId::new(102);
+    let fragment3 = FragmentId::new(103);
+    let fragment4 = FragmentId::new(104);
+    let initial_epoch = test_epoch(100);
+
+    let fragment_model = |fragment_id: FragmentId, job_id: JobId, table_id: TableId| {
+        #[expect(deprecated)]
+        LoadedFragment::from(fragment::Model {
+            fragment_id,
+            job_id,
+            fragment_type_mask: 0,
+            distribution_type: DistributionType::Single,
+            stream_node: StreamNode::from(&PbStreamNode::default()),
+            state_table_ids: TableIdArray(vec![table_id]),
+            upstream_fragment_id: I32Array::default(),
+            vnode_count: VirtualNode::COUNT_FOR_TEST as i32,
+            parallelism: Some(StreamingParallelism::Fixed(1)),
+        })
+    };
+
+    let fragment_map_job1 =
+        HashMap::from([(fragment1, fragment_model(fragment1, job_id1, table1))]);
+    let fragment_map_job2 =
+        HashMap::from([(fragment2, fragment_model(fragment2, job_id2, table2))]);
+    let fragment_map_job3 =
+        HashMap::from([(fragment3, fragment_model(fragment3, job_id3, table3))]);
+    let fragment_map_job4 =
+        HashMap::from([(fragment4, fragment_model(fragment4, job_id4, table4))]);
+
+    let build_job_model = |job_id: JobId, resource_group: &str| streaming_job::Model {
+        job_id,
+        job_status: JobStatus::Creating,
+        create_type: CreateType::Foreground,
+        timezone: None,
+        config_override: None,
+        adaptive_parallelism_strategy: None,
+        parallelism: StreamingParallelism::Fixed(1),
+        backfill_parallelism: None,
+        backfill_orders: None,
+        max_parallelism: 1,
+        specific_resource_group: Some(resource_group.to_owned()),
+        is_serverless_backfill: false,
+    };
+    let job_model1 = build_job_model(job_id1, worker1_group);
+    let job_model2 = build_job_model(job_id2, worker2_group);
+    let job_model3 = build_job_model(job_id3, worker1_group);
+    let job_model4 = build_job_model(job_id4, worker2_group);
+
+    let database_model = |database_id: DatabaseId, name: &str| database::Model {
+        database_id,
+        name: name.to_owned(),
+        resource_group: "test".to_owned(),
+        barrier_interval_ms: None,
+        checkpoint_frequency: None,
+    };
+
+    let fragment_context = LoadedFragmentContext {
+        ensembles: vec![
+            NoShuffleEnsemble::for_test([fragment1], [fragment1]),
+            NoShuffleEnsemble::for_test([fragment2], [fragment2]),
+            NoShuffleEnsemble::for_test([fragment3], [fragment3]),
+            NoShuffleEnsemble::for_test([fragment4], [fragment4]),
+        ],
+        job_fragments: HashMap::from([
+            (job_id1, fragment_map_job1),
+            (job_id2, fragment_map_job2),
+            (job_id3, fragment_map_job3),
+            (job_id4, fragment_map_job4),
+        ]),
+        job_map: HashMap::from([
+            (job_id1, job_model1),
+            (job_id2, job_model2),
+            (job_id3, job_model3),
+            (job_id4, job_model4),
+        ]),
+        streaming_job_databases: HashMap::from([
+            (job_id1, failed_database_id),
+            (job_id2, failed_database_id),
+            (job_id3, pending_database_id),
+            (job_id4, pending_database_id),
+        ]),
+        database_map: HashMap::from([
+            (failed_database_id, database_model(failed_database_id, "failed_db")),
+            (
+                pending_database_id,
+                database_model(pending_database_id, "pending_db"),
+            ),
+        ]),
+        fragment_source_ids: HashMap::new(),
+        fragment_splits: HashMap::new(),
+    };
+
+    let recovery_context = LoadedRecoveryContext {
+        fragment_context,
+        job_extra_info: HashMap::from([
+            (
+                job_id1,
+                StreamingJobExtraInfo {
+                    timezone: None,
+                    config_override: Arc::<str>::from(""),
+                    adaptive_parallelism_strategy: None,
+                    job_definition: "".to_owned(),
+                    backfill_orders: None,
+                },
+            ),
+            (
+                job_id2,
+                StreamingJobExtraInfo {
+                    timezone: None,
+                    config_override: Arc::<str>::from(""),
+                    adaptive_parallelism_strategy: None,
+                    job_definition: "".to_owned(),
+                    backfill_orders: None,
+                },
+            ),
+            (
+                job_id3,
+                StreamingJobExtraInfo {
+                    timezone: None,
+                    config_override: Arc::<str>::from(""),
+                    adaptive_parallelism_strategy: None,
+                    job_definition: "".to_owned(),
+                    backfill_orders: None,
+                },
+            ),
+            (
+                job_id4,
+                StreamingJobExtraInfo {
+                    timezone: None,
+                    config_override: Arc::<str>::from(""),
+                    adaptive_parallelism_strategy: None,
+                    job_definition: "".to_owned(),
+                    backfill_orders: None,
+                },
+            ),
+        ]),
+        upstream_sink_recovery: HashMap::new(),
+        fragment_relations: FragmentDownstreamRelation::default(),
+    };
+
+    tx.send(BarrierWorkerRuntimeInfoSnapshot {
+        active_streaming_nodes: ActiveStreamingWorkerNodes::for_test(HashMap::from_iter([
+            (worker1.id, worker1.clone()),
+            (worker2.id, worker2.clone()),
+        ])),
+        recovery_context,
+        state_table_committed_epochs: HashMap::from([
+            (table1, initial_epoch),
+            (table2, initial_epoch),
+            (table3, initial_epoch),
+            (table4, initial_epoch),
+        ]),
+        state_table_log_epochs: HashMap::new(),
+        mv_depended_subscriptions: HashMap::new(),
+        background_jobs: HashSet::new(),
+        hummock_version_stats: HummockVersionStats::default(),
+        database_infos: vec![Database {
+            id: failed_database_id,
+            name: "failed_db".to_owned(),
+            owner: 0.into(),
+            resource_group: "test".to_owned(),
+            barrier_interval_ms: None,
+            checkpoint_frequency: None,
+        },
+        Database {
+            id: pending_database_id,
+            name: "pending_db".to_owned(),
+            owner: 0.into(),
+            resource_group: "test".to_owned(),
+            barrier_interval_ms: None,
+            checkpoint_frequency: None,
+        }],
+        cdc_table_snapshot_splits: HashMap::new(),
+    })
+    .unwrap();
+
+    let make_control_stream_handle = || {
+        let (request_tx, request_rx) = mpsc::unbounded_channel();
+        let (response_tx, response_rx) = mpsc::unbounded_channel();
+        let handle = UnboundedBidiStreamHandle {
+            request_sender: request_tx,
+            response_stream: UnboundedReceiverStream::new(response_rx).boxed(),
+        };
+        (request_rx, response_tx, Some(handle))
+    };
+    let (mut request_rx1, response_tx1, mut handle1) = make_control_stream_handle();
+    let (mut request_rx2, response_tx2, mut handle2) = make_control_stream_handle();
+
+    for _ in 0..2 {
+        let ContextRequest::NewControlStream(worker, tx) = rx.recv().await.unwrap() else {
+            unreachable!()
+        };
+        if worker == worker1 {
+            tx.send(handle1.take().unwrap()).unwrap()
+        } else if worker == worker2 {
+            tx.send(handle2.take().unwrap()).unwrap()
+        } else {
+            unreachable!()
+        }
+    }
+
+    let receive_initial_inject = async |request_rx: &mut UnboundedReceiver<
+        StreamingControlStreamRequest,
+    >| {
+        let Request::CreatePartialGraph(req) = request_rx.recv().await.unwrap().request.unwrap()
+        else {
+            unreachable!()
+        };
+        let Request::InjectBarrier(init_inject_request) =
+            request_rx.recv().await.unwrap().request.unwrap()
+        else {
+            unreachable!()
+        };
+        let (initial_req_database_id, _) =
+            from_partial_graph_id(init_inject_request.partial_graph_id);
+        let epoch = init_inject_request.barrier.unwrap().epoch.unwrap();
+        assert_eq!(epoch.prev, initial_epoch);
+        let (req_database_id, _) = from_partial_graph_id(req.partial_graph_id);
+        assert_eq!(initial_req_database_id, req_database_id);
+        (req_database_id, req.partial_graph_id, epoch)
+    };
+
+    let mut initial_partial_graphs = HashMap::new();
+    let mut initial_partial_graph_epochs = HashMap::new();
+    for request_rx in [&mut request_rx1, &mut request_rx2] {
+        for _ in 0..2 {
+            let (database_id, partial_graph_id, epoch) = receive_initial_inject(request_rx).await;
+            let existing = initial_partial_graphs.insert(database_id, partial_graph_id);
+            if let Some(existing) = existing {
+                assert_eq!(existing, partial_graph_id);
+            }
+            let existing_epoch = initial_partial_graph_epochs.insert(database_id, epoch.prev);
+            if let Some(existing_epoch) = existing_epoch {
+                assert_eq!(existing_epoch, epoch.prev);
+            }
+        }
+    }
+    let failed_partial_graph_id = initial_partial_graphs[&failed_database_id];
+    let pending_partial_graph_id = initial_partial_graphs[&pending_database_id];
+    let pending_initial_prev_epoch = initial_partial_graph_epochs[&pending_database_id];
+
+    response_tx1
+        .send(Ok(StreamingControlStreamResponse {
+            response: Some(Response::ReportPartialGraphFailure(
+                ReportPartialGraphFailureResponse {
+                    partial_graph_id: failed_partial_graph_id,
+                },
+            )),
+        }))
+        .unwrap();
+
+    for request_rx in [&mut request_rx1, &mut request_rx2] {
+        let Request::ResetPartialGraphs(reset_request) =
+            request_rx.recv().await.unwrap().request.unwrap()
+        else {
+            unreachable!()
+        };
+        assert_eq!(reset_request.partial_graph_ids, vec![failed_partial_graph_id]);
+    }
+
+    for response_tx in [&response_tx1, &response_tx2] {
+        response_tx
+            .send(Ok(StreamingControlStreamResponse {
+                response: Some(Response::ResetPartialGraph(ResetPartialGraphResponse {
+                    partial_graph_id: failed_partial_graph_id,
+                    root_err: None,
+                })),
+            }))
+            .unwrap();
+    }
+
+    for (worker, response_tx) in [(&worker1, &response_tx1), (&worker2, &response_tx2)] {
+        response_tx
+            .send(Ok(StreamingControlStreamResponse {
+                response: Some(Response::CompleteBarrier(BarrierCompleteResponse {
+                    worker_id: worker.id as _,
+                    partial_graph_id: pending_partial_graph_id,
+                    epoch: pending_initial_prev_epoch,
+                    ..Default::default()
+                })),
+            }))
+            .unwrap();
+    }
+
+    let ContextRequest::MarkReady(blocked_databases) = rx.recv().await.unwrap() else {
+        unreachable!()
+    };
+    assert_eq!(blocked_databases, HashSet::from([failed_database_id]));
+
+    recovery_handle.await.unwrap();
 }
