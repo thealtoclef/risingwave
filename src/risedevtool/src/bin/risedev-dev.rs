@@ -33,7 +33,7 @@ use risedev::{
     LakekeeperService, MetaNodeService, MinioService, MoatService, MqttService, MySqlService,
     NatsService, PostgresService, PrometheusService, PubsubService, PulsarService, RISEDEV_NAME,
     RedisService, SchemaRegistryService, ServiceConfig, SqlServerService, SqliteConfig, Task, TaskGroup,
-    TaskGroup, TempoService, preflight_check,
+    TempoService, preflight_check,
 };
 use sqlx::mysql::MySqlConnectOptions;
 use sqlx::postgres::PgConnectOptions;
