@@ -58,6 +58,7 @@ impl BoundedTokenCache {
         self.insertion_order.push_back(token);
     }
 
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.entries.len()
     }
