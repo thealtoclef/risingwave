@@ -372,6 +372,10 @@ impl SourceStreamChunkRowWriter<'_> {
                     ))),
                     None => parse_field(desc), // parse from payload
                 },
+                (_, &Some(AdditionalColumnType::IngestionTime(_))) => match self.row_meta {
+                    Some(row_meta) => Ok(A::output_for(row_meta.extract_ingestion_time())),
+                    None => parse_field(desc), // parse from payload
+                },
                 (_, &Some(AdditionalColumnType::CollectionName(_))) => {
                     // collection name for `mongodb-cdc` should be parsed from the message payload
                     parse_field(desc)
