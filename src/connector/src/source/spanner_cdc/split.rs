@@ -14,6 +14,8 @@
 
 //! Spanner CDC split definitions for partition tracking and coordination.
 
+use std::collections::HashMap;
+
 use risingwave_common::types::JsonbVal;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
@@ -35,7 +37,7 @@ use crate::source::{SplitId, SplitMetaData};
 /// - `offset: Option<OffsetDateTime>` - single source of truth (timestamp)
 /// - `start_offset()` method - converts to String on-demand (matches other CDC sources)
 /// - `is_snapshot_done()` - whether backfill is complete (matches other CDC sources)
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Hash)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct SpannerCdcSplit {
     /// Partition token (None for root partition)
     pub partition_token: Option<String>,
@@ -77,6 +79,15 @@ pub struct SpannerCdcSplit {
     /// Number of messages processed (for monitoring)
     #[serde(default)]
     pub messages_processed: u64,
+
+    /// Per-partition progress (micros since epoch), keyed by `partition_token`.
+    /// `self.offset` is derived as `min(partition_progress.values())` so the committed
+    /// checkpoint never advances past the slowest live partition.
+    ///
+    /// `#[serde(skip)]`: in-memory only. Persisting would let stale entries from a
+    /// crashed reader pin the watermark to long-dead tokens after restart.
+    #[serde(skip)]
+    pub partition_progress: HashMap<String, i64>,
 }
 
 impl SpannerCdcSplit {
@@ -96,6 +107,7 @@ impl SpannerCdcSplit {
             change_stream_name,
             index,
             messages_processed: 0,
+            partition_progress: HashMap::new(),
         }
     }
 
@@ -115,6 +127,7 @@ impl SpannerCdcSplit {
             change_stream_name,
             index,
             messages_processed: 0,
+            partition_progress: HashMap::new(),
         }
     }
 
@@ -185,20 +198,45 @@ impl SpannerCdcSplit {
         spanner_offset
     }
 
-    /// Update this split's offset from a SpannerOffset.
+    /// Apply a per-partition `SpannerOffset`. Token-tagged offsets update
+    /// `partition_progress` (or remove when `is_finished`) and recompute the min
+    /// watermark.
     ///
-    /// This is called during checkpoint recovery to restore the resume position.
+    /// Tokenless offsets never advance `self.offset` — the root partition's
+    /// heartbeats arrive tokenless and would otherwise clobber the watermark when
+    /// `partition_progress` is empty (e.g. between restart and the first child's
+    /// reservation), creating a window where the committed offset jumps ahead of
+    /// children that haven't yet emitted. The legacy integer-bootstrap path in
+    /// `update_offset` handles the genuine "no per-partition state yet" case.
     pub fn update_from_offset(&mut self, offset: &crate::source::cdc::external::spanner::SpannerOffset) {
-        // Update offset from the SpannerOffset (stored as microseconds, convert to OffsetDateTime)
-        if let Ok(offset_ts) = time::OffsetDateTime::from_unix_timestamp_nanos((offset.timestamp as i128) * 1000) {
-            self.offset = Some(offset_ts);
-        } else {
-            tracing::error!(timestamp = offset.timestamp, "failed to parse offset from microseconds");
+        if let Some(token) = offset.partition_token.as_deref() {
+            if offset.is_finished {
+                self.partition_progress.remove(token);
+            } else {
+                self.partition_progress.insert(token.to_owned(), offset.offset);
+            }
+            self.recompute_committed_offset();
         }
 
-        // If the offset indicates this partition is finished, mark snapshot as done
-        if offset.is_finished {
+        // Source-level snapshot_done flag is signaled via a tokenless is_finished.
+        if offset.is_finished && offset.partition_token.is_none() {
             self.snapshot_done = true;
+        }
+    }
+
+    /// Empty `partition_progress` leaves `self.offset` untouched — the last min is
+    /// still a safe resume position (all known partitions completed before it).
+    fn recompute_committed_offset(&mut self) {
+        let Some(&min_micros) = self.partition_progress.values().min() else {
+            return;
+        };
+        match time::OffsetDateTime::from_unix_timestamp_nanos((min_micros as i128) * 1000) {
+            Ok(ts) => self.offset = Some(ts),
+            Err(e) => tracing::error!(
+                error = %e,
+                min_micros,
+                "failed to convert min partition_progress to OffsetDateTime"
+            ),
         }
     }
 
@@ -206,10 +244,17 @@ impl SpannerCdcSplit {
     ///
     /// This is called after backfill completes to set the initial position for CDC.
     pub fn set_offset_from_backfill(&mut self, snapshot_timestamp_micros: i64) {
-        if let Ok(offset_ts) = time::OffsetDateTime::from_unix_timestamp_nanos((snapshot_timestamp_micros as i128) * 1000) {
-            self.offset = Some(offset_ts);
-            // Mark snapshot as done when setting offset from backfill
-            self.snapshot_done = true;
+        match time::OffsetDateTime::from_unix_timestamp_nanos((snapshot_timestamp_micros as i128) * 1000) {
+            Ok(offset_ts) => {
+                self.offset = Some(offset_ts);
+                // Mark snapshot as done when setting offset from backfill
+                self.snapshot_done = true;
+            }
+            Err(e) => tracing::error!(
+                error = %e,
+                snapshot_timestamp_micros,
+                "failed to convert backfill snapshot timestamp to OffsetDateTime"
+            ),
         }
     }
 }
@@ -232,26 +277,33 @@ impl SplitMetaData for SpannerCdcSplit {
     }
 
     fn update_offset(&mut self, last_seen_offset: String) -> ConnectorResult<()> {
-        // Parse as plain timestamp (microseconds as string) -- the framework convention.
-        // This is what current_cdc_offset() returns: timestamp as microseconds string.
-        if let Ok(timestamp_micros) = last_seen_offset.trim().parse::<i64>() {
-            if timestamp_micros > 0 {
-                if let Ok(offset_ts) = time::OffsetDateTime::from_unix_timestamp_nanos((timestamp_micros as i128) * 1000) {
-                    self.offset = Some(offset_ts);
-                    return Ok(());
+        // Legacy integer path (used by `current_cdc_offset()` during backfill) is
+        // tokenless — apply only as a bootstrap before per-partition tracking starts,
+        // otherwise it would clobber the watermark.
+        if let Ok(timestamp_micros) = last_seen_offset.trim().parse::<i64>()
+            && timestamp_micros > 0
+        {
+            if self.partition_progress.is_empty() {
+                match time::OffsetDateTime::from_unix_timestamp_nanos(
+                    (timestamp_micros as i128) * 1000,
+                ) {
+                    Ok(offset_ts) => self.offset = Some(offset_ts),
+                    Err(e) => tracing::error!(
+                        error = %e,
+                        timestamp_micros,
+                        "failed to convert legacy integer offset to OffsetDateTime"
+                    ),
                 }
             }
+            return Ok(());
         }
 
-        // Fall back to parsing as CdcOffset enum format: {"Spanner": {...}}
-        // This is used for CDC checkpoint updates with full partition state
         let cdc_offset: crate::source::cdc::external::CdcOffset = serde_json::from_str(&last_seen_offset)?;
         match cdc_offset {
             crate::source::cdc::external::CdcOffset::Spanner(spanner_offset) => {
                 self.update_from_offset(&spanner_offset);
             }
             _ => {
-                // Should not happen for Spanner CDC
                 tracing::warn!("Received non-Spanner CdcOffset: {:?}", cdc_offset);
             }
         }
@@ -309,5 +361,121 @@ mod tests {
         let earlier = offset + time::Duration::seconds(50);
         split.advance_offset(earlier);
         assert_eq!(split.offset, Some(later));
+    }
+
+    fn spanner_offset_for(token: &str, micros: i64, finished: bool) -> crate::source::cdc::external::spanner::SpannerOffset {
+        let mut o = crate::source::cdc::external::spanner::SpannerOffset::with_partition(
+            micros,
+            Some(token.to_string()),
+            vec![],
+            micros,
+            "test".to_string(),
+            0,
+        );
+        if finished {
+            o.mark_finished();
+        }
+        o
+    }
+
+    fn micros(secs: i64) -> i64 {
+        secs * 1_000_000
+    }
+
+    #[test]
+    fn update_from_offset_min_across_partitions() {
+        let mut split = SpannerCdcSplit::new_root("test".to_string(), 0, OffsetDateTime::UNIX_EPOCH);
+
+        split.update_from_offset(&spanner_offset_for("p_fast", micros(200), false));
+        assert_eq!(split.offset.unwrap().unix_timestamp(), 200);
+
+        split.update_from_offset(&spanner_offset_for("p_slow", micros(100), false));
+        assert_eq!(split.offset.unwrap().unix_timestamp(), 100);
+
+        split.update_from_offset(&spanner_offset_for("p_slow", micros(150), false));
+        assert_eq!(split.offset.unwrap().unix_timestamp(), 150);
+    }
+
+    #[test]
+    fn update_from_offset_finished_removes_partition() {
+        let mut split = SpannerCdcSplit::new_root("test".to_string(), 0, OffsetDateTime::UNIX_EPOCH);
+
+        split.update_from_offset(&spanner_offset_for("p_slow", micros(100), false));
+        split.update_from_offset(&spanner_offset_for("p_fast", micros(200), false));
+        assert_eq!(split.offset.unwrap().unix_timestamp(), 100);
+
+        split.update_from_offset(&spanner_offset_for("p_slow", micros(100), true));
+        assert_eq!(split.offset.unwrap().unix_timestamp(), 200);
+        assert!(!split.partition_progress.contains_key("p_slow"));
+
+        // Empty map retains the last min as the safe resume hint.
+        split.update_from_offset(&spanner_offset_for("p_fast", micros(200), true));
+        assert_eq!(split.offset.unwrap().unix_timestamp(), 200);
+        assert!(split.partition_progress.is_empty());
+    }
+
+    #[test]
+    fn update_offset_json_path_routes_to_aggregation() {
+        let mut split = SpannerCdcSplit::new_root("test".to_string(), 0, OffsetDateTime::UNIX_EPOCH);
+
+        let offset_a = crate::source::cdc::external::CdcOffset::Spanner(
+            spanner_offset_for("p_a", micros(100), false),
+        );
+        let offset_b = crate::source::cdc::external::CdcOffset::Spanner(
+            spanner_offset_for("p_b", micros(50), false),
+        );
+
+        split.update_offset(serde_json::to_string(&offset_a).unwrap()).unwrap();
+        split.update_offset(serde_json::to_string(&offset_b).unwrap()).unwrap();
+        assert_eq!(split.offset.unwrap().unix_timestamp(), 50);
+        assert_eq!(split.partition_progress.len(), 2);
+    }
+
+    #[test]
+    fn update_offset_legacy_integer_ignored_once_tracking_started() {
+        let mut split = SpannerCdcSplit::new_root("test".to_string(), 0, OffsetDateTime::UNIX_EPOCH);
+
+        split.update_offset(micros(50).to_string()).unwrap();
+        assert_eq!(split.offset.unwrap().unix_timestamp(), 50);
+
+        split.update_from_offset(&spanner_offset_for("p_a", micros(100), false));
+        assert_eq!(split.offset.unwrap().unix_timestamp(), 100);
+
+        split.update_offset(micros(999).to_string()).unwrap();
+        assert_eq!(split.offset.unwrap().unix_timestamp(), 100);
+    }
+
+    #[test]
+    fn update_from_offset_tokenless_does_not_advance_self_offset() {
+        // Root heartbeats arrive tokenless. They must not advance the committed
+        // offset, even when partition_progress is empty — children that haven't
+        // reserved their slots yet would be skipped on restart otherwise.
+        let mut split = SpannerCdcSplit::new_root("test".to_string(), 0, OffsetDateTime::UNIX_EPOCH);
+        let mut tokenless = crate::source::cdc::external::spanner::SpannerOffset::with_partition(
+            micros(500), None, vec![], micros(500), "test".to_string(), 0,
+        );
+
+        split.update_from_offset(&tokenless);
+        assert_eq!(split.offset.unwrap().unix_timestamp(), 0); // UNIX_EPOCH unchanged
+        assert!(!split.snapshot_done);
+
+        // is_finished + tokenless still flips snapshot_done (source-level signal).
+        tokenless.mark_finished();
+        split.update_from_offset(&tokenless);
+        assert!(split.snapshot_done);
+        assert_eq!(split.offset.unwrap().unix_timestamp(), 0);
+    }
+
+    #[test]
+    fn encode_restore_wipes_partition_progress_keeps_committed_offset() {
+        let mut split = SpannerCdcSplit::new_root("test".to_string(), 7, OffsetDateTime::UNIX_EPOCH);
+        split.update_from_offset(&spanner_offset_for("p_a", micros(100), false));
+        split.update_from_offset(&spanner_offset_for("p_b", micros(200), false));
+        assert_eq!(split.offset.unwrap().unix_timestamp(), 100);
+
+        let restored = SpannerCdcSplit::restore_from_json(split.encode_to_json()).unwrap();
+
+        assert!(restored.partition_progress.is_empty());
+        assert_eq!(restored.offset.unwrap().unix_timestamp(), 100);
     }
 }

@@ -118,4 +118,42 @@ mod tests {
     }
 
     use crate::source::spanner_cdc::SpannerCdcProperties;
+
+    #[tokio::test]
+    async fn test_max_concurrent_partitions_zero_rejected() {
+        use crate::source::SourceContext;
+        use crate::source::SplitReader;
+        use crate::source::spanner_cdc::source::SpannerCdcSplitReader;
+
+        let props: SpannerCdcProperties = serde_json::from_value(serde_json::json!({
+            "connector": "spanner-cdc",
+            "spanner.project": "test-project",
+            "spanner.instance": "test-instance",
+            "database.name": "test-db",
+            "spanner.change_stream.name": "test-stream",
+            "spanner.change_stream.max_concurrent_partitions": "0",
+        }))
+        .unwrap();
+
+        let split = SpannerCdcSplit::new_root(
+            "test-stream".to_string(),
+            0,
+            OffsetDateTime::now_utc(),
+        );
+
+        let result = SpannerCdcSplitReader::new(
+            props,
+            vec![split],
+            Default::default(),
+            SourceContext::dummy().into(),
+            None,
+        )
+        .await;
+
+        let err = result.err().expect("expected validation error").to_string();
+        assert!(
+            err.contains("max_concurrent_partitions must be >= 1"),
+            "unexpected error: {err}",
+        );
+    }
 }
