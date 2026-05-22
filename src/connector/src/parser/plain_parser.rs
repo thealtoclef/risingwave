@@ -622,6 +622,7 @@ mod tests {
                             ],
                             change_type: Alter,
                             upstream_ddl: "ALTER TABLE test add column v2 varchar(32)",
+                            rebackfill_columns: [],
                         },
                     ],
                 },
