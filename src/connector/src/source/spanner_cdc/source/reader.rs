@@ -43,6 +43,7 @@ use risingwave_common::ensure;
 use time::OffsetDateTime;
 use tokio::sync::{Mutex, mpsc};
 use tokio_retry::strategy::{ExponentialBackoff, jitter};
+use tokio_util::sync::CancellationToken;
 
 use risingwave_pb::connector_service::{SourceType, cdc_message};
 
@@ -71,6 +72,8 @@ pub struct SpannerCdcSplitReader {
     parser_config: ParserConfig,
     /// Source context
     source_ctx: SourceContextRef,
+    /// Signals the background reader task to stop on drop.
+    cancel: CancellationToken,
 }
 
 // ---------------------------------------------------------------------------
@@ -94,6 +97,8 @@ impl SplitReader for SpannerCdcSplitReader {
         let source_id = source_ctx.source_id.as_raw_id();
         let (tx, rx) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
 
+        let cancel = CancellationToken::new();
+
         // Extract the checkpointed offset from splits.
         let checkpointed_offset = splits.iter()
             .find(|s| s.index == source_id)
@@ -116,12 +121,24 @@ impl SplitReader for SpannerCdcSplitReader {
             schema_tracker: Arc::new(SchemaTracker::new()),
             source_id,
             checkpointed_offset,
+            cancel_token: cancel.clone(),
         };
 
-        // Spawn background task — like Debezium spawns the JNI thread
+        // Spawn background task with cancellation support.
+        // The cancellation token is cloned and dropped when the reader is dropped,
+        // ensuring the task does not live longer than the reader.
+        let cancel_clone = cancel.clone();
         tokio::spawn(async move {
-            if let Err(e) = run_reader(ctx, tx).await {
-                tracing::error!(error = %e, "Spanner CDC reader task failed");
+            tokio::select! {
+                biased;
+                _ = cancel_clone.cancelled() => {
+                    tracing::info!(source_id, "Spanner CDC reader cancelled");
+                }
+                result = run_reader(ctx, tx) => {
+                    if let Err(e) = result {
+                        tracing::error!(error = %e, source_id, "Spanner CDC reader task failed");
+                    }
+                }
             }
         });
 
@@ -131,6 +148,7 @@ impl SplitReader for SpannerCdcSplitReader {
             rx,
             parser_config,
             source_ctx,
+            cancel,
         })
     }
 
@@ -138,6 +156,12 @@ impl SplitReader for SpannerCdcSplitReader {
         let parser_config = self.parser_config.clone();
         let source_context = self.source_ctx.clone();
         into_chunk_stream(self.into_data_stream(), parser_config, source_context)
+    }
+}
+
+impl Drop for SpannerCdcSplitReader {
+    fn drop(&mut self) {
+        self.cancel.cancel();
     }
 }
 
@@ -184,6 +208,7 @@ struct ReaderContext {
     schema_tracker: Arc<SchemaTracker>,
     source_id: u32,
     checkpointed_offset: Option<OffsetDateTime>,
+    cancel_token: CancellationToken,
 }
 
 /// Main reader loop — reads from Spanner change stream and sends to `tx`.
@@ -353,13 +378,14 @@ fn spawn_partition_task(
     let schema_tracker = ctx.schema_tracker.clone();
     let tx = tx.clone();
     let split_id = split_id.clone();
+    let cancel_token = ctx.cancel_token.clone();
 
     partition_streams.push(tokio::spawn(async move {
         read_partition(
             client, database_name, split, change_stream_name, heartbeat_interval_ms,
             split_id, retry_attempts, retry_backoff,
             retry_backoff_max_delay_ms, retry_backoff_factor,
-            schema_tracker, tx, active_parents, child_discovery_tx,
+            schema_tracker, tx, active_parents, child_discovery_tx, cancel_token,
         ).await
     }));
 }
@@ -379,35 +405,21 @@ async fn read_partition(
     tx: mpsc::Sender<Vec<SourceMessage>>,
     active_parents: Arc<Mutex<HashSet<String>>>,
     child_discovery_tx: tokio::sync::mpsc::UnboundedSender<SpannerCdcSplit>,
+    cancel_token: CancellationToken,
 ) -> Result<()> {
-    let start_ts = split.offset.ok_or_else(|| {
-        ConnectorError::from(anyhow::anyhow!(
+    if split.offset.is_none() {
+        return Err(ConnectorError::from(anyhow::anyhow!(
             "offset is None for split_id={}, change_stream={}",
             split_id, change_stream_name
-        ))
-    })?;
+        )));
+    }
 
     if let Some(ref token) = split.partition_token {
         active_parents.lock().await.insert(token.clone());
     }
 
-    let mut stmt = Statement::new(format!(
-        "SELECT ChangeRecord FROM READ_{} (\
-            @start_timestamp, @end_timestamp, @partition_token, @heartbeat_milliseconds\
-        )",
-        change_stream_name
-    ));
-    stmt.add_param("start_timestamp", &start_ts);
-    stmt.add_param("end_timestamp", &Option::<OffsetDateTime>::None);
-    if let Some(ref token) = split.partition_token {
-        stmt.add_param("partition_token", token);
-    } else {
-        stmt.add_param("partition_token", &Option::<String>::None);
-    }
-    stmt.add_param("heartbeat_milliseconds", &heartbeat_interval_ms);
-
     tracing::info!(
-        %split_id, %start_ts,
+        %split_id, start_ts = ?split.offset,
         partition_token = ?split.partition_token,
         "change stream query starting"
     );
@@ -415,12 +427,17 @@ async fn read_partition(
     let retry_strategy = ExponentialBackoff::from_millis(retry_backoff.as_millis() as u64)
         .max_delay(tokio::time::Duration::from_millis(retry_backoff_max_delay_ms))
         .factor(retry_backoff_factor)
-        .take(retry_attempts as usize)
+        .take(retry_attempts.saturating_add(1) as usize)
         .map(jitter);
 
+    let max_attempts = (retry_attempts.saturating_add(1)) as usize;
     let mut last_error = None;
 
     for (attempt, delay) in retry_strategy.enumerate() {
+        if cancel_token.is_cancelled() {
+            tracing::debug!(%split_id, "partition task cancelled");
+            break;
+        }
         if tx.is_closed() {
             if let Some(ref token) = split.partition_token {
                 active_parents.lock().await.remove(token.as_str());
@@ -428,26 +445,90 @@ async fn read_partition(
             return Ok(());
         }
 
-        match execute_query(
-            &client, &database_name, &stmt, &mut split, &split_id, &schema_tracker,
-            &tx, active_parents.clone(), &child_discovery_tx, &change_stream_name,
-        ).await {
-            Ok(()) => return Ok(()),
-            Err(e) => {
-                tracing::warn!(
-                    %split_id, attempt = attempt + 1,
-                    max_attempts = retry_attempts + 1,
-                    ?delay, error = %e,
-                    "query failed, retrying"
-                );
+        // Rebuild stmt each attempt: `execute_query` advances split.offset before sending,
+        // so retries must resume from the (now-advanced) offset to avoid re-emitting records.
+        let start_ts = split.offset.ok_or_else(|| {
+            ConnectorError::from(anyhow::anyhow!(
+                "offset became None during retry for split_id={}, change_stream={}",
+                split_id, change_stream_name
+            ))
+        })?;
+
+        let mut stmt = Statement::new(format!(
+            "SELECT ChangeRecord FROM READ_{} (\
+                @start_timestamp, @end_timestamp, @partition_token, @heartbeat_milliseconds\
+            )",
+            change_stream_name
+        ));
+        stmt.add_param("start_timestamp", &start_ts);
+        stmt.add_param("end_timestamp", &Option::<OffsetDateTime>::None);
+        if let Some(ref token) = split.partition_token {
+            stmt.add_param("partition_token", token);
+        } else {
+            stmt.add_param("partition_token", &Option::<String>::None);
+        }
+        stmt.add_param("heartbeat_milliseconds", &heartbeat_interval_ms);
+
+        if attempt > 0 {
+            tracing::info!(
+                %split_id, attempt = attempt + 1, %start_ts,
+                "change stream query retrying from advanced offset"
+            );
+        }
+
+        // Race the query against cancellation so a blocking Spanner call can be interrupted.
+        let attempt_result = tokio::select! {
+            biased;
+            _ = cancel_token.cancelled() => {
+                tracing::debug!(%split_id, attempt = attempt + 1, "partition task cancelled mid-query");
+                None
+            }
+            r = execute_query(
+                &client, &database_name, &stmt, &mut split, &split_id, &schema_tracker,
+                &tx, active_parents.clone(), &child_discovery_tx, &change_stream_name,
+            ) => Some(r)
+        };
+
+        match attempt_result {
+            Some(Ok(())) => {
+                if let Some(ref token) = split.partition_token {
+                    active_parents.lock().await.remove(token.as_str());
+                }
+                return Ok(());
+            }
+            None => break,
+            Some(Err(e)) => {
+                let is_final_attempt = attempt + 1 >= max_attempts;
+                if is_final_attempt {
+                    tracing::warn!(
+                        %split_id, attempt = attempt + 1,
+                        max_attempts, error = %e,
+                        "query failed, no more retries"
+                    );
+                } else {
+                    tracing::warn!(
+                        %split_id, attempt = attempt + 1,
+                        max_attempts, ?delay, error = %e,
+                        "query failed, retrying"
+                    );
+                    tokio::select! {
+                        biased;
+                        _ = cancel_token.cancelled() => {}
+                        _ = tokio::time::sleep(delay) => {}
+                    }
+                }
+                // Log borrows e via Display (error = %e); move into last_error afterwards.
+                // ConnectorError is not Clone.
                 last_error = Some(e);
-                tokio::time::sleep(delay).await;
             }
         }
     }
 
     if let Some(ref token) = split.partition_token {
         active_parents.lock().await.remove(token.as_str());
+    }
+    if cancel_token.is_cancelled() {
+        return Ok(());
     }
     Err(last_error.unwrap_or_else(|| {
         anyhow::anyhow!("change stream query failed with no error recorded").into()

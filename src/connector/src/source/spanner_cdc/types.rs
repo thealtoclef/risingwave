@@ -209,30 +209,6 @@ impl SpannerType {
     }
 }
 
-/// Map a Spanner type name string (as produced by `SpannerType::to_type_string()`) to a RisingWave DataType.
-///
-/// Returns `None` for unsupported types (STRUCT, PROTO, ENUM).
-pub fn spanner_type_name_to_rw_type(type_name: &str) -> Option<DataType> {
-    // Handle ARRAY<element_type>
-    if let Some(inner) = type_name.strip_prefix("ARRAY<").and_then(|s| s.strip_suffix('>')) {
-        return spanner_type_name_to_rw_type(inner)
-            .map(|elem_type| DataType::List(ListType::new(elem_type)));
-    }
-    match type_name {
-        "BOOL" => Some(DataType::Boolean),
-        "INT64" => Some(DataType::Int64),
-        "FLOAT64" => Some(DataType::Float64),
-        "FLOAT32" => Some(DataType::Float32),
-        "TIMESTAMP" => Some(DataType::Timestamptz),
-        "DATE" => Some(DataType::Date),
-        "STRING" => Some(DataType::Varchar),
-        "BYTES" => Some(DataType::Bytea),
-        "NUMERIC" => Some(DataType::Decimal),
-        "JSON" => Some(DataType::Jsonb),
-        _ => None,
-    }
-}
-
 /// Custom serializer/deserializer for SpannerType in ColumnType
 ///
 /// The Google Cloud Spanner library returns the type field as a JSON string,

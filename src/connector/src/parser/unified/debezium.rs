@@ -40,7 +40,7 @@ use crate::source::cdc::external::mysql::{
     mysql_type_to_rw_type, timestamp_val_to_timestamptz, type_name_to_mysql_type,
 };
 use crate::source::cdc::external::postgres::{pg_type_to_rw_type, type_name_to_pg_type};
-use crate::source::spanner_cdc::types::spanner_type_name_to_rw_type;
+use crate::source::cdc::external::spanner::spanner_type_to_rw_type;
 use crate::source::{ConnectorProperties, SourceColumnDesc};
 
 /// Parse Debezium `tableChanges[].id` into `(schema_name, table_name)`.
@@ -394,7 +394,7 @@ pub async fn parse_schema_change(
                             }
                         }
                         ConnectorProperties::SpannerCdc(_) => {
-                            match spanner_type_name_to_rw_type(type_name.as_str()) {
+                            match spanner_type_to_rw_type(type_name.as_str()).ok() {
                                 Some(data_type) => data_type,
                                 None => {
                                     tracing::warn!(
