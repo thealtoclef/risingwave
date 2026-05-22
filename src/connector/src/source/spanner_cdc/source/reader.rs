@@ -105,6 +105,7 @@ impl SplitReader for SpannerCdcSplitReader {
 
         let ctx = ReaderContext {
             client,
+            database_name: properties.database.clone(),
             change_stream_name: properties.change_stream_name.clone(),
             max_concurrent_partitions: properties.get_change_stream_max_concurrent_partitions(),
             heartbeat_interval_ms,
@@ -172,6 +173,7 @@ impl SpannerCdcSplitReader {
 /// Context for the background reader task.
 struct ReaderContext {
     client: Client,
+    database_name: String,
     change_stream_name: String,
     max_concurrent_partitions: usize,
     heartbeat_interval_ms: i64,
@@ -341,6 +343,7 @@ fn spawn_partition_task(
     child_discovery_tx: tokio::sync::mpsc::UnboundedSender<SpannerCdcSplit>,
 ) {
     let client = ctx.client.clone();
+    let database_name = ctx.database_name.clone();
     let change_stream_name = ctx.change_stream_name.clone();
     let heartbeat_interval_ms = ctx.heartbeat_interval_ms;
     let retry_attempts = ctx.retry_attempts;
@@ -353,7 +356,7 @@ fn spawn_partition_task(
 
     partition_streams.push(tokio::spawn(async move {
         read_partition(
-            client, split, change_stream_name, heartbeat_interval_ms,
+            client, database_name, split, change_stream_name, heartbeat_interval_ms,
             split_id, retry_attempts, retry_backoff,
             retry_backoff_max_delay_ms, retry_backoff_factor,
             schema_tracker, tx, active_parents, child_discovery_tx,
@@ -363,6 +366,7 @@ fn spawn_partition_task(
 
 async fn read_partition(
     client: Client,
+    database_name: String,
     mut split: SpannerCdcSplit,
     change_stream_name: String,
     heartbeat_interval_ms: i64,
@@ -425,7 +429,7 @@ async fn read_partition(
         }
 
         match execute_query(
-            &client, &stmt, &mut split, &split_id, &schema_tracker,
+            &client, &database_name, &stmt, &mut split, &split_id, &schema_tracker,
             &tx, active_parents.clone(), &child_discovery_tx, &change_stream_name,
         ).await {
             Ok(()) => return Ok(()),
@@ -456,6 +460,7 @@ async fn read_partition(
 
 async fn execute_query(
     client: &Client,
+    database_name: &str,
     stmt: &Statement,
     split: &mut SpannerCdcSplit,
     split_id: &SplitId,
@@ -514,7 +519,13 @@ async fn execute_query(
                         }
                         // Send schema change alone so the parser can process it
                         // before the data records that follow.
-                        let schema_msg = make_schema_change_msg(split, split_id, json, data_change);
+                        let schema_msg = make_schema_change_msg(
+                            split,
+                            split_id,
+                            json,
+                            data_change,
+                            database_name,
+                        );
                         if tx.send(vec![schema_msg]).await.is_err() {
                             return Ok(());
                         }
@@ -529,6 +540,7 @@ async fn execute_query(
                 for modification in &data_change.mods {
                     let tagged = TaggedChangeRecord {
                         split_id: split_id.clone(),
+                        database_name: database_name.to_owned(),
                         data_change: data_change.clone(),
                         modification: modification.clone(),
                     };
@@ -627,17 +639,19 @@ fn make_schema_change_msg(
     split_id: &SplitId,
     payload: Vec<u8>,
     data_change: &crate::source::spanner_cdc::types::DataChangeRecord,
+    database_name: &str,
 ) -> SourceMessage {
     SourceMessage {
         key: None,
         payload: Some(payload.into()),
         offset: make_offset_string(split),
         split_id: split_id.clone(),
-        meta: SourceMeta::DebeziumCdc(DebeziumCdcMeta::new(
+        meta: SourceMeta::DebeziumCdc(DebeziumCdcMeta::new_with_database_name(
             data_change.table_name.clone(),
             (data_change.commit_time().unix_timestamp_nanos() / 1_000_000) as i64,
             cdc_message::CdcMessageType::SchemaChange,
             SourceType::Unspecified,
+            Some(database_name.to_owned()),
         )),
     }
 }

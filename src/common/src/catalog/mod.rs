@@ -140,6 +140,7 @@ pub const CDC_OFFSET_COLUMN_NAME: &str = "_rw_offset";
 /// see [`ColumnCatalog::debezium_cdc_source_cols()`] for details
 pub const CDC_SOURCE_COLUMN_NUM: u32 = 3;
 pub const CDC_TABLE_NAME_COLUMN_NAME: &str = "_rw_table_name";
+pub const RW_INGESTION_TIME_COLUMN_NAME: &str = "_rw_ingestion_time";
 
 pub const ICEBERG_SOURCE_PREFIX: &str = "__iceberg_source_";
 pub const ICEBERG_SINK_PREFIX: &str = "__iceberg_sink_";

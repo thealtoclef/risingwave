@@ -265,10 +265,15 @@ mod tests {
     use futures::{StreamExt, TryStreamExt};
     use futures_async_stream::try_stream;
     use itertools::Itertools;
-    use risingwave_common::catalog::ColumnCatalog;
+    use risingwave_common::array::Op;
+    use risingwave_common::catalog::{ColumnCatalog, ColumnId};
+    use risingwave_common::row::Row;
+    use risingwave_common::types::{DataType, Datum, ScalarRefImpl, Timestamptz};
     use risingwave_pb::connector_service::{SourceType, cdc_message};
+    use risingwave_pb::plan_common::additional_column::ColumnType as AdditionalColumnType;
 
     use super::*;
+    use crate::parser::additional_columns::build_additional_column_desc;
     use crate::parser::{MessageMeta, SourceStreamChunkBuilder, TransactionControl};
     use crate::source::cdc::DebeziumCdcMeta;
     use crate::source::{
@@ -478,6 +483,7 @@ mod tests {
             source_meta: &cdc_meta,
             split_id: "1001",
             offset: "",
+            process_time_ms: 0,
         };
 
         let expect_tx_id = "3E11FA47-71CA-11E1-9E33-C80AA9429562:23";
@@ -546,6 +552,7 @@ mod tests {
             source_meta: &cdc_meta,
             split_id: "1001",
             offset: "",
+            process_time_ms: 0,
         };
 
         let res = parser
@@ -615,11 +622,185 @@ mod tests {
                             ],
                             change_type: Alter,
                             upstream_ddl: "ALTER TABLE test add column v2 varchar(32)",
+                            rebackfill_columns: [],
                         },
                     ],
                 },
             )
         "#]]
         .assert_debug_eq(&res);
+    }
+
+    #[test]
+    fn test_ingestion_time_additional_column_uses_parser_process_time() {
+        let columns = ["timestamp", "ingestion_time"]
+            .into_iter()
+            .map(|col_type| {
+                SourceColumnDesc::from(
+                    &build_additional_column_desc(
+                        ColumnId::placeholder(),
+                        "mysql-cdc",
+                        col_type,
+                        None,
+                        None,
+                        None,
+                        true,
+                        true,
+                    )
+                    .unwrap(),
+                )
+            })
+            .collect_vec();
+        let mut builder = SourceStreamChunkBuilder::new(columns, SourceCtrlOpts::for_test());
+
+        let cdc_meta = SourceMeta::DebeziumCdc(DebeziumCdcMeta::new(
+            "mydb.orders".to_owned(),
+            1_710_000_000_123,
+            cdc_message::CdcMessageType::Data,
+            SourceType::Mysql,
+        ));
+        let msg_meta = MessageMeta {
+            source_meta: &cdc_meta,
+            split_id: "1001",
+            offset: "0",
+            process_time_ms: 1_720_000_000_456,
+        };
+
+        builder
+            .row_writer()
+            .with_meta(msg_meta)
+            .do_insert(|_| Ok(Datum::None))
+            .unwrap();
+        builder.finish_current_chunk();
+        let chunk = builder.consume_ready_chunks().next().unwrap();
+        let (_, row) = chunk.rows().next().unwrap();
+
+        let source_timestamp = match row.datum_at(0).unwrap() {
+            ScalarRefImpl::Timestamptz(ts) => ts,
+            other => panic!("unexpected source timestamp datum: {other:?}"),
+        };
+        let ingestion_timestamp = match row.datum_at(1).unwrap() {
+            ScalarRefImpl::Timestamptz(ts) => ts,
+            other => panic!("unexpected ingestion timestamp datum: {other:?}"),
+        };
+
+        assert_eq!(
+            source_timestamp,
+            Timestamptz::from_millis(1_710_000_000_123).unwrap()
+        );
+        assert_eq!(
+            ingestion_timestamp,
+            Timestamptz::from_millis(1_720_000_000_456).unwrap()
+        );
+        assert_ne!(source_timestamp, ingestion_timestamp);
+    }
+
+    #[test]
+    fn test_ingestion_time_additional_column_type() {
+        let desc = build_additional_column_desc(
+            ColumnId::placeholder(),
+            "mysql-cdc",
+            "ingestion_time",
+            None,
+            None,
+            None,
+            true,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(desc.data_type, DataType::Timestamptz);
+        assert_matches::assert_matches!(
+            desc.additional_column.column_type,
+            Some(AdditionalColumnType::IngestionTime(_))
+        );
+    }
+
+    #[test]
+    fn test_ingestion_time_additional_column_overflow_returns_null() {
+        let columns = [SourceColumnDesc::from(
+            &build_additional_column_desc(
+                ColumnId::placeholder(),
+                "mysql-cdc",
+                "ingestion_time",
+                None,
+                None,
+                None,
+                true,
+                true,
+            )
+            .unwrap(),
+        )];
+        let mut builder =
+            SourceStreamChunkBuilder::new(columns.into_iter().collect(), SourceCtrlOpts::for_test());
+
+        let cdc_meta = SourceMeta::DebeziumCdc(DebeziumCdcMeta::new(
+            "mydb.orders".to_owned(),
+            1_710_000_000_123,
+            cdc_message::CdcMessageType::Data,
+            SourceType::Mysql,
+        ));
+        let msg_meta = MessageMeta {
+            source_meta: &cdc_meta,
+            split_id: "1001",
+            offset: "0",
+            process_time_ms: i64::MAX,
+        };
+
+        builder
+            .row_writer()
+            .with_meta(msg_meta)
+            .do_insert(|_| Ok(Datum::None))
+            .unwrap();
+        builder.finish_current_chunk();
+        let chunk = builder.consume_ready_chunks().next().unwrap();
+        let (_, row) = chunk.rows().next().unwrap();
+
+        assert!(row.datum_at(0).is_none());
+    }
+
+    #[test]
+    fn test_heartbeat_ingestion_time_additional_column() {
+        let columns = [SourceColumnDesc::from(
+            &build_additional_column_desc(
+                ColumnId::placeholder(),
+                "mysql-cdc",
+                "ingestion_time",
+                None,
+                None,
+                None,
+                true,
+                true,
+            )
+            .unwrap(),
+        )];
+        let mut builder =
+            SourceStreamChunkBuilder::new(columns.into_iter().collect(), SourceCtrlOpts::for_test());
+
+        let cdc_meta = SourceMeta::DebeziumCdc(DebeziumCdcMeta::new(
+            "mydb.orders".to_owned(),
+            1_710_000_000_123,
+            cdc_message::CdcMessageType::Heartbeat,
+            SourceType::Mysql,
+        ));
+        let msg_meta = MessageMeta {
+            source_meta: &cdc_meta,
+            split_id: "1001",
+            offset: "0",
+            process_time_ms: 1_720_000_000_456,
+        };
+
+        builder.heartbeat(msg_meta);
+        let chunk = builder.consume_ready_chunks().next().unwrap();
+        let (op, row, visible) = chunk.row_at(0);
+
+        assert_eq!(op, Op::Insert);
+        assert!(!visible);
+        assert_eq!(
+            row.datum_at(0),
+            Some(ScalarRefImpl::Timestamptz(
+                Timestamptz::from_millis(1_720_000_000_456).unwrap()
+            ))
+        );
     }
 }
