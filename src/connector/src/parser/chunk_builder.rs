@@ -357,9 +357,7 @@ impl SourceStreamChunkRowWriter<'_> {
                                         desc.name.as_str(),
                                     )?))
                                 } else {
-                                    Err(AccessError::Uncategorized {
-                                        message: "CDC metadata not found in the message".to_owned(),
-                                    })
+                                    parse_field(desc)
                                 }
                             }
                             None => parse_field(desc), // parse from payload
@@ -367,9 +365,10 @@ impl SourceStreamChunkRowWriter<'_> {
                     }
                 }
                 (_, &Some(AdditionalColumnType::Timestamp(_))) => match self.row_meta {
-                    Some(row_meta) => Ok(A::output_for(extract_timestamp_from_meta(
-                        row_meta.source_meta,
-                    ))),
+                    Some(row_meta) => match extract_timestamp_from_meta(row_meta.source_meta) {
+                        Some(ts) => Ok(A::output_for(Some(ts))),
+                        None => parse_field(desc),
+                    },
                     None => parse_field(desc), // parse from payload
                 },
                 (_, &Some(AdditionalColumnType::IngestionTime(_))) => match self.row_meta {

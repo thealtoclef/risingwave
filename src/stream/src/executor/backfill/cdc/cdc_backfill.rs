@@ -1006,7 +1006,7 @@ mod tests {
     use risingwave_common::array::{Array, DataChunk, Op, StreamChunk};
     use risingwave_common::catalog::{ColumnDesc, ColumnId, Field, Schema};
     use risingwave_common::row::Row;
-    use risingwave_common::types::{DataType, Datum, JsonbVal, ScalarRefImpl};
+    use risingwave_common::types::{DataType, Datum, JsonbVal, ScalarRefImpl, Timestamptz};
     use risingwave_common::util::epoch::test_epoch;
     use risingwave_common::util::iter_util::ZipEqFast;
     use risingwave_connector::parser::additional_columns::build_additional_column_desc;
@@ -1062,14 +1062,43 @@ mod tests {
         let mut columns = vec![
             ColumnDesc::named("O_ORDERKEY", ColumnId::new(1), DataType::Int64),
             ColumnDesc::named("O_CUSTKEY", ColumnId::new(2), DataType::Int64),
-            ColumnDesc::named("O_ORDERSTATUS", ColumnId::new(3), DataType::Varchar),
-            ColumnDesc::named("O_TOTALPRICE", ColumnId::new(4), DataType::Decimal),
-            ColumnDesc::named("O_ORDERDATE", ColumnId::new(5), DataType::Date),
-            ColumnDesc::named("commit_ts", ColumnId::new(6), DataType::Timestamptz),
+            build_additional_column_desc(
+                ColumnId::new(3),
+                "mysql-cdc",
+                "timestamp",
+                Some("source_commit_ts".to_owned()),
+                None,
+                None,
+                true,
+                true,
+            )
+            .unwrap(),
+            build_additional_column_desc(
+                ColumnId::new(4),
+                "mysql-cdc",
+                "database_name",
+                Some("source_db".to_owned()),
+                None,
+                None,
+                true,
+                true,
+            )
+            .unwrap(),
+            build_additional_column_desc(
+                ColumnId::new(5),
+                "mysql-cdc",
+                "table_name",
+                Some("source_table".to_owned()),
+                None,
+                None,
+                true,
+                true,
+            )
+            .unwrap(),
         ];
         columns.push(
             build_additional_column_desc(
-                ColumnId::new(7),
+                ColumnId::new(6),
                 "mysql-cdc",
                 "ingestion_time",
                 Some("ingest_ts_1".to_owned()),
@@ -1082,7 +1111,7 @@ mod tests {
         );
         columns.push(
             build_additional_column_desc(
-                ColumnId::new(8),
+                ColumnId::new(7),
                 "mysql-cdc",
                 "ingestion_time",
                 Some("ingest_ts_2".to_owned()),
@@ -1102,14 +1131,22 @@ mod tests {
         let Message::Chunk(chunk) = message.unwrap() else {
             panic!("expect chunk");
         };
-        assert_eq!(chunk.columns().len(), 9);
+        assert_eq!(chunk.columns().len(), 8);
         let (_, row) = chunk.rows().next().unwrap();
-        let ingest_ts_1 = row.datum_at(6);
-        let ingest_ts_2 = row.datum_at(7);
+        assert_eq!(
+            row.datum_at(2),
+            Some(ScalarRefImpl::Timestamptz(
+                Timestamptz::from_millis(1_695_277_757_000).unwrap()
+            ))
+        );
+        assert_eq!(row.datum_at(3), Some(ScalarRefImpl::Utf8("mydb")));
+        assert_eq!(row.datum_at(4), Some(ScalarRefImpl::Utf8("orders_new")));
+        let ingest_ts_1 = row.datum_at(5);
+        let ingest_ts_2 = row.datum_at(6);
         assert!(matches!(ingest_ts_1, Some(ScalarRefImpl::Timestamptz(_))));
         assert_eq!(ingest_ts_1, ingest_ts_2);
         assert_eq!(
-            chunk.columns()[8].as_utf8().iter().collect::<Vec<_>>(),
+            chunk.columns()[7].as_utf8().iter().collect::<Vec<_>>(),
             vec![Some("file: 1.binlog, pos: 100")]
         );
     }
