@@ -265,7 +265,9 @@ mod tests {
     use futures::{StreamExt, TryStreamExt};
     use futures_async_stream::try_stream;
     use itertools::Itertools;
+    use risingwave_common::array::Op;
     use risingwave_common::catalog::{ColumnCatalog, ColumnId};
+    use risingwave_common::row::Row;
     use risingwave_common::types::{DataType, Datum, ScalarRefImpl, Timestamptz};
     use risingwave_pb::connector_service::{SourceType, cdc_message};
     use risingwave_pb::plan_common::additional_column::ColumnType as AdditionalColumnType;
