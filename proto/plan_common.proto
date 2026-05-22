@@ -276,6 +276,8 @@ message AdditionalSubject {}
 
 message AdditionalColumnPulsarMessageIdData {}
 
+message AdditionalColumnIngestionTime {}
+
 message AdditionalColumn {
   oneof column_type {
     AdditionalColumnKey key = 1;
@@ -292,6 +294,7 @@ message AdditionalColumn {
     AdditionalColumnPayload payload = 12;
     AdditionalSubject subject = 13;
     AdditionalColumnPulsarMessageIdData pulsar_message_id_data = 14;
+    AdditionalColumnIngestionTime ingestion_time = 15;
   }
 }
 
@@ -306,6 +309,7 @@ enum AdditionalColumnType {
   ADDITIONAL_COLUMN_TYPE_NORMAL = 7;
   ADDITIONAL_COLUMN_TYPE_PAYLOAD = 8;
   ADDITIONAL_COLUMN_TYPE_PULSAR_MESSAGE_ID_DATA = 9; // for pulsar source, used for ack message
+  ADDITIONAL_COLUMN_TYPE_INGESTION_TIME = 10;
 }
 
 message SourceRefreshMode {

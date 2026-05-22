@@ -397,7 +397,9 @@ pub async fn parse_schema_change(
                             match spanner_type_name_to_rw_type(type_name.as_str()) {
                                 Some(data_type) => data_type,
                                 None => {
-                                    tracing::warn!(error = "unsupported spanner type in schema change message");
+                                    tracing::warn!(
+                                        error = "unsupported spanner type in schema change message"
+                                    );
                                     return Err(AccessError::CdcAutoSchemaChangeError {
                                         ty: type_name,
                                         table_name: format!("{}.{}", source_name, table_name),

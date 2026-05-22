@@ -23,10 +23,12 @@ use itertools::Itertools;
 use risingwave_common::array::DataChunk;
 use risingwave_common::bail;
 use risingwave_common::catalog::ColumnDesc;
+use risingwave_common::types::{Scalar, ScalarImpl, Timestamptz};
 use risingwave_connector::parser::{
     BigintUnsignedHandlingMode, ByteStreamSourceParser, DebeziumParser, DebeziumProps,
-    EncodingProperties, JsonProperties, ProtocolProperties, SourceStreamChunkBuilder,
-    SpecificParserConfig, TimeHandling, TimestampHandling, TimestamptzHandling,
+    EncodingProperties, JsonProperties, MessageMeta, ProtocolProperties,
+    SourceStreamChunkBuilder, SpecificParserConfig, TimeHandling, TimestampHandling,
+    TimestamptzHandling,
 };
 use risingwave_connector::source::cdc::CdcScanOptions;
 use risingwave_connector::source::cdc::external::{
@@ -54,6 +56,33 @@ use crate::task::CreateMviewProgressReporter;
 
 /// `split_id`, `is_finished`, `row_count`, `cdc_offset` all occupy 1 column each.
 const METADATA_STATE_LEN: usize = 4;
+
+pub(crate) fn ingestion_time_scalar_from_millis(
+    process_time_ms: i64,
+    context: &'static str,
+) -> Option<ScalarImpl> {
+    match Timestamptz::from_millis(process_time_ms) {
+        Some(ts) => Some(ts.to_scalar_value()),
+        None => {
+            tracing::error!(
+                process_time_ms,
+                context,
+                "failed to convert ingestion timestamp from processing time"
+            );
+            None
+        }
+    }
+}
+
+pub(crate) fn current_process_time_ms(context: &'static str) -> Option<i64> {
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(duration) => Some(duration.as_millis() as i64),
+        Err(error) => {
+            tracing::error!(error = %error, context, "failed to get current ingestion time");
+            None
+        }
+    }
+}
 
 pub struct CdcBackfillExecutor<S: StateStore> {
     actor_ctx: ActorContextRef,
@@ -922,6 +951,7 @@ async fn parse_debezium_chunk(
     // then chain the parsed row with `_rw_offset` row to get a new row.
     let payloads = chunk.data_chunk().project(&[0]);
     let offsets = chunk.data_chunk().project(&[1]).compact_vis();
+    let process_time_ms = current_process_time_ms("shared cdc transform upstream").unwrap_or(0);
 
     // TODO: preserve the transaction semantics
     for payload in payloads.rows() {
@@ -934,7 +964,9 @@ async fn parse_debezium_chunk(
             .parse_inner(
                 None,
                 Some(jsonb_ref.to_string().as_bytes().to_vec()),
-                builder.row_writer(),
+                builder
+                    .row_writer()
+                    .with_meta(MessageMeta::shared_cdc_reparse(process_time_ms)),
             )
             .await
             .unwrap();
@@ -973,9 +1005,11 @@ mod tests {
     use futures::{StreamExt, pin_mut};
     use risingwave_common::array::{Array, DataChunk, Op, StreamChunk};
     use risingwave_common::catalog::{ColumnDesc, ColumnId, Field, Schema};
-    use risingwave_common::types::{DataType, Datum, JsonbVal};
+    use risingwave_common::row::Row;
+    use risingwave_common::types::{DataType, Datum, JsonbVal, ScalarRefImpl, Timestamptz};
     use risingwave_common::util::epoch::test_epoch;
     use risingwave_common::util::iter_util::ZipEqFast;
+    use risingwave_connector::parser::additional_columns::build_additional_column_desc;
     use risingwave_connector::source::cdc::CdcScanOptions;
     use risingwave_storage::memory::MemoryStateStore;
 
@@ -1025,21 +1059,202 @@ mod tests {
         let upstream = Box::new(source).execute();
 
         // schema to the debezium parser
-        let columns = vec![
+        let mut columns = vec![
             ColumnDesc::named("O_ORDERKEY", ColumnId::new(1), DataType::Int64),
             ColumnDesc::named("O_CUSTKEY", ColumnId::new(2), DataType::Int64),
-            ColumnDesc::named("O_ORDERSTATUS", ColumnId::new(3), DataType::Varchar),
-            ColumnDesc::named("O_TOTALPRICE", ColumnId::new(4), DataType::Decimal),
-            ColumnDesc::named("O_ORDERDATE", ColumnId::new(5), DataType::Date),
-            ColumnDesc::named("commit_ts", ColumnId::new(6), DataType::Timestamptz),
+            build_additional_column_desc(
+                ColumnId::new(3),
+                "mysql-cdc",
+                "timestamp",
+                Some("source_commit_ts".to_owned()),
+                None,
+                None,
+                true,
+                true,
+            )
+            .unwrap(),
+            build_additional_column_desc(
+                ColumnId::new(4),
+                "mysql-cdc",
+                "database_name",
+                Some("source_db".to_owned()),
+                None,
+                None,
+                true,
+                true,
+            )
+            .unwrap(),
+            build_additional_column_desc(
+                ColumnId::new(5),
+                "mysql-cdc",
+                "table_name",
+                Some("source_table".to_owned()),
+                None,
+                None,
+                true,
+                true,
+            )
+            .unwrap(),
+        ];
+        columns.push(
+            build_additional_column_desc(
+                ColumnId::new(6),
+                "mysql-cdc",
+                "ingestion_time",
+                Some("ingest_ts_1".to_owned()),
+                None,
+                None,
+                true,
+                true,
+            )
+            .unwrap(),
+        );
+        columns.push(
+            build_additional_column_desc(
+                ColumnId::new(7),
+                "mysql-cdc",
+                "ingestion_time",
+                Some("ingest_ts_2".to_owned()),
+                None,
+                None,
+                true,
+                true,
+            )
+            .unwrap(),
+        );
+
+        let parsed_stream = transform_upstream(upstream, columns, None, None, None, None, false);
+        pin_mut!(parsed_stream);
+        let Some(message) = parsed_stream.next().await else {
+            panic!("expect chunk");
+        };
+        let Message::Chunk(chunk) = message.unwrap() else {
+            panic!("expect chunk");
+        };
+        assert_eq!(chunk.columns().len(), 8);
+        let (_, row) = chunk.rows().next().unwrap();
+        assert_eq!(
+            row.datum_at(2),
+            Some(ScalarRefImpl::Timestamptz(
+                Timestamptz::from_millis(1_695_277_757_000).unwrap()
+            ))
+        );
+        assert_eq!(row.datum_at(3), Some(ScalarRefImpl::Utf8("mydb")));
+        assert_eq!(row.datum_at(4), Some(ScalarRefImpl::Utf8("orders_new")));
+        let ingest_ts_1 = row.datum_at(5);
+        let ingest_ts_2 = row.datum_at(6);
+        assert!(matches!(ingest_ts_1, Some(ScalarRefImpl::Timestamptz(_))));
+        assert_eq!(ingest_ts_1, ingest_ts_2);
+        assert_eq!(
+            chunk.columns()[7].as_utf8().iter().collect::<Vec<_>>(),
+            vec![Some("file: 1.binlog, pos: 100")]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_transform_upstream_chunk_with_spanner_source_metadata() {
+        let schema = Schema::new(vec![
+            Field::unnamed(DataType::Jsonb),   // debezium json payload
+            Field::unnamed(DataType::Varchar), // _rw_offset
+            Field::unnamed(DataType::Varchar), // _rw_table_name
+        ]);
+        let stream_key = vec![0];
+        let (mut tx, source) = MockSource::channel();
+        let source = source.into_executor(schema.clone(), stream_key.clone());
+
+        let payload = r#"{
+            "payload": {
+                "before": null,
+                "after": { "id": "pickle-2B1X", "amount": 48 },
+                "source": { "ts_ms": 1716372092578, "db": "cymbal", "table": "quantum_pickle_registry" },
+                "op": "c"
+            }
+        }"#;
+        let datums: Vec<Datum> = vec![
+            Some(JsonbVal::from_str(payload).unwrap().into()),
+            Some("{\"spanner\":true}".to_owned().into()),
+            Some("quantum_pickle_registry".to_owned().into()),
+        ];
+
+        let mut builders = schema.create_array_builders(8);
+        for (builder, datum) in builders.iter_mut().zip_eq_fast(datums.iter()) {
+            builder.append(datum.clone());
+        }
+        let columns = builders
+            .into_iter()
+            .map(|builder| builder.finish().into())
+            .collect();
+        let chunk = StreamChunk::from_parts(vec![Op::Insert], DataChunk::new(columns, 1));
+
+        tx.push_chunk(chunk);
+        let upstream = Box::new(source).execute();
+
+        let columns = vec![
+            ColumnDesc::named("id", ColumnId::new(1), DataType::Varchar),
+            ColumnDesc::named("amount", ColumnId::new(2), DataType::Int64),
+            build_additional_column_desc(
+                ColumnId::new(3),
+                "spanner-cdc",
+                "timestamp",
+                Some("source_commit_ts".to_owned()),
+                None,
+                None,
+                true,
+                true,
+            )
+            .unwrap(),
+            build_additional_column_desc(
+                ColumnId::new(4),
+                "spanner-cdc",
+                "database_name",
+                Some("source_db".to_owned()),
+                None,
+                None,
+                true,
+                true,
+            )
+            .unwrap(),
+            build_additional_column_desc(
+                ColumnId::new(5),
+                "spanner-cdc",
+                "table_name",
+                Some("source_table".to_owned()),
+                None,
+                None,
+                true,
+                true,
+            )
+            .unwrap(),
+            build_additional_column_desc(
+                ColumnId::new(6),
+                "spanner-cdc",
+                "ingestion_time",
+                Some("ingest_ts".to_owned()),
+                None,
+                None,
+                true,
+                true,
+            )
+            .unwrap(),
         ];
 
         let parsed_stream = transform_upstream(upstream, columns, None, None, None, None, false);
         pin_mut!(parsed_stream);
-        // the output chunk must contain the offset column
-        if let Some(message) = parsed_stream.next().await {
-            println!("chunk: {:#?}", message.unwrap());
-        }
+        let Some(message) = parsed_stream.next().await else {
+            panic!("expect chunk");
+        };
+        let Message::Chunk(chunk) = message.unwrap() else {
+            panic!("expect chunk");
+        };
+        let (_, row) = chunk.rows().next().unwrap();
+        assert_eq!(row.datum_at(2), Some(ScalarRefImpl::Timestamptz(Timestamptz::from_millis(1_716_372_092_578).unwrap())));
+        assert_eq!(row.datum_at(3), Some(ScalarRefImpl::Utf8("cymbal")));
+        assert_eq!(row.datum_at(4), Some(ScalarRefImpl::Utf8("quantum_pickle_registry")));
+        assert!(matches!(row.datum_at(5), Some(ScalarRefImpl::Timestamptz(_))));
+        assert_eq!(
+            chunk.columns()[6].as_utf8().iter().collect::<Vec<_>>(),
+            vec![Some("{\"spanner\":true}")]
+        );
     }
 
     #[tokio::test]
