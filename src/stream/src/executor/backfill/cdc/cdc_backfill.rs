@@ -74,6 +74,16 @@ pub(crate) fn ingestion_time_scalar_from_millis(
     }
 }
 
+pub(crate) fn current_process_time_ms(context: &'static str) -> Option<i64> {
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(duration) => Some(duration.as_millis() as i64),
+        Err(error) => {
+            tracing::error!(error = %error, context, "failed to get current ingestion time");
+            None
+        }
+    }
+}
+
 pub struct CdcBackfillExecutor<S: StateStore> {
     actor_ctx: ActorContextRef,
 
@@ -941,7 +951,7 @@ async fn parse_debezium_chunk(
     // then chain the parsed row with `_rw_offset` row to get a new row.
     let payloads = chunk.data_chunk().project(&[0]);
     let offsets = chunk.data_chunk().project(&[1]).compact_vis();
-    let process_time_ms = chrono::Utc::now().timestamp_millis();
+    let process_time_ms = current_process_time_ms("shared cdc transform upstream").unwrap_or(0);
 
     // TODO: preserve the transaction semantics
     for payload in payloads.rows() {
