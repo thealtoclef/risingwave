@@ -343,6 +343,7 @@ fn spawn_partition_task(
     child_discovery_tx: tokio::sync::mpsc::UnboundedSender<SpannerCdcSplit>,
 ) {
     let client = ctx.client.clone();
+    let database_name = ctx.database_name.clone();
     let change_stream_name = ctx.change_stream_name.clone();
     let heartbeat_interval_ms = ctx.heartbeat_interval_ms;
     let retry_attempts = ctx.retry_attempts;
@@ -355,7 +356,7 @@ fn spawn_partition_task(
 
     partition_streams.push(tokio::spawn(async move {
         read_partition(
-            client, split, change_stream_name, heartbeat_interval_ms,
+            client, database_name, split, change_stream_name, heartbeat_interval_ms,
             split_id, retry_attempts, retry_backoff,
             retry_backoff_max_delay_ms, retry_backoff_factor,
             schema_tracker, tx, active_parents, child_discovery_tx,
@@ -365,6 +366,7 @@ fn spawn_partition_task(
 
 async fn read_partition(
     client: Client,
+    database_name: String,
     mut split: SpannerCdcSplit,
     change_stream_name: String,
     heartbeat_interval_ms: i64,
@@ -427,7 +429,7 @@ async fn read_partition(
         }
 
         match execute_query(
-            &client, &stmt, &mut split, &split_id, &schema_tracker,
+            &client, &database_name, &stmt, &mut split, &split_id, &schema_tracker,
             &tx, active_parents.clone(), &child_discovery_tx, &change_stream_name,
         ).await {
             Ok(()) => return Ok(()),
@@ -458,6 +460,7 @@ async fn read_partition(
 
 async fn execute_query(
     client: &Client,
+    database_name: &str,
     stmt: &Statement,
     split: &mut SpannerCdcSplit,
     split_id: &SplitId,
@@ -521,7 +524,7 @@ async fn execute_query(
                             split_id,
                             json,
                             data_change,
-                            &ctx.database_name,
+                            database_name,
                         );
                         if tx.send(vec![schema_msg]).await.is_err() {
                             return Ok(());
@@ -537,7 +540,7 @@ async fn execute_query(
                 for modification in &data_change.mods {
                     let tagged = TaggedChangeRecord {
                         split_id: split_id.clone(),
-                        database_name: ctx.database_name.clone(),
+                        database_name: database_name.to_owned(),
                         data_change: data_change.clone(),
                         modification: modification.clone(),
                     };
