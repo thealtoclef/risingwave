@@ -1005,6 +1005,7 @@ mod tests {
     use futures::{StreamExt, pin_mut};
     use risingwave_common::array::{Array, DataChunk, Op, StreamChunk};
     use risingwave_common::catalog::{ColumnDesc, ColumnId, Field, Schema};
+    use risingwave_common::row::Row;
     use risingwave_common::types::{DataType, Datum, JsonbVal, ScalarRefImpl};
     use risingwave_common::util::epoch::test_epoch;
     use risingwave_common::util::iter_util::ZipEqFast;
