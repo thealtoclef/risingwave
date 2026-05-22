@@ -30,7 +30,7 @@ pub use protobuf::*;
 use risingwave_common::catalog::{CDC_TABLE_NAME_COLUMN_NAME, KAFKA_TIMESTAMP_COLUMN_NAME};
 use risingwave_common::log::LogSuppressor;
 use risingwave_common::metrics::GLOBAL_ERROR_METRICS;
-use risingwave_common::types::{DatumCow, DatumRef};
+use risingwave_common::types::{DatumCow, DatumRef, ScalarRefImpl, Timestamptz};
 use risingwave_common::util::tracing::InstrumentStream;
 use risingwave_connector_codec::decoder::avro::MapHandling;
 use thiserror_ext::AsReport;
@@ -95,6 +95,8 @@ pub use debezium::DEBEZIUM_IGNORE_KEY;
 use debezium::schema_change::SchemaChangeEnvelope;
 pub use unified::{AccessError, AccessResult};
 
+static EMPTY_SOURCE_META: SourceMeta = SourceMeta::Empty;
+
 /// The meta data of the original message for a row writer.
 ///
 /// Extracted from the `SourceMessage`.
@@ -103,9 +105,19 @@ pub struct MessageMeta<'a> {
     source_meta: &'a SourceMeta,
     split_id: &'a str,
     offset: &'a str,
+    process_time_ms: i64,
 }
 
 impl<'a> MessageMeta<'a> {
+    pub fn shared_cdc_reparse(process_time_ms: i64) -> MessageMeta<'static> {
+        MessageMeta {
+            source_meta: &EMPTY_SOURCE_META,
+            split_id: "",
+            offset: "",
+            process_time_ms,
+        }
+    }
+
     /// Extract the value for the given column.
     ///
     /// Returns `None` if the column is not a meta column.
@@ -140,6 +152,19 @@ impl<'a> MessageMeta<'a> {
         };
 
         datum
+    }
+
+    fn extract_ingestion_time(self) -> DatumRef<'a> {
+        match Timestamptz::from_millis(self.process_time_ms) {
+            Some(ts) => Some(ScalarRefImpl::Timestamptz(ts)),
+            None => {
+                tracing::error!(
+                    process_time_ms = self.process_time_ms,
+                    "failed to convert ingestion timestamp from parser process time"
+                );
+                None
+            }
+        }
     }
 }
 
@@ -277,6 +302,7 @@ async fn parse_message_stream<P: ByteStreamSourceParser>(
                         source_meta: &msg.meta,
                         split_id: &msg.split_id,
                         offset: &msg.offset,
+                        process_time_ms,
                     });
                     for chunk in chunk_builder.consume_ready_chunks() {
                         yield SourceReaderEvent::DataChunk(chunk);
@@ -312,6 +338,7 @@ async fn parse_message_stream<P: ByteStreamSourceParser>(
                         source_meta: &msg.meta,
                         split_id: &msg.split_id,
                         offset: &msg.offset,
+                        process_time_ms,
                     }),
                 )
                 .await

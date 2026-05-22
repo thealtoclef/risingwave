@@ -16,15 +16,17 @@ use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
 use risingwave_common::bail;
-use risingwave_common::catalog::{ColumnCatalog, ColumnDesc, ColumnId, max_column_id};
+use risingwave_common::catalog::{
+    ColumnCatalog, ColumnDesc, ColumnId, RW_INGESTION_TIME_COLUMN_NAME, max_column_id,
+};
 use risingwave_common::types::{DataType, StructType};
 use risingwave_pb::plan_common::additional_column::ColumnType as AdditionalColumnType;
 use risingwave_pb::plan_common::{
     AdditionalCollectionName, AdditionalColumn, AdditionalColumnFilename, AdditionalColumnHeader,
-    AdditionalColumnHeaders, AdditionalColumnKey, AdditionalColumnOffset,
-    AdditionalColumnPartition, AdditionalColumnPayload, AdditionalColumnPulsarMessageIdData,
-    AdditionalColumnTimestamp, AdditionalDatabaseName, AdditionalSchemaName, AdditionalSubject,
-    AdditionalTableName,
+    AdditionalColumnHeaders, AdditionalColumnIngestionTime, AdditionalColumnKey,
+    AdditionalColumnOffset, AdditionalColumnPartition, AdditionalColumnPayload,
+    AdditionalColumnPulsarMessageIdData, AdditionalColumnTimestamp, AdditionalDatabaseName,
+    AdditionalSchemaName, AdditionalSubject, AdditionalTableName,
 };
 
 use crate::error::ConnectorResult;
@@ -97,6 +99,7 @@ pub static CDC_BACKFILL_TABLE_ADDITIONAL_COLUMNS: LazyLock<Option<HashSet<&'stat
     LazyLock::new(|| {
         Some(HashSet::from([
             "timestamp",
+            "ingestion_time",
             "database_name",
             "schema_name",
             "table_name",
@@ -120,6 +123,10 @@ pub fn gen_default_addition_col_name(
     inner_field_name: Option<&str>,
     data_type: Option<&DataType>,
 ) -> String {
+    if additional_col_type == "ingestion_time" {
+        return RW_INGESTION_TIME_COLUMN_NAME.to_owned();
+    }
+
     let legacy_dt_name = data_type.map(|dt| format!("{:?}", dt).to_lowercase());
     let col_name = [
         Some(connector_name),
@@ -195,6 +202,16 @@ pub fn build_additional_column_desc(
             AdditionalColumn {
                 column_type: Some(AdditionalColumnType::Timestamp(
                     AdditionalColumnTimestamp {},
+                )),
+            },
+        ),
+        "ingestion_time" => ColumnDesc::named_with_additional_column(
+            column_name,
+            column_id,
+            DataType::Timestamptz,
+            AdditionalColumn {
+                column_type: Some(AdditionalColumnType::IngestionTime(
+                    AdditionalColumnIngestionTime {},
                 )),
             },
         ),
@@ -466,6 +483,50 @@ mod test {
                 Some(&DataType::Varchar)
             ),
             "_rw_kafka_header_inner_varchar"
+        );
+        assert_eq!(
+            gen_default_addition_col_name("mysql-cdc", "ingestion_time", None, None),
+            RW_INGESTION_TIME_COLUMN_NAME
+        );
+    }
+
+    #[test]
+    fn test_build_ingestion_time_additional_column_desc() {
+        let desc = build_additional_column_desc(
+            ColumnId::new(1),
+            "mysql-cdc",
+            "ingestion_time",
+            None,
+            None,
+            None,
+            true,
+            true,
+        )
+        .unwrap();
+        assert_eq!(desc.name, RW_INGESTION_TIME_COLUMN_NAME);
+        assert_eq!(desc.data_type, DataType::Timestamptz);
+        assert_matches::assert_matches!(
+            desc.additional_column.column_type,
+            Some(AdditionalColumnType::IngestionTime(_))
+        );
+    }
+
+    #[test]
+    fn test_ingestion_time_rejected_for_non_cdc_connector() {
+        let err = build_additional_column_desc(
+            ColumnId::new(1),
+            KAFKA_CONNECTOR,
+            "ingestion_time",
+            None,
+            None,
+            None,
+            true,
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("additional column type ingestion_time is not supported")
         );
     }
 }

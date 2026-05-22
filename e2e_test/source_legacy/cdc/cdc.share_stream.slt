@@ -92,6 +92,58 @@ include database_name as database_name
 include table_name as table_name
 from mysql_mytest table 'mytest.products';
 
+statement ok
+create table rw.products_ingestion_default (
+ id INT,
+ name STRING,
+ description STRING,
+ PRIMARY KEY (id)
+) include ingestion_time
+from mysql_mytest table 'mytest.products';
+
+query TTTT
+select column_name from information_schema.columns where table_name = 'products_ingestion_default' order by ordinal_position;
+----
+id
+name
+description
+_rw_ingestion_time
+
+statement ok
+create table rw.products_ingestion_alias (
+ id INT,
+ name STRING,
+ description STRING,
+ PRIMARY KEY (id)
+) include ingestion_time as ingest_ts
+from mysql_mytest table 'mytest.products';
+
+query TTTT
+select column_name from information_schema.columns where table_name = 'products_ingestion_alias' order by ordinal_position;
+----
+id
+name
+description
+ingest_ts
+
+statement error Invalid input syntax: column "name" specified more than once
+create table rw.products_ingestion_dup (
+ id INT,
+ name STRING,
+ description STRING,
+ PRIMARY KEY (id)
+) include ingestion_time as name
+from mysql_mytest table 'mytest.products';
+
+statement error column name prefixed with "_rw" are reserved word.
+create table rw.products_ingestion_reserved (
+ id INT,
+ name STRING,
+ description STRING,
+ _rw_ingestion_time TIMESTAMPTZ,
+ PRIMARY KEY (id)
+) from mysql_mytest table 'mytest.products';
+
 # sleep to ensure (default,'Milk','Milk is a white liquid food') is consumed from Debezium message instead of backfill.
 sleep 10s
 
@@ -311,6 +363,16 @@ query I retry 6 backoff 1s
 SELECT * from orders_test_cnt
 ----
 4
+
+query I retry 6 backoff 1s
+SELECT count(*) FROM rw.products_ingestion_default WHERE _rw_ingestion_time IS NOT NULL
+----
+11
+
+query I retry 6 backoff 1s
+SELECT count(*) FROM rw.products_ingestion_alias WHERE ingest_ts IS NOT NULL
+----
+11
 
 query ITT retry 6 backoff 1s
 SELECT id,name,description FROM rw.products_test order by id limit 3
