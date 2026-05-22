@@ -95,6 +95,8 @@ pub use debezium::DEBEZIUM_IGNORE_KEY;
 use debezium::schema_change::SchemaChangeEnvelope;
 pub use unified::{AccessError, AccessResult};
 
+static EMPTY_SOURCE_META: SourceMeta = SourceMeta::Empty;
+
 /// The meta data of the original message for a row writer.
 ///
 /// Extracted from the `SourceMessage`.
@@ -107,6 +109,15 @@ pub struct MessageMeta<'a> {
 }
 
 impl<'a> MessageMeta<'a> {
+    pub fn shared_cdc_reparse(process_time_ms: i64) -> MessageMeta<'static> {
+        MessageMeta {
+            source_meta: &EMPTY_SOURCE_META,
+            split_id: "",
+            offset: "",
+            process_time_ms,
+        }
+    }
+
     /// Extract the value for the given column.
     ///
     /// Returns `None` if the column is not a meta column.

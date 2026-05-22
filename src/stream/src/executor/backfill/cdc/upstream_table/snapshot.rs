@@ -30,6 +30,7 @@ use risingwave_pb::plan_common::additional_column::ColumnType;
 
 use super::external::ExternalStorageTable;
 use crate::common::rate_limit::limited_chunk_size;
+use crate::executor::backfill::cdc::cdc_backfill::ingestion_time_scalar_from_millis;
 use crate::executor::backfill::utils::{get_new_pos, iter_chunks};
 use crate::executor::{StreamExecutorError, StreamExecutorResult};
 
@@ -137,6 +138,10 @@ fn with_additional_columns(
     database_name: String,
 ) -> StreamChunk {
     let (ops, mut columns, visibility) = snapshot_chunk.into_inner();
+    let ingestion_time = ingestion_time_scalar_from_millis(
+        chrono::Utc::now().timestamp_millis(),
+        "cdc snapshot additional columns",
+    );
     for desc in additional_columns {
         let mut builder = desc.data_type.create_array_builder(visibility.len());
         match *desc.additional_column.column_type.as_ref().unwrap() {
@@ -162,6 +167,13 @@ fn with_additional_columns(
                     visibility.len(),
                     Some(ScalarImpl::from(schema_table_name.table_name.clone())),
                 );
+            }
+            ColumnType::IngestionTime(_) => {
+                if let Some(value) = &ingestion_time {
+                    builder.append_n(visibility.len(), Some(value.clone()));
+                } else {
+                    builder.append_n_null(visibility.len());
+                }
             }
             // set null for other additional columns
             _ => {
