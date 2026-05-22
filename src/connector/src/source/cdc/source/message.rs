@@ -58,6 +58,7 @@ pub struct DebeziumCdcMeta {
     /// - For MySQL Debezium topics: `db.table` → `0` (keep `db.table` as the routing key)
     table_name_start: usize,
 
+    database_name_override: Option<String>,
     pub full_table_name: String,
     // extracted from `payload.source.ts_ms`, the time that the change event was made in the database
     pub source_ts_ms: i64,
@@ -73,6 +74,9 @@ impl DebeziumCdcMeta {
     }
 
     pub fn extract_database_name(&self) -> DatumRef<'_> {
+        if let Some(database_name) = self.database_name_override.as_deref() {
+            return Some(ScalarRefImpl::Utf8(database_name));
+        }
         Some(ScalarRefImpl::Utf8(
             &self.full_table_name.as_str()[0..self.db_name_end],
         ))
@@ -164,12 +168,29 @@ impl DebeziumCdcMeta {
         msg_type: cdc_message::CdcMessageType,
         source_type: SourceType,
     ) -> Self {
+        Self::new_with_database_name(
+            full_table_name,
+            source_ts_ms,
+            msg_type,
+            source_type,
+            None,
+        )
+    }
+
+    pub fn new_with_database_name(
+        full_table_name: String,
+        source_ts_ms: i64,
+        msg_type: cdc_message::CdcMessageType,
+        source_type: SourceType,
+        database_name_override: Option<String>,
+    ) -> Self {
         let (db_name_end, table_name_start) =
             Self::derive_name_indices_from_full_table_name(&full_table_name, source_type);
         Self {
             source_type,
             db_name_end,
             table_name_start,
+            database_name_override,
             full_table_name,
             source_ts_ms,
             msg_type: msg_type.into(),

@@ -1295,7 +1295,6 @@ mod tests {
     use risingwave_pb::plan_common::PbRowFormatType;
     use risingwave_storage::memory::MemoryStateStore;
     use tokio::sync::mpsc::unbounded_channel;
-    use tracing_test::traced_test;
 
     use super::*;
     use crate::executor::AddMutation;
@@ -1390,7 +1389,6 @@ mod tests {
         );
     }
 
-    #[traced_test]
     #[tokio::test]
     async fn test_split_change_mutation() {
         let source_id = SourceId::new(0);
