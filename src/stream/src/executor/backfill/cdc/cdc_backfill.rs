@@ -1152,6 +1152,112 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_transform_upstream_chunk_with_spanner_source_metadata() {
+        let schema = Schema::new(vec![
+            Field::unnamed(DataType::Jsonb),   // debezium json payload
+            Field::unnamed(DataType::Varchar), // _rw_offset
+            Field::unnamed(DataType::Varchar), // _rw_table_name
+        ]);
+        let stream_key = vec![0];
+        let (mut tx, source) = MockSource::channel();
+        let source = source.into_executor(schema.clone(), stream_key.clone());
+
+        let payload = r#"{
+            "payload": {
+                "before": null,
+                "after": { "id": "pickle-2B1X", "amount": 48 },
+                "source": { "ts_ms": 1716372092578, "db": "cymbal", "table": "quantum_pickle_registry" },
+                "op": "c"
+            }
+        }"#;
+        let datums: Vec<Datum> = vec![
+            Some(JsonbVal::from_str(payload).unwrap().into()),
+            Some("{\"spanner\":true}".to_owned().into()),
+            Some("quantum_pickle_registry".to_owned().into()),
+        ];
+
+        let mut builders = schema.create_array_builders(8);
+        for (builder, datum) in builders.iter_mut().zip_eq_fast(datums.iter()) {
+            builder.append(datum.clone());
+        }
+        let columns = builders
+            .into_iter()
+            .map(|builder| builder.finish().into())
+            .collect();
+        let chunk = StreamChunk::from_parts(vec![Op::Insert], DataChunk::new(columns, 1));
+
+        tx.push_chunk(chunk);
+        let upstream = Box::new(source).execute();
+
+        let columns = vec![
+            ColumnDesc::named("id", ColumnId::new(1), DataType::Varchar),
+            ColumnDesc::named("amount", ColumnId::new(2), DataType::Int64),
+            build_additional_column_desc(
+                ColumnId::new(3),
+                "spanner-cdc",
+                "timestamp",
+                Some("source_commit_ts".to_owned()),
+                None,
+                None,
+                true,
+                true,
+            )
+            .unwrap(),
+            build_additional_column_desc(
+                ColumnId::new(4),
+                "spanner-cdc",
+                "database_name",
+                Some("source_db".to_owned()),
+                None,
+                None,
+                true,
+                true,
+            )
+            .unwrap(),
+            build_additional_column_desc(
+                ColumnId::new(5),
+                "spanner-cdc",
+                "table_name",
+                Some("source_table".to_owned()),
+                None,
+                None,
+                true,
+                true,
+            )
+            .unwrap(),
+            build_additional_column_desc(
+                ColumnId::new(6),
+                "spanner-cdc",
+                "ingestion_time",
+                Some("ingest_ts".to_owned()),
+                None,
+                None,
+                true,
+                true,
+            )
+            .unwrap(),
+        ];
+
+        let parsed_stream = transform_upstream(upstream, columns, None, None, None, None, false);
+        pin_mut!(parsed_stream);
+        let Some(message) = parsed_stream.next().await else {
+            panic!("expect chunk");
+        };
+        let Message::Chunk(chunk) = message.unwrap() else {
+            panic!("expect chunk");
+        };
+        let (_, row) = chunk.rows().next().unwrap();
+        assert_eq!(row.datum_at(2), Some(ScalarRefImpl::Timestamptz(Timestamptz::from_millis(1_716_372_092_578).unwrap())));
+        assert_eq!(row.datum_at(3), Some(ScalarRefImpl::Utf8("cymbal")));
+        assert_eq!(row.datum_at(4), Some(ScalarRefImpl::Utf8("quantum_pickle_registry")));
+        assert!(matches!(row.datum_at(5), Some(ScalarRefImpl::Timestamptz(_))));
+        assert_eq!(
+            chunk.columns()[6].as_utf8().iter().collect::<Vec<_>>(),
+            vec![Some("{\"spanner\":true}")]
+        );
+    }
+
+    #[tokio::test]
     async fn test_build_reader_and_poll_upstream() {
         let actor_context = ActorContext::for_test(1);
         let external_storage_table = ExternalStorageTable::for_test_undefined();
