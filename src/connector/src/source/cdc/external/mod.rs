@@ -384,7 +384,7 @@ pub struct ExternalTableConfig {
 
     /// Parallelism for Spanner partition query execution
     #[serde(rename = "spanner.partition_query.parallelism")]
-    #[serde(deserialize_with = "crate::deserialize_u32_from_string")]
+    #[serde(deserialize_with = "crate::deserialize_positive_u32_from_string")]
     #[serde(default = "spanner_partition_query_parallelism_default")]
     pub spanner_partition_query_parallelism: u32,
 

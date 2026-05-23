@@ -88,6 +88,26 @@ where
     })
 }
 
+pub(crate) fn deserialize_positive_u32_from_string<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: de::Deserializer<'de>,
+{
+    let s: String = de::Deserialize::deserialize(deserializer)?;
+    let v: u32 = s.parse().map_err(|_| {
+        de::Error::invalid_value(
+            de::Unexpected::Str(&s),
+            &"positive integer",
+        )
+    })?;
+    if v == 0 {
+        return Err(de::Error::invalid_value(
+            de::Unexpected::Unsigned(0),
+            &"positive integer (parallelism must be > 0)",
+        ));
+    }
+    Ok(v)
+}
+
 pub(crate) fn deserialize_i64_from_string_opt<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
 where
     D: de::Deserializer<'de>,
