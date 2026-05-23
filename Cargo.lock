@@ -5954,11 +5954,11 @@ dependencies = [
 [[package]]
 name = "gcloud-auth"
 version = "1.3.0"
-source = "git+https://github.com/tuantran0910/yoshidan-google-cloud-rust.git?rev=eba83476ba37caceeca205898599c09ed655c9e9#eba83476ba37caceeca205898599c09ed655c9e9"
+source = "git+https://github.com/tuantran0910/yoshidan-google-cloud-rust.git?rev=8eb46a81a6a62b3792091d28d7369a87a019362b#8eb46a81a6a62b3792091d28d7369a87a019362b"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
- "gcloud-metadata 1.0.2 (git+https://github.com/tuantran0910/yoshidan-google-cloud-rust.git?rev=eba83476ba37caceeca205898599c09ed655c9e9)",
+ "gcloud-metadata 1.0.2 (git+https://github.com/tuantran0910/yoshidan-google-cloud-rust.git?rev=8eb46a81a6a62b3792091d28d7369a87a019362b)",
  "home",
  "jsonwebtoken 10.3.0",
  "reqwest 0.13.2",
@@ -6020,7 +6020,7 @@ dependencies = [
 [[package]]
 name = "gcloud-gax"
 version = "1.4.0"
-source = "git+https://github.com/tuantran0910/yoshidan-google-cloud-rust.git?rev=eba83476ba37caceeca205898599c09ed655c9e9#eba83476ba37caceeca205898599c09ed655c9e9"
+source = "git+https://github.com/tuantran0910/yoshidan-google-cloud-rust.git?rev=8eb46a81a6a62b3792091d28d7369a87a019362b#8eb46a81a6a62b3792091d28d7369a87a019362b"
 dependencies = [
  "http 1.4.0",
  "thiserror 2.0.17",
@@ -6047,7 +6047,7 @@ dependencies = [
 [[package]]
 name = "gcloud-googleapis"
 version = "1.3.0"
-source = "git+https://github.com/tuantran0910/yoshidan-google-cloud-rust.git?rev=eba83476ba37caceeca205898599c09ed655c9e9#eba83476ba37caceeca205898599c09ed655c9e9"
+source = "git+https://github.com/tuantran0910/yoshidan-google-cloud-rust.git?rev=8eb46a81a6a62b3792091d28d7369a87a019362b#8eb46a81a6a62b3792091d28d7369a87a019362b"
 dependencies = [
  "prost 0.14.3",
  "prost-types 0.14.3",
@@ -6058,10 +6058,10 @@ dependencies = [
 [[package]]
 name = "gcloud-longrunning"
 version = "1.4.0"
-source = "git+https://github.com/tuantran0910/yoshidan-google-cloud-rust.git?rev=eba83476ba37caceeca205898599c09ed655c9e9#eba83476ba37caceeca205898599c09ed655c9e9"
+source = "git+https://github.com/tuantran0910/yoshidan-google-cloud-rust.git?rev=8eb46a81a6a62b3792091d28d7369a87a019362b#8eb46a81a6a62b3792091d28d7369a87a019362b"
 dependencies = [
- "gcloud-gax 1.4.0 (git+https://github.com/tuantran0910/yoshidan-google-cloud-rust.git?rev=eba83476ba37caceeca205898599c09ed655c9e9)",
- "gcloud-googleapis 1.3.0 (git+https://github.com/tuantran0910/yoshidan-google-cloud-rust.git?rev=eba83476ba37caceeca205898599c09ed655c9e9)",
+ "gcloud-gax 1.4.0 (git+https://github.com/tuantran0910/yoshidan-google-cloud-rust.git?rev=8eb46a81a6a62b3792091d28d7369a87a019362b)",
+ "gcloud-googleapis 1.3.0 (git+https://github.com/tuantran0910/yoshidan-google-cloud-rust.git?rev=8eb46a81a6a62b3792091d28d7369a87a019362b)",
  "prost 0.14.3",
  "tonic",
 ]
@@ -6080,7 +6080,7 @@ dependencies = [
 [[package]]
 name = "gcloud-metadata"
 version = "1.0.2"
-source = "git+https://github.com/tuantran0910/yoshidan-google-cloud-rust.git?rev=eba83476ba37caceeca205898599c09ed655c9e9#eba83476ba37caceeca205898599c09ed655c9e9"
+source = "git+https://github.com/tuantran0910/yoshidan-google-cloud-rust.git?rev=8eb46a81a6a62b3792091d28d7369a87a019362b#8eb46a81a6a62b3792091d28d7369a87a019362b"
 dependencies = [
  "reqwest 0.13.2",
  "thiserror 2.0.17",
@@ -6108,13 +6108,13 @@ dependencies = [
 [[package]]
 name = "gcloud-spanner"
 version = "1.8.0"
-source = "git+https://github.com/tuantran0910/yoshidan-google-cloud-rust.git?rev=eba83476ba37caceeca205898599c09ed655c9e9#eba83476ba37caceeca205898599c09ed655c9e9"
+source = "git+https://github.com/tuantran0910/yoshidan-google-cloud-rust.git?rev=8eb46a81a6a62b3792091d28d7369a87a019362b#8eb46a81a6a62b3792091d28d7369a87a019362b"
 dependencies = [
  "base64 0.22.1",
  "bigdecimal 0.4.10",
- "gcloud-auth 1.3.0 (git+https://github.com/tuantran0910/yoshidan-google-cloud-rust.git?rev=eba83476ba37caceeca205898599c09ed655c9e9)",
- "gcloud-gax 1.4.0 (git+https://github.com/tuantran0910/yoshidan-google-cloud-rust.git?rev=eba83476ba37caceeca205898599c09ed655c9e9)",
- "gcloud-googleapis 1.3.0 (git+https://github.com/tuantran0910/yoshidan-google-cloud-rust.git?rev=eba83476ba37caceeca205898599c09ed655c9e9)",
+ "gcloud-auth 1.3.0 (git+https://github.com/tuantran0910/yoshidan-google-cloud-rust.git?rev=8eb46a81a6a62b3792091d28d7369a87a019362b)",
+ "gcloud-gax 1.4.0 (git+https://github.com/tuantran0910/yoshidan-google-cloud-rust.git?rev=8eb46a81a6a62b3792091d28d7369a87a019362b)",
+ "gcloud-googleapis 1.3.0 (git+https://github.com/tuantran0910/yoshidan-google-cloud-rust.git?rev=8eb46a81a6a62b3792091d28d7369a87a019362b)",
  "gcloud-longrunning",
  "parking_lot 0.12.5",
  "prost 0.14.3",
