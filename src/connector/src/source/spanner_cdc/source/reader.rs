@@ -430,6 +430,28 @@ async fn read_partition(
         .take(retry_attempts.saturating_add(1) as usize)
         .map(jitter);
 
+    let start_ts = split.offset.ok_or_else(|| {
+        ConnectorError::from(anyhow::anyhow!(
+            "offset is None for split_id={}, change_stream={}",
+            split_id, change_stream_name
+        ))
+    })?;
+
+    let mut stmt = Statement::new(format!(
+        "SELECT ChangeRecord FROM READ_{} (\
+            @start_timestamp, @end_timestamp, @partition_token, @heartbeat_milliseconds\
+        )",
+        change_stream_name
+    ));
+    stmt.add_param("start_timestamp", &start_ts);
+    stmt.add_param("end_timestamp", &Option::<OffsetDateTime>::None);
+    if let Some(ref token) = split.partition_token {
+        stmt.add_param("partition_token", token);
+    } else {
+        stmt.add_param("partition_token", &Option::<String>::None);
+    }
+    stmt.add_param("heartbeat_milliseconds", &heartbeat_interval_ms);
+
     let max_attempts = (retry_attempts.saturating_add(1)) as usize;
     let mut last_error = None;
 
@@ -443,37 +465,6 @@ async fn read_partition(
                 active_parents.lock().await.remove(token.as_str());
             }
             return Ok(());
-        }
-
-        // Rebuild stmt each attempt: `execute_query` advances split.offset before sending,
-        // so retries must resume from the (now-advanced) offset to avoid re-emitting records.
-        let start_ts = split.offset.ok_or_else(|| {
-            ConnectorError::from(anyhow::anyhow!(
-                "offset became None during retry for split_id={}, change_stream={}",
-                split_id, change_stream_name
-            ))
-        })?;
-
-        let mut stmt = Statement::new(format!(
-            "SELECT ChangeRecord FROM READ_{} (\
-                @start_timestamp, @end_timestamp, @partition_token, @heartbeat_milliseconds\
-            )",
-            change_stream_name
-        ));
-        stmt.add_param("start_timestamp", &start_ts);
-        stmt.add_param("end_timestamp", &Option::<OffsetDateTime>::None);
-        if let Some(ref token) = split.partition_token {
-            stmt.add_param("partition_token", token);
-        } else {
-            stmt.add_param("partition_token", &Option::<String>::None);
-        }
-        stmt.add_param("heartbeat_milliseconds", &heartbeat_interval_ms);
-
-        if attempt > 0 {
-            tracing::info!(
-                %split_id, attempt = attempt + 1, %start_ts,
-                "change stream query retrying from advanced offset"
-            );
         }
 
         // Race the query against cancellation so a blocking Spanner call can be interrupted.
