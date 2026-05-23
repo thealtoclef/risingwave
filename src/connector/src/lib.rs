@@ -625,3 +625,57 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod deserialize_positive_u32_tests {
+    use super::*;
+    use serde::Deserialize;
+    use serde_json;
+
+    #[derive(Deserialize)]
+    struct TestConfig {
+        #[serde(deserialize_with = "deserialize_positive_u32_from_string")]
+        value: u32,
+    }
+
+    #[test]
+    fn test_valid_positive_values() {
+        let cfg: TestConfig = serde_json::from_value(serde_json::json!({ "value": "4" })).unwrap();
+        assert_eq!(cfg.value, 4);
+
+        let cfg: TestConfig = serde_json::from_value(serde_json::json!({ "value": "1" })).unwrap();
+        assert_eq!(cfg.value, 1);
+
+        let cfg: TestConfig = serde_json::from_value(serde_json::json!({ "value": "100" })).unwrap();
+        assert_eq!(cfg.value, 100);
+    }
+
+    #[test]
+    fn test_zero_rejected() {
+        let result: Result<TestConfig, _> =
+            serde_json::from_value(serde_json::json!({ "value": "0" }));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_empty_string_rejected() {
+        let result: Result<TestConfig, _> =
+            serde_json::from_value(serde_json::json!({ "value": "" }));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_non_numeric_string_rejected() {
+        let result: Result<TestConfig, _> =
+            serde_json::from_value(serde_json::json!({ "value": "abc" }));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_u32_max_accepted() {
+        let max = u32::MAX.to_string();
+        let cfg: TestConfig =
+            serde_json::from_value(serde_json::json!({ "value": max })).unwrap();
+        assert_eq!(cfg.value, u32::MAX);
+    }
+}
