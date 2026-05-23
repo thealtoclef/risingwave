@@ -22,9 +22,11 @@
 //! immediately when the first data record with the new schema arrives, preventing any
 //! data loss from race conditions.
 
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use time::OffsetDateTime;
 use tokio::sync::RwLock;
 
 use crate::error::ConnectorResult;
@@ -62,10 +64,26 @@ impl ColumnSchema {
     }
 }
 
-/// Schema tracker that compares column_types from each record
+/// Tracked schema with the commit-timestamp watermark of the last record that
+/// advanced it. The watermark gates schema transitions so that stale records
+/// from a lagging partition cannot flip the schema backwards.
+#[derive(Debug, Clone)]
+struct TrackedSchema {
+    schema: TableSchema,
+    last_commit_ts: OffsetDateTime,
+}
+
+/// Schema tracker that compares column_types from each record.
+///
+/// Spanner change-stream partitions are read concurrently and there is no
+/// cross-partition commit-timestamp ordering. To prevent a slower partition's
+/// older-schema record from reverting the tracker after a faster partition has
+/// already advanced to a new schema, every stored entry carries a per-table
+/// commit-timestamp watermark. Records with `commit_timestamp` strictly less
+/// than the watermark are dropped without emission.
 pub struct SchemaTracker {
-    /// Map of table_name -> known schema
-    known_schemas: Arc<RwLock<HashMap<String, TableSchema>>>,
+    /// Map of table_name -> tracked schema + watermark
+    known_schemas: Arc<RwLock<HashMap<String, TrackedSchema>>>,
 }
 
 impl SchemaTracker {
@@ -82,38 +100,61 @@ impl SchemaTracker {
     ///
     /// On first encounter with a table, always emits a schema change (false positive approach,
     /// let meta deduplicate — same as Postgres).
-    /// On subsequent encounters, emits only if `compare_schemas` detects a change.
+    /// On subsequent encounters, emits only if `compare_schemas` detects a change AND the
+    /// incoming record's commit timestamp is not older than the stored watermark.
     pub async fn check_and_evolve(
         &self,
         record: &DataChangeRecord,
     ) -> ConnectorResult<Option<Vec<u8>>> {
-        let table_name = record.table_name.clone();
-
-        // Extract schema from column_types
+        let table_name = &record.table_name;
+        let new_ts = record.commit_time();
         let new_schema = Self::extract_schema_from_record(record)?;
 
-        // Get the old schema (if any)
-        let old_schema = {
-            let schemas = self.known_schemas.read().await;
-            schemas.get(&table_name).cloned()
-        };
+        // Single write lock: removes the read→write TOCTOU between partitions.
+        let mut schemas = self.known_schemas.write().await;
 
-        match old_schema {
-            None => {
-                // First encounter: always emit schema change (false positive, let meta deduplicate)
-                let mut schemas = self.known_schemas.write().await;
-                schemas.insert(table_name.clone(), new_schema.clone());
-                let json = Self::format_as_debezium_json(&table_name, &new_schema)?;
+        match schemas.entry(table_name.clone()) {
+            Entry::Vacant(slot) => {
+                // Format before insert so a serialization failure leaves the
+                // tracker untouched (no emit, no state change).
+                let json = Self::format_as_debezium_json(table_name, &new_schema)?;
+                slot.insert(TrackedSchema {
+                    schema: new_schema,
+                    last_commit_ts: new_ts,
+                });
                 Ok(Some(json))
             }
-            Some(old_schema) => {
-                // Subsequent encounter: emit only if schema changed
-                if Self::schemas_differ(&old_schema, &new_schema) {
-                    let mut schemas = self.known_schemas.write().await;
-                    schemas.insert(table_name.clone(), new_schema.clone());
-                    let json = Self::format_as_debezium_json(&table_name, &new_schema)?;
+            Entry::Occupied(mut slot) => {
+                let tracked = slot.get_mut();
+                // Strict `<` (not `<=`): Spanner guarantees two DataChangeRecords
+                // for the same table at the same commit_timestamp carry identical
+                // column_types, because DDL commits at its own distinct timestamp.
+                // Treating equality as fresh therefore cannot cause flapping.
+                if new_ts < tracked.last_commit_ts {
+                    // Only log when a stale record would have reverted the schema —
+                    // that's the race this gate exists to prevent. Same-schema
+                    // stale records are normal under concurrent partitions and
+                    // would otherwise produce constant log noise.
+                    if Self::schemas_differ(&tracked.schema, &new_schema) {
+                        tracing::warn!(
+                            table = %table_name,
+                            ?new_ts,
+                            stored_ts = ?tracked.last_commit_ts,
+                            "dropped stale schema record that would have reverted the tracked schema"
+                        );
+                    }
+                    return Ok(None);
+                }
+
+                if Self::schemas_differ(&tracked.schema, &new_schema) {
+                    // Format before mutating so a serialization failure leaves
+                    // the tracker untouched — the next newer record retries.
+                    let json = Self::format_as_debezium_json(table_name, &new_schema)?;
+                    tracked.last_commit_ts = new_ts;
+                    tracked.schema = new_schema;
                     Ok(Some(json))
                 } else {
+                    tracked.last_commit_ts = new_ts;
                     Ok(None)
                 }
             }
@@ -207,13 +248,20 @@ impl SchemaTracker {
     /// Get the current known schema for a table (for testing/debugging)
     pub async fn get_schema(&self, table_name: &str) -> Option<TableSchema> {
         let schemas = self.known_schemas.read().await;
-        schemas.get(table_name).cloned()
+        schemas.get(table_name).map(|t| t.schema.clone())
     }
 
-    /// Manually set a schema (useful for initialization or testing)
-    pub async fn set_schema(&self, schema: TableSchema) {
+    /// Manually set a schema with its commit-timestamp watermark
+    /// (useful for initialization or testing).
+    pub async fn set_schema(&self, schema: TableSchema, last_commit_ts: OffsetDateTime) {
         let mut schemas = self.known_schemas.write().await;
-        schemas.insert(schema.table_name.clone(), schema);
+        schemas.insert(
+            schema.table_name.clone(),
+            TrackedSchema {
+                schema,
+                last_commit_ts,
+            },
+        );
     }
 }
 
@@ -227,7 +275,38 @@ impl Default for SchemaTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::source::spanner_cdc::types::{SpannerType, TypeCode};
+    use crate::source::spanner_cdc::types::{Mod, SpannerType, TypeCode};
+
+    fn col(name: &str, code: TypeCode, ordinal: i64, pk: bool) -> ColumnType {
+        ColumnType {
+            name: name.to_string(),
+            spanner_type: SpannerType::simple(code),
+            is_primary_key: pk,
+            ordinal_position: ordinal,
+        }
+    }
+
+    fn record_at(
+        table: &str,
+        commit_ts: OffsetDateTime,
+        column_types: Vec<ColumnType>,
+    ) -> DataChangeRecord {
+        DataChangeRecord {
+            commit_timestamp: commit_ts,
+            record_sequence: "0".to_string(),
+            server_transaction_id: "txn".to_string(),
+            is_last_record_in_transaction_in_partition: true,
+            table_name: table.to_string(),
+            value_capture_type: "NEW_ROW".to_string(),
+            column_types,
+            mods: Vec::<Mod>::new(),
+            mod_type: "INSERT".to_string(),
+            number_of_records_in_transaction: 1,
+            number_of_partitions_in_transaction: 1,
+            transaction_tag: String::new(),
+            is_system_transaction: false,
+        }
+    }
 
     #[test]
     fn test_schema_comparison() {
@@ -289,5 +368,146 @@ mod tests {
         };
 
         assert!(!SchemaTracker::schemas_differ(&schema, &schema));
+    }
+
+    #[tokio::test]
+    async fn test_first_encounter_still_emits() {
+        let tracker = SchemaTracker::new();
+        let ts = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+        let record = record_at(
+            "t",
+            ts,
+            vec![col("id", TypeCode::Int64, 1, true)],
+        );
+
+        let result = tracker.check_and_evolve(&record).await.unwrap();
+        assert!(result.is_some(), "first encounter must emit a schema change");
+
+        let stored = tracker.get_schema("t").await.unwrap();
+        assert_eq!(stored.columns.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_stale_record_does_not_revert_schema() {
+        let tracker = SchemaTracker::new();
+        let t1 = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+        let t_mid = OffsetDateTime::from_unix_timestamp(1_700_000_050).unwrap();
+        let t2 = OffsetDateTime::from_unix_timestamp(1_700_000_100).unwrap();
+
+        let old_cols = vec![col("id", TypeCode::Int64, 1, true)];
+        let new_cols = vec![
+            col("id", TypeCode::Int64, 1, true),
+            col("name", TypeCode::String, 2, false),
+        ];
+
+        // Partition A delivers the newer (post-DDL) record first.
+        let r_new = record_at("t", t2, new_cols);
+        let emitted_new = tracker.check_and_evolve(&r_new).await.unwrap();
+        assert!(emitted_new.is_some(), "first encounter emits");
+
+        // Partition B then delivers an older (pre-DDL) record. It must NOT
+        // flip the tracker back to the old schema.
+        let r_old = record_at("t", t1, old_cols.clone());
+        let emitted_old = tracker.check_and_evolve(&r_old).await.unwrap();
+        assert!(
+            emitted_old.is_none(),
+            "stale record (older commit_ts) must not emit a schema change"
+        );
+
+        let stored = tracker.get_schema("t").await.unwrap();
+        assert_eq!(
+            stored.columns.len(),
+            2,
+            "tracker should still hold the newer schema"
+        );
+
+        // Watermark invariant: a stale record must not have advanced the
+        // watermark. A second record at t_mid (still < t2) must also be
+        // rejected, proving the watermark is still at t2.
+        let r_mid = record_at("t", t_mid, old_cols);
+        let emitted_mid = tracker.check_and_evolve(&r_mid).await.unwrap();
+        assert!(
+            emitted_mid.is_none(),
+            "watermark must still be at t2; record at t_mid (< t2) must be stale"
+        );
+        let stored = tracker.get_schema("t").await.unwrap();
+        assert_eq!(stored.columns.len(), 2, "schema still unchanged");
+    }
+
+    #[tokio::test]
+    async fn test_monotonic_advance_without_schema_change() {
+        let tracker = SchemaTracker::new();
+        let t1 = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+        let t2 = OffsetDateTime::from_unix_timestamp(1_700_000_100).unwrap();
+        let t_stale = OffsetDateTime::from_unix_timestamp(1_699_999_000).unwrap();
+
+        let cols = vec![col("id", TypeCode::Int64, 1, true)];
+
+        let r1 = record_at("t", t1, cols.clone());
+        let r2 = record_at("t", t2, cols.clone());
+
+        assert!(tracker.check_and_evolve(&r1).await.unwrap().is_some());
+        assert!(
+            tracker.check_and_evolve(&r2).await.unwrap().is_none(),
+            "identical schema with newer ts must not re-emit"
+        );
+
+        // Confirm the watermark actually advanced: an even-older record must be
+        // treated as stale.
+        let r_stale = record_at("t", t_stale, cols);
+        assert!(tracker.check_and_evolve(&r_stale).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_real_schema_change_at_or_after_watermark_emits() {
+        // "After" subcase: schema change with a strictly newer commit_ts.
+        {
+            let tracker = SchemaTracker::new();
+            let t1 = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+            let t2 = OffsetDateTime::from_unix_timestamp(1_700_000_100).unwrap();
+
+            let old_cols = vec![col("id", TypeCode::Int64, 1, true)];
+            let new_cols = vec![
+                col("id", TypeCode::Int64, 1, true),
+                col("name", TypeCode::String, 2, false),
+            ];
+
+            let r1 = record_at("t", t1, old_cols);
+            let r2 = record_at("t", t2, new_cols);
+
+            assert!(tracker.check_and_evolve(&r1).await.unwrap().is_some());
+            assert!(
+                tracker.check_and_evolve(&r2).await.unwrap().is_some(),
+                "real schema change with newer commit_ts must emit"
+            );
+            let stored = tracker.get_schema("t").await.unwrap();
+            assert_eq!(stored.columns.len(), 2);
+        }
+
+        // "At" subcase: schema change at the exact same commit_ts as the
+        // current watermark must still emit (strict-less-than gate, not
+        // less-or-equal). This shouldn't happen with real Spanner data, but
+        // the gate behavior at equality is part of the contract.
+        {
+            let tracker = SchemaTracker::new();
+            let ts = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+
+            let old_cols = vec![col("id", TypeCode::Int64, 1, true)];
+            let new_cols = vec![
+                col("id", TypeCode::Int64, 1, true),
+                col("name", TypeCode::String, 2, false),
+            ];
+
+            let r1 = record_at("t", ts, old_cols);
+            let r2 = record_at("t", ts, new_cols);
+
+            assert!(tracker.check_and_evolve(&r1).await.unwrap().is_some());
+            assert!(
+                tracker.check_and_evolve(&r2).await.unwrap().is_some(),
+                "real schema change at equal commit_ts must also emit"
+            );
+            let stored = tracker.get_schema("t").await.unwrap();
+            assert_eq!(stored.columns.len(), 2);
+        }
     }
 }
