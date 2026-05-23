@@ -23,7 +23,6 @@
 //! data loss from race conditions.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 
 use tokio::sync::RwLock;
 
@@ -65,14 +64,14 @@ impl ColumnSchema {
 /// Schema tracker that compares column_types from each record
 pub struct SchemaTracker {
     /// Map of table_name -> known schema
-    known_schemas: Arc<RwLock<HashMap<String, TableSchema>>>,
+    known_schemas: RwLock<HashMap<String, TableSchema>>,
 }
 
 impl SchemaTracker {
     /// Create a new schema tracker
     pub fn new() -> Self {
         Self {
-            known_schemas: Arc::new(RwLock::new(HashMap::new())),
+            known_schemas: RwLock::new(HashMap::new()),
         }
     }
 

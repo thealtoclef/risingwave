@@ -101,11 +101,6 @@ pub struct SpannerCdcProperties {
     #[serde(rename = "spanner.change_stream.max_concurrent_partitions")]
     pub change_stream_max_concurrent_partitions: Option<u32>,
 
-    /// Buffer size for prefetching messages (default: 1024)
-    #[serde_as(as = "Option<DisplayFromStr>")]
-    #[serde(rename = "spanner.buffer_size")]
-    pub buffer_size: Option<usize>,
-
     /// Retry attempts for transient failures (default: 3)
     #[serde_as(as = "Option<DisplayFromStr>")]
     #[serde(rename = "spanner.retry_attempts")]
@@ -186,11 +181,6 @@ impl SpannerCdcProperties {
         self.change_stream_max_concurrent_partitions.unwrap_or(5) as usize
     }
 
-    /// Get buffer size (default: 1024)
-    pub fn get_buffer_size(&self) -> usize {
-        self.buffer_size.unwrap_or(1024)
-    }
-
     /// Get retry attempts (default: 3)
     pub fn get_retry_attempts(&self) -> u32 {
         self.retry_attempts.unwrap_or(3)
@@ -216,7 +206,8 @@ impl SpannerCdcProperties {
     pub fn heartbeat_interval_ms(&self) -> ConnectorResult<i64> {
         let duration = duration_str::parse(&self.heartbeat_interval)
             .map_err(|e| anyhow::anyhow!("failed to parse heartbeat_interval: {}", e))?;
-        Ok(duration.as_millis() as i64)
+        Ok(i64::try_from(duration.as_millis())
+            .map_err(|_| anyhow::anyhow!("heartbeat_interval value too large to fit in i64"))?)
     }
 
     /// Create a Spanner client using the shared factory.

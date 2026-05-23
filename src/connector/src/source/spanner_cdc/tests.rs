@@ -113,8 +113,57 @@ mod tests {
         .unwrap();
 
         assert_eq!(props.get_change_stream_max_concurrent_partitions(), 5);
-        assert_eq!(props.get_buffer_size(), 1024);
         assert_eq!(props.get_retry_attempts(), 3);
+    }
+
+    // Regression test for issue 3.3: heartbeat_interval_ms must reject values that
+    // overflow i64 when converted to milliseconds, instead of silently truncating.
+    #[test]
+    fn test_heartbeat_interval_overflow_rejected() {
+        // ~317 million years in seconds -> 10^19 ms, exceeds i64::MAX (9.2*10^18).
+        // duration_str parses "s"; the result fits in Duration (u64 secs) but
+        // converting to millis overflows i64.
+        let props: SpannerCdcProperties = serde_json::from_value(serde_json::json!({
+            "connector": "spanner-cdc",
+            "spanner.project": "test-project",
+            "spanner.instance": "test-instance",
+            "database.name": "test-db",
+            "spanner.change_stream.name": "test-stream",
+            "spanner.heartbeat_interval": "10000000000000000s",
+        }))
+        .unwrap();
+
+        let err = props
+            .heartbeat_interval_ms()
+            .expect_err("expected Err for oversized heartbeat_interval");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("too large"),
+            "error message should mention overflow, got: {msg}"
+        );
+    }
+
+    // Negative control: verify parse failures are still reported separately from overflow.
+    #[test]
+    fn test_heartbeat_interval_parse_failure() {
+        let props: SpannerCdcProperties = serde_json::from_value(serde_json::json!({
+            "connector": "spanner-cdc",
+            "spanner.project": "test-project",
+            "spanner.instance": "test-instance",
+            "database.name": "test-db",
+            "spanner.change_stream.name": "test-stream",
+            "spanner.heartbeat_interval": "garbage",
+        }))
+        .unwrap();
+
+        let err = props
+            .heartbeat_interval_ms()
+            .expect_err("expected Err for malformed heartbeat_interval");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("parse"),
+            "error message should mention parse failure, got: {msg}"
+        );
     }
 
     use crate::source::spanner_cdc::SpannerCdcProperties;

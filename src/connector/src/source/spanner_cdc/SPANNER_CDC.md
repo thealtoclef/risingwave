@@ -251,7 +251,6 @@ Created → Scheduled → Running → Finished
 |-----------|---------|-------------|
 | `spanner.databoost.enabled` | `false` | Enable DataBoost for partitioned snapshot backfill (requires `spanner.databases.useDataBoost` IAM permission) |
 | `spanner.partition_query.parallelism` | `1` | Number of concurrent partition queries during snapshot backfill |
-| `spanner.buffer_size` | `16` | Buffer size for the mpsc channel between background reader and source executor (matches Debezium's channel size) |
 | `auto.schema.change` | `false` | Enable automatic schema change propagation |
 
 **Note**: `spanner.databoost.enabled` and `spanner.partition_query.parallelism` are table-level properties set automatically by the frontend during `CREATE TABLE FROM source`. They are passed internally and should not be set manually in `CREATE SOURCE`.
@@ -441,7 +440,7 @@ Schema change messages use the same Debezium JSON format as Postgres CDC, so the
 
 `ddl` is always `"UNKNOWN_DDL"` because Spanner change streams do not carry DDL text, mirroring how Postgres CDC (via Debezium) emits `"UNKNOWN_DDL"` for RELATION messages.
 
-Type names use the Spanner type string (e.g., `"INT64"`, `"STRING"`) and are resolved to RisingWave `DataType` by `spanner_type_name_to_rw_type` inside `parse_schema_change`.
+Type names use the Spanner type string (e.g., `"INT64"`, `"STRING"`) and are resolved to RisingWave `DataType` by `spanner_type_to_rw_type` (in `cdc/external/spanner.rs`) inside `parse_schema_change`.
 
 ---
 
@@ -708,7 +707,7 @@ PROTO types are mapped to `BYTEA` and ENUM types map to `VARCHAR`. If you see NU
 | `source/message.rs` | `TaggedChangeRecord → SourceMessage` conversion; uses `SourceMeta::DebeziumCdc` so messages flow through the standard Debezium CDC path in `PlainParser` |
 | `split.rs` | Split definition (`SpannerCdcSplit`) with partition state machine |
 | `schema_track.rs` | In-memory schema tracker for automatic schema evolution; emits Debezium-format JSON schema change messages |
-| `types.rs` | Spanner data type definitions, JSON serialization, and `spanner_type_name_to_rw_type` mapping used during schema change parsing |
+| `types.rs` | Spanner data type definitions (`TypeCode`, `SpannerType`, `ColumnType`, `DataChangeRecord`, `Mod`) and JSON serialization for schema change messages |
 
 ### Backfill (Snapshot Read)
 
@@ -723,7 +722,7 @@ PROTO types are mapped to `BYTEA` and ENUM types map to `VARCHAR`. If you see NU
 | File | Purpose |
 |------|---------|
 | `src/connector/src/parser/plain_parser.rs` | Parses Spanner messages via the standard `SourceMeta::DebeziumCdc` branch — no separate Spanner block needed |
-| `src/connector/src/parser/unified/debezium.rs` | `parse_schema_change` — handles schema change JSON for all CDC sources including Spanner; uses `spanner_type_name_to_rw_type` for type resolution |
+| `src/connector/src/parser/unified/debezium.rs` | `parse_schema_change` — handles schema change JSON for all CDC sources including Spanner; uses `spanner_type_to_rw_type` (in `cdc/external/spanner.rs`) for type resolution |
 
 ### Frontend Integration
 
