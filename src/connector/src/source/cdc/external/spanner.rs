@@ -906,22 +906,17 @@ impl SpannerExternalTableReader {
             partitions.len(), self.partition_query_parallelism
         );
 
-        // Execute partitions concurrently using Arc<Mutex<>> pattern
+        // Execute partitions concurrently using execute_concurrent for true parallel reads
         use futures::stream::{StreamExt, TryStreamExt};
-        use tokio::sync::Mutex;
 
-        let txn = Arc::new(Mutex::new(txn));
-
-        // Stream partitions and execute them concurrently
         let results = futures::stream::iter(partitions)
             .map(|partition| {
-                let txn = Arc::clone(&txn);
+                let txn_ref = &txn;
                 async move {
-                    let mut txn_guard = txn.lock().await;
-                    let mut rows = txn_guard
-                        .execute(partition, None)
+                    let mut rows = txn_ref
+                        .execute_concurrent(partition, None)
                         .await
-                        .context("failed to execute partition")?;
+                        .context("failed to execute partition concurrently")?;
 
                     let mut partition_rows = Vec::new();
                     while let Some(row) = rows.next().await.context("row read failed")? {
