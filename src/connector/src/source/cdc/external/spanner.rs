@@ -924,7 +924,7 @@ impl SpannerExternalTableReader {
                     Ok::<_, ConnectorError>(partition_rows)
                 }
             })
-            .buffered(self.partition_query_parallelism.max(1) as usize)
+            .buffered(self.partition_query_parallelism as usize)
             .try_collect::<Vec<_>>()
             .await?;
 
