@@ -407,35 +407,16 @@ async fn read_partition(
     child_discovery_tx: tokio::sync::mpsc::UnboundedSender<SpannerCdcSplit>,
     cancel_token: CancellationToken,
 ) -> Result<()> {
-    if split.offset.is_none() {
-        return Err(ConnectorError::from(anyhow::anyhow!(
-            "offset is None for split_id={}, change_stream={}",
-            split_id, change_stream_name
-        )));
-    }
-
-    if let Some(ref token) = split.partition_token {
-        active_parents.lock().await.insert(token.clone());
-    }
-
-    tracing::info!(
-        %split_id, start_ts = ?split.offset,
-        partition_token = ?split.partition_token,
-        "change stream query starting"
-    );
-
-    let retry_strategy = ExponentialBackoff::from_millis(retry_backoff.as_millis() as u64)
-        .max_delay(tokio::time::Duration::from_millis(retry_backoff_max_delay_ms))
-        .factor(retry_backoff_factor)
-        .take(retry_attempts.saturating_add(1) as usize)
-        .map(jitter);
-
     let start_ts = split.offset.ok_or_else(|| {
         ConnectorError::from(anyhow::anyhow!(
             "offset is None for split_id={}, change_stream={}",
             split_id, change_stream_name
         ))
     })?;
+
+    if let Some(ref token) = split.partition_token {
+        active_parents.lock().await.insert(token.clone());
+    }
 
     let mut stmt = Statement::new(format!(
         "SELECT ChangeRecord FROM READ_{} (\
@@ -451,6 +432,18 @@ async fn read_partition(
         stmt.add_param("partition_token", &Option::<String>::None);
     }
     stmt.add_param("heartbeat_milliseconds", &heartbeat_interval_ms);
+
+    tracing::info!(
+        %split_id, %start_ts,
+        partition_token = ?split.partition_token,
+        "change stream query starting"
+    );
+
+    let retry_strategy = ExponentialBackoff::from_millis(retry_backoff.as_millis() as u64)
+        .max_delay(tokio::time::Duration::from_millis(retry_backoff_max_delay_ms))
+        .factor(retry_backoff_factor)
+        .take(retry_attempts.saturating_add(1) as usize)
+        .map(jitter);
 
     let max_attempts = (retry_attempts.saturating_add(1)) as usize;
     let mut last_error = None;
