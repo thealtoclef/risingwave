@@ -393,8 +393,8 @@ impl SpannerExternalTableReader {
             .context("PK range query failed")?;
 
         if let Some(row) = rows.next().await.context("PK range row failed")? {
-            let min_val = spanner_cell_to_scalar_impl(&row, &split_column.data_type, "min_val");
-            let max_val = spanner_cell_to_scalar_impl(&row, &split_column.data_type, "max_val");
+            let min_val = spanner_cell_to_scalar_impl(&row, &split_column.data_type, "min_val")?;
+            let max_val = spanner_cell_to_scalar_impl(&row, &split_column.data_type, "max_val")?;
             match (min_val, max_val) {
                 (Some(min), Some(max)) => Ok(Some((min, max))),
                 _ => Ok(None),
@@ -434,7 +434,7 @@ impl SpannerExternalTableReader {
             .context("boundary query failed")?;
 
         if let Some(row) = rows.next().await.context("boundary row fetch failed")? {
-            let datum = spanner_cell_to_scalar_impl(&row, &split_column.data_type, "val");
+            let datum = spanner_cell_to_scalar_impl(&row, &split_column.data_type, "val")?;
             Ok(Some(datum))
         } else {
             Ok(None)
@@ -466,7 +466,7 @@ impl SpannerExternalTableReader {
 
         if let Some(row) = rows.next().await.context("next_greater_bound row fetch failed")?
         {
-            let datum = spanner_cell_to_scalar_impl(&row, &split_column.data_type, "val");
+            let datum = spanner_cell_to_scalar_impl(&row, &split_column.data_type, "val")?;
             Ok(Some(datum))
         } else {
             Ok(None)
@@ -1302,196 +1302,209 @@ fn decimal_to_spanner_numeric(
 
 /// Extracts a single typed cell from a Spanner row as a `ScalarImpl`.
 ///
-/// Follows the same pattern as `postgres_cell_to_scalar_impl` in the Postgres CDC parser.
+/// SQL NULL is returned as `Ok(None)`; wire-format / type mismatches
+/// propagate as `Err` rather than silently degrading to NULL.
 fn spanner_cell_to_scalar_impl(
     row: &google_cloud_spanner::row::Row,
     data_type: &DataType,
     col_name: &str,
-) -> Option<ScalarImpl> {
-    match data_type {
+) -> ConnectorResult<Option<ScalarImpl>> {
+    let read_err = |e: google_cloud_spanner::row::Error| -> ConnectorError {
+        anyhow!(
+            "spanner cell read failed for column '{}' as {:?}: {}",
+            col_name,
+            data_type,
+            e
+        )
+        .into()
+    };
+
+    let scalar = match data_type {
         DataType::Boolean => row
-            .column_by_name::<bool>(col_name)
-            .ok()
+            .column_by_name::<Option<bool>>(col_name)
+            .map_err(read_err)?
             .map(ScalarImpl::Bool),
 
         DataType::Int64 => row
-            .column_by_name::<i64>(col_name)
-            .ok()
+            .column_by_name::<Option<i64>>(col_name)
+            .map_err(read_err)?
             .map(ScalarImpl::Int64),
 
         DataType::Int32 => row
-            .column_by_name::<i64>(col_name)
-            .ok()
+            .column_by_name::<Option<i64>>(col_name)
+            .map_err(read_err)?
             .map(|v| ScalarImpl::Int32(v as i32)),
 
         DataType::Int16 => row
-            .column_by_name::<i64>(col_name)
-            .ok()
+            .column_by_name::<Option<i64>>(col_name)
+            .map_err(read_err)?
             .map(|v| ScalarImpl::Int16(v as i16)),
 
         DataType::Float64 => row
-            .column_by_name::<f64>(col_name)
-            .ok()
+            .column_by_name::<Option<f64>>(col_name)
+            .map_err(read_err)?
             .map(|v| ScalarImpl::Float64(F64::from(v))),
 
         DataType::Float32 => row
-            .column_by_name::<f64>(col_name)
-            .ok()
+            .column_by_name::<Option<f64>>(col_name)
+            .map_err(read_err)?
             .map(|v| ScalarImpl::Float32(F32::from(v as f32))),
 
-        DataType::Varchar => {
-            // Handle VARCHAR, ENUM (stored as string), TIME, INTERVAL
-            row.column_by_name::<String>(col_name)
-                .ok()
-                .map(|s| ScalarImpl::Utf8(s.into()))
-        }
+        DataType::Varchar => row
+            .column_by_name::<Option<String>>(col_name)
+            .map_err(read_err)?
+            .map(|s| ScalarImpl::Utf8(s.into())),
 
         DataType::Bytea => {
-            // Handle BYTEA and PROTO types (stored as bytes)
-            // Try reading as Vec<u8> first (for PROTO)
-            if let Ok(v) = row.column_by_name::<Vec<u8>>(col_name) {
-                Some(ScalarImpl::Bytea(v.into()))
-            } else {
-                // Fallback: read as string (for BYTES stored as base64 string)
-                row.column_by_name::<String>(col_name)
-                    .ok()
-                    .map(|s| ScalarImpl::Bytea(s.into_bytes().into()))
+            // PROTO arrives as `Vec<u8>`; BYTES arrives as a base64 `String`.
+            match row.column_by_name::<Option<Vec<u8>>>(col_name) {
+                Ok(v) => v.map(|b| ScalarImpl::Bytea(b.into())),
+                Err(_) => row
+                    .column_by_name::<Option<String>>(col_name)
+                    .map_err(read_err)?
+                    .map(|s| ScalarImpl::Bytea(s.into_bytes().into())),
             }
         }
 
         DataType::Timestamptz => {
             use risingwave_common::types::Timestamptz;
-            row.column_by_name::<time::OffsetDateTime>(col_name)
-                .ok()
+            row.column_by_name::<Option<time::OffsetDateTime>>(col_name)
+                .map_err(read_err)?
                 .map(|v| {
                     let micros = (v.unix_timestamp_nanos() / 1000) as i64;
                     ScalarImpl::Timestamptz(Timestamptz::from_micros(micros))
                 })
         }
 
-        DataType::Timestamp => {
-            use risingwave_common::types::Timestamp;
-            row.column_by_name::<time::OffsetDateTime>(col_name)
-                .ok()
-                .map(|v| {
-                    let micros = (v.unix_timestamp_nanos() / 1000) as i64;
-                    ScalarImpl::Timestamp(Timestamp::with_micros(micros).unwrap())
-                })
-        }
+        DataType::Timestamp => row
+            .column_by_name::<Option<time::OffsetDateTime>>(col_name)
+            .map_err(read_err)?
+            .map(|v| {
+                let micros = (v.unix_timestamp_nanos() / 1000) as i64;
+                risingwave_common::types::Timestamp::with_micros(micros).map(ScalarImpl::Timestamp)
+            })
+            .transpose()
+            .map_err(|e| anyhow!("spanner Timestamp out of range for '{}': {}", col_name, e))?,
 
-        DataType::Date => {
-            use risingwave_common::types::Date;
-            row.column_by_name::<time::Date>(col_name)
-                .ok()
-                .and_then(|v| {
-                    let s = format!("{:04}-{:02}-{:02}", v.year(), v.month(), v.day());
-                    Date::from_str(&s).ok()
-                })
-                .map(ScalarImpl::Date)
-        }
+        DataType::Date => row
+            .column_by_name::<Option<time::Date>>(col_name)
+            .map_err(read_err)?
+            .map(|v| {
+                let s = format!("{:04}-{:02}-{:02}", v.year(), v.month(), v.day());
+                risingwave_common::types::Date::from_str(&s).map(ScalarImpl::Date)
+            })
+            .transpose()
+            .map_err(|e| anyhow!("spanner Date parse failed for '{}': {}", col_name, e))?,
 
-        DataType::Decimal => {
-            use risingwave_common::types::Decimal;
-            // Numeric is returned as BigDecimal by the spanner library
-            // Read as string first (Spanner stores NUMERIC as string)
-            row.column_by_name::<String>(col_name)
-                .ok()
-                .and_then(|s| Decimal::from_str(&s).ok())
-                .map(ScalarImpl::Decimal)
-        }
+        DataType::Decimal => row
+            .column_by_name::<Option<String>>(col_name)
+            .map_err(read_err)?
+            .map(|s| risingwave_common::types::Decimal::from_str(&s).map(ScalarImpl::Decimal))
+            .transpose()
+            .map_err(|e| anyhow!("spanner Decimal parse failed for '{}': {}", col_name, e))?,
 
         DataType::Jsonb => {
             // Covers Spanner JSON and STRUCT uniformly via the type-aware walker.
-            row.column_by_name::<SpannerJson>(col_name)
-                .ok()
+            row.column_by_name::<Option<SpannerJson>>(col_name)
+                .map_err(read_err)?
                 .map(|j| ScalarImpl::Jsonb(j.0.into()))
         }
 
         DataType::List(list_type) => {
-            // Build a typed `ScalarImpl::List` dispatched on the declared
-            // inner type. Spanner forbids nested arrays so `inner` is scalar.
+            // Dispatched on the declared inner type; Spanner forbids nested arrays.
             use risingwave_common::array::ListValue;
             use risingwave_common::types::{Date, Decimal, Timestamp, Timestamptz};
 
             let inner = list_type.elem();
             let datums: Option<Vec<Datum>> = match inner {
                 DataType::Boolean => row
-                    .column_by_name::<Vec<Option<bool>>>(col_name)
-                    .ok()
+                    .column_by_name::<Option<Vec<Option<bool>>>>(col_name)
+                    .map_err(read_err)?
                     .map(|vs| vs.into_iter().map(|o| o.map(ScalarImpl::Bool)).collect()),
                 DataType::Int64 => row
-                    .column_by_name::<Vec<Option<i64>>>(col_name)
-                    .ok()
+                    .column_by_name::<Option<Vec<Option<i64>>>>(col_name)
+                    .map_err(read_err)?
                     .map(|vs| vs.into_iter().map(|o| o.map(ScalarImpl::Int64)).collect()),
                 DataType::Int32 => row
-                    .column_by_name::<Vec<Option<i64>>>(col_name)
-                    .ok()
+                    .column_by_name::<Option<Vec<Option<i64>>>>(col_name)
+                    .map_err(read_err)?
                     .map(|vs| {
                         vs.into_iter()
                             .map(|o| o.map(|v| ScalarImpl::Int32(v as i32)))
                             .collect()
                     }),
                 DataType::Int16 => row
-                    .column_by_name::<Vec<Option<i64>>>(col_name)
-                    .ok()
+                    .column_by_name::<Option<Vec<Option<i64>>>>(col_name)
+                    .map_err(read_err)?
                     .map(|vs| {
                         vs.into_iter()
                             .map(|o| o.map(|v| ScalarImpl::Int16(v as i16)))
                             .collect()
                     }),
                 DataType::Float64 => row
-                    .column_by_name::<Vec<Option<f64>>>(col_name)
-                    .ok()
+                    .column_by_name::<Option<Vec<Option<f64>>>>(col_name)
+                    .map_err(read_err)?
                     .map(|vs| {
                         vs.into_iter()
                             .map(|o| o.map(|v| ScalarImpl::Float64(F64::from(v))))
                             .collect()
                     }),
                 DataType::Float32 => row
-                    .column_by_name::<Vec<Option<f64>>>(col_name)
-                    .ok()
+                    .column_by_name::<Option<Vec<Option<f64>>>>(col_name)
+                    .map_err(read_err)?
                     .map(|vs| {
                         vs.into_iter()
                             .map(|o| o.map(|v| ScalarImpl::Float32(F32::from(v as f32))))
                             .collect()
                     }),
                 DataType::Varchar => row
-                    .column_by_name::<Vec<Option<String>>>(col_name)
-                    .ok()
+                    .column_by_name::<Option<Vec<Option<String>>>>(col_name)
+                    .map_err(read_err)?
                     .map(|vs| {
                         vs.into_iter()
                             .map(|o| o.map(|s| ScalarImpl::Utf8(s.into())))
                             .collect()
                     }),
                 DataType::Bytea => row
-                    .column_by_name::<Vec<Option<Vec<u8>>>>(col_name)
-                    .ok()
+                    .column_by_name::<Option<Vec<Option<Vec<u8>>>>>(col_name)
+                    .map_err(read_err)?
                     .map(|vs| {
                         vs.into_iter()
                             .map(|o| o.map(|b| ScalarImpl::Bytea(b.into())))
                             .collect()
                     }),
-                DataType::Date => row
-                    .column_by_name::<Vec<Option<time::Date>>>(col_name)
-                    .ok()
-                    .map(|vs| {
-                        vs.into_iter()
-                            .map(|o| {
-                                o.and_then(|v| {
-                                    let s = format!(
-                                        "{:04}-{:02}-{:02}",
-                                        v.year(),
-                                        v.month() as u8,
-                                        v.day()
-                                    );
-                                    Date::from_str(&s).ok().map(ScalarImpl::Date)
+                DataType::Date => {
+                    let vs = row
+                        .column_by_name::<Option<Vec<Option<time::Date>>>>(col_name)
+                        .map_err(read_err)?;
+                    match vs {
+                        None => None,
+                        Some(vs) => Some(
+                            vs.into_iter()
+                                .map(|o| match o {
+                                    None => Ok(None),
+                                    Some(v) => {
+                                        let s = format!(
+                                            "{:04}-{:02}-{:02}",
+                                            v.year(),
+                                            v.month() as u8,
+                                            v.day()
+                                        );
+                                        Date::from_str(&s)
+                                            .map(|d| Some(ScalarImpl::Date(d)))
+                                            .map_err(|e| anyhow!(
+                                                "spanner Date parse failed in ARRAY '{}': {}",
+                                                col_name, e
+                                            ))
+                                    }
                                 })
-                            })
-                            .collect()
-                    }),
+                                .collect::<Result<Vec<Datum>, _>>()?,
+                        ),
+                    }
+                }
                 DataType::Timestamptz => row
-                    .column_by_name::<Vec<Option<time::OffsetDateTime>>>(col_name)
-                    .ok()
+                    .column_by_name::<Option<Vec<Option<time::OffsetDateTime>>>>(col_name)
+                    .map_err(read_err)?
                     .map(|vs| {
                         vs.into_iter()
                             .map(|o| {
@@ -1502,90 +1515,103 @@ fn spanner_cell_to_scalar_impl(
                             })
                             .collect()
                     }),
-                DataType::Timestamp => row
-                    .column_by_name::<Vec<Option<time::OffsetDateTime>>>(col_name)
-                    .ok()
-                    .map(|vs| {
-                        vs.into_iter()
-                            .map(|o| {
-                                o.and_then(|v| {
-                                    let micros = (v.unix_timestamp_nanos() / 1000) as i64;
-                                    Timestamp::with_micros(micros)
-                                        .ok()
-                                        .map(ScalarImpl::Timestamp)
+                DataType::Timestamp => {
+                    let vs = row
+                        .column_by_name::<Option<Vec<Option<time::OffsetDateTime>>>>(col_name)
+                        .map_err(read_err)?;
+                    match vs {
+                        None => None,
+                        Some(vs) => Some(
+                            vs.into_iter()
+                                .map(|o| match o {
+                                    None => Ok(None),
+                                    Some(v) => {
+                                        let micros = (v.unix_timestamp_nanos() / 1000) as i64;
+                                        Timestamp::with_micros(micros)
+                                            .map(|t| Some(ScalarImpl::Timestamp(t)))
+                                            .map_err(|e| anyhow!(
+                                                "spanner Timestamp out of range in ARRAY '{}': {}",
+                                                col_name, e
+                                            ))
+                                    }
                                 })
-                            })
-                            .collect()
-                    }),
-                DataType::Decimal => row
-                    .column_by_name::<Vec<Option<String>>>(col_name)
-                    .ok()
-                    .map(|vs| {
-                        vs.into_iter()
-                            .map(|o| {
-                                o.and_then(|s| Decimal::from_str(&s).ok().map(ScalarImpl::Decimal))
-                            })
-                            .collect()
-                    }),
+                                .collect::<Result<Vec<Datum>, _>>()?,
+                        ),
+                    }
+                }
+                DataType::Decimal => {
+                    let vs = row
+                        .column_by_name::<Option<Vec<Option<String>>>>(col_name)
+                        .map_err(read_err)?;
+                    match vs {
+                        None => None,
+                        Some(vs) => Some(
+                            vs.into_iter()
+                                .map(|o| match o {
+                                    None => Ok(None),
+                                    Some(s) => Decimal::from_str(&s)
+                                        .map(|d| Some(ScalarImpl::Decimal(d)))
+                                        .map_err(|e| anyhow!(
+                                            "spanner Decimal parse failed in ARRAY '{}': {}",
+                                            col_name, e
+                                        )),
+                                })
+                                .collect::<Result<Vec<Datum>, _>>()?,
+                        ),
+                    }
+                }
                 DataType::Jsonb => {
-                    // Read the whole ARRAY in one shot; `Vec<Option<SpannerJson>>`
-                    // would reuse the outer ARRAY field for each element and
-                    // lose the per-element type context.
-                    row.column_by_name::<SpannerJson>(col_name)
-                        .ok()
-                        .and_then(|j| match j.0 {
-                            serde_json::Value::Array(items) => Some(
-                                items
-                                    .into_iter()
-                                    .map(|v| {
-                                        if v.is_null() {
-                                            None
-                                        } else {
-                                            Some(ScalarImpl::Jsonb(v.into()))
-                                        }
-                                    })
-                                    .collect(),
-                            ),
-                            _ => None,
-                        })
+                    // Read the whole ARRAY in one shot so the walker keeps
+                    // per-element Type context (a per-element read would
+                    // reuse the outer ARRAY field via `Vec<T>: TryFromValue`).
+                    let j = row
+                        .column_by_name::<Option<SpannerJson>>(col_name)
+                        .map_err(read_err)?;
+                    match j.map(|j| j.0) {
+                        None => None,
+                        Some(serde_json::Value::Array(items)) => Some(
+                            items
+                                .into_iter()
+                                .map(|v| {
+                                    if v.is_null() {
+                                        None
+                                    } else {
+                                        Some(ScalarImpl::Jsonb(v.into()))
+                                    }
+                                })
+                                .collect(),
+                        ),
+                        Some(other) => bail!(
+                            "expected JSON array for ARRAY column '{}', got {:?}",
+                            col_name, other
+                        ),
+                    }
                 }
-                other => {
-                    tracing::warn!(
-                        "column '{}' has unsupported ARRAY inner type {:?}",
-                        col_name,
-                        other
-                    );
-                    None
-                }
+                other => bail!(
+                    "unsupported ARRAY inner type for column '{}': {:?}",
+                    col_name, other
+                ),
             };
 
-            datums.map(|datums| {
-                ScalarImpl::List(ListValue::from_datum_iter(inner, datums))
-            })
+            datums.map(|datums| ScalarImpl::List(ListValue::from_datum_iter(inner, datums)))
         }
 
-        // Unknown or unsupported types - try to read as string as fallback
-        _ => {
-            tracing::warn!(
-                "column '{}' has unsupported type {:?} - reading as string fallback",
-                col_name,
-                data_type
-            );
-            row.column_by_name::<String>(col_name)
-                .ok()
-                .map(|s| ScalarImpl::Utf8(s.into()))
-        }
-    }
+        other => bail!(
+            "unsupported RisingWave type for Spanner cell '{}': {:?}",
+            col_name, other
+        ),
+    };
+    Ok(scalar)
 }
 
 fn spanner_row_to_owned_row(
     row: &google_cloud_spanner::row::Row,
     fields: &[Field],
 ) -> ConnectorResult<OwnedRow> {
-    let values = fields
+    let values: Vec<Datum> = fields
         .iter()
         .map(|f| spanner_cell_to_scalar_impl(row, &f.data_type, &f.name))
-        .collect();
+        .collect::<ConnectorResult<_>>()?;
     Ok(OwnedRow::new(values))
 }
 
@@ -1714,7 +1740,8 @@ mod tests {
 
         let dt = DataType::List(ListType::new(DataType::Int64));
         let scalar = spanner_cell_to_scalar_impl(&row, &dt, "arr")
-            .expect("list cell should decode");
+            .expect("list cell read")
+            .expect("list cell not null");
         let ScalarImpl::List(list_value) = scalar else {
             panic!("expected ScalarImpl::List, got {:?}", scalar);
         };
@@ -1803,6 +1830,7 @@ mod tests {
         // `ARRAY<STRUCT<...>>` is mapped to `List(Jsonb)` by `spanner_type_to_rw_type`.
         let dt = DataType::List(ListType::new(DataType::Jsonb));
         let scalar = spanner_cell_to_scalar_impl(&row, &dt, "arr")
+            .expect("ARRAY<STRUCT> read")
             .expect("ARRAY<STRUCT> must not silently become NULL");
         let ScalarImpl::List(list_value) = scalar else {
             panic!("expected ScalarImpl::List, got {:?}", scalar);
