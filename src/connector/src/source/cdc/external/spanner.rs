@@ -1325,20 +1325,7 @@ fn decimal_to_spanner_numeric(
     match d {
         Decimal::Normalized(n) => BigDecimal::from_str(&n.to_string())
             .map_err(|e| anyhow!("invalid Decimal for Spanner NUMERIC bind: {}", e).into()),
-        other => {
-            // Log only the variant name (NaN/PosInf/NegInf), not the value.
-            let variant = match other {
-                Decimal::NaN => "NaN",
-                Decimal::PositiveInf => "PositiveInf",
-                Decimal::NegativeInf => "NegativeInf",
-                Decimal::Normalized(_) => unreachable!(),
-            };
-            Err(anyhow!(
-                "Decimal variant {} cannot be bound to Spanner NUMERIC",
-                variant
-            )
-            .into())
-        }
+        other => Err(anyhow!("Decimal value {:?} cannot be bound to Spanner NUMERIC", other).into()),
     }
 }
 
@@ -1623,21 +1610,10 @@ fn spanner_cell_to_scalar_impl(
                                 })
                                 .collect(),
                         ),
-                        Some(other) => {
-                            // Log only the JSON kind, not the value (security: avoid leaking cell data).
-                            let kind = match &other {
-                                serde_json::Value::Null => "Null",
-                                serde_json::Value::Bool(_) => "Bool",
-                                serde_json::Value::Number(_) => "Number",
-                                serde_json::Value::String(_) => "String",
-                                serde_json::Value::Array(_) => "Array",
-                                serde_json::Value::Object(_) => "Object",
-                            };
-                            bail!(
-                                "expected JSON array for ARRAY column '{}', got {}",
-                                col_name, kind
-                            )
-                        }
+                        Some(other) => bail!(
+                            "expected JSON array for ARRAY column '{}', got {:?}",
+                            col_name, other
+                        ),
                     }
                 }
                 other => bail!(
