@@ -438,13 +438,17 @@ mod tests {
     async fn test_monotonic_advance_without_schema_change() {
         let tracker = SchemaTracker::new();
         let t1 = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+        let t_mid = OffsetDateTime::from_unix_timestamp(1_700_000_050).unwrap();
         let t2 = OffsetDateTime::from_unix_timestamp(1_700_000_100).unwrap();
-        let t_stale = OffsetDateTime::from_unix_timestamp(1_699_999_000).unwrap();
 
         let cols = vec![col("id", TypeCode::Int64, 1, true)];
+        let cols_changed = vec![
+            col("id", TypeCode::Int64, 1, true),
+            col("name", TypeCode::String, 2, false),
+        ];
 
         let r1 = record_at("t", t1, cols.clone());
-        let r2 = record_at("t", t2, cols.clone());
+        let r2 = record_at("t", t2, cols);
 
         assert!(tracker.check_and_evolve(&r1).await.unwrap().is_some());
         assert!(
@@ -452,10 +456,24 @@ mod tests {
             "identical schema with newer ts must not re-emit"
         );
 
-        // Confirm the watermark actually advanced: an even-older record must be
-        // treated as stale.
-        let r_stale = record_at("t", t_stale, cols);
-        assert!(tracker.check_and_evolve(&r_stale).await.unwrap().is_none());
+        // Watermark must have advanced from t1 to t2 on the same-schema r2.
+        // Send a *different-schema* record at t_mid where t1 < t_mid < t2:
+        //   - If watermark is t2 (correct): t_mid < t2 → dropped → None.
+        //   - If watermark is still t1 (bug, advancement skipped on no-diff):
+        //     t_mid >= t1 → fresh → schema differs → would emit Some.
+        // Using a differing schema is what distinguishes the two cases; a
+        // same-schema record at t_mid would return None either way.
+        let r_mid = record_at("t", t_mid, cols_changed);
+        assert!(
+            tracker.check_and_evolve(&r_mid).await.unwrap().is_none(),
+            "watermark must have advanced to t2; t_mid record must be stale"
+        );
+        let stored = tracker.get_schema("t").await.unwrap();
+        assert_eq!(
+            stored.columns.len(),
+            1,
+            "tracker must still hold the original (unchanged) schema"
+        );
     }
 
     #[tokio::test]
