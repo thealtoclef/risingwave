@@ -425,8 +425,8 @@ impl SpannerExternalTableReader {
         );
 
         let mut stmt = Statement::new(&sql);
-        add_scalar_param(&mut stmt, "left", left_value);
-        add_scalar_param(&mut stmt, "max", max_value);
+        add_scalar_param(&mut stmt, "left", left_value)?;
+        add_scalar_param(&mut stmt, "max", max_value)?;
 
         let mut rows = txn
             .query(stmt)
@@ -456,8 +456,8 @@ impl SpannerExternalTableReader {
         );
 
         let mut stmt = Statement::new(&sql);
-        add_scalar_param(&mut stmt, "start", start_offset);
-        add_scalar_param(&mut stmt, "max", max_value);
+        add_scalar_param(&mut stmt, "start", start_offset)?;
+        add_scalar_param(&mut stmt, "max", max_value)?;
 
         let mut rows = txn
             .query(stmt)
@@ -724,7 +724,7 @@ impl SpannerExternalTableReader {
                 self.field_names, Self::quote_column(&self.table_name), filter, order_key, scan_limit
             );
             let mut stmt = Statement::new(&sql);
-            add_pk_params(&mut stmt, pk_row);
+            add_pk_params(&mut stmt, pk_row)?;
             stmt
         } else {
             let sql = format!(
@@ -856,7 +856,7 @@ impl SpannerExternalTableReader {
             let sql = format!("SELECT {} FROM {} WHERE {} < @pk_end", self.field_names, tbl, col);
             let mut stmt = Statement::new(&sql);
             if let Some(ref scalar) = right[0] {
-                add_scalar_param(&mut stmt, "pk_end", scalar);
+                add_scalar_param(&mut stmt, "pk_end", scalar)?;
             }
             (format!("WHERE {} < @pk_end", col), stmt)
         } else if is_last_split {
@@ -864,7 +864,7 @@ impl SpannerExternalTableReader {
             let sql = format!("SELECT {} FROM {} WHERE {} >= @pk_start", self.field_names, tbl, col);
             let mut stmt = Statement::new(&sql);
             if let Some(ref scalar) = left[0] {
-                add_scalar_param(&mut stmt, "pk_start", scalar);
+                add_scalar_param(&mut stmt, "pk_start", scalar)?;
             }
             (format!("WHERE {} >= @pk_start", col), stmt)
         } else {
@@ -875,10 +875,10 @@ impl SpannerExternalTableReader {
             );
             let mut stmt = Statement::new(&sql);
             if let Some(ref scalar) = left[0] {
-                add_scalar_param(&mut stmt, "pk_start", scalar);
+                add_scalar_param(&mut stmt, "pk_start", scalar)?;
             }
             if let Some(ref scalar) = right[0] {
-                add_scalar_param(&mut stmt, "pk_end", scalar);
+                add_scalar_param(&mut stmt, "pk_end", scalar)?;
             }
             (format!("WHERE {} >= @pk_start AND {} < @pk_end", col, col), stmt)
         };
@@ -977,10 +977,15 @@ fn try_increase_split_id(split_id: &mut i64) -> ConnectorResult<()> {
     }
 }
 
-/// Adds a `ScalarImpl` value as a named parameter to a Spanner `Statement`.
+/// Binds a `ScalarImpl` as a named parameter on a Spanner `Statement`.
 ///
-/// Converts RisingWave scalar types to the corresponding Spanner parameter types.
-fn add_scalar_param(stmt: &mut Statement, name: &str, scalar: &ScalarImpl) {
+/// Handles every type Spanner allows as a PK column part (all except
+/// `FLOAT32`, `ARRAY`, `JSON`, `STRUCT`).
+fn add_scalar_param(
+    stmt: &mut Statement,
+    name: &str,
+    scalar: &ScalarImpl,
+) -> ConnectorResult<()> {
     match scalar {
         ScalarImpl::Int16(v) => stmt.add_param(name, &(*v as i64)),
         ScalarImpl::Int32(v) => stmt.add_param(name, &(*v as i64)),
@@ -989,9 +994,44 @@ fn add_scalar_param(stmt: &mut Statement, name: &str, scalar: &ScalarImpl) {
         ScalarImpl::Float64(v) => stmt.add_param(name, &v.0),
         ScalarImpl::Utf8(v) => stmt.add_param(name, &v.as_ref().to_string()),
         ScalarImpl::Bool(v) => stmt.add_param(name, v),
-        ScalarImpl::Decimal(v) => stmt.add_param(name, &v.to_string()),
-        _ => panic!("unsupported ScalarImpl type for Spanner param binding: {:?}", scalar),
+        ScalarImpl::Decimal(d) => {
+            // Must bind as BigDecimal so the emitted TypeCode is Numeric;
+            // a String bind would be rejected against a NUMERIC column.
+            // Bound type isn't unit-testable (`Statement::param_types` is
+            // `pub(crate)`) — covered by the Spanner CDC e2e suite.
+            let bd = decimal_to_spanner_numeric(d)?;
+            stmt.add_param(name, &bd);
+        }
+        ScalarImpl::Date(v) => {
+            use chrono::Datelike;
+            let nd = v.0;
+            let month = time::Month::try_from(nd.month() as u8)
+                .map_err(|e| anyhow!("invalid month in Date {:?}: {}", nd, e))?;
+            let td = time::Date::from_calendar_date(nd.year(), month, nd.day() as u8)
+                .map_err(|e| anyhow!("invalid Date {:?} for Spanner bind: {}", nd, e))?;
+            stmt.add_param(name, &td);
+        }
+        ScalarImpl::Timestamp(v) => {
+            // Spanner TIMESTAMP is a UTC instant; treat RW's naive Timestamp
+            // as UTC to match the read path in `spanner_cell_to_scalar_impl`.
+            let micros = v.0.and_utc().timestamp_micros();
+            let od = time::OffsetDateTime::from_unix_timestamp_nanos((micros as i128) * 1_000)
+                .map_err(|e| anyhow!("invalid Timestamp {} micros for Spanner bind: {}", micros, e))?;
+            stmt.add_param(name, &od);
+        }
+        ScalarImpl::Timestamptz(v) => {
+            let micros = v.timestamp_micros();
+            let od = time::OffsetDateTime::from_unix_timestamp_nanos((micros as i128) * 1_000)
+                .map_err(|e| anyhow!("invalid Timestamptz {} micros for Spanner bind: {}", micros, e))?;
+            stmt.add_param(name, &od);
+        }
+        ScalarImpl::Bytea(v) => {
+            let bytes: &[u8] = v.as_ref();
+            stmt.add_param(name, &bytes);
+        }
+        other => bail!("unsupported ScalarImpl for Spanner param binding: {:?}", other),
     }
+    Ok(())
 }
 
 /// Builds a lexicographic `>` filter for composite PKs, expanded for Spanner
@@ -1021,13 +1061,14 @@ fn build_pk_filter_sql(pk_names: &[String]) -> String {
 }
 
 /// Adds PK row values as named parameters (@pk0, @pk1, ...) to a Spanner `Statement`.
-fn add_pk_params(stmt: &mut Statement, pk_row: &OwnedRow) {
+fn add_pk_params(stmt: &mut Statement, pk_row: &OwnedRow) -> ConnectorResult<()> {
     for (i, datum_ref) in pk_row.iter().enumerate() {
         if let Some(scalar_ref) = datum_ref {
             let scalar = scalar_ref.into_scalar_impl();
-            add_scalar_param(stmt, &format!("pk{}", i), &scalar);
+            add_scalar_param(stmt, &format!("pk{}", i), &scalar)?;
         }
     }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1147,6 +1188,118 @@ pub(crate) fn spanner_type_to_rw_type(spanner_type: &str) -> ConnectorResult<Dat
 // Row / value helpers
 // ---------------------------------------------------------------------------
 
+/// Decodes a Spanner column into `serde_json::Value` using the declared
+/// `Type` to disambiguate `Kind::StringValue`, which Spanner overloads for
+/// `STRING`/`INT64`/`NUMERIC`/`BYTES`/`TIMESTAMP`/`JSON`/etc.
+///
+/// A kind-only walker would coerce a `STRING` field with value `"1"` /
+/// `"null"` into a JSON number/null and corrupt the data.
+struct SpannerJson(serde_json::Value);
+
+impl google_cloud_spanner::row::TryFromValue for SpannerJson {
+    fn try_from(
+        value: &prost_types::Value,
+        field: &google_cloud_googleapis::spanner::v1::struct_type::Field,
+    ) -> Result<Self, google_cloud_spanner::row::Error> {
+        Ok(SpannerJson(prost_value_to_json(value, field.r#type.as_ref())))
+    }
+}
+
+fn prost_value_to_json(
+    v: &prost_types::Value,
+    ty: Option<&google_cloud_googleapis::spanner::v1::Type>,
+) -> serde_json::Value {
+    use google_cloud_googleapis::spanner::v1::TypeCode;
+    use prost_types::value::Kind;
+
+    let code = ty.map(|t| t.code).unwrap_or(TypeCode::Unspecified as i32);
+
+    match v.kind.as_ref() {
+        None | Some(Kind::NullValue(_)) => serde_json::Value::Null,
+        Some(Kind::BoolValue(b)) => serde_json::Value::Bool(*b),
+        Some(Kind::NumberValue(n)) => serde_json::Number::from_f64(*n)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
+        Some(Kind::StringValue(s)) => {
+            if code == TypeCode::Json as i32 {
+                serde_json::from_str(s).unwrap_or_else(|_| serde_json::Value::String(s.clone()))
+            } else if code == TypeCode::Int64 as i32 {
+                s.parse::<i64>()
+                    .ok()
+                    .map(|n| serde_json::Value::Number(n.into()))
+                    .unwrap_or_else(|| serde_json::Value::String(s.clone()))
+            } else {
+                // All other TypeCodes are opaque text in JSON terms; keep
+                // verbatim so STRING values like "1" / "null" don't retype.
+                serde_json::Value::String(s.clone())
+            }
+        }
+        Some(Kind::ListValue(l)) => {
+            if code == TypeCode::Struct as i32 {
+                // STRUCT in result rows is a positional ListValue; pair each
+                // child with its declared field type.
+                let struct_ty = ty.and_then(|t| t.struct_type.as_ref());
+                let fields: Vec<_> = struct_ty
+                    .map(|st| st.fields.as_slice())
+                    .unwrap_or_default()
+                    .iter()
+                    .zip(l.values.iter())
+                    .map(|(f, child)| {
+                        (f.name.clone(), prost_value_to_json(child, f.r#type.as_ref()))
+                    })
+                    .collect();
+                serde_json::Value::Object(fields.into_iter().collect())
+            } else {
+                let elem_ty = ty.and_then(|t| t.array_element_type.as_deref());
+                serde_json::Value::Array(
+                    l.values
+                        .iter()
+                        .map(|child| prost_value_to_json(child, elem_ty))
+                        .collect(),
+                )
+            }
+        }
+        Some(Kind::StructValue(s)) => {
+            // STRUCT-keyed-by-name form: look up each field's declared type.
+            let struct_ty = ty.and_then(|t| t.struct_type.as_ref());
+            let lookup: std::collections::HashMap<&str, Option<&google_cloud_googleapis::spanner::v1::Type>> =
+                struct_ty
+                    .map(|st| {
+                        st.fields
+                            .iter()
+                            .map(|f| (f.name.as_str(), f.r#type.as_ref()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+            serde_json::Value::Object(
+                s.fields
+                    .iter()
+                    .map(|(k, child)| {
+                        let field_ty = lookup.get(k.as_str()).copied().flatten();
+                        (k.clone(), prost_value_to_json(child, field_ty))
+                    })
+                    .collect(),
+            )
+        }
+    }
+}
+
+/// Sole chokepoint for `Decimal` → Spanner `NUMERIC` parameter conversion.
+/// Returning `BigDecimal` here is what makes `add_scalar_param` bind as
+/// `TypeCode::Numeric`; see the comment in that function.
+fn decimal_to_spanner_numeric(
+    d: &risingwave_common::types::Decimal,
+) -> ConnectorResult<google_cloud_spanner::bigdecimal::BigDecimal> {
+    use google_cloud_spanner::bigdecimal::BigDecimal;
+    use risingwave_common::types::Decimal;
+
+    match d {
+        Decimal::Normalized(n) => BigDecimal::from_str(&n.to_string())
+            .map_err(|e| anyhow!("invalid Decimal for Spanner NUMERIC bind: {}", e).into()),
+        other => Err(anyhow!("Decimal value {:?} cannot be bound to Spanner NUMERIC", other).into()),
+    }
+}
+
 /// Extracts a single typed cell from a Spanner row as a `ScalarImpl`.
 ///
 /// Follows the same pattern as `postgres_cell_to_scalar_impl` in the Postgres CDC parser.
@@ -1248,36 +1401,167 @@ fn spanner_cell_to_scalar_impl(
         }
 
         DataType::Jsonb => {
-            // Handle JSON and STRUCT types (stored as JSON string)
-            row.column_by_name::<String>(col_name)
+            // Covers Spanner JSON and STRUCT uniformly via the type-aware walker.
+            row.column_by_name::<SpannerJson>(col_name)
                 .ok()
-                .and_then(|s| {
-                    // Try to parse as JSON first
-                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&s) {
-                        Some(ScalarImpl::Jsonb(json.into()))
-                    } else {
-                        // If not valid JSON, wrap as string
-                        Some(ScalarImpl::Jsonb(
-                            serde_json::json!(s).into()
-                        ))
-                    }
-                })
+                .map(|j| ScalarImpl::Jsonb(j.0.into()))
         }
 
-        DataType::List(_) => {
-            // Handle ARRAY types - read as JSON array and convert
-            // The spanner library returns arrays as JSON strings
-            row.column_by_name::<String>(col_name)
-                .ok()
-                .and_then(|s| {
-                    // Parse the JSON array string
-                    if let Ok(json_arr) = serde_json::from_str::<serde_json::Value>(&s) {
-                        // Return as JSONB for now (preserves all data)
-                        Some(ScalarImpl::Jsonb(json_arr.into()))
-                    } else {
-                        None
-                    }
-                })
+        DataType::List(list_type) => {
+            // Build a typed `ScalarImpl::List` dispatched on the declared
+            // inner type. Spanner forbids nested arrays so `inner` is scalar.
+            use risingwave_common::array::ListValue;
+            use risingwave_common::types::{Date, Decimal, Timestamp, Timestamptz};
+
+            let inner = list_type.elem();
+            let datums: Option<Vec<Datum>> = match inner {
+                DataType::Boolean => row
+                    .column_by_name::<Vec<Option<bool>>>(col_name)
+                    .ok()
+                    .map(|vs| vs.into_iter().map(|o| o.map(ScalarImpl::Bool)).collect()),
+                DataType::Int64 => row
+                    .column_by_name::<Vec<Option<i64>>>(col_name)
+                    .ok()
+                    .map(|vs| vs.into_iter().map(|o| o.map(ScalarImpl::Int64)).collect()),
+                DataType::Int32 => row
+                    .column_by_name::<Vec<Option<i64>>>(col_name)
+                    .ok()
+                    .map(|vs| {
+                        vs.into_iter()
+                            .map(|o| o.map(|v| ScalarImpl::Int32(v as i32)))
+                            .collect()
+                    }),
+                DataType::Int16 => row
+                    .column_by_name::<Vec<Option<i64>>>(col_name)
+                    .ok()
+                    .map(|vs| {
+                        vs.into_iter()
+                            .map(|o| o.map(|v| ScalarImpl::Int16(v as i16)))
+                            .collect()
+                    }),
+                DataType::Float64 => row
+                    .column_by_name::<Vec<Option<f64>>>(col_name)
+                    .ok()
+                    .map(|vs| {
+                        vs.into_iter()
+                            .map(|o| o.map(|v| ScalarImpl::Float64(F64::from(v))))
+                            .collect()
+                    }),
+                DataType::Float32 => row
+                    .column_by_name::<Vec<Option<f64>>>(col_name)
+                    .ok()
+                    .map(|vs| {
+                        vs.into_iter()
+                            .map(|o| o.map(|v| ScalarImpl::Float32(F32::from(v as f32))))
+                            .collect()
+                    }),
+                DataType::Varchar => row
+                    .column_by_name::<Vec<Option<String>>>(col_name)
+                    .ok()
+                    .map(|vs| {
+                        vs.into_iter()
+                            .map(|o| o.map(|s| ScalarImpl::Utf8(s.into())))
+                            .collect()
+                    }),
+                DataType::Bytea => row
+                    .column_by_name::<Vec<Option<Vec<u8>>>>(col_name)
+                    .ok()
+                    .map(|vs| {
+                        vs.into_iter()
+                            .map(|o| o.map(|b| ScalarImpl::Bytea(b.into())))
+                            .collect()
+                    }),
+                DataType::Date => row
+                    .column_by_name::<Vec<Option<time::Date>>>(col_name)
+                    .ok()
+                    .map(|vs| {
+                        vs.into_iter()
+                            .map(|o| {
+                                o.and_then(|v| {
+                                    let s = format!(
+                                        "{:04}-{:02}-{:02}",
+                                        v.year(),
+                                        v.month() as u8,
+                                        v.day()
+                                    );
+                                    Date::from_str(&s).ok().map(ScalarImpl::Date)
+                                })
+                            })
+                            .collect()
+                    }),
+                DataType::Timestamptz => row
+                    .column_by_name::<Vec<Option<time::OffsetDateTime>>>(col_name)
+                    .ok()
+                    .map(|vs| {
+                        vs.into_iter()
+                            .map(|o| {
+                                o.map(|v| {
+                                    let micros = (v.unix_timestamp_nanos() / 1000) as i64;
+                                    ScalarImpl::Timestamptz(Timestamptz::from_micros(micros))
+                                })
+                            })
+                            .collect()
+                    }),
+                DataType::Timestamp => row
+                    .column_by_name::<Vec<Option<time::OffsetDateTime>>>(col_name)
+                    .ok()
+                    .map(|vs| {
+                        vs.into_iter()
+                            .map(|o| {
+                                o.and_then(|v| {
+                                    let micros = (v.unix_timestamp_nanos() / 1000) as i64;
+                                    Timestamp::with_micros(micros)
+                                        .ok()
+                                        .map(ScalarImpl::Timestamp)
+                                })
+                            })
+                            .collect()
+                    }),
+                DataType::Decimal => row
+                    .column_by_name::<Vec<Option<String>>>(col_name)
+                    .ok()
+                    .map(|vs| {
+                        vs.into_iter()
+                            .map(|o| {
+                                o.and_then(|s| Decimal::from_str(&s).ok().map(ScalarImpl::Decimal))
+                            })
+                            .collect()
+                    }),
+                DataType::Jsonb => {
+                    // Read the whole ARRAY in one shot; `Vec<Option<SpannerJson>>`
+                    // would reuse the outer ARRAY field for each element and
+                    // lose the per-element type context.
+                    row.column_by_name::<SpannerJson>(col_name)
+                        .ok()
+                        .and_then(|j| match j.0 {
+                            serde_json::Value::Array(items) => Some(
+                                items
+                                    .into_iter()
+                                    .map(|v| {
+                                        if v.is_null() {
+                                            None
+                                        } else {
+                                            Some(ScalarImpl::Jsonb(v.into()))
+                                        }
+                                    })
+                                    .collect(),
+                            ),
+                            _ => None,
+                        })
+                }
+                other => {
+                    tracing::warn!(
+                        "column '{}' has unsupported ARRAY inner type {:?}",
+                        col_name,
+                        other
+                    );
+                    None
+                }
+            };
+
+            datums.map(|datums| {
+                ScalarImpl::List(ListValue::from_datum_iter(inner, datums))
+            })
         }
 
         // Unknown or unsupported types - try to read as string as fallback
@@ -1321,6 +1605,229 @@ mod tests {
         assert!(matches!(spanner_type_to_rw_type("INT64").unwrap(), DataType::Int64));
         assert!(matches!(spanner_type_to_rw_type("STRING").unwrap(), DataType::Varchar));
         assert!(matches!(spanner_type_to_rw_type("ARRAY<INT64>").unwrap(), DataType::List(_)));
+    }
+
+    #[test]
+    fn test_add_scalar_param_covers_all_valid_pk_types() {
+        // Spanner allows every type except FLOAT32/ARRAY/JSON/STRUCT in a PK;
+        // all of these must bind without panicking.
+        use risingwave_common::types::{Date, Decimal, Interval, Timestamp, Timestamptz};
+
+        let cases: Vec<(&str, ScalarImpl)> = vec![
+            ("i16", ScalarImpl::Int16(1)),
+            ("i32", ScalarImpl::Int32(2)),
+            ("i64", ScalarImpl::Int64(3)),
+            ("f32", ScalarImpl::Float32(F32::from(1.5_f32))),
+            ("f64", ScalarImpl::Float64(F64::from(2.5_f64))),
+            ("bool", ScalarImpl::Bool(true)),
+            ("utf8", ScalarImpl::Utf8("hello".into())),
+            (
+                "decimal",
+                ScalarImpl::Decimal(Decimal::from_str("123.456").unwrap()),
+            ),
+            (
+                "date",
+                ScalarImpl::Date(Date::from_str("2025-01-02").unwrap()),
+            ),
+            (
+                "timestamp",
+                ScalarImpl::Timestamp(Timestamp::with_micros(1_700_000_000_000_000).unwrap()),
+            ),
+            (
+                "timestamptz",
+                ScalarImpl::Timestamptz(Timestamptz::from_micros(1_700_000_000_000_000)),
+            ),
+            (
+                "bytea",
+                ScalarImpl::Bytea(b"\x00\x01\x02".to_vec().into_boxed_slice()),
+            ),
+        ];
+        for (name, scalar) in cases {
+            let mut stmt = Statement::new("SELECT 1");
+            add_scalar_param(&mut stmt, name, &scalar)
+                .unwrap_or_else(|e| panic!("binding {} failed: {}", name, e));
+        }
+
+        // Non-representable Decimals and PK-invalid types must error, not panic.
+        let mut stmt = Statement::new("SELECT 1");
+        assert!(add_scalar_param(&mut stmt, "nan", &ScalarImpl::Decimal(Decimal::NaN)).is_err());
+
+        let mut stmt = Statement::new("SELECT 1");
+        let interval = ScalarImpl::Interval(Interval::from_month_day_usec(0, 1, 0));
+        assert!(add_scalar_param(&mut stmt, "interval", &interval).is_err());
+    }
+
+    #[test]
+    fn test_decimal_to_spanner_numeric_rejects_non_normalized() {
+        // Only the conversion helper's error semantics are unit-testable;
+        // the bound TypeCode requires e2e coverage.
+        use risingwave_common::types::Decimal;
+
+        assert!(decimal_to_spanner_numeric(&Decimal::from_str("3.14").unwrap()).is_ok());
+        assert!(decimal_to_spanner_numeric(&Decimal::NaN).is_err());
+        assert!(decimal_to_spanner_numeric(&Decimal::PositiveInf).is_err());
+        assert!(decimal_to_spanner_numeric(&Decimal::NegativeInf).is_err());
+    }
+
+    #[test]
+    fn test_list_decoder_int64_with_nulls() {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        use google_cloud_googleapis::spanner::v1::struct_type::Field as SpField;
+        use google_cloud_googleapis::spanner::v1::{Type, TypeCode};
+        use google_cloud_spanner::row::Row;
+        use prost_types::value::Kind;
+        use prost_types::Value as ProstValue;
+        use risingwave_common::types::ToOwnedDatum;
+
+        // ARRAY<INT64> [10, NULL, 20]; Spanner encodes INT64 as StringValue.
+        let elem_kind = |s: &str| ProstValue {
+            kind: Some(Kind::StringValue(s.to_owned())),
+        };
+        let null_kind = || ProstValue {
+            kind: Some(Kind::NullValue(0)),
+        };
+        let list = ProstValue {
+            kind: Some(Kind::ListValue(prost_types::ListValue {
+                values: vec![elem_kind("10"), null_kind(), elem_kind("20")],
+            })),
+        };
+
+        let array_type = Type {
+            code: TypeCode::Array as i32,
+            array_element_type: Some(Box::new(Type {
+                code: TypeCode::Int64 as i32,
+                ..Default::default()
+            })),
+            struct_type: None,
+            type_annotation: 0,
+            proto_type_fqn: String::new(),
+        };
+        let field = SpField {
+            name: "arr".to_owned(),
+            r#type: Some(array_type),
+        };
+        let mut index = HashMap::new();
+        index.insert("arr".to_owned(), 0);
+        let row = Row::new(Arc::new(index), Arc::new(vec![field]), vec![list]);
+
+        let dt = DataType::List(ListType::new(DataType::Int64));
+        let scalar = spanner_cell_to_scalar_impl(&row, &dt, "arr")
+            .expect("list cell should decode");
+        let ScalarImpl::List(list_value) = scalar else {
+            panic!("expected ScalarImpl::List, got {:?}", scalar);
+        };
+        let datums: Vec<Datum> = list_value.iter().map(|d| d.to_owned_datum()).collect();
+        assert_eq!(
+            datums,
+            vec![
+                Some(ScalarImpl::Int64(10)),
+                None,
+                Some(ScalarImpl::Int64(20)),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_list_decoder_array_of_struct_preserves_field_types() {
+        // Regression: INT64 fields become JSON numbers; STRING fields with
+        // values like "1" or "null" must stay JSON strings, not be retyped.
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        use google_cloud_googleapis::spanner::v1::struct_type::Field as SpField;
+        use google_cloud_googleapis::spanner::v1::{StructType, Type, TypeCode};
+        use google_cloud_spanner::row::Row;
+        use prost_types::value::Kind;
+        use prost_types::{ListValue as ProstList, Value as ProstValue};
+        use risingwave_common::types::ToOwnedDatum;
+
+        // Spanner encodes STRUCT result values as positional ListValues.
+        let positional_struct = |a: &str, b: &str| ProstValue {
+            kind: Some(Kind::ListValue(ProstList {
+                values: vec![
+                    ProstValue {
+                        kind: Some(Kind::StringValue(a.to_owned())),
+                    },
+                    ProstValue {
+                        kind: Some(Kind::StringValue(b.to_owned())),
+                    },
+                ],
+            })),
+        };
+        let array = ProstValue {
+            kind: Some(Kind::ListValue(ProstList {
+                // Second element exercises the STRING-"null" regression case.
+                values: vec![positional_struct("1", "hello"), positional_struct("2", "null")],
+            })),
+        };
+
+        let struct_type = StructType {
+            fields: vec![
+                SpField {
+                    name: "a".to_owned(),
+                    r#type: Some(Type {
+                        code: TypeCode::Int64 as i32,
+                        ..Default::default()
+                    }),
+                },
+                SpField {
+                    name: "b".to_owned(),
+                    r#type: Some(Type {
+                        code: TypeCode::String as i32,
+                        ..Default::default()
+                    }),
+                },
+            ],
+        };
+        let array_type = Type {
+            code: TypeCode::Array as i32,
+            array_element_type: Some(Box::new(Type {
+                code: TypeCode::Struct as i32,
+                struct_type: Some(struct_type),
+                ..Default::default()
+            })),
+            struct_type: None,
+            type_annotation: 0,
+            proto_type_fqn: String::new(),
+        };
+        let field = SpField {
+            name: "arr".to_owned(),
+            r#type: Some(array_type),
+        };
+        let mut index = HashMap::new();
+        index.insert("arr".to_owned(), 0);
+        let row = Row::new(Arc::new(index), Arc::new(vec![field]), vec![array]);
+
+        // `ARRAY<STRUCT<...>>` is mapped to `List(Jsonb)` by `spanner_type_to_rw_type`.
+        let dt = DataType::List(ListType::new(DataType::Jsonb));
+        let scalar = spanner_cell_to_scalar_impl(&row, &dt, "arr")
+            .expect("ARRAY<STRUCT> must not silently become NULL");
+        let ScalarImpl::List(list_value) = scalar else {
+            panic!("expected ScalarImpl::List, got {:?}", scalar);
+        };
+
+        let datums: Vec<Datum> = list_value.iter().map(|d| d.to_owned_datum()).collect();
+        assert_eq!(datums.len(), 2);
+
+        let elem_json = |d: &Datum| match d.as_ref().expect("element is not null") {
+            ScalarImpl::Jsonb(j) => j.clone().take(),
+            other => panic!("expected Jsonb element, got {:?}", other),
+        };
+        let first = elem_json(&datums[0]);
+        let second = elem_json(&datums[1]);
+
+        assert_eq!(
+            first,
+            serde_json::json!({"a": 1, "b": "hello"}),
+            "INT64 → number, STRING → string"
+        );
+        assert_eq!(
+            second,
+            serde_json::json!({"a": 2, "b": "null"}),
+            "STRING value 'null' must remain the string \"null\", not JSON null"
+        );
     }
 
     #[test]
