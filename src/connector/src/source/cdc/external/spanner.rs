@@ -1029,36 +1029,10 @@ fn add_scalar_param(
             let bytes: &[u8] = v.as_ref();
             stmt.add_param(name, &bytes);
         }
-        other => {
-            // Log only the variant name, not the value (security: avoid leaking cell data).
-            let variant = match other {
-                ScalarImpl::Int16(_) => "Int16",
-                ScalarImpl::Int32(_) => "Int32",
-                ScalarImpl::Int64(_) => "Int64",
-                ScalarImpl::Int256(_) => "Int256",
-                ScalarImpl::Float32(_) => "Float32",
-                ScalarImpl::Float64(_) => "Float64",
-                ScalarImpl::Utf8(_) => "Utf8",
-                ScalarImpl::Bool(_) => "Bool",
-                ScalarImpl::Decimal(_) => "Decimal",
-                ScalarImpl::Interval(_) => "Interval",
-                ScalarImpl::Date(_) => "Date",
-                ScalarImpl::Time(_) => "Time",
-                ScalarImpl::Timestamp(_) => "Timestamp",
-                ScalarImpl::Timestamptz(_) => "Timestamptz",
-                ScalarImpl::Jsonb(_) => "Jsonb",
-                ScalarImpl::Serial(_) => "Serial",
-                ScalarImpl::Struct(_) => "Struct",
-                ScalarImpl::List(_) => "List",
-                ScalarImpl::Map(_) => "Map",
-                ScalarImpl::Vector(_) => "Vector",
-                ScalarImpl::Bytea(_) => "Bytea",
-            };
-            bail!(
-                "unsupported ScalarImpl variant for Spanner param binding: {}",
-                variant
-            )
-        }
+        other => bail!(
+            "unsupported ScalarImpl variant for Spanner param binding: {:?}",
+            other
+        ),
     }
     Ok(())
 }
