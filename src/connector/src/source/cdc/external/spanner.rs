@@ -1006,9 +1006,9 @@ fn add_scalar_param(
             use chrono::Datelike;
             let nd = v.0;
             let month = time::Month::try_from(nd.month() as u8)
-                .map_err(|e| anyhow!("invalid month in Date {:?}: {}", nd, e))?;
+                .map_err(|e| anyhow!("invalid month in Date: {}", e))?;
             let td = time::Date::from_calendar_date(nd.year(), month, nd.day() as u8)
-                .map_err(|e| anyhow!("invalid Date {:?} for Spanner bind: {}", nd, e))?;
+                .map_err(|e| anyhow!("invalid Date for Spanner bind: {}", e))?;
             stmt.add_param(name, &td);
         }
         ScalarImpl::Timestamp(v) => {
@@ -1016,20 +1016,49 @@ fn add_scalar_param(
             // as UTC to match the read path in `spanner_cell_to_scalar_impl`.
             let micros = v.0.and_utc().timestamp_micros();
             let od = time::OffsetDateTime::from_unix_timestamp_nanos((micros as i128) * 1_000)
-                .map_err(|e| anyhow!("invalid Timestamp {} micros for Spanner bind: {}", micros, e))?;
+                .map_err(|e| anyhow!("invalid Timestamp for Spanner bind: {}", e))?;
             stmt.add_param(name, &od);
         }
         ScalarImpl::Timestamptz(v) => {
             let micros = v.timestamp_micros();
             let od = time::OffsetDateTime::from_unix_timestamp_nanos((micros as i128) * 1_000)
-                .map_err(|e| anyhow!("invalid Timestamptz {} micros for Spanner bind: {}", micros, e))?;
+                .map_err(|e| anyhow!("invalid Timestamptz for Spanner bind: {}", e))?;
             stmt.add_param(name, &od);
         }
         ScalarImpl::Bytea(v) => {
             let bytes: &[u8] = v.as_ref();
             stmt.add_param(name, &bytes);
         }
-        other => bail!("unsupported ScalarImpl for Spanner param binding: {:?}", other),
+        other => {
+            // Log only the variant name, not the value (security: avoid leaking cell data).
+            let variant = match other {
+                ScalarImpl::Int16(_) => "Int16",
+                ScalarImpl::Int32(_) => "Int32",
+                ScalarImpl::Int64(_) => "Int64",
+                ScalarImpl::Int256(_) => "Int256",
+                ScalarImpl::Float32(_) => "Float32",
+                ScalarImpl::Float64(_) => "Float64",
+                ScalarImpl::Utf8(_) => "Utf8",
+                ScalarImpl::Bool(_) => "Bool",
+                ScalarImpl::Decimal(_) => "Decimal",
+                ScalarImpl::Interval(_) => "Interval",
+                ScalarImpl::Date(_) => "Date",
+                ScalarImpl::Time(_) => "Time",
+                ScalarImpl::Timestamp(_) => "Timestamp",
+                ScalarImpl::Timestamptz(_) => "Timestamptz",
+                ScalarImpl::Jsonb(_) => "Jsonb",
+                ScalarImpl::Serial(_) => "Serial",
+                ScalarImpl::Struct(_) => "Struct",
+                ScalarImpl::List(_) => "List",
+                ScalarImpl::Map(_) => "Map",
+                ScalarImpl::Vector(_) => "Vector",
+                ScalarImpl::Bytea(_) => "Bytea",
+            };
+            bail!(
+                "unsupported ScalarImpl variant for Spanner param binding: {}",
+                variant
+            )
+        }
     }
     Ok(())
 }
@@ -1296,7 +1325,20 @@ fn decimal_to_spanner_numeric(
     match d {
         Decimal::Normalized(n) => BigDecimal::from_str(&n.to_string())
             .map_err(|e| anyhow!("invalid Decimal for Spanner NUMERIC bind: {}", e).into()),
-        other => Err(anyhow!("Decimal value {:?} cannot be bound to Spanner NUMERIC", other).into()),
+        other => {
+            // Log only the variant name (NaN/PosInf/NegInf), not the value.
+            let variant = match other {
+                Decimal::NaN => "NaN",
+                Decimal::PositiveInf => "PositiveInf",
+                Decimal::NegativeInf => "NegativeInf",
+                Decimal::Normalized(_) => unreachable!(),
+            };
+            Err(anyhow!(
+                "Decimal variant {} cannot be bound to Spanner NUMERIC",
+                variant
+            )
+            .into())
+        }
     }
 }
 
@@ -1581,10 +1623,21 @@ fn spanner_cell_to_scalar_impl(
                                 })
                                 .collect(),
                         ),
-                        Some(other) => bail!(
-                            "expected JSON array for ARRAY column '{}', got {:?}",
-                            col_name, other
-                        ),
+                        Some(other) => {
+                            // Log only the JSON kind, not the value (security: avoid leaking cell data).
+                            let kind = match &other {
+                                serde_json::Value::Null => "Null",
+                                serde_json::Value::Bool(_) => "Bool",
+                                serde_json::Value::Number(_) => "Number",
+                                serde_json::Value::String(_) => "String",
+                                serde_json::Value::Array(_) => "Array",
+                                serde_json::Value::Object(_) => "Object",
+                            };
+                            bail!(
+                                "expected JSON array for ARRAY column '{}', got {}",
+                                col_name, kind
+                            )
+                        }
                     }
                 }
                 other => bail!(
