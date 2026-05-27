@@ -13,7 +13,7 @@ rustflags = ["-Ctarget-feature=+neon"]
 # Extra flags for Linux targets.
 [target.'cfg(target_os = "linux")']
 rustflags = [
-    "-Clink-arg=-fuse-ld=lld",       #2781
+    "-Clink-arg=-fuse-ld=mold",
     "-Clink-arg=-Wl,--no-rosegment", #4574
 ]
 

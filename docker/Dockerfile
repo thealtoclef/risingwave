@@ -8,7 +8,7 @@ RUN apt-get update \
 
 FROM base AS rust-base
 
-RUN apt-get update && apt-get -y install make cmake protobuf-compiler bash lld unzip rsync
+RUN apt-get update && apt-get -y install make cmake protobuf-compiler bash lld mold unzip rsync
 
 # Install Node.js as dependency for building the dashboard.
 # Bump version together with `dashboard/.node-version`.
@@ -24,6 +24,10 @@ SHELL ["/bin/bash", "-c"]
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- --no-modify-path --default-toolchain none -y
 ENV PATH /root/.cargo/bin:$PATH
 ENV CARGO_INCREMENTAL=0
+
+# Use mold linker for lower memory and faster linking.
+# mold has no effect on runtime performance (same machine code, noise-level layout diffs).
+ENV RUSTFLAGS="-C link-arg=-fuse-ld=mold"
 
 COPY rust-toolchain rust-toolchain
 
@@ -66,11 +70,16 @@ FROM rust-base AS rust-builder
 ARG GIT_SHA
 ENV GIT_SHA=$GIT_SHA
 
-ARG CARGO_PROFILE
+ARG CARGO_PROFILE=thin-production-lineinfo
 ENV CARGO_PROFILE=$CARGO_PROFILE
 
 COPY ./ /risingwave
 WORKDIR /risingwave
+
+# Limit concurrent rustc processes to cap peak build memory.
+# Each rustc + linker process consumes 1-3GB; 4 jobs = ~8-12GB peak vs unbounded.
+ARG CARGO_BUILD_JOBS=4
+ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
 
 ENV ENABLE_BUILD_DASHBOARD=1
 ENV OPENSSL_STATIC=1
@@ -79,7 +88,7 @@ RUN cargo fetch && \
   cargo build -p risingwave_cmd_all --profile ${CARGO_PROFILE} --features "rw-static-link" --features udf --features datafusion && \
   mkdir -p /risingwave/bin && \
   mv /risingwave/target/${CARGO_PROFILE}/risingwave /risingwave/bin/ && \
-  mv /risingwave/target/${CARGO_PROFILE}/risingwave.dwp /risingwave/bin/ && \
+  (mv /risingwave/target/${CARGO_PROFILE}/risingwave.dwp /risingwave/bin/ 2>/dev/null || true) && \
   cp ./target/${CARGO_PROFILE}/build/tikv-jemalloc-sys-*/out/build/bin/jeprof /risingwave/bin/ && \
   chmod +x /risingwave/bin/jeprof && \
   mkdir -p /risingwave/lib/adbc && \
@@ -137,7 +146,7 @@ RUN rustup show && sed -i '1s/^/default_toolchain = "stable"\n/' ~/.rustup/setti
 RUN mkdir -p /risingwave/bin/connector-node && mkdir -p /risingwave/lib
 
 COPY --from=rust-builder /risingwave/bin/risingwave /risingwave/bin/risingwave
-COPY --from=rust-builder /risingwave/bin/risingwave.dwp /risingwave/bin/risingwave.dwp
+COPY --from=rust-builder /risingwave/bin/risingwave.dwp* /risingwave/bin/
 COPY --from=java-builder /risingwave/bin/connector-node /risingwave/bin/connector-node
 COPY --from=rust-builder /risingwave/bin/jeprof /usr/local/bin/jeprof
 COPY --from=rust-base /root/.cargo/bin/flamegraph /usr/local/bin/flamegraph

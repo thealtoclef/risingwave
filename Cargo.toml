@@ -394,6 +394,17 @@ lto = "thin"
 inherits = "production"
 debug = 0 # no debug info, only symbols
 
+# Middle ground: no DWARF variable/type info but retains function names and line numbers.
+# Crash backtraces are fully readable. Binary is ~5% larger than thin-production.
+# Use this instead of thin-production when production crash debugging matters.
+[profile.thin-production-lineinfo]
+inherits = "production"
+debug = "line-tables-only"
+# Limit parallel codegen units to reduce peak memory during ThinLTO backend.
+# With lto = "thin", each CGU spawns a parallel LTO worker consuming 1-3GB.
+# Dropping from 16 (default) to 4 caps peak memory at ~8-12GB vs ~16-48GB.
+codegen-units = 4
+
 [profile.ci-release]
 inherits = "release"
 incremental = false
