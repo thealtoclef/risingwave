@@ -25,10 +25,6 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- --no-mo
 ENV PATH /root/.cargo/bin:$PATH
 ENV CARGO_INCREMENTAL=0
 
-# Use mold linker for lower memory and faster linking.
-# mold has no effect on runtime performance (same machine code, noise-level layout diffs).
-ENV RUSTFLAGS="-C link-arg=-fuse-ld=mold"
-
 COPY rust-toolchain rust-toolchain
 
 # We need to add the `rustfmt` dependency, otherwise `risingwave_pb` will not compile
