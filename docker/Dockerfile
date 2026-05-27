@@ -72,11 +72,6 @@ ENV CARGO_PROFILE=$CARGO_PROFILE
 COPY ./ /risingwave
 WORKDIR /risingwave
 
-# Limit concurrent rustc processes to cap peak build memory.
-# Each rustc + linker process consumes 1-3GB; 4 jobs = ~8-12GB peak vs unbounded.
-ARG CARGO_BUILD_JOBS=4
-ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
-
 ENV ENABLE_BUILD_DASHBOARD=1
 ENV OPENSSL_STATIC=1
 
