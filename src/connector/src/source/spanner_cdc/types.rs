@@ -214,7 +214,10 @@ impl SpannerType {
 /// Returns `None` for unsupported types (STRUCT, PROTO, ENUM).
 pub fn spanner_type_name_to_rw_type(type_name: &str) -> Option<DataType> {
     // Handle ARRAY<element_type>
-    if let Some(inner) = type_name.strip_prefix("ARRAY<").and_then(|s| s.strip_suffix('>')) {
+    if let Some(inner) = type_name
+        .strip_prefix("ARRAY<")
+        .and_then(|s| s.strip_suffix('>'))
+    {
         return spanner_type_name_to_rw_type(inner)
             .map(|elem_type| DataType::List(ListType::new(elem_type)));
     }
@@ -399,8 +402,9 @@ impl TryFromStruct for ColumnType {
     fn try_from_struct(s: Struct<'_>) -> Result<Self, RowError> {
         // Read the type field as a JSON string, then deserialize to SpannerType
         let type_json: String = s.column_by_name("type")?;
-        let spanner_type: SpannerType = serde_json::from_str(&type_json)
-            .map_err(|e| RowError::CustomParseError(format!("Failed to parse SpannerType: {}", e)))?;
+        let spanner_type: SpannerType = serde_json::from_str(&type_json).map_err(|e| {
+            RowError::CustomParseError(format!("Failed to parse SpannerType: {}", e))
+        })?;
 
         Ok(Self {
             name: s.column_by_name("name")?,
@@ -524,27 +528,28 @@ impl Mod {
         // Spanner change streams encode ALL values as JSON strings regardless of the
         // underlying column type (INT64, FLOAT64, BOOL, etc.). We use `convert_value`
         // to restore proper JSON types based on the `column_types` metadata.
-        let merge_keys_and_values = |keys: &Option<String>,
-                                     values: &Option<String>|
-         -> Result<serde_json::Map<String, JsonValue>, serde_json::Error> {
-            let mut merged = serde_json::Map::new();
+        let merge_keys_and_values =
+            |keys: &Option<String>,
+             values: &Option<String>|
+             -> Result<serde_json::Map<String, JsonValue>, serde_json::Error> {
+                let mut merged = serde_json::Map::new();
 
-            if let Some(k) = keys {
-                let keys_map: serde_json::Map<String, JsonValue> = serde_json::from_str(k)?;
-                for (key, value) in keys_map {
-                    merged.insert(key.clone(), convert_value(&key, value));
+                if let Some(k) = keys {
+                    let keys_map: serde_json::Map<String, JsonValue> = serde_json::from_str(k)?;
+                    for (key, value) in keys_map {
+                        merged.insert(key.clone(), convert_value(&key, value));
+                    }
                 }
-            }
 
-            if let Some(v) = values {
-                let values_map: serde_json::Map<String, JsonValue> = serde_json::from_str(v)?;
-                for (key, value) in values_map {
-                    merged.insert(key.clone(), convert_value(&key, value));
+                if let Some(v) = values {
+                    let values_map: serde_json::Map<String, JsonValue> = serde_json::from_str(v)?;
+                    for (key, value) in values_map {
+                        merged.insert(key.clone(), convert_value(&key, value));
+                    }
                 }
-            }
 
-            Ok(merged)
-        };
+                Ok(merged)
+            };
 
         // Parse before and after values based on operation type
         let (before, after, op) = match mod_type {
@@ -560,11 +565,10 @@ impl Mod {
                 // For NEW_ROW capture type, old_values is None, empty string, or empty JSON object.
                 // In this case, set before to null AND change op to "c" (CREATE) to ensure
                 // the DebeziumParser treats this as an INSERT operation, not an UPDATE with retract.
-                let has_old_values = self.old_values.as_ref()
-                    .map_or(false, |v| {
-                        // Check if the JSON string is non-empty and not just "{}"
-                        !v.is_empty() && v != "{}"
-                    });
+                let has_old_values = self.old_values.as_ref().map_or(false, |v| {
+                    // Check if the JSON string is non-empty and not just "{}"
+                    !v.is_empty() && v != "{}"
+                });
 
                 let (before_data, op_val) = if has_old_values {
                     let merged = merge_keys_and_values(&self.keys, &self.old_values)?;
