@@ -449,18 +449,30 @@ Type names use the Spanner type string (e.g., `"INT64"`, `"STRING"`) and are res
 
 ### How It Works
 
-Spanner embeds `column_types` metadata in every `DataChangeRecord`. The `SchemaTracker` (`schema_track.rs`) compares this against the previously seen schema on each record:
+Spanner embeds `column_types` metadata in every `DataChangeRecord`. The `SchemaTracker` (`schema_track.rs`) keeps a per-table entry of `(schema, last_commit_ts)`. The `last_commit_ts` watermark is critical: partition readers run concurrently and Spanner does not provide cross-partition commit-timestamp ordering, so without a watermark a slower partition's older-schema record could arrive after a faster partition had advanced the tracker and flip the schema backwards across a DDL boundary.
 
 ```
-DataChangeRecord arrives (contains column_types)
+DataChangeRecord arrives (contains column_types + commit_timestamp)
   │
   ├── Table not yet seen (first encounter after startup/recovery)?
-  │     → Emit schema change event (false positive)
+  │     → Insert schema + watermark; emit schema change event (false positive)
   │       Meta deduplicates: if columns unchanged, no-op
   │
   └── Table previously seen?
-        → Emit only if schemas_differ() detects an actual change
+        ├── commit_timestamp < watermark? (stale record from lagging partition)
+        │     → Drop without mutating tracker
+        │       Log at WARN only if the dropped schema differs from tracked —
+        │       that's the regression this gate exists to prevent. Same-schema
+        │       stale records are normal under concurrent partitions and stay
+        │       silent.
+        │
+        └── commit_timestamp >= watermark?
+              → Advance watermark monotonically
+                If schemas_differ(): overwrite schema + emit schema change event
+                Otherwise: no emit
 ```
+
+Strict `<` (not `<=`) is used at the stale gate: Spanner guarantees two `DataChangeRecord`s for the same table at the same `commit_timestamp` carry identical `column_types`, because a DDL transaction commits at its own distinct timestamp. Equal-timestamp records therefore cannot cause schema flapping and are routed through the normal diff path.
 
 **Debezium-Pattern Schema Change Emission**
 
