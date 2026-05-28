@@ -23,6 +23,7 @@ RisingWave components are developed in Rust and split into several crates:
 - Write simple, easy-to-read and easy-to-maintain code.
 - Use `cargo fmt` to format the code if needed.
 - Follow existing code patterns and conventions in the repository.
+- Do not run `cargo` or `risedev` commands unless the user explicitly asks for them.
 
 ## Build, Run, Test
 
