@@ -126,11 +126,7 @@ impl SpannerCdcSplit {
     /// Create a new root partition (no parents).
     ///
     /// Offset is REQUIRED - set by enumerator using user-provided timestamp or current time.
-    pub fn new_root(
-        change_stream_name: String,
-        index: u32,
-        offset: OffsetDateTime,
-    ) -> Self {
+    pub fn new_root(change_stream_name: String, index: u32, offset: OffsetDateTime) -> Self {
         Self {
             partition_token: None,
             parent_partition_tokens: vec![],
@@ -238,13 +234,14 @@ impl SpannerCdcSplit {
 
         for progress in self.partition_progress.values() {
             if progress.state == PartitionState::Running
-                && let Some(off) = progress.offset {
-                    match min_offset {
-                        Some(current) if off < current => min_offset = Some(off),
-                        None => min_offset = Some(off),
-                        _ => {}
-                    }
+                && let Some(off) = progress.offset
+            {
+                match min_offset {
+                    Some(current) if off < current => min_offset = Some(off),
+                    None => min_offset = Some(off),
+                    _ => {}
                 }
+            }
         }
 
         match min_offset {
@@ -266,13 +263,14 @@ impl SpannerCdcSplit {
     ) {
         if let Some(ref token) = offset.partition_token {
             // Child partition — update HashMap only.
-            let entry = self.partition_progress.entry(token.clone()).or_insert_with(|| {
-                PerPartitionProgress {
+            let entry = self
+                .partition_progress
+                .entry(token.clone())
+                .or_insert_with(|| PerPartitionProgress {
                     offset: None,
                     parent_tokens: offset.parent_partition_tokens.clone(),
                     state: PartitionState::Pending,
-                }
-            });
+                });
 
             if let Ok(offset_ts) =
                 OffsetDateTime::from_unix_timestamp_nanos((offset.offset as i128) * 1000)
@@ -314,9 +312,9 @@ impl SpannerCdcSplit {
     ///
     /// This is called after backfill completes to set the initial position for CDC.
     pub fn set_offset_from_backfill(&mut self, snapshot_timestamp_micros: i64) {
-        if let Ok(offset_ts) = OffsetDateTime::from_unix_timestamp_nanos(
-            (snapshot_timestamp_micros as i128) * 1000,
-        ) {
+        if let Ok(offset_ts) =
+            OffsetDateTime::from_unix_timestamp_nanos((snapshot_timestamp_micros as i128) * 1000)
+        {
             self.offset = Some(offset_ts);
             // Mark snapshot as done when setting offset from backfill
             self.snapshot_done = true;
@@ -335,11 +333,10 @@ impl SplitMetaData for SpannerCdcSplit {
         let lagging_edge = self.lagging_edge_micros();
         let mut persisted = self.clone();
         if lagging_edge > 0
-            && let Ok(ts) =
-                OffsetDateTime::from_unix_timestamp_nanos((lagging_edge as i128) * 1000)
-            {
-                persisted.offset = Some(ts);
-            }
+            && let Ok(ts) = OffsetDateTime::from_unix_timestamp_nanos((lagging_edge as i128) * 1000)
+        {
+            persisted.offset = Some(ts);
+        }
         persisted.partition_progress.clear();
         persisted.root_finished = false;
         serde_json::to_value(persisted)
@@ -454,24 +451,44 @@ mod tests {
 
         split.partition_progress.insert(
             "fast".into(),
-            PerPartitionProgress { offset: Some(t100), parent_tokens: vec![], state: PartitionState::Running },
+            PerPartitionProgress {
+                offset: Some(t100),
+                parent_tokens: vec![],
+                state: PartitionState::Running,
+            },
         );
         split.partition_progress.insert(
             "slow".into(),
-            PerPartitionProgress { offset: Some(t50), parent_tokens: vec![], state: PartitionState::Running },
+            PerPartitionProgress {
+                offset: Some(t50),
+                parent_tokens: vec![],
+                state: PartitionState::Running,
+            },
         );
 
-        assert_eq!(split.lagging_edge_micros(), (t50.unix_timestamp_nanos() / 1000) as i64);
+        assert_eq!(
+            split.lagging_edge_micros(),
+            (t50.unix_timestamp_nanos() / 1000) as i64
+        );
 
         split.partition_progress.get_mut("slow").unwrap().state = PartitionState::Finished;
-        assert_eq!(split.lagging_edge_micros(), (t100.unix_timestamp_nanos() / 1000) as i64);
+        assert_eq!(
+            split.lagging_edge_micros(),
+            (t100.unix_timestamp_nanos() / 1000) as i64
+        );
 
         split.partition_progress.get_mut("fast").unwrap().state = PartitionState::Finished;
-        assert_eq!(split.lagging_edge_micros(), (t200.unix_timestamp_nanos() / 1000) as i64);
+        assert_eq!(
+            split.lagging_edge_micros(),
+            (t200.unix_timestamp_nanos() / 1000) as i64
+        );
 
         // All finished — falls back to root's last offset.
         split.root_finished = true;
-        assert_eq!(split.lagging_edge_micros(), (t200.unix_timestamp_nanos() / 1000) as i64);
+        assert_eq!(
+            split.lagging_edge_micros(),
+            (t200.unix_timestamp_nanos() / 1000) as i64
+        );
     }
 
     #[test]
@@ -497,12 +514,26 @@ mod tests {
         );
 
         // Lagging edge should be root's offset (t200), not the Pending child's discovery time.
-        assert_eq!(split.lagging_edge_micros(), (t200.unix_timestamp_nanos() / 1000) as i64);
+        assert_eq!(
+            split.lagging_edge_micros(),
+            (t200.unix_timestamp_nanos() / 1000) as i64
+        );
 
         // When child becomes Running with actual data at t100, lagging edge should be t100.
-        split.partition_progress.get_mut("pending_child").unwrap().state = PartitionState::Running;
-        split.partition_progress.get_mut("pending_child").unwrap().offset = Some(t100);
-        assert_eq!(split.lagging_edge_micros(), (t100.unix_timestamp_nanos() / 1000) as i64);
+        split
+            .partition_progress
+            .get_mut("pending_child")
+            .unwrap()
+            .state = PartitionState::Running;
+        split
+            .partition_progress
+            .get_mut("pending_child")
+            .unwrap()
+            .offset = Some(t100);
+        assert_eq!(
+            split.lagging_edge_micros(),
+            (t100.unix_timestamp_nanos() / 1000) as i64
+        );
     }
 
     #[test]
@@ -522,7 +553,10 @@ mod tests {
         split.update_from_offset(&child_offset);
 
         assert_eq!(split.offset, Some(t0));
-        assert_eq!(split.partition_progress["child1"].state, PartitionState::Running);
+        assert_eq!(
+            split.partition_progress["child1"].state,
+            PartitionState::Running
+        );
     }
 
     #[test]
@@ -557,7 +591,10 @@ mod tests {
         );
         offset.mark_finished();
         split.update_from_offset(&offset);
-        assert_eq!(split.partition_progress["child1"].state, PartitionState::Finished);
+        assert_eq!(
+            split.partition_progress["child1"].state,
+            PartitionState::Finished
+        );
         assert!(!split.snapshot_done);
 
         // Root finished — sets snapshot_done.
@@ -597,7 +634,10 @@ mod tests {
         split.root_finished = true;
 
         // Lagging edge = min(root=200, child1=50) = 50 (p1 Finished, excluded).
-        assert_eq!(split.lagging_edge_micros(), (t50.unix_timestamp_nanos() / 1000) as i64);
+        assert_eq!(
+            split.lagging_edge_micros(),
+            (t50.unix_timestamp_nanos() / 1000) as i64
+        );
 
         let json = split.encode_to_json();
         let restored = SpannerCdcSplit::restore_from_json(json).unwrap();
@@ -637,7 +677,10 @@ mod tests {
         );
 
         // Lagging edge anchored to active child at t50.
-        assert_eq!(split.lagging_edge_micros(), (t50.unix_timestamp_nanos() / 1000) as i64);
+        assert_eq!(
+            split.lagging_edge_micros(),
+            (t50.unix_timestamp_nanos() / 1000) as i64
+        );
 
         let json = split.encode_to_json();
         let restored = SpannerCdcSplit::restore_from_json(json).unwrap();
@@ -668,13 +711,21 @@ mod tests {
         );
 
         // Lagging edge = min(root=100, child=50) = 50.
-        assert_eq!(split.lagging_edge_micros(), (t50.unix_timestamp_nanos() / 1000) as i64);
+        assert_eq!(
+            split.lagging_edge_micros(),
+            (t50.unix_timestamp_nanos() / 1000) as i64
+        );
 
         // InjectSourceOffsets: plain integer advances root unconditionally.
-        split.update_offset((t200.unix_timestamp_nanos() / 1000).to_string()).unwrap();
+        split
+            .update_offset((t200.unix_timestamp_nanos() / 1000).to_string())
+            .unwrap();
         assert_eq!(split.offset, Some(t200));
 
         // Lagging edge is still protected: min(root=200, child=50) = 50.
-        assert_eq!(split.lagging_edge_micros(), (t50.unix_timestamp_nanos() / 1000) as i64);
+        assert_eq!(
+            split.lagging_edge_micros(),
+            (t50.unix_timestamp_nanos() / 1000) as i64
+        );
     }
 }

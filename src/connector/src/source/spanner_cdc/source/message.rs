@@ -14,11 +14,10 @@
 
 use risingwave_pb::connector_service::{SourceType, cdc_message};
 
-use crate::source::SourceMeta;
 use crate::source::base::SourceMessage;
 use crate::source::cdc::DebeziumCdcMeta;
 use crate::source::spanner_cdc::types::{DataChangeRecord, Mod};
-use crate::source::{SplitId};
+use crate::source::{SourceMeta, SplitId};
 
 /// Tagged change record with split information
 #[derive(Debug, Clone)]
@@ -80,15 +79,16 @@ impl From<TaggedChangeRecord> for SourceMessage {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::Value;
     use risingwave_common::types::ScalarRefImpl;
+    use serde_json::Value;
     use time::OffsetDateTime;
 
     use super::TaggedChangeRecord;
-    use crate::source::SourceMeta;
     use crate::source::base::SourceMessage;
-    use crate::source::spanner_cdc::types::{ColumnType, DataChangeRecord, Mod, SpannerType, TypeCode};
-    use crate::source::SplitId;
+    use crate::source::spanner_cdc::types::{
+        ColumnType, DataChangeRecord, Mod, SpannerType, TypeCode,
+    };
+    use crate::source::{SourceMeta, SplitId};
 
     #[test]
     fn test_spanner_message_payload_includes_debezium_source_metadata() {
@@ -134,8 +134,12 @@ mod tests {
         let source_ts_ms = (commit_timestamp.unix_timestamp_nanos() / 1_000_000) as i64;
         let message = SourceMessage::from(record);
 
-        let payload: Value = serde_json::from_slice(message.payload.as_ref().unwrap().as_ref()).unwrap();
-        assert_eq!(payload["payload"]["source"]["ts_ms"], Value::from(source_ts_ms));
+        let payload: Value =
+            serde_json::from_slice(message.payload.as_ref().unwrap().as_ref()).unwrap();
+        assert_eq!(
+            payload["payload"]["source"]["ts_ms"],
+            Value::from(source_ts_ms)
+        );
         assert_eq!(payload["payload"]["source"]["db"], Value::from("test-db"));
         assert_eq!(payload["payload"]["source"]["table"], Value::from("orders"));
         assert_eq!(payload["payload"]["after"]["id"], Value::from("A-1"));
@@ -145,7 +149,13 @@ mod tests {
             panic!("expected debezium cdc meta");
         };
         assert_eq!(meta.source_ts_ms, source_ts_ms);
-        assert_eq!(meta.extract_database_name(), Some(ScalarRefImpl::Utf8("test-db")));
-        assert_eq!(meta.extract_table_name(), Some(ScalarRefImpl::Utf8("orders")));
+        assert_eq!(
+            meta.extract_database_name(),
+            Some(ScalarRefImpl::Utf8("test-db"))
+        );
+        assert_eq!(
+            meta.extract_table_name(),
+            Some(ScalarRefImpl::Utf8("orders"))
+        );
     }
 }
