@@ -262,7 +262,9 @@ impl CatalogController {
                 .count(&txn)
                 .await?;
             if creating != 0 {
-                if creating == 1 && object_type == ObjectType::Sink {
+                if creating == 1 && object_type == ObjectType::Sink
+                    || drop_mode == DropMode::Cascade
+                {
                     info!("dropping creating sink job, it will be cancelled");
                 } else {
                     return Err(MetaError::permission_denied(format!(
