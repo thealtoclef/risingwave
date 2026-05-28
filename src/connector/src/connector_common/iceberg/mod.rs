@@ -1026,6 +1026,8 @@ mod tests {
             catalog_security: None,
             gcp_auth_scopes: None,
             catalog_io_impl: None,
+            namespace_properties: None,
+            table_properties: None,
         }
     }
 
