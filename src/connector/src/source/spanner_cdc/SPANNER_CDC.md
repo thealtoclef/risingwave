@@ -12,7 +12,7 @@ This connector reads data from Google Cloud Spanner change streams and delivers 
 - **Debezium-Pattern Reader**: Same architecture as Postgres CDC — background task, mpsc channel, simple rx.recv()
 - **Full Type Support**: All Spanner types supported with data-preserving fallbacks
 - **Automatic Partition Management**: Handles parent-child partition splits and merges
-- **Watermark-Based Scheduling**: Ensures timestamp-ordered processing across partitions
+- **Lagging-Edge Scheduling**: Ensures timestamp-ordered processing across partitions via minimum of active offsets
 - **Schema Evolution**: Automatic detection and propagation of schema changes (ADD COLUMN)
 - **Production Ready**: Retry logic, checkpointing, graceful shutdown
 
@@ -137,8 +137,8 @@ The `mpsc` channel provides natural **backpressure**: when the source executor i
 │  │ SpannerCdcSplit  │ ← Persisted state, restored on restart    │
 │  │ - partition_token│                                           │
 │  │ - parent_tokens │                                           │
-│  │ - watermark      │ ← Resume position                         │
-│  │ - state: Enum    │ ← Created|Running|Finished                 │
+│  │ - offset         │ ← Resume position (lagging edge)          │
+│  │ - state: Enum    │ ← Pending|Running|Finished                 │
 │  │ - index          │ ← source_id.as_raw_id() (unique per source)│
 │  └────────┬────────┘                                           │
 └───────────┼─────────────────────────────────────────────────────┘
@@ -150,7 +150,7 @@ The `mpsc` channel provides natural **backpressure**: when the source executor i
 │  ┌─────────────────┐                                           │
 │  │  SpannerOffset   │ ← Lightweight checkpoint format           │
 │  │ - timestamp      │                                           │
-│  │ - watermark      │                                           │
+│  │ - offset         │ ← Lagging-edge offset (microseconds)      │
 │  │ - partition_token│                                           │
 │  │ - is_finished    │ ← Quick check without full state         │
 │  └─────────────────┘                                           │
@@ -161,8 +161,8 @@ The `mpsc` channel provides natural **backpressure**: when the source executor i
 │           Runtime Coordination (In-memory, NOT persisted)       │
 ├─────────────────────────────────────────────────────────────────┤
 │  • mpsc channel for child partition discovery                   │
-│  • HashSet tracks active parent partitions                      │
-│  • Watermark-based scheduling (start_timestamp >= min_watermark)│
+│  • HashMap tracks per-partition progress (Pending/Running/Finished)│
+│  • Lagging-edge offset computation (`lagging_edge_micros()` = min of root + running children)
 │  • Ensures children wait for ALL parents to finish             │
 │  • Recreated on restart from persisted splits                  │
 └─────────────────────────────────────────────────────────────────┘
@@ -176,32 +176,29 @@ The `mpsc` channel provides natural **backpressure**: when the source executor i
 
 ---
 
-### Watermark-Based Scheduling
+### Lagging-Edge Offset Scheduling
 
 From Spanner's partition coordination design:
 > "To make sure changes for a key is processed in timestamp order, wait until
 > the records returned from all parents have been processed."
 
-A child partition is scheduled only when:
-1. **ALL** parent partitions have finished (`state == Finished`)
-2. AND the child's `start_timestamp >= current_min_watermark`
+A child partition is scheduled only when **ALL** parent partitions have finished (`state == Finished`).
 
-This ensures timestamp-ordered processing across the partition tree.
+The offset is computed via `lagging_edge_micros()`: `min(root_offset, min(running children offsets))`. This ensures we never checkpoint past data that hasn't been fully consumed. Pending children are excluded because their offset is `discovery_time` (query start, not data progress).
 
 **Partition State Machine**:
 ```
-Created → Scheduled → Running → Finished
+Pending → Running → Finished
 ```
 
-- **Created**: Partition discovered but not yet scheduled
-- **Scheduled**: Partition queued for processing
+- **Pending**: Partition discovered but waiting for all parents to finish
 - **Running**: Partition actively being queried
 - **Finished**: Partition fully processed (will not be restarted)
 
 **Child Partition Discovery**:
 - Child partitions are discovered at runtime via `ChildPartitionsRecord` from Spanner
 - An mpsc channel (`child_discovery_tx`) sends discovered child partitions to the main loop
-- A `HashSet<String>` tracks active parent tokens that must finish before children start
+- A `HashMap<String, PerPartitionProgress>` tracks per-partition state and coordinates parent-child dependencies
 
 ---
 
@@ -596,8 +593,8 @@ Tests require a real Spanner instance. Use the `spanner-real` risedev profile:
 
 - **Full checkpoint support** via `SplitMetaData` trait
 - State persisted in RisingWave state table
-- Automatic recovery on restart from last committed offset
-- Partition state machine: `Created` → `Scheduled` → `Running` → `Finished`
+- Automatic recovery on restart from last committed offset (lagging edge)
+- Partition state machine: `Pending` → `Running` → `Finished`
 
 ### Retry with Exponential Backoff
 
