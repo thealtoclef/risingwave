@@ -21,28 +21,21 @@
 //! 3. `into_data_stream()` calls `rx.recv()` and yields messages
 //! 4. `into_stream()` wraps with `into_chunk_stream` (parser)
 //!
-//! ## Spanner Change Stream Query Model
+//! ## ReorderBuffer cross-partition ordering
 //!
-//! The background task handles Spanner-specific concerns:
-//! - **Partition management**: Tracks partition tokens and handles splits/merges
-//! - **Parent-child coordination**: Child partitions wait until ALL parents finish
-//! - **Heartbeat handling**: Updates offset based on heartbeat records
-//! - **Schema evolution**: Detects schema changes and emits them as separate messages
-//!   (mimicking Debezium's Relation messages that precede DML events)
+//! Spanner change-stream partitions are read concurrently with no cross-partition
+//! commit-timestamp ordering. Partition tasks send `PartitionRecord`s to a shared
+//! record channel. The `run_reader` main loop runs a `ReorderBuffer` that:
 //!
-//! ## Per-partition progress
+//! 1. Tracks per-partition high watermarks (data records + heartbeats)
+//! 2. Computes a global watermark = min(active partitions' watermarks)
+//! 3. Buffers records and emits them in commit-ts order only when the global
+//!    watermark has advanced past their timestamp
 //!
-//! Child partitions are tracked in a local `HashMap` keyed by partition token
-//! for dedup and parent coordination. Control messages (registration + finished)
-//! go through the mpsc data channel so the executor's `SpannerCdcSplit` stays
-//! in sync via `update_in_place`.
-//!
-//! On restart the reader always starts a fresh root from the lagging-edge
-//! offset. Old partition tokens may have expired, so per-partition restart
-//! is not safe.
+//! This ensures schema changes are always seen in commit-ts order, making it
+//! impossible for a lagging partition to regress the tracked schema.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -51,23 +44,24 @@ use futures_async_stream::try_stream;
 use google_cloud_spanner::client::Client;
 use google_cloud_spanner::statement::Statement;
 use risingwave_common::ensure;
+use risingwave_pb::connector_service::{SourceType, cdc_message};
 use time::OffsetDateTime;
 use tokio::sync::mpsc;
 use tokio_retry::strategy::{ExponentialBackoff, jitter};
-
-use risingwave_pb::connector_service::{SourceType, cdc_message};
 
 use super::TaggedChangeRecord;
 use crate::error::{ConnectorError, ConnectorResult as Result};
 use crate::parser::ParserConfig;
 use crate::source::cdc::DebeziumCdcMeta;
-use crate::source::spanner_cdc::schema_track::SchemaTracker;
+use crate::source::spanner_cdc::reorder_buffer::{
+    PartitionRecord, ReorderBuffer, ReorderBufferEvent,
+};
 use crate::source::spanner_cdc::split::{PartitionState, PerPartitionProgress};
 use crate::source::spanner_cdc::types::ChangeStreamRecord;
 use crate::source::spanner_cdc::{SpannerCdcProperties, SpannerCdcSplit};
 use crate::source::{
-    BoxSourceChunkStream, Column, SourceContextRef, SourceMessage, SplitId,
-    SplitReader, SourceMeta, into_chunk_stream,
+    BoxSourceChunkStream, Column, SourceContextRef, SourceMessage, SourceMeta, SplitId,
+    SplitReader, into_chunk_stream,
 };
 
 const DEFAULT_CHANNEL_SIZE: usize = 16;
@@ -132,7 +126,6 @@ impl SplitReader for SpannerCdcSplitReader {
             retry_backoff: properties.get_retry_backoff(),
             retry_backoff_max_delay_ms: properties.get_retry_backoff_max_delay_ms(),
             retry_backoff_factor: properties.get_retry_backoff_factor(),
-            schema_tracker: Arc::new(SchemaTracker::new()),
             source_id,
             checkpointed_offset,
         };
@@ -173,12 +166,14 @@ impl SpannerCdcSplitReader {
         }
         // Sender dropped — reader task exited. Report error metric
         // same as Debezium's CdcSplitReader does on channel errors.
-        risingwave_common::metrics::GLOBAL_ERROR_METRICS.user_source_error.report([
-            "spanner_cdc_source".to_owned(),
-            source_id,
-            self.source_ctx.source_name.clone(),
-            self.source_ctx.fragment_id.to_string(),
-        ]);
+        risingwave_common::metrics::GLOBAL_ERROR_METRICS
+            .user_source_error
+            .report([
+                "spanner_cdc_source".to_owned(),
+                source_id,
+                self.source_ctx.source_name.clone(),
+                self.source_ctx.fragment_id.to_string(),
+            ]);
         return Err(ConnectorError::from(anyhow::anyhow!(
             "Spanner CDC reader channel closed"
         )));
@@ -200,7 +195,6 @@ struct ReaderContext {
     retry_backoff: std::time::Duration,
     retry_backoff_max_delay_ms: u64,
     retry_backoff_factor: u64,
-    schema_tracker: Arc<SchemaTracker>,
     source_id: u32,
     checkpointed_offset: Option<OffsetDateTime>,
 }
@@ -211,18 +205,77 @@ struct PartitionResult {
     final_offset: Option<OffsetDateTime>,
 }
 
-/// Main reader loop — reads from Spanner change stream and sends to `tx`.
-///
-/// Manages partition lifecycle (root → children → grandchildren…) per the
-/// Spanner change stream query model. This is the Spanner equivalent of
-/// Debezium's JNI thread that reads from the WAL.
-async fn run_reader(
-    ctx: ReaderContext,
-    tx: mpsc::Sender<Vec<SourceMessage>>,
-) -> Result<()> {
-    let mut partition_streams: FuturesUnordered<
-        tokio::task::JoinHandle<Result<PartitionResult>>,
-    > = FuturesUnordered::new();
+/// Tagged wrapper so the ReorderBuffer knows which partition a record came from.
+struct TaggedPartitionRecord {
+    partition_token: Option<String>,
+    record: PartitionRecord,
+}
+
+/// Key for grouping child partitions into sibling groups.
+/// Children from the same parent split/merge share the same (parents, start_timestamp).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct SiblingKey {
+    parent_tokens: Vec<String>, // sorted
+    start_ts: OffsetDateTime,
+}
+
+/// Collect all ready children from `pending_children` and `child_discovery_rx`.
+/// "Ready" means all parent partitions have finished.
+fn collect_ready_children(
+    pending_children: &mut VecDeque<SpannerCdcSplit>,
+    child_discovery_rx: &mut tokio::sync::mpsc::UnboundedReceiver<SpannerCdcSplit>,
+    partition_progress: &mut HashMap<String, PerPartitionProgress>,
+) -> Vec<SpannerCdcSplit> {
+    let mut ready = Vec::new();
+    let mut still_pending = VecDeque::new();
+
+    // From pending_children
+    for child in pending_children.drain(..) {
+        if parents_all_finished(&child.parent_partition_tokens, partition_progress) {
+            ready.push(child);
+        } else {
+            still_pending.push_back(child);
+        }
+    }
+    *pending_children = still_pending;
+
+    // Drain any newly arrived children from the channel
+    while let Ok(child) = child_discovery_rx.try_recv() {
+        if let Some(ref token) = child.partition_token {
+            let start_offset = child.offset.unwrap_or_else(OffsetDateTime::now_utc);
+            let parents = child.parent_partition_tokens.clone();
+            if !register_child(partition_progress, token.clone(), parents, start_offset) {
+                continue; // duplicate
+            }
+        }
+        if parents_all_finished(&child.parent_partition_tokens, partition_progress) {
+            ready.push(child);
+        } else {
+            pending_children.push_back(child);
+        }
+    }
+
+    ready
+}
+
+/// Group children by (sorted parent tokens, start_timestamp) → sibling groups.
+fn group_siblings(children: &[SpannerCdcSplit]) -> HashMap<SiblingKey, Vec<SpannerCdcSplit>> {
+    let mut groups: HashMap<SiblingKey, Vec<SpannerCdcSplit>> = HashMap::new();
+    for child in children {
+        let mut parents = child.parent_partition_tokens.clone();
+        parents.sort();
+        let key = SiblingKey {
+            parent_tokens: parents,
+            start_ts: child.offset.unwrap_or_else(OffsetDateTime::now_utc),
+        };
+        groups.entry(key).or_default().push(child.clone());
+    }
+    groups
+}
+
+async fn run_reader(ctx: ReaderContext, tx: mpsc::Sender<Vec<SourceMessage>>) -> Result<()> {
+    let mut partition_streams: FuturesUnordered<tokio::task::JoinHandle<Result<PartitionResult>>> =
+        FuturesUnordered::new();
 
     let max_concurrent = ctx.max_concurrent_partitions;
     let mut active_count: usize = 0;
@@ -234,29 +287,53 @@ async fn run_reader(
     let (child_discovery_tx, mut child_discovery_rx) =
         tokio::sync::mpsc::unbounded_channel::<SpannerCdcSplit>();
 
+    // Shared record channel: partition tasks → ReorderBuffer
+    let (record_tx, mut record_rx) = mpsc::channel::<TaggedPartitionRecord>(DEFAULT_CHANNEL_SIZE);
+
     let split_id = SplitId::from(ctx.source_id.to_string());
-    let root_offset = ctx.checkpointed_offset.unwrap_or_else(OffsetDateTime::now_utc);
+    let root_offset = ctx
+        .checkpointed_offset
+        .unwrap_or_else(OffsetDateTime::now_utc);
+    let mut reorder_buf = ReorderBuffer::new();
 
-    tracing::info!(
-        starting_offset = ?root_offset,
-        "starting Spanner CDC reader with root partition"
-    );
+    let mut next_sibling_group_id: u64 = 1;
 
-    let root_split = SpannerCdcSplit::new_root(
-        ctx.change_stream_name.clone(),
-        ctx.source_id,
-        root_offset,
-    );
+    tracing::info!(starting_offset = ?root_offset, "starting Spanner CDC reader with root partition");
+
+    let root_split =
+        SpannerCdcSplit::new_root(ctx.change_stream_name.clone(), ctx.source_id, root_offset);
+    reorder_buf.handle(ReorderBufferEvent::PartitionStarted {
+        token: root_split.partition_token.clone(),
+        start_ts: root_offset,
+        group_id: None,
+    });
+
     active_count += 1;
     spawn_partition_task(
-        &ctx, root_split, &split_id, &tx,
-        &mut partition_streams, child_discovery_tx.clone(),
+        &ctx,
+        root_split,
+        &split_id,
+        &mut partition_streams,
+        child_discovery_tx.clone(),
+        &record_tx,
     );
 
     // Main event loop
     loop {
-        // If the mpsc receiver was dropped (source executor stopped), we stop too.
         if tx.is_closed() {
+            // Graceful shutdown: RisingWave cancelled us (source dropped, rebalance, etc).
+            // Drain the ReorderBuffer and attempt a final send so the downstream
+            // can checkpoint as far as possible before we exit.
+            let remaining = reorder_buf.drain();
+            if !remaining.is_empty() {
+                tracing::info!(
+                    count = remaining.len(),
+                    "graceful shutdown: emitting buffered records"
+                );
+                // tx is closed, so send will fail — but the try makes the intent clear.
+                // Records will be re-delivered from the last checkpoint on restart.
+                let _ = tx.send(remaining).await;
+            }
             tracing::info!("reader channel closed, stopping");
             break;
         }
@@ -264,103 +341,101 @@ async fn run_reader(
         tokio::select! {
             result = partition_streams.next() => {
                 match result {
-                    Some(Ok(Ok(partition_result))) => {
-                        if let Some(ref token) = partition_result.partition_token {
+                    Some(Ok(Ok(pr))) => {
+                        reorder_buf.handle(ReorderBufferEvent::PartitionFinished {
+                            token: pr.partition_token.clone(),
+                        });
+
+                        if let Some(ref token) = pr.partition_token {
                             if let Some(entry) = partition_progress.get_mut(token) {
                                 entry.state = PartitionState::Finished;
-                                if let Some(off) = partition_result.final_offset {
-                                    entry.offset = Some(off);
-                                }
-                            }
-                            let msg = make_partition_control_message(
-                                &split_id,
-                                token,
-                                &partition_progress.get(token)
-                                    .map(|e| e.parent_tokens.clone())
-                                    .unwrap_or_default(),
-                                partition_result.final_offset
-                                    .map(|o| (o.unix_timestamp_nanos() / 1000) as i64)
-                                    .unwrap_or(0),
-                                true,
-                            );
-                            if tx.send(vec![msg]).await.is_err() {
-                                break;
-                            }
-                        } else {
-                            let msg = make_root_finished_message(
-                                &split_id,
-                                partition_result.final_offset
-                                    .map(|o| (o.unix_timestamp_nanos() / 1000) as i64)
-                                    .unwrap_or(0),
-                            );
-                            if tx.send(vec![msg]).await.is_err() {
-                                break;
+                                if let Some(off) = pr.final_offset { entry.offset = Some(off); }
                             }
                         }
-                    }
-                    Some(Ok(Err(e))) => return Err(e),
-                    Some(Err(e)) => {
-                        return Err(ConnectorError::from(anyhow::anyhow!(
-                            "partition task panicked: {}", e
-                        )));
-                    }
-                    None => {
-                        // Try pending children before declaring done
-                        let mut started = false;
-                        while active_count < max_concurrent {
-                            if let Some(child) = pending_children.pop_front() {
-                                if parents_all_finished(&child.parent_partition_tokens, &partition_progress) {
-                                    if let Some(ref token) = child.partition_token {
-                                        set_running(&mut partition_progress, token);
-                                    }
-                                    active_count += 1;
-                                    spawn_partition_task(
-                                        &ctx, child, &split_id, &tx,
-                                        &mut partition_streams, child_discovery_tx.clone(),
-                                    );
-                                    started = true;
-                                } else {
+
+                        // Collect ready children and group by sibling key
+                        let ready_children = collect_ready_children(
+                            &mut pending_children, &mut child_discovery_rx,
+                            &mut partition_progress,
+                        );
+
+                        // Group by (sorted parent tokens, start_timestamp) → sibling groups
+                        let groups = group_siblings(&ready_children);
+                        for (_key, children) in groups {
+                            let group_id = next_sibling_group_id;
+                            next_sibling_group_id += 1;
+
+                            let tokens: Vec<Option<String>> = children.iter()
+                                .map(|c| c.partition_token.clone()).collect();
+                            reorder_buf.handle(ReorderBufferEvent::SiblingGroupDeclared {
+                                group_id, tokens,
+                            });
+
+                            for child in children {
+                                if active_count >= max_concurrent {
                                     pending_children.push_front(child);
                                     break;
                                 }
-                            } else {
-                                break;
+                                let child_start_ts = child.offset.unwrap_or(root_offset);
+                                if let Some(ref token) = child.partition_token {
+                                    set_running(&mut partition_progress, token);
+                                }
+                                reorder_buf.handle(ReorderBufferEvent::PartitionStarted {
+                                    token: child.partition_token.clone(),
+                                    start_ts: child_start_ts,
+                                    group_id: Some(group_id),
+                                });
+                                active_count += 1;
+                                spawn_partition_task(
+                                    &ctx, child, &split_id, &mut partition_streams,
+                                    child_discovery_tx.clone(), &record_tx,
+                                );
                             }
                         }
-                        if started { continue; }
-                        // All partition tasks completed and no pending children can
-                        // start. This indicates the Spanner change stream has terminated
-                        // (e.g., stream deleted or retention expired).
-                        tracing::warn!(
-                            %split_id,
-                            pending = pending_children.len(),
-                            "all Spanner change stream partitions finished"
-                        );
+
+                        // Emit control message + any buffered records now ready
+                        let mut batch = reorder_buf.drain();
+                        if let Some(ref token) = pr.partition_token {
+                            let ctrl = make_partition_control_message(
+                                &split_id, token,
+                                &partition_progress.get(token).map(|e| e.parent_tokens.clone()).unwrap_or_default(),
+                                pr.final_offset.map(|o| (o.unix_timestamp_nanos() / 1000) as i64).unwrap_or(0),
+                                true,
+                            );
+                            batch.push(ctrl);
+                        } else {
+                            let ctrl = make_root_finished_message(
+                                &split_id,
+                                pr.final_offset.map(|o| (o.unix_timestamp_nanos() / 1000) as i64).unwrap_or(0),
+                            );
+                            batch.push(ctrl);
+                        }
+                        if !batch.is_empty() && tx.send(batch).await.is_err() { break; }
+                    }
+                    Some(Ok(Err(e))) => return Err(e),
+                    Some(Err(e)) => {
+                        return Err(ConnectorError::from(anyhow::anyhow!("partition task panicked: {}", e)));
+                    }
+                    None => {
+                        // All partition streams finished
+                        let batch = reorder_buf.drain();
+                        if !batch.is_empty() && tx.send(batch).await.is_err() { break; }
+                        tracing::warn!(%split_id, pending = pending_children.len(), "all partitions finished");
                         break;
                     }
                 }
 
                 active_count = active_count.saturating_sub(1);
 
-                // Start pending children
+                // Try starting pending children (non-parent-triggered path)
                 while active_count < max_concurrent {
                     if let Some(child) = pending_children.pop_front() {
                         if parents_all_finished(&child.parent_partition_tokens, &partition_progress) {
-                            if let Some(ref token) = child.partition_token {
-                                set_running(&mut partition_progress, token);
-                            }
+                            if let Some(ref token) = child.partition_token { set_running(&mut partition_progress, token); }
                             active_count += 1;
-                            spawn_partition_task(
-                                &ctx, child, &split_id, &tx,
-                                &mut partition_streams, child_discovery_tx.clone(),
-                            );
-                        } else {
-                            pending_children.push_front(child);
-                            break;
-                        }
-                    } else {
-                        break;
-                    }
+                            spawn_partition_task(&ctx, child, &split_id, &mut partition_streams, child_discovery_tx.clone(), &record_tx);
+                        } else { pending_children.push_front(child); break; }
+                    } else { break; }
                 }
             }
 
@@ -379,29 +454,33 @@ async fn run_reader(
                     // when it finishes). This avoids anchoring the lagging edge
                     // to discovery_time before real data is consumed.
                 }
+                pending_children.push_back(child);
+            }
 
-                tracing::debug!(
-                    token = ?child.partition_token,
-                    parents = ?child.parent_partition_tokens,
-                    "discovered child partition"
-                );
-
-                if parents_all_finished(&child.parent_partition_tokens, &partition_progress)
-                    && active_count < max_concurrent
-                {
-                    if let Some(ref token) = child.partition_token {
-                        set_running(&mut partition_progress, token);
-                    }
-                    active_count += 1;
-                    spawn_partition_task(
-                        &ctx, child, &split_id, &tx,
-                        &mut partition_streams, child_discovery_tx.clone(),
-                    );
-                } else {
-                    pending_children.push_back(child);
+            Some(tagged) = record_rx.recv() => {
+                let messages = reorder_buf.handle(ReorderBufferEvent::Record {
+                    partition_token: tagged.partition_token,
+                    record: tagged.record,
+                });
+                if !messages.is_empty() {
+                    if tx.send(messages).await.is_err() { break; }
                 }
             }
         }
+    }
+
+    // Safety net: drain anything still buffered (e.g., after a `break` from
+    // a send error). Partition tasks have already exited or will exit when
+    // `record_tx` is dropped.
+    let remaining = reorder_buf.drain();
+    if !remaining.is_empty() {
+        tracing::info!(
+            count = remaining.len(),
+            "final drain: emitting remaining buffered records"
+        );
+        // Best-effort send. If `tx` is closed, these records are re-delivered
+        // from the last checkpoint on restart.
+        let _ = tx.send(remaining).await;
     }
 
     Ok(())
@@ -444,10 +523,7 @@ fn parents_all_finished(
     })
 }
 
-fn set_running(
-    partition_progress: &mut HashMap<String, PerPartitionProgress>,
-    token: &str,
-) {
+fn set_running(partition_progress: &mut HashMap<String, PerPartitionProgress>, token: &str) {
     if let Some(entry) = partition_progress.get_mut(token) {
         entry.state = PartitionState::Running;
     }
@@ -461,9 +537,9 @@ fn spawn_partition_task(
     ctx: &ReaderContext,
     split: SpannerCdcSplit,
     split_id: &SplitId,
-    tx: &mpsc::Sender<Vec<SourceMessage>>,
     partition_streams: &mut FuturesUnordered<tokio::task::JoinHandle<Result<PartitionResult>>>,
     child_discovery_tx: tokio::sync::mpsc::UnboundedSender<SpannerCdcSplit>,
+    record_tx: &mpsc::Sender<TaggedPartitionRecord>,
 ) {
     let client = ctx.client.clone();
     let database_name = ctx.database_name.clone();
@@ -473,21 +549,29 @@ fn spawn_partition_task(
     let retry_backoff = ctx.retry_backoff;
     let retry_backoff_max_delay_ms = ctx.retry_backoff_max_delay_ms;
     let retry_backoff_factor = ctx.retry_backoff_factor;
-    let schema_tracker = ctx.schema_tracker.clone();
-    let tx = tx.clone();
+    let record_tx = record_tx.clone();
     let split_id = split_id.clone();
     let partition_token = split.partition_token.clone();
 
     partition_streams.push(tokio::spawn(async move {
         let result = read_partition(
-            client, database_name, split, change_stream_name, heartbeat_interval_ms,
-            split_id, retry_attempts, retry_backoff,
-            retry_backoff_max_delay_ms, retry_backoff_factor,
-            schema_tracker, tx, child_discovery_tx,
-        ).await;
+            client,
+            database_name,
+            split,
+            change_stream_name,
+            heartbeat_interval_ms,
+            split_id,
+            retry_attempts,
+            retry_backoff,
+            retry_backoff_max_delay_ms,
+            retry_backoff_factor,
+            record_tx,
+            child_discovery_tx,
+        )
+        .await;
         match result {
             Ok(final_offset) => Ok(PartitionResult {
-                partition_token: partition_token,
+                partition_token,
                 final_offset: Some(final_offset),
             }),
             Err(e) => Err(e),
@@ -511,21 +595,19 @@ async fn read_partition(
     retry_backoff: std::time::Duration,
     retry_backoff_max_delay_ms: u64,
     retry_backoff_factor: u64,
-    schema_tracker: Arc<SchemaTracker>,
-    tx: mpsc::Sender<Vec<SourceMessage>>,
+    record_tx: mpsc::Sender<TaggedPartitionRecord>,
     child_discovery_tx: tokio::sync::mpsc::UnboundedSender<SpannerCdcSplit>,
 ) -> Result<OffsetDateTime> {
     let start_ts = split.offset.ok_or_else(|| {
         ConnectorError::from(anyhow::anyhow!(
             "offset is None for split_id={}, change_stream={}",
-            split_id, change_stream_name
+            split_id,
+            change_stream_name
         ))
     })?;
 
     let mut stmt = Statement::new(format!(
-        "SELECT ChangeRecord FROM READ_{} (\
-            @start_timestamp, @end_timestamp, @partition_token, @heartbeat_milliseconds\
-        )",
+        "SELECT ChangeRecord FROM READ_{} (@start_timestamp, @end_timestamp, @partition_token, @heartbeat_milliseconds)",
         change_stream_name
     ));
     stmt.add_param("start_timestamp", &start_ts);
@@ -537,14 +619,12 @@ async fn read_partition(
     }
     stmt.add_param("heartbeat_milliseconds", &heartbeat_interval_ms);
 
-    tracing::info!(
-        %split_id, %start_ts,
-        partition_token = ?split.partition_token,
-        "change stream query starting"
-    );
+    tracing::info!(%split_id, %start_ts, partition_token = ?split.partition_token, "change stream query starting");
 
     let retry_strategy = ExponentialBackoff::from_millis(retry_backoff.as_millis() as u64)
-        .max_delay(tokio::time::Duration::from_millis(retry_backoff_max_delay_ms))
+        .max_delay(tokio::time::Duration::from_millis(
+            retry_backoff_max_delay_ms,
+        ))
         .factor(retry_backoff_factor)
         .take(retry_attempts as usize)
         .map(jitter);
@@ -552,28 +632,29 @@ async fn read_partition(
     let mut last_error = None;
 
     for (attempt, delay) in retry_strategy.enumerate() {
-        if tx.is_closed() {
+        if record_tx.is_closed() {
             return Ok(split.offset.unwrap_or(start_ts));
         }
-
         match execute_query(
-            &client, &database_name, &stmt, &mut split, &split_id, &schema_tracker,
-            &tx, &child_discovery_tx, &change_stream_name,
-        ).await {
+            &client,
+            &database_name,
+            &stmt,
+            &mut split,
+            &split_id,
+            &record_tx,
+            &child_discovery_tx,
+            &change_stream_name,
+        )
+        .await
+        {
             Ok(()) => return Ok(split.offset.unwrap_or(start_ts)),
             Err(e) => {
-                tracing::warn!(
-                    %split_id, attempt = attempt + 1,
-                    max_attempts = retry_attempts + 1,
-                    ?delay, error = %e,
-                    "query failed, retrying"
-                );
+                tracing::warn!(%split_id, attempt = attempt + 1, max_attempts = retry_attempts + 1, ?delay, error = %e, "query failed, retrying");
                 last_error = Some(e);
                 tokio::time::sleep(delay).await;
             }
         }
     }
-
     Err(last_error.unwrap_or_else(|| {
         anyhow::anyhow!("change stream query failed with no error recorded").into()
     }))
@@ -585,8 +666,7 @@ async fn execute_query(
     stmt: &Statement,
     split: &mut SpannerCdcSplit,
     split_id: &SplitId,
-    schema_tracker: &Arc<SchemaTracker>,
-    tx: &mpsc::Sender<Vec<SourceMessage>>,
+    record_tx: &mpsc::Sender<TaggedPartitionRecord>,
     child_discovery_tx: &tokio::sync::mpsc::UnboundedSender<SpannerCdcSplit>,
     change_stream_name: &str,
 ) -> Result<()> {
@@ -604,7 +684,7 @@ async fn execute_query(
         .await
         .map_err(|e| anyhow::anyhow!("failed to get next row: {}", e))?
     {
-        if tx.is_closed() {
+        if record_tx.is_closed() {
             return Ok(());
         }
 
@@ -613,49 +693,11 @@ async fn execute_query(
             .map_err(|e| anyhow::anyhow!("failed to get ChangeRecord column: {}", e))?;
 
         for record in change_records {
-            let mut messages = Vec::new();
-
             for data_change in &record.data_change_record {
-                tracing::debug!(
-                    split_id = %split_id,
-                    table_name = %data_change.table_name,
-                    commit_time = ?data_change.commit_time(),
-                    mod_count = data_change.mods.len(),
-                    "received data change from Spanner change stream"
-                );
+                tracing::debug!(split_id = %split_id, table_name = %data_change.table_name, commit_time = ?data_change.commit_time(), mod_count = data_change.mods.len(), "received data change");
                 split.advance_offset(data_change.commit_time());
 
-                // Schema evolution: emit schema change as a SEPARATE message
-                // before the data records, mimicking Debezium's Relation messages
-                // that naturally precede DML events in Postgres WAL.
-                match schema_tracker.check_and_evolve(data_change).await {
-                    Ok(Some(json)) => {
-                        // Flush accumulated messages first to preserve ordering.
-                        if !messages.is_empty() {
-                            if tx.send(std::mem::take(&mut messages)).await.is_err() {
-                                return Ok(());
-                            }
-                        }
-                        // Send schema change alone so the parser can process it
-                        // before the data records that follow.
-                        let schema_msg = make_schema_change_msg(
-                            split,
-                            split_id,
-                            json,
-                            data_change,
-                            database_name,
-                        );
-                        if tx.send(vec![schema_msg]).await.is_err() {
-                            return Ok(());
-                        }
-                        // Fall through: data records accumulate in `messages`
-                        // and are sent in the next batch.
-                    }
-                    Ok(None) => {}
-                    Err(e) => return Err(e),
-                }
-
-                // Data messages for all modifications
+                let mut data_msgs = Vec::new();
                 for modification in &data_change.mods {
                     let tagged = TaggedChangeRecord {
                         split_id: split_id.clone(),
@@ -665,20 +707,33 @@ async fn execute_query(
                     };
                     let mut msg = SourceMessage::from(tagged);
                     msg.offset = make_offset_string(split);
-                    messages.push(msg);
+                    data_msgs.push(msg);
+                }
+
+                let tagged = TaggedPartitionRecord {
+                    partition_token: split.partition_token.clone(),
+                    record: PartitionRecord::DataChange {
+                        commit_ts: data_change.commit_time(),
+                        table_name: data_change.table_name.clone(),
+                        column_types: data_change.column_types.clone(),
+                        split_id: split_id.clone(),
+                        database_name: database_name.to_string(),
+                        offset: make_offset_string(split),
+                        data_msgs,
+                    },
+                };
+                if record_tx.send(tagged).await.is_err() {
+                    return Ok(());
                 }
             }
 
-            // Heartbeats
+            // Heartbeats advance the partition watermark even when no data changes
+            // are occurring. Sent to the ReorderBuffer so the global watermark can progress.
             for heartbeat in &record.heartbeat_record {
-                tracing::debug!(
-                    split_id = %split_id,
-                    heartbeat_time = ?heartbeat.heartbeat_time(),
-                    "received heartbeat from change stream"
-                );
+                tracing::debug!(split_id = %split_id, heartbeat_time = ?heartbeat.heartbeat_time(), "received heartbeat");
                 split.advance_offset(heartbeat.heartbeat_time());
 
-                let heartbeat_msg = SourceMessage {
+                let hb_msg = SourceMessage {
                     key: None,
                     payload: None,
                     offset: make_offset_string(split),
@@ -690,17 +745,14 @@ async fn execute_query(
                         SourceType::Unspecified,
                     )),
                 };
-                messages.push(heartbeat_msg);
-            }
-
-            // Send messages to the mpsc channel
-            if !messages.is_empty() {
-                tracing::debug!(
-                    split_id = %split_id,
-                    message_count = messages.len(),
-                    "sending CDC messages"
-                );
-                if tx.send(messages).await.is_err() {
+                let tagged = TaggedPartitionRecord {
+                    partition_token: split.partition_token.clone(),
+                    record: PartitionRecord::Heartbeat {
+                        commit_ts: heartbeat.heartbeat_time(),
+                        msg: hb_msg,
+                    },
+                };
+                if record_tx.send(tagged).await.is_err() {
                     return Ok(());
                 }
             }
@@ -722,11 +774,7 @@ async fn execute_query(
         }
     }
 
-    tracing::info!(
-        %split_id,
-        final_offset = ?split.offset,
-        "change stream result set exhausted"
-    );
+    tracing::info!(%split_id, final_offset = ?split.offset, "change stream result set exhausted");
     Ok(())
 }
 
@@ -744,8 +792,7 @@ fn make_offset_string(split: &SpannerCdcSplit) -> String {
         split.index,
     );
     let cdc_offset = crate::source::cdc::external::CdcOffset::Spanner(spanner_offset);
-    serde_json::to_string(&cdc_offset)
-        .unwrap_or_else(|_| split.offset_as_micros().to_string())
+    serde_json::to_string(&cdc_offset).unwrap_or_else(|_| split.offset_as_micros().to_string())
 }
 
 /// Control message for child partition lifecycle (finished only).
@@ -761,15 +808,14 @@ fn make_partition_control_message(
     offset_micros: i64,
     is_finished: bool,
 ) -> SourceMessage {
-    let mut spanner_offset =
-        crate::source::cdc::external::spanner::SpannerOffset::with_partition(
-            offset_micros,
-            Some(partition_token.to_string()),
-            parent_tokens.to_vec(),
-            offset_micros,
-            String::new(),
-            0,
-        );
+    let mut spanner_offset = crate::source::cdc::external::spanner::SpannerOffset::with_partition(
+        offset_micros,
+        Some(partition_token.to_string()),
+        parent_tokens.to_vec(),
+        offset_micros,
+        String::new(),
+        0,
+    );
     if is_finished {
         spanner_offset.mark_finished();
     }
@@ -788,10 +834,7 @@ fn make_partition_control_message(
     }
 }
 
-fn make_root_finished_message(
-    split_id: &SplitId,
-    final_offset_micros: i64,
-) -> SourceMessage {
+fn make_root_finished_message(split_id: &SplitId, final_offset_micros: i64) -> SourceMessage {
     let mut spanner_offset =
         crate::source::cdc::external::spanner::SpannerOffset::new(final_offset_micros);
     spanner_offset.mark_finished();
@@ -806,28 +849,6 @@ fn make_root_finished_message(
             final_offset_micros / 1000,
             cdc_message::CdcMessageType::Heartbeat,
             SourceType::Unspecified,
-        )),
-    }
-}
-
-fn make_schema_change_msg(
-    split: &SpannerCdcSplit,
-    split_id: &SplitId,
-    payload: Vec<u8>,
-    data_change: &crate::source::spanner_cdc::types::DataChangeRecord,
-    database_name: &str,
-) -> SourceMessage {
-    SourceMessage {
-        key: None,
-        payload: Some(payload.into()),
-        offset: make_offset_string(split),
-        split_id: split_id.clone(),
-        meta: SourceMeta::DebeziumCdc(DebeziumCdcMeta::new_with_database_name(
-            data_change.table_name.clone(),
-            (data_change.commit_time().unix_timestamp_nanos() / 1_000_000) as i64,
-            cdc_message::CdcMessageType::SchemaChange,
-            SourceType::Unspecified,
-            Some(database_name.to_owned()),
         )),
     }
 }
