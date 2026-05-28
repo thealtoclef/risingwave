@@ -21,8 +21,6 @@
 //! MySQL CDC (`SHOW MASTER STATUS`).
 
 use std::str::FromStr;
-use std::sync::Arc;
-
 use anyhow::{Context, anyhow};
 use futures::stream::BoxStream;
 use futures::pin_mut;
@@ -902,41 +900,20 @@ impl SpannerExternalTableReader {
             .context("failed to get partitions for PK range")?;
 
         tracing::info!(
-            "split_snapshot_read: got {} intra-partitions, executing with parallelism={}",
+            "split_snapshot_read: got {} intra-partitions, streaming rows sequentially with configured parallelism={}",
             partitions.len(), self.partition_query_parallelism
         );
 
-        // Execute partitions concurrently using Arc<Mutex<>> pattern
-        use futures::stream::{StreamExt, TryStreamExt};
-        use tokio::sync::Mutex;
+        // Stream each intra-partition directly instead of collecting all rows in memory.
+        // The current upstream library requires mutable access to the batch transaction for
+        // partition execution, so partitions are still consumed sequentially here.
+        for partition in partitions {
+            let mut rows = txn
+                .execute(partition, None)
+                .await
+                .context("failed to execute partition")?;
 
-        let txn = Arc::new(Mutex::new(txn));
-
-        // Stream partitions and execute them concurrently
-        let results = futures::stream::iter(partitions)
-            .map(|partition| {
-                let txn = Arc::clone(&txn);
-                async move {
-                    let mut txn_guard = txn.lock().await;
-                    let mut rows = txn_guard
-                        .execute(partition, None)
-                        .await
-                        .context("failed to execute partition")?;
-
-                    let mut partition_rows = Vec::new();
-                    while let Some(row) = rows.next().await.context("row read failed")? {
-                        partition_rows.push(row);
-                    }
-                    Ok::<_, ConnectorError>(partition_rows)
-                }
-            })
-            .buffered(self.partition_query_parallelism as usize)
-            .try_collect::<Vec<_>>()
-            .await?;
-
-        // Yield all rows from all partitions
-        for partition_rows in results {
-            for row in partition_rows {
+            while let Some(row) = rows.next().await.context("row read failed")? {
                 yield spanner_row_to_owned_row(&row, &fields)?;
             }
         }
