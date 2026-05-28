@@ -493,7 +493,7 @@ impl<S: StateStore> SourceExecutor<S> {
                         }
                     }
                     SplitImpl::SpannerCdc(spanner_split) => {
-                        let ts_micros = spanner_split.offset_as_micros();
+                        let ts_micros = spanner_split.lagging_edge_micros();
                         if ts_micros > 0 {
                             self.metrics
                                 .spanner_cdc_state_timestamp
