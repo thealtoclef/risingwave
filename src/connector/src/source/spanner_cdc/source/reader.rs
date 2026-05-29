@@ -972,7 +972,6 @@ mod tests {
             partition_token: Some(token.to_string()),
             parent_partition_tokens: parents.iter().map(|p| p.to_string()).collect(),
             offset: Some(offset),
-            snapshot_done: false,
             change_stream_name: String::new(),
             index: 0,
         }
