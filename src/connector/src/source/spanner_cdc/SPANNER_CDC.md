@@ -213,7 +213,6 @@ Identical to Debezium's pattern: in-flight records lost on cancellation are re-d
 │  │ - partition_token│                                           │
 │  │ - parent_tokens │                                           │
 │  │ - offset         │ ← ReorderBuffer watermark (monotonic)    │
-│  │ - snapshot_done  │ ← Whether backfill is complete            │
 │  │ - index          │ ← source_id.as_raw_id() (unique per source)│
 │  └────────┬────────┘                                           │
 └───────────┼─────────────────────────────────────────────────────┘
@@ -301,7 +300,6 @@ Identical to Debezium's pattern: in-flight records lost on cancellation are re-d
 |-----------|---------|-------------|
 | `spanner.databoost.enabled` | `false` | Enable DataBoost for partitioned snapshot backfill (requires `spanner.databases.useDataBoost` IAM permission) |
 | `spanner.partition_query.parallelism` | `1` | Number of concurrent partition queries during snapshot backfill |
-| `spanner.buffer_size` | `16` | Buffer size for the mpsc channel between background reader and source executor (matches Debezium's channel size) |
 | `auto.schema.change` | `false` | Enable automatic schema change propagation |
 
 **Note**: `spanner.databoost.enabled` and `spanner.partition_query.parallelism` are table-level properties set automatically by the frontend during `CREATE TABLE FROM source`. They are passed internally and should not be set manually in `CREATE SOURCE`.

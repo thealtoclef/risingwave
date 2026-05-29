@@ -78,13 +78,6 @@ pub struct SpannerCdcSplit {
     #[serde(default)]
     pub offset: Option<OffsetDateTime>,
 
-    /// Whether snapshot/backfill is done (RisingWave CDC convention)
-    ///
-    /// - false: Backfill in progress or not started
-    /// - true: Backfill complete, CDC streaming active
-    #[serde(default)]
-    pub snapshot_done: bool,
-
     /// Change stream name
     pub change_stream_name: String,
 
@@ -101,7 +94,6 @@ impl SpannerCdcSplit {
             partition_token: None,
             parent_partition_tokens: vec![],
             offset: Some(offset),
-            snapshot_done: false,
             change_stream_name,
             index,
         }
@@ -119,7 +111,6 @@ impl SpannerCdcSplit {
             partition_token: Some(token),
             parent_partition_tokens: parent_tokens,
             offset: Some(offset),
-            snapshot_done: false,
             change_stream_name,
             index,
         }
