@@ -118,7 +118,6 @@ mod tests {
         .unwrap();
 
         assert_eq!(props.get_change_stream_max_concurrent_partitions(), 5);
-        assert_eq!(props.get_buffer_size(), 1024);
         assert_eq!(props.get_retry_attempts(), 3);
     }
 

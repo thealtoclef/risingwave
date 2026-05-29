@@ -100,11 +100,6 @@ pub struct SpannerCdcProperties {
     #[serde(rename = "spanner.change_stream.max_concurrent_partitions")]
     pub change_stream_max_concurrent_partitions: Option<u32>,
 
-    /// Buffer size for prefetching messages (default: 1024)
-    #[serde_as(as = "Option<DisplayFromStr>")]
-    #[serde(rename = "spanner.buffer_size")]
-    pub buffer_size: Option<usize>,
-
     /// Retry attempts for transient failures (default: 3)
     #[serde_as(as = "Option<DisplayFromStr>")]
     #[serde(rename = "spanner.retry_attempts")]
@@ -183,11 +178,6 @@ impl SpannerCdcProperties {
     /// Get max concurrent partitions per reader (default: 5).
     pub fn get_change_stream_max_concurrent_partitions(&self) -> usize {
         self.change_stream_max_concurrent_partitions.unwrap_or(5) as usize
-    }
-
-    /// Get buffer size (default: 1024)
-    pub fn get_buffer_size(&self) -> usize {
-        self.buffer_size.unwrap_or(1024)
     }
 
     /// Get retry attempts (default: 3)
