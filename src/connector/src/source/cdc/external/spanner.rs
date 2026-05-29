@@ -45,23 +45,14 @@ use crate::source::cdc::external::{
 /// Spanner offset representing a position in the change stream.
 ///
 /// Uses the commit timestamp (microseconds since epoch) as the ordering key.
-/// Includes partition metadata for checkpoint / restoration.
+/// Stamped from the ReorderBuffer's `last_emitted_watermark`.
 #[derive(Debug, Clone, Default, PartialEq, PartialOrd, serde::Serialize, serde::Deserialize)]
 pub struct SpannerOffset {
     /// Commit timestamp of the change stream position (microseconds since epoch).
     pub timestamp: i64,
-    #[serde(default)]
-    pub partition_token: Option<String>,
-    #[serde(default)]
-    pub parent_partition_tokens: Vec<String>,
-    /// Highest timestamp processed by this partition (microseconds).
+    /// Highest timestamp processed (microseconds). Same as `timestamp` for
+    /// watermark-based offsets.
     pub offset: i64,
-    #[serde(default)]
-    pub stream_name: String,
-    #[serde(default)]
-    pub index: u32,
-    #[serde(default)]
-    pub is_finished: bool,
 }
 
 impl SpannerOffset {
@@ -69,31 +60,7 @@ impl SpannerOffset {
         Self {
             timestamp,
             offset: timestamp,
-            ..Default::default()
         }
-    }
-
-    pub fn with_partition(
-        offset: i64,
-        partition_token: Option<String>,
-        parent_partition_tokens: Vec<String>,
-        timestamp: i64,
-        stream_name: String,
-        index: u32,
-    ) -> Self {
-        Self {
-            timestamp,
-            partition_token,
-            parent_partition_tokens,
-            offset,
-            stream_name,
-            index,
-            is_finished: false,
-        }
-    }
-
-    pub fn mark_finished(&mut self) {
-        self.is_finished = true;
     }
 }
 
@@ -692,7 +659,7 @@ impl SpannerExternalTableReader {
     /// Spanner CDC uses JSON-serialized `CdcOffset::Spanner` format.
     /// This is consistent with the offset format produced by both
     /// the backfill phase (`current_cdc_offset()`) and the CDC phase
-    /// (`make_offset_string()` in reader.rs).
+    /// (`make_watermark_offset_string()` in reader.rs).
     pub fn get_cdc_offset_parser() -> crate::source::cdc::external::CdcOffsetParseFunc {
         Box::new(move |offset_str| {
             serde_json::from_str::<CdcOffset>(offset_str)

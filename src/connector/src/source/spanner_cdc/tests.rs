@@ -22,7 +22,8 @@ mod tests {
 
     #[test]
     fn test_split_root_partition() {
-        let split = SpannerCdcSplit::new_root("test-stream".to_string(), 0, OffsetDateTime::now_utc());
+        let split =
+            SpannerCdcSplit::new_root("test-stream".to_string(), 0, OffsetDateTime::now_utc());
 
         assert!(split.is_root());
         assert!(split.partition_token.is_none());
@@ -45,13 +46,17 @@ mod tests {
 
         assert!(!split.is_root());
         assert_eq!(split.partition_token, Some("child-token".to_string()));
-        assert_eq!(split.parent_partition_tokens, vec!["parent-token".to_string()]);
+        assert_eq!(
+            split.parent_partition_tokens,
+            vec!["parent-token".to_string()]
+        );
         assert_eq!(split.id().to_string(), "1");
     }
 
     #[test]
     fn test_split_serialization_roundtrip() {
-        let split = SpannerCdcSplit::new_root("test-stream".to_string(), 0, OffsetDateTime::now_utc());
+        let split =
+            SpannerCdcSplit::new_root("test-stream".to_string(), 0, OffsetDateTime::now_utc());
 
         let json = split.encode_to_json();
         let restored = SpannerCdcSplit::restore_from_json(json).unwrap();
