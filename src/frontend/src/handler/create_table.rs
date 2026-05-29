@@ -109,6 +109,7 @@ use risingwave_connector::sink::iceberg::{
     IcebergWriteMode, ORDER_KEY, SNAPSHOT_EXPIRATION_CLEAR_EXPIRED_FILES,
     SNAPSHOT_EXPIRATION_CLEAR_EXPIRED_META_DATA, SNAPSHOT_EXPIRATION_MAX_AGE_MILLIS,
     SNAPSHOT_EXPIRATION_RETAIN_LAST, SNAPSHOT_EXPIRATION_RETAIN_MAX, WRITE_MODE,
+    COMMIT_CHECKPOINT_SIZE_THRESHOLD_MB,
     parse_partition_by_exprs, validate_order_key_columns,
 };
 use risingwave_pb::ddl_service::create_iceberg_table_request::{PbSinkJobInfo, PbTableJobInfo};
@@ -1971,6 +1972,30 @@ pub async fn create_iceberg_engine_table(
         COMMIT_CHECKPOINT_INTERVAL.to_owned(),
         commit_checkpoint_interval.to_string(),
     );
+
+    if let Some(commit_checkpoint_size_threshold_mb) =
+        handler_args.with_options.get(COMMIT_CHECKPOINT_SIZE_THRESHOLD_MB)
+    {
+        let threshold_mb: u64 = commit_checkpoint_size_threshold_mb.parse().map_err(|_| {
+            ErrorCode::InvalidInputSyntax(format!(
+                "{} must be a positive integer: {}",
+                COMMIT_CHECKPOINT_SIZE_THRESHOLD_MB, commit_checkpoint_size_threshold_mb
+            ))
+        })?;
+        if threshold_mb == 0 {
+            bail!("{COMMIT_CHECKPOINT_SIZE_THRESHOLD_MB} must be greater than 0");
+        }
+
+        if let Some(x) = source.as_mut() {
+            x.with_properties
+                .remove(COMMIT_CHECKPOINT_SIZE_THRESHOLD_MB);
+        }
+        sink_with.insert(
+            COMMIT_CHECKPOINT_SIZE_THRESHOLD_MB.to_owned(),
+            threshold_mb.to_string(),
+        );
+    }
+
     sink_with.insert("create_table_if_not_exists".to_owned(), "true".to_owned());
 
     sink_with.insert("is_exactly_once".to_owned(), "true".to_owned());

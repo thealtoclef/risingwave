@@ -349,6 +349,7 @@ fn test_parse_iceberg_config() {
             orphan_file_dry_run: false,
             orphan_file_load_concurrency: None,
             orphan_file_delete_concurrency: None,
+            commit_checkpoint_size_threshold_mb: None,
         };
 
     assert_eq!(iceberg_config, expected_iceberg_config);
