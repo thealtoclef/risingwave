@@ -462,10 +462,20 @@ impl<S: StateStore> CdcBackfillExecutor<S> {
                         Either::Left(msg) => {
                             match msg? {
                                 Message::Barrier(barrier) => {
-                                    // increase the barrier count and check whether need to start a new snapshot
+                                    // increase the barrier count for snapshot-interval tracking
                                     barrier_count += 1;
                                     let can_start_new_snapshot =
                                         barrier_count == self.options.snapshot_barrier_interval;
+
+                                    // Checkpoint barriers trigger a buffer flush to ensure the
+                                    // backfill's persisted `last_binlog_offset` is never behind
+                                    // the source's persisted offset at any committed epoch,
+                                    // closing the buffer-loss window on recovery.
+                                    let is_checkpoint = barrier.kind.is_checkpoint();
+
+                                    // Track whether a Throttle mutation requires rebuilding
+                                    // the snapshot stream after this barrier.
+                                    let mut needs_rebuild_snapshot = false;
 
                                     if let Some(mutation) = barrier.mutation.as_deref() {
                                         use crate::executor::Mutation;
@@ -489,20 +499,7 @@ impl<S: StateStore> CdcBackfillExecutor<S> {
                                                     rate_limit_to_zero = self
                                                         .rate_limit_rps
                                                         .is_some_and(|val| val == 0);
-                                                    // update and persist current backfill progress without draining the buffered upstream chunks
-                                                    state_impl
-                                                        .mutate_state(
-                                                            current_pk_pos.clone(),
-                                                            last_binlog_offset.clone(),
-                                                            total_snapshot_row_count,
-                                                            false,
-                                                        )
-                                                        .await?;
-                                                    state_impl.commit_state(barrier.epoch).await?;
-                                                    yield Message::Barrier(barrier);
-
-                                                    // rebuild the snapshot stream with new rate limit
-                                                    continue 'backfill_loop;
+                                                    needs_rebuild_snapshot = true;
                                                 }
                                             }
                                             Mutation::Update(UpdateMutation {
@@ -529,10 +526,84 @@ impl<S: StateStore> CdcBackfillExecutor<S> {
                                         cur_barrier_snapshot_processed_rows,
                                         cur_barrier_upstream_processed_rows,
                                     );
+                                    cur_barrier_snapshot_processed_rows = 0;
+                                    cur_barrier_upstream_processed_rows = 0;
 
-                                    // when processing a barrier, check whether can start a new snapshot
-                                    // if the number of barriers reaches the snapshot interval
-                                    if can_start_new_snapshot {
+                                    if is_checkpoint {
+                                        // Checkpoint flush: drain the buffer and update
+                                        // last_binlog_offset inline so the persisted state is
+                                        // never behind the source's committed offset.
+                                        //
+                                        // Periodically also trigger the full snapshot teardown
+                                        // path (`break` + post-loop drain) to avoid keeping
+                                        // upstream database connections open indefinitely
+                                        // during long backfills.
+                                        if let Some(current_pos) = &current_pk_pos {
+                                            for chunk in upstream_chunk_buffer.drain(..) {
+                                                cur_barrier_upstream_processed_rows +=
+                                                    chunk.cardinality() as u64;
+                                                consumed_binlog_offset =
+                                                    get_cdc_chunk_last_offset(
+                                                        &offset_parse_func,
+                                                        &chunk,
+                                                    )?;
+                                                yield Message::Chunk(mapping_chunk(
+                                                    mark_cdc_chunk(
+                                                        &offset_parse_func,
+                                                        chunk,
+                                                        current_pos,
+                                                        &pk_indices,
+                                                        &pk_order,
+                                                        last_binlog_offset.clone(),
+                                                    )?,
+                                                    &self.output_indices,
+                                                ));
+                                            }
+                                        } else {
+                                            // When no snapshot rows have been read yet
+                                            // (`current_pk_pos` is None), clearing the buffer
+                                            // without advancing `last_binlog_offset` is safe:
+                                            // on recovery, the backfill restarts the snapshot
+                                            // from scratch, so all CDC events are re-emitted
+                                            // and re-processed.  No data can be lost here.
+                                            upstream_chunk_buffer.clear();
+                                        }
+                                        if consumed_binlog_offset.is_some() {
+                                            debug_assert!(
+                                                last_binlog_offset
+                                                    .as_ref()
+                                                    .zip(consumed_binlog_offset.as_ref())
+                                                    .map_or(true, |(old, new)| new >= old),
+                                                "checkpoint drain: consumed offset went backwards"
+                                            );
+                                            last_binlog_offset
+                                                .clone_from(&consumed_binlog_offset);
+                                        }
+                                        // When we've also reached the snapshot-interval
+                                        // boundary, hand off to the post-loop teardown path
+                                        // (which will persist and yield).  Doing this
+                                        // BEFORE commit_state avoids a double-commit panic.
+                                        if can_start_new_snapshot {
+                                            pending_barrier = Some(barrier);
+                                            break;
+                                        }
+
+                                        state_impl
+                                            .mutate_state(
+                                                current_pk_pos.clone(),
+                                                last_binlog_offset.clone(),
+                                                total_snapshot_row_count,
+                                                false,
+                                            )
+                                            .await?;
+                                        state_impl.commit_state(barrier.epoch).await?;
+
+                                        yield Message::Barrier(barrier);
+
+                                        if needs_rebuild_snapshot {
+                                            continue 'backfill_loop;
+                                        }
+                                    } else if can_start_new_snapshot {
                                         // staging the barrier
                                         pending_barrier = Some(barrier);
                                         tracing::debug!(
@@ -558,6 +629,10 @@ impl<S: StateStore> CdcBackfillExecutor<S> {
 
                                         // emit barrier and continue consume the backfill stream
                                         yield Message::Barrier(barrier);
+
+                                        if needs_rebuild_snapshot {
+                                            continue 'backfill_loop;
+                                        }
                                     }
                                 }
                                 Message::Chunk(chunk) => {

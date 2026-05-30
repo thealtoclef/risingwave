@@ -127,6 +127,11 @@ impl<S: StateStore> ParallelizedCdcBackfillExecutor<S> {
         );
         let snapshot_split_column_index =
             pk_indices[self.options.backfill_split_pk_column_index as usize];
+        // `filter_stream_chunk` is called on chunks that have passed through
+        // `mapping_chunk`.  This index is safe because `output_indices` for CDC
+        // scan nodes is the identity permutation (0..schema.len()), enforced by
+        // the assertion in `stream_cdc_scan.rs:53`.  Mapping is therefore a no-op
+        // on column order, so the original schema index is still valid.
         let cdc_table_snapshot_split_column =
             vec![self.external_table.schema().fields[snapshot_split_column_index].clone()];
 
@@ -358,6 +363,10 @@ impl<S: StateStore> ParallelizedCdcBackfillExecutor<S> {
                     is_snapshot_paused,
                     "start cdc backfill split"
                 );
+                // Capture finished-split bounds BEFORE extending with the
+                // current split, so we can forward CDC events for already-
+                // finished splits immediately without buffering them.
+                let finished_split_bounds = current_actor_bounds.clone();
                 extends_current_actor_bound(&mut current_actor_bounds, split);
 
                 let split_cdc_offset_low = {
@@ -498,9 +507,28 @@ impl<S: StateStore> ParallelizedCdcBackfillExecutor<S> {
                                     // }
 
                                     let chunk = mapping_chunk(chunk, &self.output_indices);
+
+                                    // Forward CDC events for already-finished
+                                    // splits immediately without buffering. These
+                                    // splits have had their snapshot fully read,
+                                    // so downstream ordering is correct.
+                                    if let Some(finished_chunk) = filter_stream_chunk(
+                                        chunk.clone(),
+                                        &finished_split_bounds,
+                                        snapshot_split_column_index,
+                                    ) && finished_chunk.cardinality() > 0
+                                    {
+                                        yield Message::Chunk(finished_chunk);
+                                    }
+
+                                    // Buffer only CDC events for the *current* split.
+                                    // These must wait until the snapshot covers their PKs
+                                    // (yielded when the snapshot stream ends).
+                                    let current_split_bounds =
+                                        Some((split.left_bound_inclusive.clone(), split.right_bound_exclusive.clone()));
                                     if let Some(filtered_chunk) = filter_stream_chunk(
                                         chunk,
-                                        &current_actor_bounds,
+                                        &current_split_bounds,
                                         snapshot_split_column_index,
                                     ) && filtered_chunk.cardinality() > 0
                                     {
