@@ -336,6 +336,13 @@ pub struct IcebergConfig {
     #[serde(default)]
     pub order_key: Option<String>,
 
+    /// Explicit Iceberg table location used at table creation. When set, it is
+    /// used as `TableCreation.location` directly; otherwise the location is
+    /// derived from `warehouse.path`. Required for catalogs that don't derive a
+    /// location from `warehouse.path`.
+    #[serde(rename = "table.location", default)]
+    pub table_location: Option<String>,
+
     /// Commit every n(>0) checkpoints, default is 60.
     #[serde(default = "iceberg_default_commit_checkpoint_interval")]
     #[serde_as(as = "DisplayFromStr")]
