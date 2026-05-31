@@ -665,7 +665,6 @@ async fn read_partition(
         "SELECT ChangeRecord FROM READ_{} (@start_timestamp, @end_timestamp, @partition_token, @heartbeat_milliseconds)",
         change_stream_name
     ));
-    stmt.add_param("start_timestamp", &start_ts);
     stmt.add_param("end_timestamp", &Option::<OffsetDateTime>::None);
     if let Some(ref token) = split.partition_token {
         stmt.add_param("partition_token", token);
@@ -678,6 +677,10 @@ async fn read_partition(
 
     // Edge case: retry_attempts=0 means no retries, execute once and return
     if retry_attempts == 0 {
+        if record_tx.is_closed() {
+            return Ok(());
+        }
+        stmt.add_param("start_timestamp", &start_ts);
         return execute_query(
             &client,
             &database_name,
@@ -705,6 +708,12 @@ async fn read_partition(
         if record_tx.is_closed() {
             return Ok(());
         }
+        // Resume from the latest successfully processed position (falls back
+        // to original start_ts on first attempt).
+        let resume_ts = split
+            .offset
+            .expect("offset validated at entry and only set to Some by advance_offset");
+        stmt.add_param("start_timestamp", &resume_ts);
         match execute_query(
             &client,
             &database_name,
@@ -719,15 +728,17 @@ async fn read_partition(
         {
             Ok(()) => return Ok(()),
             Err(e) => {
-                tracing::warn!(%split_id, attempt = attempt + 1, max_attempts = retry_attempts, ?delay, error = %e, "query failed, retrying");
+                let will_retry = attempt + 1 < retry_attempts as usize;
+                tracing::warn!(%split_id, attempt = attempt + 1, max_attempts = retry_attempts, ?delay, error = %e, resume_ts = ?resume_ts, will_retry, "query failed");
                 last_error = Some(e);
+                if !will_retry {
+                    break;
+                }
                 tokio::time::sleep(delay).await;
             }
         }
     }
-    Err(last_error.unwrap_or_else(|| {
-        anyhow::anyhow!("change stream query failed with no error recorded").into()
-    }))
+    Err(last_error.expect("loop body sets last_error on each failed attempt"))
 }
 
 async fn execute_query(
