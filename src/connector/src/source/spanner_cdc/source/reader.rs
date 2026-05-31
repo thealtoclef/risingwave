@@ -27,10 +27,10 @@
 //! commit-timestamp ordering. Partition tasks send `PartitionRecord`s to a shared
 //! record channel. The `run_reader` main loop runs a `ReorderBuffer` that:
 //!
-//! 1. Tracks per-partition high watermarks (data records + heartbeats)
-//! 2. Computes a global watermark = min(active partitions' watermarks)
-//! 3. Buffers records and emits them in commit-ts order only when the global
-//!    watermark has advanced past their timestamp
+//! 1. Tracks per-partition offsets (data records + heartbeats)
+//! 2. Computes a watermark = min(all partition offsets)
+//! 3. Buffers records and emits them in commit-ts order only when the watermark
+//!    has advanced past their timestamp
 //!
 //! This ensures schema changes are always seen in commit-ts order, making it
 //! impossible for a lagging partition to regress the tracked schema.
@@ -208,21 +208,17 @@ struct TaggedPartitionRecord {
     record: PartitionRecord,
 }
 
-/// Key for grouping child partitions into sibling groups.
+/// Key for grouping child partitions by (parent_tokens, start_ts).
 /// Children from the same parent split/merge share the same (parents, start_timestamp).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct SiblingKey {
+struct ChildGroupKey {
     parent_tokens: Vec<String>, // sorted
     start_ts: OffsetDateTime,
 }
 
-/// A child partition waiting to be started. Carries its pre-assigned sibling
-/// group_id through the pending queue so that deferred siblings don't get
-/// re-grouped when they're dequeued later.
+/// A child partition waiting to be started.
 struct PendingChild {
     split: SpannerCdcSplit,
-    /// Pre-assigned sibling group_id. `None` = first discovery, not yet grouped.
-    group_id: Option<u64>,
 }
 
 /// Pending child partition queue ordered by start_ts for BFS scheduling.
@@ -337,38 +333,11 @@ fn collect_ready_children(
                 continue; // duplicate
             }
         }
-        pending_children.push(PendingChild {
-            split,
-            group_id: None,
-        });
+        pending_children.push(PendingChild { split });
     }
 
     // Drain all ready children — BFS order by construction
     pending_children.drain_ready(partition_progress)
-}
-
-/// Group ungrouped children by (sorted parent tokens, start_timestamp) → sibling groups.
-/// Children that already have a `group_id` are excluded — they were deferred from
-/// a previous round and carry their pre-assigned group.
-fn group_ungrouped_children(
-    children: Vec<PendingChild>,
-) -> (HashMap<SiblingKey, Vec<PendingChild>>, Vec<PendingChild>) {
-    let mut groups: HashMap<SiblingKey, Vec<PendingChild>> = HashMap::new();
-    let mut pre_grouped = Vec::new();
-    for child in children {
-        if child.group_id.is_some() {
-            pre_grouped.push(child);
-            continue;
-        }
-        let mut parents = child.split.parent_partition_tokens.clone();
-        parents.sort();
-        let key = SiblingKey {
-            parent_tokens: parents,
-            start_ts: child.split.offset.unwrap_or_else(OffsetDateTime::now_utc),
-        };
-        groups.entry(key).or_default().push(child);
-    }
-    (groups, pre_grouped)
 }
 
 async fn run_reader(ctx: ReaderContext, tx: mpsc::Sender<Vec<SourceMessage>>) -> Result<()> {
@@ -394,8 +363,6 @@ async fn run_reader(ctx: ReaderContext, tx: mpsc::Sender<Vec<SourceMessage>>) ->
         .unwrap_or_else(OffsetDateTime::now_utc);
     let mut reorder_buf = ReorderBuffer::new();
 
-    let mut next_sibling_group_id: u64 = 1;
-
     tracing::info!(starting_offset = ?root_offset, "starting Spanner CDC reader with root partition");
 
     let root_split =
@@ -403,7 +370,6 @@ async fn run_reader(ctx: ReaderContext, tx: mpsc::Sender<Vec<SourceMessage>>) ->
     reorder_buf.handle(ReorderBufferEvent::PartitionStarted {
         token: root_split.partition_token.clone(),
         start_ts: root_offset,
-        group_id: None,
     });
 
     active_count += 1;
@@ -438,6 +404,7 @@ async fn run_reader(ctx: ReaderContext, tx: mpsc::Sender<Vec<SourceMessage>>) ->
         }
 
         tokio::select! {
+            biased;
             result = partition_streams.next() => {
                 match result {
                     Some(Ok(Ok(pr))) => {
@@ -457,58 +424,37 @@ async fn run_reader(ctx: ReaderContext, tx: mpsc::Sender<Vec<SourceMessage>>) ->
                             &mut partition_progress,
                         );
 
-                        // Separate pre-grouped (deferred) from ungrouped (first discovery)
-                        // and group the ungrouped ones into sibling groups.
-                        let (groups, pre_grouped) = group_ungrouped_children(ready_children);
-
-                        // 1. Start pre-grouped children (carry their existing group_id)
-                        for child in pre_grouped {
-                            if active_count >= max_concurrent {
-                                pending_children.push_deferred(child);
-                                continue;
-                            }
-                            let start_ts =
-                                child.split.offset.unwrap_or(root_offset);
-                            if let Some(ref token) = child.split.partition_token {
-                                set_running(&mut partition_progress, token);
-                            }
-                            reorder_buf.handle(ReorderBufferEvent::PartitionStarted {
-                                token: child.split.partition_token.clone(),
-                                start_ts,
-                                group_id: child.group_id,
-                            });
-                            active_count += 1;
-                            spawn_partition_task(
-                                &ctx,
-                                child.split,
-                                &split_id,
-                                &mut partition_streams,
-                                child_discovery_tx.clone(),
-                                &record_tx,
-                            );
+                        // Group all ready children by (sorted parent tokens, start_ts)
+                        let mut groups: HashMap<ChildGroupKey, Vec<PendingChild>> = HashMap::new();
+                        for child in ready_children {
+                            let mut parents = child.split.parent_partition_tokens.clone();
+                            parents.sort();
+                            let key = ChildGroupKey {
+                                parent_tokens: parents,
+                                start_ts: child.split.offset.unwrap_or(root_offset),
+                            };
+                            groups.entry(key).or_default().push(child);
                         }
 
-                        // 2. Start newly grouped children
+                        // Start children in each group
                         for (_key, children) in groups {
-                            let group_id = next_sibling_group_id;
-                            next_sibling_group_id += 1;
-
                             let tokens: Vec<Option<String>> = children
                                 .iter()
                                 .map(|c| c.split.partition_token.clone())
                                 .collect();
-                            reorder_buf.handle(ReorderBufferEvent::SiblingGroupDeclared {
-                                group_id,
+                            // All children in this group share the same start_ts
+                            let group_start_ts = children
+                                .first()
+                                .and_then(|c| c.split.offset)
+                                .unwrap_or(root_offset);
+                            reorder_buf.handle(ReorderBufferEvent::DeclarePartitions {
                                 tokens,
+                                start_ts: group_start_ts,
                             });
 
                             for child in children {
                                 if active_count >= max_concurrent {
-                                    // Carry group_id through deferral
-                                    pending_children.push_deferred(PendingChild {
-                                        split: child.split,
-                                        group_id: Some(group_id),
-                                    });
+                                    pending_children.push_deferred(child);
                                     continue;
                                 }
                                 let start_ts =
@@ -519,7 +465,6 @@ async fn run_reader(ctx: ReaderContext, tx: mpsc::Sender<Vec<SourceMessage>>) ->
                                 reorder_buf.handle(ReorderBufferEvent::PartitionStarted {
                                     token: child.split.partition_token.clone(),
                                     start_ts,
-                                    group_id: Some(group_id),
                                 });
                                 active_count += 1;
                                 spawn_partition_task(
@@ -532,21 +477,12 @@ async fn run_reader(ctx: ReaderContext, tx: mpsc::Sender<Vec<SourceMessage>>) ->
                                 );
                             }
                         }
-
-                        // Emit any buffered records now ready
-                        let mut batch = reorder_buf.drain();
-                        stamp_watermark(&mut batch, &reorder_buf);
-                        if !batch.is_empty() && tx.send(batch).await.is_err() { break; }
                     }
                     Some(Ok(Err(e))) => return Err(e),
                     Some(Err(e)) => {
                         return Err(ConnectorError::from(anyhow::anyhow!("partition task panicked: {}", e)));
                     }
                     None => {
-                        // All partition streams finished
-                        let mut batch = reorder_buf.drain();
-                        stamp_watermark(&mut batch, &reorder_buf);
-                        if !batch.is_empty() && tx.send(batch).await.is_err() { break; }
                         tracing::warn!(%split_id, pending = pending_children.len(), "all partitions finished");
                         break;
                     }
@@ -554,7 +490,9 @@ async fn run_reader(ctx: ReaderContext, tx: mpsc::Sender<Vec<SourceMessage>>) ->
 
                 active_count = active_count.saturating_sub(1);
 
-                // Try starting pending children (non-parent-triggered path)
+                // Try starting pending children (non-parent-triggered path).
+                // These children were already declared via DeclarePartitions
+                // when their parent finished — placeholders are in place.
                 while active_count < max_concurrent {
                     if let Some(child) = pending_children.pop_ready(&partition_progress) {
                         if let Some(ref token) = child.split.partition_token { set_running(&mut partition_progress, token); }
@@ -562,7 +500,6 @@ async fn run_reader(ctx: ReaderContext, tx: mpsc::Sender<Vec<SourceMessage>>) ->
                         reorder_buf.handle(ReorderBufferEvent::PartitionStarted {
                             token: child.split.partition_token.clone(),
                             start_ts,
-                            group_id: child.group_id,
                         });
                         active_count += 1;
                         spawn_partition_task(&ctx, child.split, &split_id, &mut partition_streams, child_discovery_tx.clone(), &record_tx);
@@ -579,54 +516,25 @@ async fn run_reader(ctx: ReaderContext, tx: mpsc::Sender<Vec<SourceMessage>>) ->
                 }
                 pending_children.push(PendingChild {
                     split: child,
-                    group_id: None,
                 });
-
-                // Immediately try to start children whose parents are already finished.
-                // Without this, a child discovered after all its parents have finished
-                // would sit idle until the next partition-finish event cycles the loop.
-                //
-                // Note: this path bypasses `group_ungrouped_children`, so each child
-                // is spawned solo (no SiblingGroupDeclared). In practice this rarely
-                // fires for actual siblings — `collect_ready_children` in the
-                // PartitionFinished arm drains the discovery channel first, and
-                // multi-parent children stay un-ready until the last parent finishes.
-                while active_count < max_concurrent {
-                    if let Some(child) = pending_children.pop_ready(&partition_progress) {
-                        if let Some(ref token) = child.split.partition_token {
-                            set_running(&mut partition_progress, token);
-                        }
-                        let start_ts = child.split.offset.unwrap_or(root_offset);
-                        reorder_buf.handle(ReorderBufferEvent::PartitionStarted {
-                            token: child.split.partition_token.clone(),
-                            start_ts,
-                            group_id: child.group_id,
-                        });
-                        active_count += 1;
-                        spawn_partition_task(
-                            &ctx,
-                            child.split,
-                            &split_id,
-                            &mut partition_streams,
-                            child_discovery_tx.clone(),
-                            &record_tx,
-                        );
-                    } else {
-                        break;
-                    }
-                }
+                // Children are started by the PartitionFinished arm (Arm 1),
+                // which groups children by (parent_tokens, start_ts) and
+                // declares partitions with placeholders before starting them.
             }
 
             Some(tagged) = record_rx.recv() => {
-                let mut messages = reorder_buf.handle(ReorderBufferEvent::Record {
+                reorder_buf.handle(ReorderBufferEvent::Record {
                     partition_token: tagged.partition_token,
                     record: tagged.record,
                 });
-                if !messages.is_empty() {
-                    stamp_watermark(&mut messages, &reorder_buf);
-                    if tx.send(messages).await.is_err() { break; }
-                }
             }
+        }
+
+        // Drain and emit after every event — single drain point, no data loss
+        let mut batch = reorder_buf.drain();
+        stamp_watermark(&mut batch, &reorder_buf);
+        if !batch.is_empty() && tx.send(batch).await.is_err() {
+            break;
         }
     }
 
@@ -653,10 +561,7 @@ async fn run_reader(ctx: ReaderContext, tx: mpsc::Sender<Vec<SourceMessage>>) ->
 // ---------------------------------------------------------------------------
 
 /// Register a child partition. Returns `true` if new, `false` if duplicate.
-fn register_child(
-    partition_progress: &mut HashMap<String, PartitionState>,
-    token: String,
-) -> bool {
+fn register_child(partition_progress: &mut HashMap<String, PartitionState>, token: String) -> bool {
     use std::collections::hash_map::Entry;
     match partition_progress.entry(token) {
         Entry::Vacant(e) => {
@@ -725,9 +630,7 @@ fn spawn_partition_task(
             child_discovery_tx,
         )
         .await
-        .map(|()| PartitionResult {
-            partition_token,
-        })
+        .map(|()| PartitionResult { partition_token })
     }));
 }
 
@@ -773,6 +676,21 @@ async fn read_partition(
 
     tracing::info!(%split_id, %start_ts, partition_token = ?split.partition_token, "change stream query starting");
 
+    // Edge case: retry_attempts=0 means no retries, execute once and return
+    if retry_attempts == 0 {
+        return execute_query(
+            &client,
+            &database_name,
+            &stmt,
+            &mut split,
+            &split_id,
+            &record_tx,
+            &child_discovery_tx,
+            &change_stream_name,
+        )
+        .await;
+    }
+
     let retry_strategy = ExponentialBackoff::from_millis(retry_backoff.as_millis() as u64)
         .max_delay(tokio::time::Duration::from_millis(
             retry_backoff_max_delay_ms,
@@ -801,7 +719,7 @@ async fn read_partition(
         {
             Ok(()) => return Ok(()),
             Err(e) => {
-                tracing::warn!(%split_id, attempt = attempt + 1, max_attempts = retry_attempts + 1, ?delay, error = %e, "query failed, retrying");
+                tracing::warn!(%split_id, attempt = attempt + 1, max_attempts = retry_attempts, ?delay, error = %e, "query failed, retrying");
                 last_error = Some(e);
                 tokio::time::sleep(delay).await;
             }
@@ -939,9 +857,8 @@ async fn execute_query(
 /// This is the correct "consumed up to" position — the executor receives a
 /// single monotonically advancing offset, like other CDC sources.
 fn make_watermark_offset_string(watermark_micros: i64) -> String {
-    let spanner_offset = crate::source::cdc::external::spanner::SpannerOffset::new(
-        watermark_micros,
-    );
+    let spanner_offset =
+        crate::source::cdc::external::spanner::SpannerOffset::new(watermark_micros);
     let cdc_offset = crate::source::cdc::external::CdcOffset::Spanner(spanner_offset);
     serde_json::to_string(&cdc_offset).unwrap_or_else(|_| watermark_micros.to_string())
 }
@@ -959,6 +876,8 @@ fn stamp_watermark(batch: &mut [SourceMessage], reorder_buf: &ReorderBuffer) {
         for msg in batch.iter_mut() {
             msg.offset = offset_str.clone();
         }
+    } else if !batch.is_empty() {
+        tracing::warn!("stamp_watermark called with wm_micros=0, messages will carry empty offset");
     }
 }
 
@@ -999,15 +918,12 @@ mod tests {
         // Push children at different start_ts, out of order
         q.push(PendingChild {
             split: make_split("C3", ts(300), vec!["P1"]),
-            group_id: None,
         });
         q.push(PendingChild {
             split: make_split("C1", ts(100), vec!["P1"]),
-            group_id: None,
         });
         q.push(PendingChild {
             split: make_split("C2", ts(200), vec!["P1"]),
-            group_id: None,
         });
 
         let ready = q.drain_ready(&progress);
@@ -1035,12 +951,10 @@ mod tests {
         // New child at ts=100
         q.push(PendingChild {
             split: make_split("NEW", ts(100), vec!["P1"]),
-            group_id: None,
         });
         // Deferred child at ts=100 (should come out first)
         q.push_deferred(PendingChild {
             split: make_split("DEFERRED", ts(100), vec!["P1"]),
-            group_id: Some(42),
         });
 
         let ready = q.drain_ready(&progress);
@@ -1067,11 +981,9 @@ mod tests {
 
         q.push(PendingChild {
             split: make_split("C1", ts(100), vec!["P1"]),
-            group_id: None,
         });
         q.push(PendingChild {
             split: make_split("C2", ts(200), vec!["P1"]),
-            group_id: None,
         });
 
         let ready = q.drain_ready(&progress);
@@ -1097,11 +1009,9 @@ mod tests {
 
         q.push(PendingChild {
             split: make_split("C2", ts(200), vec!["P1"]),
-            group_id: None,
         });
         q.push(PendingChild {
             split: make_split("C1", ts(100), vec!["P1"]),
-            group_id: None,
         });
 
         let child = q.pop_ready(&progress).unwrap();
@@ -1122,11 +1032,9 @@ mod tests {
 
         q.push(PendingChild {
             split: make_split("C1", ts(100), vec!["P2"]), // not ready
-            group_id: None,
         });
         q.push(PendingChild {
             split: make_split("C2", ts(200), vec!["P1"]), // ready
-            group_id: None,
         });
 
         let child = q.pop_ready(&progress).unwrap();
@@ -1136,25 +1044,6 @@ mod tests {
             "skip C1 (P2 not finished), return C2"
         );
         assert_eq!(q.len(), 1, "C1 still pending");
-    }
-
-    // ---------------------------------------------------------------
-    // group_id survives through push_deferred → pop_ready
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn pending_queue_carries_group_id_through_deferral() {
-        let mut q = PendingQueue::new();
-        let mut progress = HashMap::new();
-        finish_parent(&mut progress, "P1");
-
-        q.push_deferred(PendingChild {
-            split: make_split("C1", ts(100), vec!["P1"]),
-            group_id: Some(7),
-        });
-
-        let child = q.pop_ready(&progress).unwrap();
-        assert_eq!(child.group_id, Some(7), "group_id must survive deferral");
     }
 
     // ---------------------------------------------------------------
@@ -1174,18 +1063,15 @@ mod tests {
         for i in 0..4 {
             q.push_deferred(PendingChild {
                 split: make_split(&format!("OV{i}"), ts(100), vec!["P1"]),
-                group_id: Some(1),
             });
         }
 
         // Plus 2 new children at ts=200
         q.push(PendingChild {
             split: make_split("NEW1", ts(200), vec!["P1"]),
-            group_id: None,
         });
         q.push(PendingChild {
             split: make_split("NEW2", ts(200), vec!["P1"]),
-            group_id: None,
         });
 
         assert_eq!(q.len(), 6, "all 6 children must be in queue");
@@ -1210,32 +1096,21 @@ mod tests {
             .map(|c| c.split.partition_token.as_deref().unwrap())
             .collect();
         assert_eq!(ts200_tokens, vec!["NEW1", "NEW2"]);
-
-        // All group_ids preserved
-        for child in &ready[0..4] {
-            assert_eq!(child.group_id, Some(1), "deferred child keeps group_id");
-        }
-        for child in &ready[4..6] {
-            assert_eq!(child.group_id, None, "new child has no group_id");
-        }
     }
 
     #[test]
     fn pending_queue_is_empty_and_len() {
         let mut q = PendingQueue::new();
-        assert!(q.len() == 0);
         assert_eq!(q.len(), 0);
 
         q.push(PendingChild {
             split: make_split("C1", ts(100), vec!["P1"]),
-            group_id: None,
         });
         assert!(q.len() > 0);
         assert_eq!(q.len(), 1);
 
         q.push(PendingChild {
             split: make_split("C2", ts(200), vec!["P1"]),
-            group_id: None,
         });
         assert_eq!(q.len(), 2);
 
@@ -1244,7 +1119,6 @@ mod tests {
         finish_parent(&mut progress, "P1");
         let ready = q.drain_ready(&progress);
         assert_eq!(ready.len(), 2);
-        assert!(q.len() == 0);
         assert_eq!(q.len(), 0);
     }
 }

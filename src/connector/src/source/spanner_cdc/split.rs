@@ -177,7 +177,6 @@ impl SpannerCdcSplit {
             self.advance_offset(offset_ts);
         }
     }
-
 }
 
 impl SplitMetaData for SpannerCdcSplit {

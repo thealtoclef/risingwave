@@ -29,7 +29,6 @@ mod tests {
         assert!(split.partition_token.is_none());
         assert!(split.parent_partition_tokens.is_empty());
         assert!(split.offset.is_some());
-        assert!(!split.snapshot_done);
         // Root split ID is the index
         assert_eq!(split.id().to_string(), "0");
     }
@@ -64,7 +63,6 @@ mod tests {
         assert_eq!(split.partition_token, restored.partition_token);
         assert_eq!(split.change_stream_name, restored.change_stream_name);
         assert_eq!(split.index, restored.index);
-        assert_eq!(split.snapshot_done, restored.snapshot_done);
     }
 
     #[test]

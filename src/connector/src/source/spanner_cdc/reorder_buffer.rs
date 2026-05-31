@@ -22,43 +22,43 @@
 //!
 //! 1. **Buffer**: records from each partition are buffered in a `BTreeMap`
 //!    keyed by commit timestamp.
-//! 2. **Reorder**: the global watermark is the minimum high-watermark across
-//!    all *eligible* partitions (active, non-finished, in a complete sibling
-//!    group). Records at `commit_ts <= global_watermark` are drained in order.
+//! 2. **Reorder**: the watermark is `min(partition.offset)` across all
+//!    non-finished partitions. Records at `commit_ts <= watermark` are
+//!    drained in order.
 //! 3. **Emit**: drained records are emitted as `Vec<SourceMessage>`, with
 //!    schema-change messages prepended before their data records.
 //!
-//! ## Sibling group gating
+//! ## Placeholder entries
 //!
-//! When a parent partition splits or merges, it produces child partitions that
-//! all share the same `start_timestamp`. These are **siblings**. The reorder
-//! buffer gates flushing on sibling-group completeness: no records from any
-//! member of a group participate in watermark computation until ALL members
-//! have been started.
+//! When a parent partition splits or merges, it produces child partitions
+//! that all share the same `start_timestamp`. Placeholder entries are
+//! inserted for every known future partition at `start_ts`. The global
+//! watermark (`min` across all non-finished partitions) is naturally
+//! pinned at `start_ts` until every partition starts and advances past it.
 //!
 //! This prevents the following race:
 //! ```text
 //! Parent A splits → B1, B2, B3, B4 (all start at T0).
 //! max_concurrent=3 → B1,B2,B3 start. B4 queued.
-//! Without gating: global_wm=min(B1,B2,B3) → emits past T0.
+//! Without placeholders: global_wm=min(B1,B2,B3) → emits past T0.
 //! B4 starts at T0 → produces data at ts=150 (pre-DDL).
 //! Already emitted data at ts=400 (post-DDL). Order violation!
 //!
-//! With gating: group {B1,B2,B3,B4} incomplete → buffer, don't flush.
-//! B4 starts → group complete → watermark advances → flush in order.
+//! With placeholders: B4 placeholder at T0 → global_wm pinned at T0.
+//! B4 starts → advances past T0 → watermark advances → flush in order.
 //! ```
 //!
 //! ## Watermark model
 //!
-//! Each partition tracks a **high watermark** (latest commit_ts from data
-//! records or heartbeats). The global watermark is:
+//! Each partition tracks an **offset** (latest commit_ts from data records
+//! or heartbeats). Un-started partitions have placeholder entries at their
+//! `start_ts`. The watermark is:
 //! ```text
-//! global_watermark = max(
+//! watermark = max(
 //!     last_emitted_watermark,    // hard floor: never regress
-//!     min(                       // min across eligible partitions
-//!         partition.watermark
-//!         WHERE partition is active
-//!           AND partition's sibling group is complete (or no group)
+//!     min(                       // min across all non-finished partitions
+//!         partition.offset
+//!         WHERE partition is not finished
 //!     )
 //! )
 //! ```
@@ -138,20 +138,18 @@ impl PartitionRecord {
 
 /// Events that drive the reorder buffer state machine.
 pub(crate) enum ReorderBufferEvent {
-    /// Declare a sibling group. No member's watermark participates in
-    /// global watermark computation until ALL declared tokens have been
-    /// `PartitionStarted`.
-    SiblingGroupDeclared {
-        group_id: u64,
+    /// Declare that these partition tokens exist at `start_ts`. Inserts
+    /// placeholder entries so the global watermark is pinned until each
+    /// partition starts and advances.
+    DeclarePartitions {
         tokens: Vec<Option<String>>,
+        start_ts: OffsetDateTime,
     },
 
     /// A partition has started reading. Its initial watermark is `start_ts`.
-    /// If `group_id` is set, this partition belongs to that sibling group.
     PartitionStarted {
         token: Option<String>,
         start_ts: OffsetDateTime,
-        group_id: Option<u64>,
     },
 
     /// A partition has finished reading. Excluded from future watermark
@@ -210,38 +208,9 @@ impl From<PartitionRecord> for BufferedRecord {
 
 /// Per-partition state tracked by the reorder buffer.
 struct PartitionEntry {
-    watermark: OffsetDateTime,
+    /// Latest commit_ts this partition has reached.
+    offset: OffsetDateTime,
     finished: bool,
-    group_id: Option<u64>,
-}
-
-/// A sibling group — partitions that must all be started before any of
-/// them contribute to the global watermark.
-struct SiblingGroup {
-    /// All tokens declared for this group.
-    expected: HashSet<Option<String>>,
-    /// Tokens that have been PartitionStarted.
-    started: HashSet<Option<String>>,
-}
-
-impl SiblingGroup {
-    fn new(tokens: Vec<Option<String>>) -> Self {
-        Self {
-            expected: tokens.into_iter().collect(),
-            started: HashSet::new(),
-        }
-    }
-
-    /// True when every declared token has been started.
-    fn is_complete(&self) -> bool {
-        self.expected.iter().all(|t| self.started.contains(t))
-    }
-
-    fn mark_started(&mut self, token: &Option<String>) {
-        if self.expected.contains(token) {
-            self.started.insert(token.clone());
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -254,10 +223,8 @@ impl SiblingGroup {
 /// Designed for single-threaded use inside the `run_reader` main loop.
 /// Call [`ReorderBuffer::handle`] with [`ReorderBufferEvent`]s.
 pub(crate) struct ReorderBuffer {
-    /// Per-partition state.
+    /// Partition token → offset + finished status.
     partitions: HashMap<Option<String>, PartitionEntry>,
-    /// Sibling groups keyed by group_id.
-    sibling_groups: HashMap<u64, SiblingGroup>,
     /// Records buffered by commit_ts, awaiting the global watermark.
     buffer: BTreeMap<OffsetDateTime, Vec<BufferedRecord>>,
     /// In-memory schema tracker (content-only, no watermarks).
@@ -271,64 +238,74 @@ impl ReorderBuffer {
     pub fn new() -> Self {
         Self {
             partitions: HashMap::new(),
-            sibling_groups: HashMap::new(),
             buffer: BTreeMap::new(),
             known_schemas: HashMap::new(),
             last_emitted_watermark: None,
         }
     }
 
-    /// Process an event. Returns messages ready to emit in commit-ts order.
-    pub fn handle(&mut self, event: ReorderBufferEvent) -> Vec<SourceMessage> {
+    /// Process an event. Updates internal state only — call [`drain`] to
+    /// retrieve records that are now ready to emit.
+    pub fn handle(&mut self, event: ReorderBufferEvent) {
         match event {
-            ReorderBufferEvent::SiblingGroupDeclared { group_id, tokens } => {
-                self.sibling_groups
-                    .insert(group_id, SiblingGroup::new(tokens));
-                vec![]
+            ReorderBufferEvent::DeclarePartitions { tokens, start_ts } => {
+                // `or_insert` so a real PartitionStarted that arrived first
+                // is not clobbered.
+                for token in &tokens {
+                    self.partitions
+                        .entry(token.clone())
+                        .or_insert(PartitionEntry {
+                            offset: start_ts,
+                            finished: false,
+                        });
+                }
             }
-            ReorderBufferEvent::PartitionStarted {
-                token,
-                start_ts,
-                group_id,
-            } => {
-                // Register partition
+            ReorderBufferEvent::PartitionStarted { token, start_ts } => {
+                // Register partition.  If a placeholder already exists at
+                // the same start_ts this is a no-op overwrite.  We assert
+                // the offset doesn't regress as a safety check.
+                if let Some(existing) = self.partitions.get(&token) {
+                    assert!(
+                        start_ts >= existing.offset,
+                        "PartitionStarted offset regression: {} < {}",
+                        start_ts,
+                        existing.offset
+                    );
+                }
                 self.partitions.insert(
                     token.clone(),
                     PartitionEntry {
-                        watermark: start_ts,
+                        offset: start_ts,
                         finished: false,
-                        group_id,
                     },
                 );
-                // Mark as started in its sibling group
-                if let Some(gid) = &self.partitions.get(&token).and_then(|e| e.group_id) {
-                    if let Some(group) = self.sibling_groups.get_mut(gid) {
-                        group.mark_started(&token);
-                    }
-                }
-                self.drain_ready()
             }
             ReorderBufferEvent::PartitionFinished { token } => {
                 if let Some(entry) = self.partitions.get_mut(&token) {
                     entry.finished = true;
                 }
-                self.drain_ready()
             }
             ReorderBufferEvent::Record {
                 partition_token,
                 record,
             } => {
                 let commit_ts = record.commit_ts();
-                // Advance this partition's watermark
+                // Advance this partition's offset
                 if let Some(entry) = self.partitions.get_mut(&partition_token) {
-                    entry.watermark = commit_ts;
+                    entry.offset = commit_ts;
                 }
                 // Buffer the record
                 self.buffer
                     .entry(commit_ts)
                     .or_default()
                     .push(record.into());
-                self.drain_ready()
+                let buffered = self.buffer_len();
+                if buffered > 0 && buffered % 10_000 == 0 {
+                    tracing::warn!(
+                        buffered,
+                        "reorder buffer growing — unstarted partition pinning watermark or downstream backpressure"
+                    );
+                }
             }
         }
     }
@@ -345,15 +322,17 @@ impl ReorderBuffer {
         self.last_emitted_watermark
     }
 
-    /// Compute the global watermark.
-    ///
-    /// Only partitions whose sibling group is complete (or that have no group)
-    /// participate. Finished partitions are excluded. The result is clamped to
-    /// `last_emitted_watermark` (never regress).
+    /// Total number of buffered records across all timestamps.
+    pub fn buffer_len(&self) -> usize {
+        self.buffer.values().map(|v| v.len()).sum()
+    }
+
+    /// Compute the watermark: `min(partition.offset)` across all
+    /// non-finished partitions, clamped to `last_emitted_watermark`.
     ///
     /// When all partitions are finished and buffer is non-empty, returns
     /// the highest buffered timestamp to force-drain everything remaining.
-    fn global_watermark(&self) -> Option<OffsetDateTime> {
+    fn watermark(&self) -> Option<OffsetDateTime> {
         let has_active = self.partitions.values().any(|e| !e.finished);
 
         // All done → drain remaining buffer
@@ -361,25 +340,12 @@ impl ReorderBuffer {
             return self.buffer.keys().last().copied();
         }
 
-        // Compute min across eligible partitions
+        // min across all non-finished partitions (placeholders included)
         let raw = self
             .partitions
             .iter()
-            .filter(|(_, entry)| {
-                if entry.finished {
-                    return false;
-                }
-                // Check sibling group completeness
-                if let Some(gid) = &entry.group_id {
-                    if let Some(group) = self.sibling_groups.get(gid) {
-                        if !group.is_complete() {
-                            return false;
-                        }
-                    }
-                }
-                true
-            })
-            .map(|(_, entry)| entry.watermark)
+            .filter(|(_, entry)| !entry.finished)
+            .map(|(_, entry)| entry.offset)
             .min();
 
         match (raw, self.last_emitted_watermark) {
@@ -389,9 +355,9 @@ impl ReorderBuffer {
         }
     }
 
-    /// Drain all buffered records whose `commit_ts <= global_watermark`.
+    /// Drain all buffered records whose `commit_ts <= watermark`.
     fn drain_ready(&mut self) -> Vec<SourceMessage> {
-        let wm = match self.global_watermark() {
+        let wm = match self.watermark() {
             Some(wm) => wm,
             None => return vec![],
         };
@@ -544,6 +510,8 @@ impl ReorderBuffer {
             .collect();
 
         let payload = serde_json::json!({
+            // Spanner's change stream API does not expose the original DDL text,
+            // so we use a placeholder. Downstream consumers treat this as metadata-only.
             "ddl": "UNKNOWN_DDL",
             "tableChanges": [{
                 "id": table_name,
@@ -660,15 +628,15 @@ mod tests {
         rb.handle(ReorderBufferEvent::PartitionStarted {
             token: Some("only".into()),
             start_ts: ts(0),
-            group_id: None,
         });
-        let out = rb.handle(ReorderBufferEvent::Record {
+        rb.handle(ReorderBufferEvent::Record {
             partition_token: Some("only".into()),
             record: PartitionRecord::Heartbeat {
                 commit_ts: ts(10),
                 msg: heartbeat_msg(ts(10)),
             },
         });
+        let out = rb.drain();
         assert_eq!(out.len(), 1);
     }
 
@@ -678,30 +646,30 @@ mod tests {
         rb.handle(ReorderBufferEvent::PartitionStarted {
             token: Some("p1".into()),
             start_ts: ts(0),
-            group_id: None,
         });
         rb.handle(ReorderBufferEvent::PartitionStarted {
             token: Some("p2".into()),
             start_ts: ts(0),
-            group_id: None,
         });
 
-        let out = rb.handle(ReorderBufferEvent::Record {
+        rb.handle(ReorderBufferEvent::Record {
             partition_token: Some("p1".into()),
             record: PartitionRecord::Heartbeat {
                 commit_ts: ts(10),
                 msg: heartbeat_msg(ts(10)),
             },
         });
+        let out = rb.drain();
         assert_no_emit(&out, "P2 at ts=0, P1 at ts=10");
 
-        let out = rb.handle(ReorderBufferEvent::Record {
+        rb.handle(ReorderBufferEvent::Record {
             partition_token: Some("p2".into()),
             record: PartitionRecord::Heartbeat {
                 commit_ts: ts(10),
                 msg: heartbeat_msg(ts(10)),
             },
         });
+        let out = rb.drain();
         assert_eq!(out.len(), 2, "both at ts=10, global_wm=10");
     }
 
@@ -711,12 +679,10 @@ mod tests {
         rb.handle(ReorderBufferEvent::PartitionStarted {
             token: Some("p1".into()),
             start_ts: ts(0),
-            group_id: None,
         });
         rb.handle(ReorderBufferEvent::PartitionStarted {
             token: Some("p2".into()),
             start_ts: ts(0),
-            group_id: None,
         });
         // P1 heartbeat buffered
         rb.handle(ReorderBufferEvent::Record {
@@ -727,46 +693,44 @@ mod tests {
             },
         });
         // P2 finishes
-        let out = rb.handle(ReorderBufferEvent::PartitionFinished {
+        rb.handle(ReorderBufferEvent::PartitionFinished {
             token: Some("p2".into()),
         });
+        let out = rb.drain();
         assert_eq!(out.len(), 1, "P1's ts=10 record released");
     }
 
     // -------------------------------------------------------------------
-    // Sibling group: the core race condition fix
+    // Placeholder entries: the core race condition fix
     // -------------------------------------------------------------------
 
     #[test]
-    fn incomplete_sibling_group_blocks_flush() {
+    fn incomplete_partition_group_pins_watermark() {
         let mut rb = ReorderBuffer::new();
 
-        // Parent A → B1,B2,B3,B4. Declare sibling group.
-        rb.handle(ReorderBufferEvent::SiblingGroupDeclared {
-            group_id: 1,
+        // Parent A → B1,B2,B3,B4. Declare partition group at ts=0.
+        rb.handle(ReorderBufferEvent::DeclarePartitions {
             tokens: vec![
                 Some("B1".into()),
                 Some("B2".into()),
                 Some("B3".into()),
                 Some("B4".into()),
             ],
+            start_ts: ts(0),
         });
 
         // Start B1, B2, B3 (max_concurrent=3)
         rb.handle(ReorderBufferEvent::PartitionStarted {
             token: Some("B1".into()),
             start_ts: ts(0),
-            group_id: Some(1),
         });
         rb.handle(ReorderBufferEvent::PartitionStarted {
             token: Some("B2".into()),
             start_ts: ts(0),
-            group_id: Some(1),
         });
         rb.handle(ReorderBufferEvent::PartitionStarted {
             token: Some("B3".into()),
             start_ts: ts(0),
-            group_id: Some(1),
         });
 
         // B1 and B2 produce data + advance watermark to 400
@@ -785,43 +749,40 @@ mod tests {
             },
         });
 
-        // Nothing emitted — group incomplete (B4 not started)
-        // Records buffered but NOT flushed
-        // Verify by checking global watermark returns None
-        assert!(
-            rb.global_watermark().is_none(),
-            "incomplete group → no eligible partitions → no watermark"
+        // B4 placeholder at ts(0) pins the watermark at ts(0).
+        // No records buffered at ts=0 → nothing emitted.
+        assert_eq!(
+            rb.watermark(),
+            Some(ts(0)),
+            "B4 placeholder pins watermark at start_ts"
         );
     }
 
     #[test]
-    fn sibling_group_flushes_when_complete() {
+    fn partition_group_flushes_when_complete() {
         let mut rb = ReorderBuffer::new();
 
-        rb.handle(ReorderBufferEvent::SiblingGroupDeclared {
-            group_id: 1,
+        rb.handle(ReorderBufferEvent::DeclarePartitions {
             tokens: vec![
                 Some("B1".into()),
                 Some("B2".into()),
                 Some("B3".into()),
                 Some("B4".into()),
             ],
+            start_ts: ts(0),
         });
 
         rb.handle(ReorderBufferEvent::PartitionStarted {
             token: Some("B1".into()),
             start_ts: ts(0),
-            group_id: Some(1),
         });
         rb.handle(ReorderBufferEvent::PartitionStarted {
             token: Some("B2".into()),
             start_ts: ts(0),
-            group_id: Some(1),
         });
         rb.handle(ReorderBufferEvent::PartitionStarted {
             token: Some("B3".into()),
             start_ts: ts(0),
-            group_id: Some(1),
         });
 
         // B1,B2,B3 produce data
@@ -840,18 +801,18 @@ mod tests {
             },
         });
 
-        // Still incomplete — nothing emitted
+        // B4 placeholder at ts(0) pins watermark → nothing at ts=0 to drain
         // B1 finishes
         rb.handle(ReorderBufferEvent::PartitionFinished {
             token: Some("B1".into()),
         });
 
-        // Start B4 — group now complete!
-        let out = rb.handle(ReorderBufferEvent::PartitionStarted {
+        // Start B4 — overwrites placeholder (same ts=0)
+        rb.handle(ReorderBufferEvent::PartitionStarted {
             token: Some("B4".into()),
             start_ts: ts(0),
-            group_id: Some(1),
         });
+        let out = rb.drain();
 
         // B4 just started at ts=0, B2 at ts=400, B3 at ts=0
         // Global watermark = min(B2=400, B3=0, B4=0) = 0
@@ -860,25 +821,27 @@ mod tests {
         assert_no_emit(&out, "B4 just started at ts=0, nothing at ts=0 in buffer");
 
         // B4 heartbeat at ts=500
-        let out = rb.handle(ReorderBufferEvent::Record {
+        rb.handle(ReorderBufferEvent::Record {
             partition_token: Some("B4".into()),
             record: PartitionRecord::Heartbeat {
                 commit_ts: ts(500),
                 msg: heartbeat_msg(ts(500)),
             },
         });
+        let out = rb.drain();
         // global_wm = min(B2=400, B3=0, B4=500) = 0 (B3 hasn't advanced)
         // ts=300 and ts=400 are > 0, still buffered
         assert_no_emit(&out, "B3 hasn't advanced past ts=0");
 
         // B3 heartbeat at ts=600
-        let out = rb.handle(ReorderBufferEvent::Record {
+        rb.handle(ReorderBufferEvent::Record {
             partition_token: Some("B3".into()),
             record: PartitionRecord::Heartbeat {
                 commit_ts: ts(600),
                 msg: heartbeat_msg(ts(600)),
             },
         });
+        let out = rb.drain();
         // global_wm = min(B2=400, B3=600, B4=500) = 400
         // Drain ts=300, ts=400 → 2 heartbeats
         assert_eq!(
@@ -889,7 +852,7 @@ mod tests {
     }
 
     #[test]
-    fn late_sibling_does_not_cause_ordering_violation() {
+    fn late_partition_does_not_cause_ordering_violation() {
         // THE critical test: B4 starts late with old-schema data.
         // Verify no ordering violation.
         let mut rb = ReorderBuffer::new();
@@ -900,29 +863,26 @@ mod tests {
             col("name", TypeCode::String, 2, false),
         ];
 
-        rb.handle(ReorderBufferEvent::SiblingGroupDeclared {
-            group_id: 1,
+        rb.handle(ReorderBufferEvent::DeclarePartitions {
             tokens: vec![
                 Some("B1".into()),
                 Some("B2".into()),
                 Some("B3".into()),
                 Some("B4".into()),
             ],
+            start_ts: ts(0),
         });
         rb.handle(ReorderBufferEvent::PartitionStarted {
             token: Some("B1".into()),
             start_ts: ts(0),
-            group_id: Some(1),
         });
         rb.handle(ReorderBufferEvent::PartitionStarted {
             token: Some("B2".into()),
             start_ts: ts(0),
-            group_id: Some(1),
         });
         rb.handle(ReorderBufferEvent::PartitionStarted {
             token: Some("B3".into()),
             start_ts: ts(0),
-            group_id: Some(1),
         });
 
         // B2 produces new-schema data at ts=400
@@ -939,8 +899,8 @@ mod tests {
             },
         });
 
-        // Group incomplete → nothing emitted. ✅
-        assert!(rb.global_watermark().is_none());
+        // B4 placeholder at ts(0) pins watermark — nothing at ts=0 to drain.
+        assert_eq!(rb.watermark(), Some(ts(0)));
 
         // B1 finishes, B4 starts → group complete
         rb.handle(ReorderBufferEvent::PartitionFinished {
@@ -949,7 +909,6 @@ mod tests {
         rb.handle(ReorderBufferEvent::PartitionStarted {
             token: Some("B4".into()),
             start_ts: ts(0),
-            group_id: Some(1),
         });
 
         // B4 produces old-schema data at ts=150
@@ -968,13 +927,14 @@ mod tests {
         });
 
         // B3 heartbeat at ts=700
-        let out = rb.handle(ReorderBufferEvent::Record {
+        rb.handle(ReorderBufferEvent::Record {
             partition_token: Some("B3".into()),
             record: PartitionRecord::Heartbeat {
                 commit_ts: ts(700),
                 msg: heartbeat_msg(ts(700)),
             },
         });
+        let out = rb.drain();
 
         // global_wm = min(B2=500, B3=700, B4=600) = 500
         // Drain: ts=150 (old schema, first encounter → schema change),
@@ -1006,48 +966,48 @@ mod tests {
 
     #[test]
     fn last_emitted_watermark_prevents_regression() {
-        // Two partitions, no sibling group. P1 emits to ts=100.
+        // Two partitions, no partition group. P1 emits to ts=100.
         // Then P2 starts at ts=0 and produces ts=10.
         // The last_emitted_watermark clamps the global watermark to 100,
         // so P2's ts=10 record is immediately eligible (10 <= 100).
-        // This is correct because P2 is NOT in a sibling group — the reader
-        // decided it's safe to start P2 without waiting for siblings.
+        // This is correct because P2 is NOT in a partition group — the reader
+        // decided it's safe to start P2 without waiting for other partitions.
         let mut rb = ReorderBuffer::new();
         rb.handle(ReorderBufferEvent::PartitionStarted {
             token: Some("p1".into()),
             start_ts: ts(0),
-            group_id: None,
         });
 
         // Emit ts=100
-        let out1 = rb.handle(ReorderBufferEvent::Record {
+        rb.handle(ReorderBufferEvent::Record {
             partition_token: Some("p1".into()),
             record: PartitionRecord::Heartbeat {
                 commit_ts: ts(100),
                 msg: heartbeat_msg(ts(100)),
             },
         });
+        let out1 = rb.drain();
         assert_eq!(out1.len(), 1);
         assert_eq!(rb.last_emitted_watermark, Some(ts(100)));
 
-        // P2 joins (no sibling group — reader decided this is safe)
+        // P2 joins (no partition group — reader decided this is safe)
         rb.handle(ReorderBufferEvent::PartitionStarted {
             token: Some("p2".into()),
             start_ts: ts(0),
-            group_id: None,
         });
 
         // P2 heartbeat at ts=10
         // global_wm = min(P1=100, P2=10) = 10
         // clamped to max(10, last_emitted=100) = 100
         // ts=10 ≤ 100 → drained
-        let out2 = rb.handle(ReorderBufferEvent::Record {
+        rb.handle(ReorderBufferEvent::Record {
             partition_token: Some("p2".into()),
             record: PartitionRecord::Heartbeat {
                 commit_ts: ts(10),
                 msg: heartbeat_msg(ts(10)),
             },
         });
+        let out2 = rb.drain();
         // P2's ts=10 heartbeat is emitted because it's ≤ watermark=100
         assert_eq!(out2.len(), 1, "ts=10 ≤ clamped watermark=100, eligible");
         // Watermark doesn't regress — stays at 100
@@ -1064,15 +1024,15 @@ mod tests {
         rb.handle(ReorderBufferEvent::PartitionStarted {
             token: None,
             start_ts: ts(0),
-            group_id: None,
         });
-        let out = rb.handle(ReorderBufferEvent::Record {
+        rb.handle(ReorderBufferEvent::Record {
             partition_token: None,
             record: PartitionRecord::Heartbeat {
                 commit_ts: ts(50),
                 msg: heartbeat_msg(ts(50)),
             },
         });
+        let out = rb.drain();
         assert_eq!(
             out.len(),
             1,
@@ -1090,13 +1050,13 @@ mod tests {
         rb.handle(ReorderBufferEvent::PartitionStarted {
             token: Some("p1".into()),
             start_ts: ts(0),
-            group_id: None,
         });
         let cols = vec![col("id", TypeCode::Int64, 1, true)];
-        let out = rb.handle(ReorderBufferEvent::Record {
+        rb.handle(ReorderBufferEvent::Record {
             partition_token: Some("p1".into()),
             record: data_record(ts(10), "t", cols),
         });
+        let out = rb.drain();
         assert_eq!(count_schema_changes(&out), 1);
     }
 
@@ -1106,17 +1066,22 @@ mod tests {
         rb.handle(ReorderBufferEvent::PartitionStarted {
             token: Some("p1".into()),
             start_ts: ts(0),
-            group_id: None,
         });
         let cols = vec![col("id", TypeCode::Int64, 1, true)];
         rb.handle(ReorderBufferEvent::Record {
             partition_token: Some("p1".into()),
             record: data_record(ts(10), "t", cols.clone()),
         });
-        let out = rb.handle(ReorderBufferEvent::Record {
+        // First drain: schema change emitted for first encounter
+        let out = rb.drain();
+        assert_eq!(count_schema_changes(&out), 1);
+
+        rb.handle(ReorderBufferEvent::Record {
             partition_token: Some("p1".into()),
             record: data_record(ts(20), "t", cols),
         });
+        // Second drain: same schema → no re-emission
+        let out = rb.drain();
         assert_eq!(count_schema_changes(&out), 0);
     }
 
@@ -1126,12 +1091,10 @@ mod tests {
         rb.handle(ReorderBufferEvent::PartitionStarted {
             token: Some("p1".into()),
             start_ts: ts(0),
-            group_id: None,
         });
         rb.handle(ReorderBufferEvent::PartitionStarted {
             token: Some("p2".into()),
             start_ts: ts(0),
-            group_id: None,
         });
 
         let old_cols = vec![col("id", TypeCode::Int64, 1, true)];
@@ -1146,10 +1109,11 @@ mod tests {
             record: data_record(ts(100), "t", new_cols.clone()),
         });
         // P2 old-schema at ts=50 → global_wm=min(100,50)=50 → drain
-        let out2 = rb.handle(ReorderBufferEvent::Record {
+        rb.handle(ReorderBufferEvent::Record {
             partition_token: Some("p2".into()),
             record: data_record(ts(50), "t", old_cols),
         });
+        let out2 = rb.drain();
         assert_eq!(
             count_schema_changes(&out2),
             1,
@@ -1157,13 +1121,14 @@ mod tests {
         );
 
         // P2 heartbeat at ts=120 → global_wm=min(100,120)=100 → drain
-        let out3 = rb.handle(ReorderBufferEvent::Record {
+        rb.handle(ReorderBufferEvent::Record {
             partition_token: Some("p2".into()),
             record: PartitionRecord::Heartbeat {
                 commit_ts: ts(120),
                 msg: heartbeat_msg(ts(120)),
             },
         });
+        let out3 = rb.drain();
         assert_eq!(
             count_schema_changes(&out3),
             1,
@@ -1175,42 +1140,39 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // Deferred sibling: the max_concurrent split bug fix
+    // Deferred partition: the max_concurrent split bug fix
     // -------------------------------------------------------------------
 
     #[test]
-    fn deferred_sibling_completes_group_when_started_with_same_group_id() {
-        // Simulates: max_concurrent=3, 4 siblings declared.
+    fn deferred_partition_starts_when_slot_opens() {
+        // Simulates: max_concurrent=3, 4 partitions declared.
         // B1,B2,B3 start immediately. B4 deferred.
-        // Later B4 starts with the SAME group_id (carried through pending queue).
+        // Later B4 starts (carried through pending queue).
         // Group should complete and buffered records should drain.
         let mut rb = ReorderBuffer::new();
 
-        rb.handle(ReorderBufferEvent::SiblingGroupDeclared {
-            group_id: 1,
+        rb.handle(ReorderBufferEvent::DeclarePartitions {
             tokens: vec![
                 Some("B1".into()),
                 Some("B2".into()),
                 Some("B3".into()),
                 Some("B4".into()),
             ],
+            start_ts: ts(0),
         });
 
         // Start B1, B2, B3
         rb.handle(ReorderBufferEvent::PartitionStarted {
             token: Some("B1".into()),
             start_ts: ts(0),
-            group_id: Some(1),
         });
         rb.handle(ReorderBufferEvent::PartitionStarted {
             token: Some("B2".into()),
             start_ts: ts(0),
-            group_id: Some(1),
         });
         rb.handle(ReorderBufferEvent::PartitionStarted {
             token: Some("B3".into()),
             start_ts: ts(0),
-            group_id: Some(1),
         });
 
         // B1 and B2 produce data
@@ -1229,18 +1191,19 @@ mod tests {
             },
         });
 
-        // Group incomplete → nothing emitted
-        assert!(
-            rb.global_watermark().is_none(),
-            "B4 not started → group incomplete → no watermark"
+        // B4 placeholder at ts(0) pins watermark — nothing at ts=0 to drain
+        assert_eq!(
+            rb.watermark(),
+            Some(ts(0)),
+            "B4 placeholder pins watermark at start_ts"
         );
 
-        // B4 starts with the SAME group_id (carried through deferral)
-        let out = rb.handle(ReorderBufferEvent::PartitionStarted {
+        // B4 starts (carried through deferral)
+        rb.handle(ReorderBufferEvent::PartitionStarted {
             token: Some("B4".into()),
             start_ts: ts(0),
-            group_id: Some(1), // ← same group_id, not a new one
         });
+        let out = rb.drain();
 
         // Group now complete! But B4 just started at ts=0, B3 still at ts=0.
         // global_wm = min(B2=400, B3=0, B4=0) = 0. Nothing at ts=0 in buffer.
@@ -1254,13 +1217,14 @@ mod tests {
                 msg: heartbeat_msg(ts(500)),
             },
         });
-        let out = rb.handle(ReorderBufferEvent::Record {
+        rb.handle(ReorderBufferEvent::Record {
             partition_token: Some("B4".into()),
             record: PartitionRecord::Heartbeat {
                 commit_ts: ts(600),
                 msg: heartbeat_msg(ts(600)),
             },
         });
+        let out = rb.drain();
 
         // global_wm = min(B1=300, B2=400, B3=500, B4=600) = 300
         // Drain ts=300
@@ -1268,24 +1232,25 @@ mod tests {
         assert!(out[0].offset.contains("300"), "first emitted at ts=300");
 
         // B1 heartbeat at ts=500 → global_wm = min(500,400,500,600) = 400
-        let out = rb.handle(ReorderBufferEvent::Record {
+        rb.handle(ReorderBufferEvent::Record {
             partition_token: Some("B1".into()),
             record: PartitionRecord::Heartbeat {
                 commit_ts: ts(500),
                 msg: heartbeat_msg(ts(500)),
             },
         });
+        let out = rb.drain();
         assert_eq!(out.len(), 1, "global_wm=400 → drain ts=400");
         assert!(out[0].offset.contains("400"), "second emitted at ts=400");
     }
 
     // -------------------------------------------------------------------
-    // Independent sibling groups: watermark computed independently
+    // Independent partition groups: watermark computed independently
     // -------------------------------------------------------------------
 
     #[test]
-    fn independent_sibling_groups_dont_interfere() {
-        // Two independent sibling groups:
+    fn independent_partition_groups_dont_interfere() {
+        // Two independent partition groups:
         //   Group 1: A1, A2 at start_ts=100
         //   Group 2: B1, B2 at start_ts=300 (children of A1)
         //
@@ -1294,36 +1259,32 @@ mod tests {
         // partition in one group doesn't block the other.
         let mut rb = ReorderBuffer::new();
 
-        // Group 1: siblings A1, A2
-        rb.handle(ReorderBufferEvent::SiblingGroupDeclared {
-            group_id: 1,
+        // Group 1: partition group A1, A2
+        rb.handle(ReorderBufferEvent::DeclarePartitions {
             tokens: vec![Some("A1".into()), Some("A2".into())],
+            start_ts: ts(100),
         });
         rb.handle(ReorderBufferEvent::PartitionStarted {
             token: Some("A1".into()),
             start_ts: ts(100),
-            group_id: Some(1),
         });
         rb.handle(ReorderBufferEvent::PartitionStarted {
             token: Some("A2".into()),
             start_ts: ts(100),
-            group_id: Some(1),
         });
 
-        // Group 2: siblings B1, B2 (children of A1, but independent group)
-        rb.handle(ReorderBufferEvent::SiblingGroupDeclared {
-            group_id: 2,
+        // Group 2: partition group B1, B2 (children of A1, but independent group)
+        rb.handle(ReorderBufferEvent::DeclarePartitions {
             tokens: vec![Some("B1".into()), Some("B2".into())],
+            start_ts: ts(300),
         });
         rb.handle(ReorderBufferEvent::PartitionStarted {
             token: Some("B1".into()),
             start_ts: ts(300),
-            group_id: Some(2),
         });
         rb.handle(ReorderBufferEvent::PartitionStarted {
             token: Some("B2".into()),
             start_ts: ts(300),
-            group_id: Some(2),
         });
 
         // A1 produces data
@@ -1343,26 +1304,28 @@ mod tests {
                 msg: heartbeat_msg(ts(400)),
             },
         });
-        let out = rb.handle(ReorderBufferEvent::Record {
+        rb.handle(ReorderBufferEvent::Record {
             partition_token: Some("B2".into()),
             record: PartitionRecord::Heartbeat {
                 commit_ts: ts(500),
                 msg: heartbeat_msg(ts(500)),
             },
         });
+        let out = rb.drain();
 
         // global_wm = min(A1=200, A2=100, B1=400, B2=500) = 100
         // ts=100: nothing buffered at ts=100 → nothing to drain
         assert_no_emit(&out, "A2 watermark at ts=100 holds back drain");
 
         // A2 advances to ts=250
-        let out = rb.handle(ReorderBufferEvent::Record {
+        rb.handle(ReorderBufferEvent::Record {
             partition_token: Some("A2".into()),
             record: PartitionRecord::Heartbeat {
                 commit_ts: ts(250),
                 msg: heartbeat_msg(ts(250)),
             },
         });
+        let out = rb.drain();
 
         // global_wm = min(200, 250, 400, 500) = 200
         // Drain ts=200 (A1's heartbeat)
@@ -1380,12 +1343,10 @@ mod tests {
         rb.handle(ReorderBufferEvent::PartitionStarted {
             token: Some("p1".into()),
             start_ts: ts(0),
-            group_id: None,
         });
         rb.handle(ReorderBufferEvent::PartitionStarted {
             token: Some("p2".into()),
             start_ts: ts(0),
-            group_id: None,
         });
         // P1 heartbeat at ts=100 → buffered (P2 at ts=0)
         rb.handle(ReorderBufferEvent::Record {
@@ -1404,12 +1365,389 @@ mod tests {
             },
         });
         // global_wm = min(100, 200) = 100 → drain ts=100
-        // (this was done inside the second handle() call, so ts=100 is already drained)
+        let out = rb.drain();
+        assert_eq!(out.len(), 1, "drain ts=100");
 
         // P1 finishes → global_wm = P2=200 → drain ts=200
-        let out = rb.handle(ReorderBufferEvent::PartitionFinished {
+        rb.handle(ReorderBufferEvent::PartitionFinished {
             token: Some("p1".into()),
         });
+        let out = rb.drain();
         assert_eq!(out.len(), 1, "P1 finished → P2's ts=200 record drained");
+    }
+
+    // -------------------------------------------------------------------
+    // Mixed-group ordering: placeholder pins watermark across groups
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn mixed_group_placeholder_pins_watermark() {
+        // G1 = {B1,B2,B3,B4} at start_ts=100. B4 deferred (max_concurrent).
+        // B1,B2,B3 finish. Their children form G2 at start_ts=500.
+        // G2 advances to wm=800. B4 placeholder must pin global wm at 100.
+        // B4 starts later, produces ts=350 (old schema) before ts=400 (new).
+
+        let mut rb = ReorderBuffer::new();
+
+        let old_cols = vec![col("id", TypeCode::Int64, 1, true)];
+        let new_cols = vec![
+            col("id", TypeCode::Int64, 1, true),
+            col("name", TypeCode::String, 2, false),
+        ];
+
+        // G1: B1,B2,B3,B4 at start_ts=100
+        rb.handle(ReorderBufferEvent::DeclarePartitions {
+            tokens: vec![
+                Some("B1".into()),
+                Some("B2".into()),
+                Some("B3".into()),
+                Some("B4".into()),
+            ],
+            start_ts: ts(100),
+        });
+        rb.handle(ReorderBufferEvent::PartitionStarted {
+            token: Some("B1".into()),
+            start_ts: ts(100),
+        });
+        rb.handle(ReorderBufferEvent::PartitionStarted {
+            token: Some("B2".into()),
+            start_ts: ts(100),
+        });
+        rb.handle(ReorderBufferEvent::PartitionStarted {
+            token: Some("B3".into()),
+            start_ts: ts(100),
+        });
+
+        // B2 produces new-schema data at ts=400
+        rb.handle(ReorderBufferEvent::Record {
+            partition_token: Some("B2".into()),
+            record: data_record(ts(400), "t", new_cols.clone()),
+        });
+        // B2 heartbeat at ts=500
+        rb.handle(ReorderBufferEvent::Record {
+            partition_token: Some("B2".into()),
+            record: PartitionRecord::Heartbeat {
+                commit_ts: ts(500),
+                msg: heartbeat_msg(ts(500)),
+            },
+        });
+
+        // B4 placeholder pins watermark at ts=100
+        assert_eq!(
+            rb.watermark(),
+            Some(ts(100)),
+            "B4 placeholder at ts=100 pins global watermark"
+        );
+
+        // B1,B2,B3 finish — their watermark is gone, but B4 placeholder remains
+        rb.handle(ReorderBufferEvent::PartitionFinished {
+            token: Some("B1".into()),
+        });
+        rb.handle(ReorderBufferEvent::PartitionFinished {
+            token: Some("B2".into()),
+        });
+        rb.handle(ReorderBufferEvent::PartitionFinished {
+            token: Some("B3".into()),
+        });
+
+        // G2: children of B1-B3, complete, at start_ts=500
+        rb.handle(ReorderBufferEvent::DeclarePartitions {
+            tokens: vec![Some("C1".into()), Some("C2".into())],
+            start_ts: ts(500),
+        });
+        rb.handle(ReorderBufferEvent::PartitionStarted {
+            token: Some("C1".into()),
+            start_ts: ts(500),
+        });
+        rb.handle(ReorderBufferEvent::PartitionStarted {
+            token: Some("C2".into()),
+            start_ts: ts(500),
+        });
+        // C1 advances to ts=800
+        rb.handle(ReorderBufferEvent::Record {
+            partition_token: Some("C1".into()),
+            record: PartitionRecord::Heartbeat {
+                commit_ts: ts(800),
+                msg: heartbeat_msg(ts(800)),
+            },
+        });
+
+        // CRITICAL: watermark must still be pinned at ts=100 (B4 placeholder)
+        assert_eq!(
+            rb.watermark(),
+            Some(ts(100)),
+            "G2 running ahead must NOT push watermark past B4's start_ts"
+        );
+
+        // No records should be emitted yet (nothing at ts≤100 in buffer)
+        let drain = rb.drain();
+        assert!(drain.is_empty(), "nothing at ts≤100 should be drained yet");
+
+        // B4 finally starts — overwrites placeholder
+        rb.handle(ReorderBufferEvent::PartitionStarted {
+            token: Some("B4".into()),
+            start_ts: ts(100),
+        });
+
+        // B4 produces old-schema data at ts=350
+        // drain() below yields schema@350
+        rb.handle(ReorderBufferEvent::Record {
+            partition_token: Some("B4".into()),
+            record: data_record(ts(350), "t", old_cols.clone()),
+        });
+        let out1 = rb.drain();
+
+        // B4 heartbeat at ts=900
+        // drain() below yields schema@400 + heartbeat@500
+        rb.handle(ReorderBufferEvent::Record {
+            partition_token: Some("B4".into()),
+            record: PartitionRecord::Heartbeat {
+                commit_ts: ts(900),
+                msg: heartbeat_msg(ts(900)),
+            },
+        });
+        let out2 = rb.drain();
+
+        // Combine: out1=[schema@350], out2=[schema@400, heartbeat@500]
+        let mut all = out1;
+        all.extend(out2);
+
+        // global_wm progression:
+        //   B4 data ts=350 → wm=min(C1=800,C2=500,B4=350)=350 → drain ts=350
+        //   B4 heartbeat ts=900 → wm=min(800,500,900)=500 → drain ts=400,500
+        assert_eq!(all.len(), 3, "schema@350 + schema@400 + heartbeat@500");
+
+        // CRITICAL: ordering must be ts=350 BEFORE ts=400
+        assert!(
+            all[0].offset.contains("350"),
+            "old schema at ts=350 must come first, got offset={}",
+            all[0].offset
+        );
+        assert!(
+            all[1].offset.contains("400"),
+            "new schema at ts=400 must come second, got offset={}",
+            all[1].offset
+        );
+    }
+
+    #[test]
+    fn placeholder_does_not_emit_records() {
+        // Placeholder entries must NOT produce drain output — they have no
+        // buffered records. Only real partitions produce records.
+        let mut rb = ReorderBuffer::new();
+
+        rb.handle(ReorderBufferEvent::DeclarePartitions {
+            tokens: vec![Some("A".into()), Some("B".into())],
+            start_ts: ts(100),
+        });
+        // Only A starts, B is still a placeholder
+        rb.handle(ReorderBufferEvent::PartitionStarted {
+            token: Some("A".into()),
+            start_ts: ts(100),
+        });
+
+        // A produces data at ts=200
+        rb.handle(ReorderBufferEvent::Record {
+            partition_token: Some("A".into()),
+            record: PartitionRecord::Heartbeat {
+                commit_ts: ts(200),
+                msg: heartbeat_msg(ts(200)),
+            },
+        });
+
+        // global_wm = min(A=200, B_placeholder=100) = 100
+        // ts=100: nothing buffered → no output
+        let out = rb.drain();
+        assert!(out.is_empty(), "placeholder has no records to drain");
+    }
+
+    #[test]
+    fn placeholder_overwrite_preserves_watermark() {
+        // When PartitionStarted fires for a token that already has a
+        // placeholder, the watermark must not regress.
+        let mut rb = ReorderBuffer::new();
+
+        rb.handle(ReorderBufferEvent::DeclarePartitions {
+            tokens: vec![Some("A".into()), Some("B".into())],
+            start_ts: ts(100),
+        });
+        rb.handle(ReorderBufferEvent::PartitionStarted {
+            token: Some("A".into()),
+            start_ts: ts(100),
+        });
+
+        // A advances to ts=300 — nothing at ts≤100 to drain
+        rb.handle(ReorderBufferEvent::Record {
+            partition_token: Some("A".into()),
+            record: PartitionRecord::Heartbeat {
+                commit_ts: ts(300),
+                msg: heartbeat_msg(ts(300)),
+            },
+        });
+
+        // B placeholder at ts=100 pins watermark
+        assert_eq!(rb.watermark(), Some(ts(100)));
+
+        // B starts — same start_ts, must not clobber anything
+        rb.handle(ReorderBufferEvent::PartitionStarted {
+            token: Some("B".into()),
+            start_ts: ts(100),
+        });
+
+        // B advances to ts=250 — handle() drains ts=250 internally
+        rb.handle(ReorderBufferEvent::Record {
+            partition_token: Some("B".into()),
+            record: PartitionRecord::Heartbeat {
+                commit_ts: ts(250),
+                msg: heartbeat_msg(ts(250)),
+            },
+        });
+        let out = rb.drain();
+
+        // global_wm = min(A=300, B=250) = 250
+        // drain ts=250 (B's heartbeat) — returned by handle()
+        assert_eq!(out.len(), 1, "drain ts=250 (B's heartbeat)");
+        assert!(out[0].offset.contains("250"));
+    }
+
+    // -------------------------------------------------------------------
+    // Partitions discovered one at a time (simulates child_discovery_rx path)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn partitions_discovered_sequentially_still_pinned() {
+        // Simulates: parent finishes, children arrive one at a time via
+        // child_discovery_rx.  Each child triggers DeclarePartitions
+        // + PartitionStarted.  The placeholder from the first group
+        // declaration must pin the watermark until all partitions start.
+        let mut rb = ReorderBuffer::new();
+
+        // First partition discovered — group declared with just A
+        rb.handle(ReorderBufferEvent::DeclarePartitions {
+            tokens: vec![Some("A".into()), Some("B".into())],
+            start_ts: ts(100),
+        });
+        rb.handle(ReorderBufferEvent::PartitionStarted {
+            token: Some("A".into()),
+            start_ts: ts(100),
+        });
+
+        // A advances to ts=400
+        rb.handle(ReorderBufferEvent::Record {
+            partition_token: Some("A".into()),
+            record: PartitionRecord::Heartbeat {
+                commit_ts: ts(400),
+                msg: heartbeat_msg(ts(400)),
+            },
+        });
+
+        // B placeholder at ts=100 pins watermark — nothing at ts≤100
+        assert_eq!(rb.watermark(), Some(ts(100)));
+        let out = rb.drain();
+        assert!(out.is_empty(), "B placeholder pins watermark at 100");
+
+        // Second partition discovered — starts, advances
+        rb.handle(ReorderBufferEvent::PartitionStarted {
+            token: Some("B".into()),
+            start_ts: ts(100),
+        });
+        rb.handle(ReorderBufferEvent::Record {
+            partition_token: Some("B".into()),
+            record: PartitionRecord::Heartbeat {
+                commit_ts: ts(300),
+                msg: heartbeat_msg(ts(300)),
+            },
+        });
+
+        // global_wm = min(A=400, B=300) = 300
+        // ts=300 is B's heartbeat, no records at ts≤300 from A
+        let out = rb.drain();
+        assert_eq!(out.len(), 1, "B's ts=300 heartbeat drained");
+    }
+
+    #[test]
+    #[should_panic(expected = "offset regression")]
+    fn partition_started_panics_on_watermark_regression() {
+        // PartitionStarted with start_ts < placeholder.offset must panic.
+        let mut rb = ReorderBuffer::new();
+
+        rb.handle(ReorderBufferEvent::DeclarePartitions {
+            tokens: vec![Some("A".into())],
+            start_ts: ts(200),
+        });
+        // Placeholder at ts=200.  Starting at ts=100 would regress.
+        rb.handle(ReorderBufferEvent::PartitionStarted {
+            token: Some("A".into()),
+            start_ts: ts(100),
+        });
+    }
+
+    #[test]
+    fn overlapping_declare_partitions_uses_first_offset() {
+        // DeclarePartitions called twice for the same token at different
+        // offsets.  `or_insert` keeps the first (placeholder) entry.
+        let mut rb = ReorderBuffer::new();
+
+        rb.handle(ReorderBufferEvent::DeclarePartitions {
+            tokens: vec![Some("A".into())],
+            start_ts: ts(100),
+        });
+        // Second declaration at ts=200 — should NOT overwrite the ts=100 placeholder
+        rb.handle(ReorderBufferEvent::DeclarePartitions {
+            tokens: vec![Some("A".into())],
+            start_ts: ts(200),
+        });
+
+        // Placeholder offset is still 100 (first insert wins)
+        assert_eq!(rb.watermark(), Some(ts(100)));
+
+        // Start A at ts=100 (same as placeholder) — no regression
+        rb.handle(ReorderBufferEvent::PartitionStarted {
+            token: Some("A".into()),
+            start_ts: ts(100),
+        });
+        assert_eq!(rb.watermark(), Some(ts(100)));
+    }
+
+    #[test]
+    fn buffer_len_tracks_record_count() {
+        let mut rb = ReorderBuffer::new();
+        assert_eq!(rb.buffer_len(), 0);
+
+        rb.handle(ReorderBufferEvent::PartitionStarted {
+            token: Some("p1".into()),
+            start_ts: ts(0),
+        });
+
+        // Buffer 3 records
+        for i in 1..=3 {
+            rb.handle(ReorderBufferEvent::Record {
+                partition_token: Some("p1".into()),
+                record: PartitionRecord::Heartbeat {
+                    commit_ts: ts(i * 100),
+                    msg: heartbeat_msg(ts(i * 100)),
+                },
+            });
+        }
+
+        // All 3 buffered (watermark at ts=0, nothing drains yet)
+        assert_eq!(rb.buffer_len(), 3);
+
+        // Advance another partition to push watermark
+        rb.handle(ReorderBufferEvent::PartitionStarted {
+            token: Some("p2".into()),
+            start_ts: ts(0),
+        });
+        rb.handle(ReorderBufferEvent::Record {
+            partition_token: Some("p2".into()),
+            record: PartitionRecord::Heartbeat {
+                commit_ts: ts(500),
+                msg: heartbeat_msg(ts(500)),
+            },
+        });
+
+        // Drain: watermark = min(300, 500) = 300, drains 3 records
+        rb.drain();
+        assert_eq!(rb.buffer_len(), 1); // ts=500 still buffered
     }
 }
