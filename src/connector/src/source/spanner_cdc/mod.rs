@@ -24,8 +24,8 @@ use crate::enforce_secret::EnforceSecret;
 use crate::error::ConnectorResult;
 use crate::source::SourceProperties;
 
+pub mod coordinator;
 pub mod enumerator;
-pub mod reorder_buffer;
 pub mod source;
 pub mod split;
 pub mod types;

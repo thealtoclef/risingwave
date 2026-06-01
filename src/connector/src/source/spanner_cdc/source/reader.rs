@@ -21,19 +21,21 @@
 //! 3. `into_data_stream()` calls `rx.recv()` and yields messages
 //! 4. `into_stream()` wraps with `into_chunk_stream` (parser)
 //!
-//! ## ReorderBuffer cross-partition ordering
+//! ## PartitionCoordinator: eager emit + per-partition checkpoint
 //!
 //! Spanner change-stream partitions are read concurrently with no cross-partition
 //! commit-timestamp ordering. Partition tasks send `PartitionRecord`s to a shared
-//! record channel. The `run_reader` main loop runs a `ReorderBuffer` that:
+//! record channel. The `run_reader` main loop runs a `PartitionCoordinator` that:
 //!
-//! 1. Tracks per-partition offsets (data records + heartbeats)
-//! 2. Computes a watermark = min(all partition offsets)
-//! 3. Buffers records and emits them in commit-ts order only when the watermark
-//!    has advanced past their timestamp
-//!
-//! This ensures schema changes are always seen in commit-ts order, making it
-//! impossible for a lagging partition to regress the tracked schema.
+//! 1. Emits records **eagerly** in per-partition order (no global reorder). This
+//!    is correct because the pipeline needs only per-key ordering, which Spanner +
+//!    the `parents_all_finished` gate guarantee.
+//! 2. Tracks a scalar **checkpoint watermark** = monotonic min over non-finished
+//!    partitions, stamped on every message for checkpoint compatibility.
+//! 3. Tracks a monotonic schema accumulator (superset-only) so a lagging partition
+//!    can never shrink the schema (no destructive DROP COLUMN).
+//! 4. Exposes a per-partition **frontier** so a restart resumes each partition from
+//!    its own offset instead of re-reading the whole tree from one position.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
@@ -44,6 +46,7 @@ use futures_async_stream::try_stream;
 use google_cloud_spanner::client::Client;
 use google_cloud_spanner::statement::Statement;
 use risingwave_common::ensure;
+use risingwave_common::types::DataType;
 use risingwave_pb::connector_service::{SourceType, cdc_message};
 use time::OffsetDateTime;
 use tokio::sync::mpsc;
@@ -53,15 +56,16 @@ use super::TaggedChangeRecord;
 use crate::error::{ConnectorError, ConnectorResult as Result};
 use crate::parser::ParserConfig;
 use crate::source::cdc::DebeziumCdcMeta;
-use crate::source::spanner_cdc::reorder_buffer::{
-    PartitionRecord, ReorderBuffer, ReorderBufferEvent,
+use crate::source::cdc::external::spanner::PartitionOffset;
+use crate::source::spanner_cdc::coordinator::{
+    CoordinatorEvent, PartitionCoordinator, PartitionRecord, SeedSchema,
 };
 use crate::source::spanner_cdc::split::PartitionState;
-use crate::source::spanner_cdc::types::ChangeStreamRecord;
+use crate::source::spanner_cdc::types::{ChangeStreamRecord, SpannerType, TypeCode};
 use crate::source::spanner_cdc::{SpannerCdcProperties, SpannerCdcSplit};
 use crate::source::{
-    BoxSourceChunkStream, Column, SourceContextRef, SourceMessage, SourceMeta, SplitId,
-    SplitReader, into_chunk_stream,
+    BoxSourceChunkStream, Column, SourceColumnDesc, SourceContextRef, SourceMessage, SourceMeta,
+    SplitId, SplitReader, into_chunk_stream,
 };
 
 const DEFAULT_CHANNEL_SIZE: usize = 16;
@@ -100,15 +104,32 @@ impl SplitReader for SpannerCdcSplitReader {
         let source_id = source_ctx.source_id.as_raw_id();
         let (tx, rx) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
 
-        // Extract the checkpointed offset from splits.
-        let checkpointed_offset = splits
-            .iter()
-            .find(|s| s.index == source_id)
+        // Extract the checkpointed offset and per-partition resume frontier from splits.
+        let own_split = splits.iter().find(|s| s.index == source_id);
+        let checkpointed_offset = own_split
             .map(|s| s.offset_as_micros())
             .filter(|&m| m > 0)
             .and_then(|micros| {
                 OffsetDateTime::from_unix_timestamp_nanos((micros as i128) * 1000).ok()
             });
+        let mut resume_frontier = own_split.map(|s| s.partitions.clone()).unwrap_or_default();
+        if let Some(invalid) = resume_frontier
+            .iter()
+            .find(|p| micros_to_offset(p.micros).is_none())
+        {
+            tracing::warn!(
+                token = ?invalid.token,
+                micros = invalid.micros,
+                "invalid Spanner CDC resume frontier; falling back to scalar root resume"
+            );
+            resume_frontier.clear();
+        }
+        let seed_schema = make_seed_schema(
+            properties.table_name.clone(),
+            &parser_config.common.rw_columns,
+            &resume_frontier,
+            checkpointed_offset,
+        );
 
         // Create the Spanner client and reader context
         let client = properties.create_client().await?;
@@ -126,6 +147,8 @@ impl SplitReader for SpannerCdcSplitReader {
             retry_backoff_factor: properties.get_retry_backoff_factor(),
             source_id,
             checkpointed_offset,
+            resume_frontier,
+            seed_schema,
         };
 
         // Spawn background task — like Debezium spawns the JNI thread
@@ -195,6 +218,11 @@ struct ReaderContext {
     retry_backoff_factor: u64,
     source_id: u32,
     checkpointed_offset: Option<OffsetDateTime>,
+    /// Per-partition resume frontier from the restored split. Empty => root mode
+    /// (fresh start or legacy single-offset split); non-empty => resume each
+    /// partition from its own offset.
+    resume_frontier: Vec<PartitionOffset>,
+    seed_schema: Option<SeedSchema>,
 }
 
 /// Result from each partition task.
@@ -202,7 +230,7 @@ struct PartitionResult {
     partition_token: Option<String>,
 }
 
-/// Tagged wrapper so the ReorderBuffer knows which partition a record came from.
+/// Tagged wrapper so the coordinator knows which partition a record came from.
 struct TaggedPartitionRecord {
     partition_token: Option<String>,
     record: PartitionRecord,
@@ -340,7 +368,7 @@ fn collect_ready_children(
     pending_children.drain_ready(partition_progress)
 }
 
-async fn run_reader(ctx: ReaderContext, tx: mpsc::Sender<Vec<SourceMessage>>) -> Result<()> {
+async fn run_reader(mut ctx: ReaderContext, tx: mpsc::Sender<Vec<SourceMessage>>) -> Result<()> {
     let mut partition_streams: FuturesUnordered<tokio::task::JoinHandle<Result<PartitionResult>>> =
         FuturesUnordered::new();
 
@@ -354,42 +382,116 @@ async fn run_reader(ctx: ReaderContext, tx: mpsc::Sender<Vec<SourceMessage>>) ->
     let (child_discovery_tx, mut child_discovery_rx) =
         tokio::sync::mpsc::unbounded_channel::<SpannerCdcSplit>();
 
-    // Shared record channel: partition tasks → ReorderBuffer
+    // Shared record channel: partition tasks → coordinator
     let (record_tx, mut record_rx) = mpsc::channel::<TaggedPartitionRecord>(DEFAULT_CHANNEL_SIZE);
 
     let split_id = SplitId::from(ctx.source_id.to_string());
     let root_offset = ctx
         .checkpointed_offset
         .unwrap_or_else(OffsetDateTime::now_utc);
-    let mut reorder_buf = ReorderBuffer::new();
+    let mut coordinator = PartitionCoordinator::new_with_seed_schema(ctx.seed_schema.take());
 
-    tracing::info!(starting_offset = ?root_offset, "starting Spanner CDC reader with root partition");
+    if ctx.resume_frontier.is_empty() {
+        // Root mode: fresh start or a legacy single-offset split. Start one root
+        // partition and re-discover the whole tree from `root_offset`.
+        tracing::info!(starting_offset = ?root_offset, "starting Spanner CDC reader with root partition");
+        let root_split =
+            SpannerCdcSplit::new_root(ctx.change_stream_name.clone(), ctx.source_id, root_offset);
+        coordinator.handle(CoordinatorEvent::PartitionStarted {
+            token: root_split.partition_token.clone(),
+            parent_tokens: vec![],
+            start_ts: root_offset,
+        });
+        active_count += 1;
+        spawn_partition_task(
+            &ctx,
+            root_split,
+            &split_id,
+            &mut partition_streams,
+            child_discovery_tx.clone(),
+            &record_tx,
+        );
+    } else {
+        // Resume mode: restore each non-finished partition from its own offset
+        // (the Beam PartitionMetadata model) instead of re-reading from the minimum.
+        tracing::info!(
+            partitions = ctx.resume_frontier.len(),
+            "resuming Spanner CDC reader from per-partition frontier"
+        );
 
-    let root_split =
-        SpannerCdcSplit::new_root(ctx.change_stream_name.clone(), ctx.source_id, root_offset);
-    reorder_buf.handle(ReorderBufferEvent::PartitionStarted {
-        token: root_split.partition_token.clone(),
-        start_ts: root_offset,
-    });
+        // Seed local progress: each frontier partition gets its persisted state;
+        // any parent referenced but absent from the frontier must have finished
+        // pre-restart (the frontier persists all non-finished partitions).
+        partition_progress = seed_resume_progress(&ctx.resume_frontier);
 
-    active_count += 1;
-    spawn_partition_task(
-        &ctx,
-        root_split,
-        &split_id,
-        &mut partition_streams,
-        child_discovery_tx.clone(),
-        &record_tx,
-    );
+        // Declare every frontier partition as a placeholder so the checkpoint
+        // watermark stays pinned at each partition's offset until it advances.
+        for p in &ctx.resume_frontier {
+            if let Some(start_ts) = micros_to_offset(p.micros) {
+                coordinator.handle(CoordinatorEvent::DeclarePartitions {
+                    tokens: vec![p.token.clone()],
+                    parent_tokens: p.parent_tokens.clone(),
+                    start_ts,
+                });
+            }
+        }
+
+        // Start ready partitions (parents finished, slot available); queue the rest.
+        // Resumed Running partitions re-discover their children via
+        // ChildPartitionsRecord; `register_child` dedups against queued children.
+        for p in &ctx.resume_frontier {
+            let Some(start_ts) = micros_to_offset(p.micros) else {
+                continue;
+            };
+            let split = match &p.token {
+                None => SpannerCdcSplit::new_root(
+                    ctx.change_stream_name.clone(),
+                    ctx.source_id,
+                    start_ts,
+                ),
+                Some(tok) => SpannerCdcSplit::new_child(
+                    tok.clone(),
+                    p.parent_tokens.clone(),
+                    start_ts,
+                    ctx.change_stream_name.clone(),
+                    0,
+                ),
+            };
+            let ready =
+                p.token.is_none() || parents_all_finished(&p.parent_tokens, &partition_progress);
+            if ready && active_count < max_concurrent {
+                if let Some(ref tok) = p.token {
+                    set_running(&mut partition_progress, tok);
+                }
+                coordinator.handle(CoordinatorEvent::PartitionStarted {
+                    token: p.token.clone(),
+                    parent_tokens: p.parent_tokens.clone(),
+                    start_ts,
+                });
+                active_count += 1;
+                spawn_partition_task(
+                    &ctx,
+                    split,
+                    &split_id,
+                    &mut partition_streams,
+                    child_discovery_tx.clone(),
+                    &record_tx,
+                );
+            } else {
+                pending_children.push(PendingChild { split });
+            }
+        }
+    }
 
     // Main event loop
     loop {
+        let mut checkpoint_only = false;
         if tx.is_closed() {
             // Graceful shutdown: RisingWave cancelled us (source dropped, rebalance, etc).
-            // Drain the ReorderBuffer and attempt a final send so the downstream
+            // Drain the coordinator and attempt a final send so the downstream
             // can checkpoint as far as possible before we exit.
-            let mut remaining = reorder_buf.drain();
-            stamp_watermark(&mut remaining, &reorder_buf);
+            let mut remaining = coordinator.drain();
+            stamp_watermark(&mut remaining, &coordinator);
             if !remaining.is_empty() {
                 tracing::info!(
                     count = remaining.len(),
@@ -408,9 +510,10 @@ async fn run_reader(ctx: ReaderContext, tx: mpsc::Sender<Vec<SourceMessage>>) ->
             result = partition_streams.next() => {
                 match result {
                     Some(Ok(Ok(pr))) => {
-                        reorder_buf.handle(ReorderBufferEvent::PartitionFinished {
+                        coordinator.handle(CoordinatorEvent::PartitionFinished {
                             token: pr.partition_token.clone(),
                         });
+                        checkpoint_only = true;
 
                         if let Some(ref token) = pr.partition_token {
                             if let Some(state) = partition_progress.get_mut(token) {
@@ -437,7 +540,7 @@ async fn run_reader(ctx: ReaderContext, tx: mpsc::Sender<Vec<SourceMessage>>) ->
                         }
 
                         // Start children in each group
-                        for (_key, children) in groups {
+                        for (key, children) in groups {
                             let tokens: Vec<Option<String>> = children
                                 .iter()
                                 .map(|c| c.split.partition_token.clone())
@@ -447,10 +550,12 @@ async fn run_reader(ctx: ReaderContext, tx: mpsc::Sender<Vec<SourceMessage>>) ->
                                 .first()
                                 .and_then(|c| c.split.offset)
                                 .unwrap_or(root_offset);
-                            reorder_buf.handle(ReorderBufferEvent::DeclarePartitions {
+                            coordinator.handle(CoordinatorEvent::DeclarePartitions {
                                 tokens,
+                                parent_tokens: key.parent_tokens.clone(),
                                 start_ts: group_start_ts,
                             });
+                            checkpoint_only = true;
 
                             for child in children {
                                 if active_count >= max_concurrent {
@@ -462,10 +567,12 @@ async fn run_reader(ctx: ReaderContext, tx: mpsc::Sender<Vec<SourceMessage>>) ->
                                 if let Some(ref token) = child.split.partition_token {
                                     set_running(&mut partition_progress, token);
                                 }
-                                reorder_buf.handle(ReorderBufferEvent::PartitionStarted {
+                                coordinator.handle(CoordinatorEvent::PartitionStarted {
                                     token: child.split.partition_token.clone(),
+                                    parent_tokens: child.split.parent_partition_tokens.clone(),
                                     start_ts,
                                 });
+                                checkpoint_only = true;
                                 active_count += 1;
                                 spawn_partition_task(
                                     &ctx,
@@ -497,10 +604,12 @@ async fn run_reader(ctx: ReaderContext, tx: mpsc::Sender<Vec<SourceMessage>>) ->
                     if let Some(child) = pending_children.pop_ready(&partition_progress) {
                         if let Some(ref token) = child.split.partition_token { set_running(&mut partition_progress, token); }
                         let start_ts = child.split.offset.unwrap_or(root_offset);
-                        reorder_buf.handle(ReorderBufferEvent::PartitionStarted {
+                        coordinator.handle(CoordinatorEvent::PartitionStarted {
                             token: child.split.partition_token.clone(),
+                            parent_tokens: child.split.parent_partition_tokens.clone(),
                             start_ts,
                         });
+                        checkpoint_only = true;
                         active_count += 1;
                         spawn_partition_task(&ctx, child.split, &split_id, &mut partition_streams, child_discovery_tx.clone(), &record_tx);
                     } else { break; }
@@ -523,26 +632,29 @@ async fn run_reader(ctx: ReaderContext, tx: mpsc::Sender<Vec<SourceMessage>>) ->
             }
 
             Some(tagged) = record_rx.recv() => {
-                reorder_buf.handle(ReorderBufferEvent::Record {
+                coordinator.handle(CoordinatorEvent::Record {
                     partition_token: tagged.partition_token,
                     record: tagged.record,
                 });
             }
         }
 
-        // Drain and emit after every event — single drain point, no data loss
-        let mut batch = reorder_buf.drain();
-        stamp_watermark(&mut batch, &reorder_buf);
+        // Drain and emit after every event — eager emission, no data loss
+        let mut batch = coordinator.drain();
+        if batch.is_empty() && checkpoint_only {
+            batch.push(checkpoint_heartbeat_msg(&split_id, &coordinator));
+        }
+        stamp_watermark(&mut batch, &coordinator);
         if !batch.is_empty() && tx.send(batch).await.is_err() {
             break;
         }
     }
 
-    // Safety net: drain anything still buffered (e.g., after a `break` from
+    // Safety net: drain anything still staged (e.g., after a `break` from
     // a send error). Partition tasks have already exited or will exit when
     // `record_tx` is dropped.
-    let mut remaining = reorder_buf.drain();
-    stamp_watermark(&mut remaining, &reorder_buf);
+    let mut remaining = coordinator.drain();
+    stamp_watermark(&mut remaining, &coordinator);
     if !remaining.is_empty() {
         tracing::info!(
             count = remaining.len(),
@@ -810,7 +922,7 @@ async fn execute_query(
             }
 
             // Heartbeats advance the partition watermark even when no data changes
-            // are occurring. Sent to the ReorderBuffer so the global watermark can progress.
+            // are occurring. Sent to the coordinator so the offset can progress while idle.
             for heartbeat in &record.heartbeat_record {
                 tracing::debug!(split_id = %split_id, heartbeat_time = ?heartbeat.heartbeat_time(), "received heartbeat");
                 split.advance_offset(heartbeat.heartbeat_time());
@@ -864,32 +976,165 @@ async fn execute_query(
 // Offset / message helpers
 // ---------------------------------------------------------------------------
 
-/// Build an offset string from the ReorderBuffer's watermark timestamp.
-/// This is the correct "consumed up to" position — the executor receives a
-/// single monotonically advancing offset, like other CDC sources.
-fn make_watermark_offset_string(watermark_micros: i64) -> String {
+/// Convert microseconds since epoch to an `OffsetDateTime`.
+fn micros_to_offset(micros: i64) -> Option<OffsetDateTime> {
+    OffsetDateTime::from_unix_timestamp_nanos((micros as i128) * 1000).ok()
+}
+
+/// Build an offset string from the coordinator's scalar checkpoint watermark plus
+/// the per-partition resume frontier. The scalar `timestamp` stays as the global
+/// min checkpoint floor; `partitions` rides along so a restart resumes each
+/// partition from its own offset.
+fn make_watermark_offset_string(watermark_micros: i64, frontier: Vec<PartitionOffset>) -> String {
     let spanner_offset =
-        crate::source::cdc::external::spanner::SpannerOffset::new(watermark_micros);
+        crate::source::cdc::external::spanner::SpannerOffset::new(watermark_micros)
+            .with_partitions(frontier);
     let cdc_offset = crate::source::cdc::external::CdcOffset::Spanner(spanner_offset);
     serde_json::to_string(&cdc_offset).unwrap_or_else(|_| watermark_micros.to_string())
 }
 
-/// Stamp all messages in a batch with the ReorderBuffer's watermark.
-/// The executor's split tracks a single offset (like other CDC sources),
-/// so every message must carry the watermark, not per-partition offsets.
-fn stamp_watermark(batch: &mut [SourceMessage], reorder_buf: &ReorderBuffer) {
-    let wm_micros = reorder_buf
-        .last_emitted_watermark()
+/// Stamp all messages in a batch with the coordinator's scalar checkpoint watermark and
+/// the current per-partition frontier. Every message carries the same offset
+/// (last-in-chunk wins when the executor persists the split).
+fn stamp_watermark(batch: &mut [SourceMessage], coordinator: &PartitionCoordinator) {
+    let wm_micros = coordinator
+        .checkpoint_watermark()
         .map(|wm| (wm.unix_timestamp_nanos() / 1000) as i64)
         .unwrap_or(0);
     if wm_micros > 0 {
-        let offset_str = make_watermark_offset_string(wm_micros);
+        let offset_str = make_watermark_offset_string(wm_micros, coordinator.checkpoint_frontier());
         for msg in batch.iter_mut() {
             msg.offset = offset_str.clone();
         }
     } else if !batch.is_empty() {
         tracing::warn!("stamp_watermark called with wm_micros=0, messages will carry empty offset");
     }
+}
+
+fn checkpoint_heartbeat_msg(
+    split_id: &SplitId,
+    coordinator: &PartitionCoordinator,
+) -> SourceMessage {
+    let source_ts_ms = coordinator
+        .checkpoint_watermark()
+        .map(|wm| (wm.unix_timestamp_nanos() / 1_000_000) as i64)
+        .unwrap_or(0);
+    SourceMessage {
+        key: None,
+        payload: None,
+        offset: String::new(),
+        split_id: split_id.clone(),
+        meta: SourceMeta::DebeziumCdc(DebeziumCdcMeta::new(
+            String::new(),
+            source_ts_ms,
+            cdc_message::CdcMessageType::Heartbeat,
+            SourceType::Unspecified,
+        )),
+    }
+}
+
+fn make_seed_schema(
+    table_name: Option<String>,
+    columns: &[SourceColumnDesc],
+    resume_frontier: &[PartitionOffset],
+    checkpointed_offset: Option<OffsetDateTime>,
+) -> Option<SeedSchema> {
+    let table_name = table_name?;
+    let columns = seed_schema_from_source_columns(columns);
+    if columns.is_empty() {
+        return None;
+    }
+    let min_type_change_ts = resume_frontier
+        .iter()
+        .filter_map(|p| micros_to_offset(p.micros))
+        .max()
+        .or(checkpointed_offset);
+    Some(SeedSchema {
+        table_name,
+        columns,
+        min_type_change_ts,
+    })
+}
+
+fn seed_schema_from_source_columns(
+    columns: &[SourceColumnDesc],
+) -> Vec<(String, SpannerType, bool)> {
+    let columns: Vec<_> = columns
+        .iter()
+        .filter(|c| c.is_visible())
+        .filter_map(|c| {
+            rw_type_to_spanner_type(&c.data_type)
+                .map(|spanner_type| (c.name.clone(), spanner_type, c.is_pk))
+        })
+        .collect();
+
+    // Shared Spanner CDC sources expose a generic JSON `payload` column that
+    // does not describe any upstream table schema. Seeding from it would install
+    // an unrelated baseline before the first real table record arrives.
+    if matches!(columns.as_slice(), [(name, _, _)] if name == "payload") {
+        return vec![];
+    }
+
+    columns
+}
+
+fn rw_type_to_spanner_type(data_type: &DataType) -> Option<SpannerType> {
+    let code = match data_type {
+        DataType::Boolean => TypeCode::Bool,
+        DataType::Int64 => TypeCode::Int64,
+        DataType::Float64 => TypeCode::Float64,
+        DataType::Float32 => TypeCode::Float32,
+        DataType::Timestamp | DataType::Timestamptz => TypeCode::Timestamp,
+        DataType::Date => TypeCode::Date,
+        DataType::Varchar => TypeCode::String,
+        DataType::Bytea => TypeCode::Bytes,
+        DataType::Decimal => TypeCode::Numeric,
+        DataType::Jsonb => TypeCode::Json,
+        DataType::List(list_type) => {
+            return rw_type_to_spanner_type(list_type.elem()).map(|element_type| SpannerType {
+                code: TypeCode::Array,
+                array_element_type: Some(Box::new(element_type)),
+                struct_type: None,
+                type_annotation: None,
+                proto_type_fqn: None,
+            });
+        }
+        _ => return None,
+    };
+    Some(SpannerType::simple(code))
+}
+
+/// Seed local partition progress from a restored per-partition frontier.
+///
+/// Each frontier partition is registered with its persisted state (Running or
+/// Pending). Any parent token referenced by a frontier partition but **absent**
+/// from the frontier must have finished before the checkpoint (the frontier
+/// persists exactly the non-finished partitions), so it is marked `Finished` —
+/// which lets the `parents_all_finished` gate release resumed children.
+fn seed_resume_progress(frontier: &[PartitionOffset]) -> HashMap<String, PartitionState> {
+    let mut progress: HashMap<String, PartitionState> = HashMap::new();
+    let mut present: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for p in frontier {
+        if let Some(token) = &p.token {
+            present.insert(token.clone());
+            let state = if p.running {
+                PartitionState::Running
+            } else {
+                PartitionState::Pending
+            };
+            progress.insert(token.clone(), state);
+        }
+    }
+    for p in frontier {
+        for parent in &p.parent_tokens {
+            if !present.contains(parent) {
+                progress
+                    .entry(parent.clone())
+                    .or_insert(PartitionState::Finished);
+            }
+        }
+    }
+    progress
 }
 
 #[cfg(test)]
@@ -904,6 +1149,7 @@ mod tests {
             offset: Some(offset),
             change_stream_name: String::new(),
             index: 0,
+            partitions: vec![],
         }
     }
 
@@ -1131,5 +1377,101 @@ mod tests {
         let ready = q.drain_ready(&progress);
         assert_eq!(ready.len(), 2);
         assert_eq!(q.len(), 0);
+    }
+
+    // ---------------------------------------------------------------
+    // Resume seeding: absent parents marked Finished; readiness derived
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn resume_seed_marks_absent_parents_finished() {
+        let frontier = vec![
+            PartitionOffset {
+                token: Some("R".into()),
+                parent_tokens: vec!["G".into()],
+                micros: 100,
+                running: true,
+            },
+            PartitionOffset {
+                token: Some("C".into()),
+                parent_tokens: vec!["G2".into()],
+                micros: 100,
+                running: false,
+            },
+            PartitionOffset {
+                token: Some("D".into()),
+                parent_tokens: vec!["R".into()],
+                micros: 100,
+                running: false,
+            },
+        ];
+        let progress = seed_resume_progress(&frontier);
+
+        // Frontier partitions keep their persisted state.
+        assert_eq!(progress.get("R"), Some(&PartitionState::Running));
+        assert_eq!(progress.get("C"), Some(&PartitionState::Pending));
+        assert_eq!(progress.get("D"), Some(&PartitionState::Pending));
+        // Parents absent from the frontier are marked Finished.
+        assert_eq!(progress.get("G"), Some(&PartitionState::Finished));
+        assert_eq!(progress.get("G2"), Some(&PartitionState::Finished));
+
+        // R (parent G finished) and C (parent G2 finished) are ready;
+        // D (parent R still running) is not.
+        assert!(parents_all_finished(&["G".to_string()], &progress));
+        assert!(parents_all_finished(&["G2".to_string()], &progress));
+        assert!(!parents_all_finished(&["R".to_string()], &progress));
+    }
+
+    #[test]
+    fn checkpoint_heartbeat_persists_lifecycle_only_frontier_change() {
+        let split_id = SplitId::from("test");
+        let mut coordinator = PartitionCoordinator::new();
+        coordinator.handle(CoordinatorEvent::PartitionStarted {
+            token: Some("p1".into()),
+            parent_tokens: vec![],
+            start_ts: ts(0),
+        });
+        coordinator.handle(CoordinatorEvent::Record {
+            partition_token: Some("p1".into()),
+            record: PartitionRecord::Heartbeat {
+                commit_ts: ts(10),
+                msg: SourceMessage::dummy(),
+            },
+        });
+        assert_eq!(coordinator.drain().len(), 1);
+
+        coordinator.handle(CoordinatorEvent::PartitionFinished {
+            token: Some("p1".into()),
+        });
+        let mut batch = coordinator.drain();
+        assert!(batch.is_empty(), "finish alone emits no data record");
+        batch.push(checkpoint_heartbeat_msg(&split_id, &coordinator));
+        stamp_watermark(&mut batch, &coordinator);
+
+        let offset: crate::source::cdc::external::CdcOffset =
+            serde_json::from_str(&batch[0].offset).unwrap();
+        let crate::source::cdc::external::CdcOffset::Spanner(spanner_offset) = offset else {
+            panic!("expected Spanner offset");
+        };
+        assert_eq!(spanner_offset.timestamp, 10_000_000);
+        assert_eq!(spanner_offset.partitions, Some(vec![]));
+    }
+
+    #[test]
+    fn seed_schema_is_disabled_without_tracked_table_name() {
+        let columns = vec![SourceColumnDesc::simple("id", DataType::Int64, 0.into())];
+
+        assert!(make_seed_schema(None, &columns, &[], Some(ts(10))).is_none());
+    }
+
+    #[test]
+    fn seed_schema_skips_shared_payload_shape() {
+        let columns = vec![SourceColumnDesc::simple(
+            "payload",
+            DataType::Jsonb,
+            0.into(),
+        )];
+
+        assert!(make_seed_schema(Some("orders".into()), &columns, &[], Some(ts(10))).is_none());
     }
 }

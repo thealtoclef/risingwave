@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 use crate::error::ConnectorResult;
+use crate::source::cdc::external::spanner::PartitionOffset;
 use crate::source::{SplitId, SplitMetaData};
 
 /// Lifecycle state of a Spanner change stream partition.
@@ -45,11 +46,16 @@ pub enum PartitionState {
 /// - Offset tracking ensures timestamp-ordered processing
 ///
 /// **Offset semantics:**
-/// The reader's ReorderBuffer emits records in commit-timestamp order and
-/// tracks a `last_emitted_watermark` — the highest timestamp fully emitted.
-/// Every SourceMessage carries this watermark as its offset, so the executor's
-/// split receives a single, monotonically advancing offset (like other CDC
-/// sources). No per-partition tracking is needed on the executor side.
+/// The reader's `PartitionCoordinator` emits records eagerly and tracks a scalar
+/// **checkpoint watermark** — the monotonic min over non-finished partition
+/// offsets. Every SourceMessage carries this as its scalar offset, so the
+/// executor's split receives a single checkpoint-compatible offset like other CDC
+/// sources. It is **not** the resume point.
+///
+/// Resume is driven by a per-partition **frontier** carried in every message's
+/// `SpannerOffset.partitions` and captured here in [`SpannerCdcSplit::partitions`].
+/// A restart resumes each partition from its own offset (Beam `PartitionMetadata`
+/// model) rather than re-reading the whole tree from a single offset.
 ///
 /// **RisingWave CDC Convention:**
 /// - `start_offset()` method - converts to String on-demand (matches other CDC sources)
@@ -66,11 +72,10 @@ pub struct SpannerCdcSplit {
     #[serde(default)]
     pub parent_partition_tokens: Vec<String>,
 
-    /// CDC offset - timestamp-based position for change stream queries.
+    /// CDC offset - scalar checkpoint watermark for change stream queries.
     ///
-    /// On the executor's split: the ReorderBuffer's last emitted watermark —
-    /// the furthest position fully emitted in commit-ts order. Always advances
-    /// monotonically, never regresses.
+    /// On the executor's split: the coordinator's scalar checkpoint watermark.
+    /// Always advances monotonically; resume uses `partitions`, not this scalar.
     ///
     /// Type is `OffsetDateTime` (not String like Debezium) for type safety and efficiency.
     /// Spanner CDC uses timestamps directly, not complex Debezium offset structures.
@@ -83,6 +88,14 @@ pub struct SpannerCdcSplit {
 
     /// Split index for identification
     pub index: u32,
+
+    /// Per-partition resume frontier — every non-finished partition with its own
+    /// offset, parents and running flag, captured from the latest stamped
+    /// `SpannerOffset.partitions`. Empty for a freshly enumerated split or a split
+    /// restored from a legacy (pre-frontier) offset, in which case the reader
+    /// falls back to resuming a single root partition from `offset`.
+    #[serde(default)]
+    pub partitions: Vec<PartitionOffset>,
 }
 
 impl SpannerCdcSplit {
@@ -96,6 +109,7 @@ impl SpannerCdcSplit {
             offset: Some(offset),
             change_stream_name,
             index,
+            partitions: vec![],
         }
     }
 
@@ -113,6 +127,7 @@ impl SpannerCdcSplit {
             offset: Some(offset),
             change_stream_name,
             index,
+            partitions: vec![],
         }
     }
 
@@ -154,7 +169,7 @@ impl SpannerCdcSplit {
 
     /// Returns the offset as microseconds since epoch.
     ///
-    /// On the executor's split this is the ReorderBuffer watermark.
+    /// On the executor's split this is the coordinator's scalar checkpoint watermark.
     /// Used by `start_offset()` and the source executor metrics.
     pub fn offset_as_micros(&self) -> i64 {
         self.offset
@@ -164,9 +179,13 @@ impl SpannerCdcSplit {
 
     /// Update offset from a [`SpannerOffset`].
     ///
-    /// The reader stamps every SourceMessage with the ReorderBuffer's watermark
-    /// via `make_watermark_offset_string`, so this always receives a plain
-    /// timestamp with no partition token.
+    /// Advances the scalar checkpoint watermark and, when the offset carries a
+    /// per-partition frontier, **replaces** [`SpannerCdcSplit::partitions`] with
+    /// it. Replace (not merge) is correct: each stamped frontier is the complete
+    /// set of non-finished partitions at a barrier-consistent point and advances
+    /// monotonically, so finished partitions correctly drop out. The replace is
+    /// guarded by scalar monotonicity — a frontier whose timestamp would regress
+    /// the scalar offset is ignored.
     pub fn update_from_offset(
         &mut self,
         offset: &crate::source::cdc::external::spanner::SpannerOffset,
@@ -174,7 +193,15 @@ impl SpannerCdcSplit {
         if let Ok(offset_ts) =
             OffsetDateTime::from_unix_timestamp_nanos((offset.timestamp as i128) * 1000)
         {
+            // Determine regression against the current scalar before advancing.
+            let regresses = self.offset.is_some_and(|cur| offset_ts < cur);
             self.advance_offset(offset_ts);
+            if !regresses {
+                match &offset.partitions {
+                    Some(parts) => self.partitions = parts.clone(),
+                    None => self.partitions.clear(),
+                }
+            }
         }
     }
 }
@@ -210,6 +237,9 @@ impl SplitMetaData for SpannerCdcSplit {
                     OffsetDateTime::from_unix_timestamp_nanos((timestamp_micros as i128) * 1000)
                 {
                     self.advance_offset(offset_ts);
+                    // A manual SET OFFSET override resets resume to a single root
+                    // partition from the given timestamp — drop any stale frontier.
+                    self.partitions.clear();
                     return Ok(());
                 }
             }
@@ -325,10 +355,137 @@ mod tests {
         let t200 = t0 + time::Duration::seconds(200);
 
         let mut split = SpannerCdcSplit::new_root("test".into(), 0, t0);
+        // Seed a stale frontier; the plain-int override must clear it.
+        split.partitions = vec![PartitionOffset {
+            token: Some("stale".into()),
+            parent_tokens: vec![],
+            micros: 1,
+            running: true,
+        }];
 
         split
             .update_offset((t200.unix_timestamp_nanos() / 1000).to_string())
             .unwrap();
         assert_eq!(split.offset, Some(t200));
+        assert!(
+            split.partitions.is_empty(),
+            "SET OFFSET clears the frontier"
+        );
+    }
+
+    fn poff(token: &str, micros: i64, running: bool) -> PartitionOffset {
+        PartitionOffset {
+            token: Some(token.into()),
+            parent_tokens: vec![],
+            micros,
+            running,
+        }
+    }
+
+    #[test]
+    fn test_update_from_offset_populates_frontier() {
+        use crate::source::cdc::external::spanner::SpannerOffset;
+        let t0 = OffsetDateTime::from_unix_timestamp_nanos(1_000_000_000).unwrap();
+        let mut split = SpannerCdcSplit::new_root("test".into(), 0, t0);
+
+        let t100 = t0 + time::Duration::seconds(100);
+        let micros = (t100.unix_timestamp_nanos() / 1000) as i64;
+        let offset = SpannerOffset::new(micros)
+            .with_partitions(vec![poff("A", micros, true), poff("B", micros, false)]);
+        split.update_from_offset(&offset);
+
+        assert_eq!(split.offset, Some(t100));
+        assert_eq!(split.partitions.len(), 2);
+    }
+
+    #[test]
+    fn test_update_from_offset_replaces_frontier() {
+        use crate::source::cdc::external::spanner::SpannerOffset;
+        let t0 = OffsetDateTime::from_unix_timestamp_nanos(1_000_000_000).unwrap();
+        let mut split = SpannerCdcSplit::new_root("test".into(), 0, t0);
+
+        let m1 = ((t0 + time::Duration::seconds(100)).unix_timestamp_nanos() / 1000) as i64;
+        split.update_from_offset(
+            &SpannerOffset::new(m1).with_partitions(vec![poff("A", m1, true), poff("B", m1, true)]),
+        );
+        assert_eq!(split.partitions.len(), 2);
+
+        // Newer frontier with B finished (dropped out) and only A remaining.
+        let m2 = ((t0 + time::Duration::seconds(200)).unix_timestamp_nanos() / 1000) as i64;
+        split
+            .update_from_offset(&SpannerOffset::new(m2).with_partitions(vec![poff("A", m2, true)]));
+        assert_eq!(
+            split.partitions.len(),
+            1,
+            "replace, not merge — B drops out"
+        );
+        assert_eq!(split.partitions[0].token.as_deref(), Some("A"));
+    }
+
+    #[test]
+    fn test_update_from_offset_without_frontier_clears_stale_frontier() {
+        use crate::source::cdc::external::spanner::SpannerOffset;
+        let t0 = OffsetDateTime::from_unix_timestamp_nanos(1_000_000_000).unwrap();
+        let mut split = SpannerCdcSplit::new_root("test".into(), 0, t0);
+
+        let m1 = ((t0 + time::Duration::seconds(100)).unix_timestamp_nanos() / 1000) as i64;
+        split
+            .update_from_offset(&SpannerOffset::new(m1).with_partitions(vec![poff("A", m1, true)]));
+        assert_eq!(split.partitions.len(), 1);
+
+        let m2 = ((t0 + time::Duration::seconds(200)).unix_timestamp_nanos() / 1000) as i64;
+        split.update_from_offset(&SpannerOffset::new(m2));
+        assert!(split.partitions.is_empty());
+    }
+
+    #[test]
+    fn test_update_from_offset_monotonic_guard() {
+        use crate::source::cdc::external::spanner::SpannerOffset;
+        let t0 = OffsetDateTime::from_unix_timestamp_nanos(1_000_000_000).unwrap();
+        let mut split = SpannerCdcSplit::new_root("test".into(), 0, t0);
+
+        let m200 = ((t0 + time::Duration::seconds(200)).unix_timestamp_nanos() / 1000) as i64;
+        split.update_from_offset(
+            &SpannerOffset::new(m200).with_partitions(vec![poff("A", m200, true)]),
+        );
+        assert_eq!(split.partitions.len(), 1);
+
+        // An older frontier must be ignored (scalar would regress).
+        let m100 = ((t0 + time::Duration::seconds(100)).unix_timestamp_nanos() / 1000) as i64;
+        split.update_from_offset(
+            &SpannerOffset::new(m100)
+                .with_partitions(vec![poff("OLD", m100, true), poff("X", m100, true)]),
+        );
+        assert_eq!(split.partitions.len(), 1, "older frontier ignored");
+        assert_eq!(split.partitions[0].token.as_deref(), Some("A"));
+    }
+
+    #[test]
+    fn test_encode_decode_roundtrip_with_frontier() {
+        let t0 = OffsetDateTime::from_unix_timestamp_nanos(1_000_000_000).unwrap();
+        let mut split = SpannerCdcSplit::new_root("test_stream".into(), 7, t0);
+        split.partitions = vec![poff("A", 1, true), poff("B", 2, false)];
+
+        let json = split.encode_to_json();
+        let restored = SpannerCdcSplit::restore_from_json(json).unwrap();
+        assert_eq!(restored.partitions.len(), 2);
+        assert_eq!(restored, split);
+    }
+
+    #[test]
+    fn test_restore_legacy_split_without_frontier() {
+        // A split persisted before the frontier existed must restore with an
+        // empty `partitions` (serde default), so the reader falls back to root mode.
+        let legacy = r#"{
+            "partition_token": null,
+            "parent_partition_tokens": [],
+            "offset": "2024-01-15T10:30:45Z",
+            "change_stream_name": "s",
+            "index": 0
+        }"#;
+        let value: serde_json::Value = serde_json::from_str(legacy).unwrap();
+        let split = SpannerCdcSplit::restore_from_json(JsonbVal::from(value)).unwrap();
+        assert!(split.partitions.is_empty());
+        assert!(split.offset.is_some());
     }
 }

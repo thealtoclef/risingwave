@@ -12,8 +12,9 @@ This connector reads data from Google Cloud Spanner change streams and delivers 
 - **Debezium-Pattern Reader**: Same architecture as Postgres CDC — background task, mpsc channel, simple rx.recv()
 - **Full Type Support**: All Spanner types supported with data-preserving fallbacks
 - **Automatic Partition Management**: Handles parent-child partition splits and merges
-- **ReorderBuffer Cross-Partition Ordering**: Records from concurrent partitions are buffered and emitted in commit-timestamp order, with sibling-group gating to prevent ordering violations during partition splits
-- **Schema Evolution**: Automatic detection and propagation of schema changes (ADD COLUMN), with correct ordering guaranteed by the ReorderBuffer
+- **Eager Per-Partition Emission**: Records are emitted immediately in per-partition commit-ts order (no global reorder buffer). Per-key correctness is guaranteed by Spanner's one-partition-per-key rule plus the parents-before-children gate, so memory stays bounded and backpressure flows naturally to Spanner
+- **Per-Partition Checkpoint**: Each non-finished partition's offset is persisted, so a restart resumes each partition from its own position (Beam `PartitionMetadata` model)
+- **Monotonic Schema Evolution**: Schema changes (ADD COLUMN, type-up) are accumulated into a superset that only ever grows — a lagging partition can never shrink the schema, so no destructive DROP COLUMN is ever propagated
 - **Production Ready**: Retry logic, checkpointing, graceful shutdown
 
 ---
@@ -57,11 +58,11 @@ CREATE TABLE test_table FROM spanner_test TABLE 'test_table';
 
 ## Architecture
 
-### Reader Architecture (Debezium Pattern + ReorderBuffer)
+### Reader Architecture (Debezium Pattern + PartitionCoordinator)
 
-The Spanner CDC reader follows the **same pattern** as RisingWave's Debezium CDC reader (`CdcSplitReader`), with one critical addition: a **ReorderBuffer** that re-establishes commit-timestamp ordering across concurrent partition readers.
+The Spanner CDC reader follows the **same pattern** as RisingWave's Debezium CDC reader (`CdcSplitReader`), with a **PartitionCoordinator** that emits records eagerly, tracks the scalar checkpoint watermark, accumulates a monotonic schema, and exposes a per-partition resume frontier.
 
-**Why we need it**: Spanner change-stream partitions are read concurrently with no cross-partition ordering guarantee. A partition that splits into children may produce records that arrive out of order at the reader. The ReorderBuffer buffers, reorders, and emits them correctly.
+**Why no global reorder?** Spanner change-stream partitions are read concurrently with no cross-partition ordering guarantee — but the downstream pipeline needs only **per-key** ordering. A given key lives in exactly one partition at any commit timestamp, and across a split/merge it moves parent→child at a clean `start_timestamp` boundary that the `parents_all_finished` gate enforces. So per-key order holds **without** a global commit-ts buffer. Dropping the global reorder removes the head-of-line blocking and unbounded buffering that the old design suffered, while per-key correctness is unchanged.
 
 ```
                     Debezium (Postgres CDC)           Spanner CDC
@@ -72,7 +73,7 @@ Send:               tx.blocking_send(events)         tx.send(messages).await
 Reader struct:      { rx, parser_config, source_ctx } { rx, parser_config, source_ctx }
 into_data_stream:   rx.recv() → yield msgs           rx.recv() → yield msgs
 into_stream:        into_chunk_stream(...)            into_chunk_stream(...)
-Cross-partition ordering: N/A (Kafka per-topic)      ReorderBuffer (BTreeMap + watermark)
+Ordering model:     N/A (Kafka per-topic)            eager per-partition + per-key gate
 ```
 
 ```
@@ -96,21 +97,21 @@ Cross-partition ordering: N/A (Kafka per-topic)      ReorderBuffer (BTreeMap + w
 │                                                                   │
 └──────────────────────────────────────────────────────────────────┘
                             ▲
-                            │ mpsc::Sender (ordered batches, each
-                            │ message carries the ReorderBuffer's
-                            │ last_emitted_watermark as offset)
+                            │ mpsc::Sender (eager batches; each message
+                            │ carries the scalar checkpoint watermark + the
+                            │ per-partition frontier in SpannerOffset)
               ┌─────────────────────────────────────┐
               │     Background Reader Task           │
               │                                      │
               │  ┌──────────────────────────────┐   │
-              │  │      ReorderBuffer            │   │
-              │  │  • BTreeMap<ts, records>      │   │
-              │  │  • Per-partition watermarks   │   │
-              │  │  • Sibling group tracking     │   │
-              │  │  • Schema tracking (content)  │   │
-              │  │  • last_emitted_watermark     │   │
+              │  │     PartitionCoordinator      │   │
+              │  │  • eager emit (no buffer)     │   │
+              │  │  • per-partition offsets      │   │
+              │  │  • scalar checkpoint watermark│   │
+              │  │  • monotonic schema (superset)│   │
+              │  │  • checkpoint_frontier()      │   │
               │  └──────────┬───────────────────┘   │
-              │             │ drain in commit-ts order│
+              │             │ emit eagerly, per-partition│
               │  ┌──────────┴───────────────────┐   │
               │  │  Partition Tasks (tokio::spawn)│   │
               │  │  P1 ──→ record_tx ──┐         │   │
@@ -138,65 +139,93 @@ The `mpsc` channel provides natural **backpressure**: when the source executor i
 
 ---
 
-### ReorderBuffer Design (reorder_buffer.rs)
+### PartitionCoordinator Design (coordinator.rs)
 
-Named after PostgreSQL's `ReorderBuffer` for logical replication. The concept is identical: records arrive from multiple sources (WAL transactions in PG, partition readers in Spanner) and must be reassembled into a single commit-timestamp-ordered stream.
+The coordinator turns records from concurrent partition tasks into a single output
+stream **eagerly**, while tracking everything needed to checkpoint and resume.
 
 #### How it works
 
-1. **Buffer**: records from each partition are buffered in a `BTreeMap` keyed by commit timestamp
-2. **Reorder**: the global watermark is the minimum high-watermark across all *eligible* partitions (active, non-finished, in a complete sibling group). Records at `commit_ts ≤ global_watermark` are drained in order
-3. **Emit**: drained records are emitted as `Vec<SourceMessage>`, with schema-change messages prepended before their data records
+1. **Eager emit**: on each record, the coordinator produces its `SourceMessage`s
+   immediately (a schema-change message prepended when the schema grows) and stages
+   them for the next drain. There is no global commit-ts buffer and no emission gate.
+2. **Scalar checkpoint watermark**: the monotonic min offset over non-finished
+   partitions, with placeholders included. Stamped as each message's scalar
+   offset; used by CDC backfill coordination, lag metrics, offset comparison and
+   safe root-mode fallback. It is **not** the resume point.
+3. **Per-partition frontier** (`checkpoint_frontier()`): every non-finished
+   partition with its own offset, parents and running flag. Stamped alongside the
+   scalar offset; this is what a restart resumes from.
 
-#### Global watermark
+#### Why eager emission is correct
 
-```
-global_watermark = max(
-    last_emitted_watermark,    // hard floor: never regress
-    min(                       // min across eligible partitions
-        partition.watermark
-        WHERE partition is active
-          AND partition's sibling group is complete (or no group)
-    )
-)
-```
+The pipeline needs only **per-key** ordering, and per-key order is preserved
+without a global buffer:
 
-- **Active** = not finished (still reading from Spanner)
-- **Eligible** = active AND sibling group is complete (or no group — root partition)
-- **`last_emitted_watermark`** = hard floor, prevents any regression. Updated each time records are drained.
+- A key lives in exactly one partition at any commit timestamp, and that partition
+  emits its records in commit-ts order (Spanner guarantee).
+- Across a split/merge a key moves parent→child at a clean `start_timestamp`
+  boundary; the reader's `parents_all_finished` gate drains the parent fully before
+  the child starts. So two updates to the same key are never emitted out of order.
+- Eager cross-partition interleaving only reorders records of **different** keys,
+  which has no effect on the downstream materialized state.
 
-When all partitions are finished and buffer is non-empty, returns the highest buffered timestamp to force-drain everything remaining.
+#### Why the scalar offset remains the min checkpoint watermark
 
-#### Sibling group gating
+The scalar offset is the conservative checkpoint floor: `max(previous,
+min(non-finished partition offsets))`. It can lag fast partitions, but that is
+intentional. If the per-partition frontier is absent or invalid, root-mode fallback
+can safely re-read from this scalar floor without skipping records from a slower or
+not-yet-started child partition. Eager emission no longer depends on this value;
+per-partition resume is carried by the frontier.
 
-When a parent partition splits or merges, it produces child partitions that all share the same `start_timestamp`. These are **siblings**. The ReorderBuffer gates flushing on sibling-group completeness: no records from any member of a group participate in watermark computation until ALL members have been started.
+#### Per-partition checkpoint and resume
 
-This prevents the following race:
-```
-Parent A splits → B1, B2, B3, B4 (all start at T0).
-max_concurrent=3 → B1,B2,B3 start. B4 queued.
+The frontier is persisted (via `SpannerOffset.partitions` → `SpannerCdcSplit.partitions`).
+On restart the reader seeds each non-finished partition from its own offset; any
+parent referenced but absent from the frontier must have finished pre-restart and is
+marked `Finished` so the gate releases resumed children. Placeholders
+(`DeclarePartitions`) ensure not-yet-started split children appear in the frontier at
+their `start_ts`, so a restart re-reads them and never skips records they own. This is
+consistent under RisingWave's aligned checkpoints: the frontier persisted at barrier
+`E` matches exactly the records applied downstream by `E`; everything after is
+re-read (idempotent).
 
-Without gating: global_wm = min(B1,B2,B3) → emits past T0.
-B4 starts at T0 → produces data@150 (pre-DDL schema).
-Already emitted data@400 (post-DDL schema). ORDER VIOLATION!
+Partition lifecycle transitions can change the frontier without producing data rows
+(for example, a partition exhausts quietly and drops out of the frontier). The reader
+emits a checkpoint-only heartbeat for these transitions so the normal
+`SourceMessage.offset` → split-state path still persists the updated frontier.
 
-With gating: group {B1,B2,B3,B4} incomplete → buffer, don't flush.
-B4 starts → group complete → watermark advances → flush in commit-ts order.
-data@150 emitted BEFORE data@400. Correct!
-```
+If the restored split has **no** frontier (a fresh enumerator split or a legacy
+single-offset split), the reader falls back to **root mode** — start one root
+partition from the scalar offset and re-discover the tree. This is the always-correct
+migration/bootstrap path.
 
-**Spanner guarantee that enables this**: "All child partition records returned by a partition have the same start_timestamp" — sibling groups can be identified at discovery time. The parent returns ALL child partition records before its query terminates, so we know the full sibling set immediately.
+#### Monotonic schema accumulator
 
-**Design choice: start immediately, buffer, flush when group complete** (vs. spream's approach of blocking partition starts until `minWatermark` passes). Starting immediately allows parallel I/O — partition tasks read from Spanner concurrently. The BTreeMap buffer is pure in-memory computation, essentially free compared to network latency. This gives better throughput at the cost of slightly higher memory usage during the buffering window.
+Spanner embeds `column_types` in every `DataChangeRecord`. The coordinator keeps a
+per-table accumulated **superset** that only ever grows:
+
+- New column → merge in and emit an ALTER (ADD is monotonic and idempotent in meta).
+- Type change → applied only after the table has an observed schema-change timestamp
+  and `commit_ts >= last_schema_commit_ts`, so an older out-of-order record cannot
+  flip a column's type back. When the reader has a table-scoped live-schema seed
+  from `table.name`, first-seen type changes are accepted only at or after the seed
+  floor (`max` persisted partition offset); older records cannot regress the live
+  type. Shared all-table sources do not use a single global seed.
+- A record carrying **fewer** columns → no schema change, no shrink. The meta service
+  therefore never receives a subset schema and never issues a destructive DROP COLUMN.
+  Missing non-PK columns are NULL-filled downstream; convergence to the superset holds
+  under reordering.
 
 #### Graceful shutdown
 
 When RisingWave cancels the source (drop, rebalance, scale), `tx.is_closed()` triggers. The reader:
 
-1. Drains the ReorderBuffer (best-effort send)
+1. Drains the coordinator (best-effort send)
 2. Drops `tx` → `rx.recv()` returns `None` in `into_data_stream`
 3. Partition tasks detect `record_tx.is_closed()` and exit their query loops
-4. Tokio RAII cleans up `JoinHandle`s (no goroutine leaks)
+4. Tokio RAII cleans up `JoinHandle`s (no task leaks)
 
 Identical to Debezium's pattern: in-flight records lost on cancellation are re-delivered from the last checkpoint on restart (at-least-once semantics).
 
@@ -212,7 +241,8 @@ Identical to Debezium's pattern: in-flight records lost on cancellation are re-d
 │  │ SpannerCdcSplit  │ ← Persisted state, restored on restart    │
 │  │ - partition_token│                                           │
 │  │ - parent_tokens │                                           │
-│  │ - offset         │ ← ReorderBuffer watermark (monotonic)    │
+│  │ - offset         │ ← scalar checkpoint watermark (monotonic)│
+│  │ - partitions     │ ← per-partition resume frontier           │
 │  │ - index          │ ← source_id.as_raw_id() (unique per source)│
 │  └────────┬────────┘                                           │
 └───────────┼─────────────────────────────────────────────────────┘
@@ -222,8 +252,9 @@ Identical to Debezium's pattern: in-flight records lost on cancellation are re-d
 │              SourceMessage.offset (Checkpoint)                  │
 ├─────────────────────────────────────────────────────────────────┤
 │  ┌─────────────────┐                                           │
-│  │  SpannerOffset   │ ← Lightweight checkpoint format           │
-│  │ - timestamp      │ ← ReorderBuffer watermark (microseconds)  │
+│  │  SpannerOffset   │ ← Checkpoint format                       │
+│  │ - timestamp      │ ← scalar checkpoint watermark (micros)    │
+│  │ - partitions     │ ← Vec<PartitionOffset> resume frontier    │
 │  └─────────────────┘                                           │
 └───────────┼─────────────────────────────────────────────────────┘
             │ restored from checkpoint
@@ -231,26 +262,24 @@ Identical to Debezium's pattern: in-flight records lost on cancellation are re-d
 ┌─────────────────────────────────────────────────────────────────┐
 │     Runtime Coordination (In-memory, NOT persisted)             │
 ├─────────────────────────────────────────────────────────────────┤
-│  • ReorderBuffer: BTreeMap buffer + global watermark            │
-│  • Sibling group tracking: groups declared on parent finish,    │
-│    gates emission until all members started                     │
+│  • PartitionCoordinator: eager emit + per-partition offsets +   │
+│    scalar checkpoint watermark + monotonic schema accumulator   │
 │  • PendingQueue: BTreeMap<start_ts, children> — BFS ordering   │
-│    by construction (siblings before children, no runtime sort)  │
-│    Deferred children (carrying group_id) at front of bucket so  │
-│    sibling groups complete faster                                │
-│  • Schema tracking: content-only HashMap, no timestamps/locks   │
+│    by construction (parents before children, no runtime sort)  │
 │  • HashMap tracks per-partition progress (Pending/Running/Fin)  │
-│    for reader-local coordination only (not on executor split)  │
+│    for reader-local coordination (seeded from the frontier on   │
+│    resume; absent parents marked Finished)                      │
 │  • Children wait for ALL parents to finish before starting      │
-│  • Recreated on restart from persisted splits                  │
+│  • Recreated on restart from the persisted frontier (or root    │
+│    mode when the frontier is empty)                             │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
 | Layer | Purpose | Persisted |
 |-------|---------|-----------|
-| `SpannerCdcSplit` | Full partition state | Yes (state table) |
-| `SpannerOffset` | Lightweight checkpoint | Yes (message offset) |
-| Runtime coordination | ReorderBuffer + sibling groups + PendingQueue + schema | No (recreated on restart) |
+| `SpannerCdcSplit` | Scalar offset + per-partition frontier | Yes (state table) |
+| `SpannerOffset` | Checkpoint watermark + frontier | Yes (message offset) |
+| Runtime coordination | PartitionCoordinator + PendingQueue + progress | No (recreated on restart) |
 
 ---
 
@@ -498,48 +527,54 @@ Type names use the Spanner type string (e.g., `"INT64"`, `"STRING"`) and are res
 
 ### How It Works
 
-Spanner embeds `column_types` metadata in every `DataChangeRecord`. The ReorderBuffer maintains an in-memory `HashMap<String, TableSchema>` — a simple content-based comparison with no timestamps, no locks, and no watermarks.
-
-Schema correctness is guaranteed **by construction**: the ReorderBuffer drains records in commit-timestamp order (ascending BTreeMap scan). Schema changes are checked during drain, so they are always emitted in the correct order relative to data records.
+Spanner embeds `column_types` metadata in every `DataChangeRecord`. The coordinator
+maintains an in-memory per-table accumulated **superset** (`HashMap<String, TableSchema>`)
+plus a per-table `last_schema_commit_ts`. The schema only ever grows.
 
 ```
 DataChangeRecord arrives → PartitionRecord::DataChange
   │
-  ├── Buffered in BTreeMap keyed by commit_ts
-  │
-  └── On drain (when commit_ts ≤ global_watermark):
+  └── evolve_schema (eager, on arrival):
         ├── Table not yet seen?
-        │     → Insert schema; emit schema change message
+        │     → store schema; emit full schema change
         │
-        ├── Table seen, schemas differ?
-        │     → Update schema; emit schema change message
+        ├── New column(s) present?
+        │     → merge into the superset; emit ALTER with the superset
         │
-        └── Table seen, schemas same?
-              → No emit
+        ├── Type change AND commit_ts ≥ type-change floor?
+        │     → apply the new type; emit ALTER
+        │
+        └── Subset / no change?
+              → no emit, no shrink  (never a DROP)
 ```
 
-**Why this works when the old `SchemaTracker` didn't:**
+**Why this is robust without a global reorder:**
 
-The old `SchemaTracker` used per-table `(schema, last_commit_ts)` with `Arc<RwLock<SchemaTracker>>`. Partition tasks independently emitted schema changes to the shared `tx` channel. No cross-partition ordering → a slow partition's old-schema record could arrive after a fast partition had advanced the schema, causing regression.
+1. **ADD COLUMN is monotonic and order-insensitive** — whichever partition first
+   observes a new column triggers the ALTER; the meta service applies it
+   idempotently. A later record missing that column is a no-op (subset → no emit).
+2. **Never a subset → never a DROP.** The meta service treats a schema with fewer
+   columns as a DROP COLUMN (and that path is not idempotent on replay). By never
+   emitting a subset, the coordinator closes that data-loss hazard entirely.
+3. **Type changes are commit-ts gated** so an older out-of-order record cannot revert
+   a newer type. After restart, a table-scoped live-schema seed uses the max
+   persisted partition offset as the minimum safe timestamp for first-seen type
+   changes; shared sources skip seeding to avoid applying one table's schema to another.
 
-The new design eliminates this because:
-1. **All records go through the ReorderBuffer** — single-threaded, no locks
-2. **BTreeMap drain is ordered by commit_ts** — schema changes are naturally sequenced
-3. **Sibling group gating** — prevents late-joining partitions from pulling the watermark backward
-
-**Example — schema change across a DDL boundary:**
+**Example — schema change across a DDL boundary (eager + monotonic):**
 ```
-Partition B2 produces data@400 with NEW schema (column "city" added)
-Partition B4 produces data@150 with OLD schema (no "city")
+Partition (fast) produces data@400 with NEW schema (column "city" added)
+Partition (slow) produces data@150 with OLD schema (no "city")
 
-Without ReorderBuffer: B2's data emitted first, schema set to new.
-  B4's data arrives later → old schema → REGRESSION or DROP.
-
-With ReorderBuffer: Both buffered. When group completes:
-  Drain: data@150 (old schema, first seen → emit schema change)
-         data@400 (new schema → emit schema change)
-  ORDERING CORRECT: old schema before new schema.
+Fast record observed first → ALTER ADD "city"; superset = {id, name, city}.
+Slow record observed later → subset of the superset → NO schema change, NO drop.
+  Its missing "city" is NULL-filled downstream.
+Result: superset retained, no column ever lost, regardless of arrival order.
 ```
+
+> **Design note**: not propagating a real Spanner DROP COLUMN is the deliberate,
+> safe choice under "don't lose data" — a dropped source column is retained in the
+> materialized view (future upserts NULL it) rather than destructively removed.
 
 ### Schema Change Message Format
 
@@ -564,13 +599,20 @@ Schema change messages use the same Debezium JSON format as Postgres CDC, proces
 
 `ddl` is always `"UNKNOWN_DDL"` because Spanner change streams do not carry DDL text, mirroring how Postgres CDC (via Debezium) emits `"UNKNOWN_DDL"` for RELATION messages.
 
-### False-Positive on First Encounter
+### First Encounter After Restart
 
-The schema tracker is in-memory and resets on every restart. This means the first `DataChangeRecord` for each table after any startup or recovery always triggers a schema change event, even if the schema hasn't changed.
+The schema tracker is in-memory and resets on every restart. For unseeded tables,
+the first `DataChangeRecord` for each table after startup or recovery triggers a
+schema change event even if the schema has not changed.
 
 This mirrors how Postgres CDC (Debezium) works: a RELATION message is sent unconditionally at the start of each session. RisingWave's meta service deduplicates by comparing the incoming column set against the current table columns — if identical, the replace job is skipped.
 
-This design closes the **recovery gap**: if a schema change happened while the reader was down, the first record after restart will carry the new `column_types`, meta will detect the difference, and the table will be updated automatically.
+For a single tracked table (`table.name` is present), the reader seeds the
+coordinator from RisingWave's restored table schema. This suppresses false DROP
+signals from lagging subset records and allows first-seen type changes only when the
+record timestamp is at or after the seed floor. For shared all-table sources, the
+seed is skipped because the parser column list belongs to one output schema, not a
+per-table schema map.
 
 ### Enabling Schema Evolution
 
@@ -586,8 +628,8 @@ CREATE SOURCE spanner_source WITH (
 | Operation | Supported |
 |-----------|-----------|
 | ADD COLUMN | Yes |
-| DROP COLUMN | No |
-| Column type change | No |
+| Column type change | Yes (commit-ts gated; seeded restart requires record timestamp at/after seed floor) |
+| DROP COLUMN | Not propagated — column is retained, never dropped (safe under "don't lose data") |
 | Table rename | No |
 | Primary key change | No |
 
@@ -671,8 +713,9 @@ Tests require a real Spanner instance. Use the `spanner-real` risedev profile:
 ### Checkpointing & Recovery
 
 - **Full checkpoint support** via `SplitMetaData` trait
-- State persisted in RisingWave state table
-- Automatic recovery on restart from last committed offset (ReorderBuffer watermark)
+- State persisted in RisingWave state table (scalar checkpoint watermark + per-partition frontier)
+- Automatic recovery on restart: each non-finished partition resumes from its own offset
+  (frontier); falls back to root mode from the scalar offset when no frontier exists
 - Partition state machine: `Pending` → `Running` → `Finished`
 
 ### Retry with Exponential Backoff
@@ -732,12 +775,14 @@ RisingWave exposes operational metrics via Prometheus. Spanner CDC has full metr
 
 ### Schema Evolution
 
-**Supported**:
-- Adding columns (ADD COLUMN) - requires `auto.schema.change = 'true'`
+**Supported** (requires `auto.schema.change = 'true'`):
+- Adding columns (ADD COLUMN) — accumulated into a monotonic superset
+- Column type changes — applied in commit-ts order; seeded restart accepts first-seen type changes only at or after the seed floor
+
+**By design (not propagated)**:
+- Column deletion — a dropped source column is **retained** in the materialized view rather than destructively dropped (the schema only ever grows). This is the safe choice under "don't lose data".
 
 **Not Yet Implemented**:
-- Column type changes
-- Column deletion
 - Table rename
 - Primary key changes
 - Schema rollback
@@ -792,10 +837,10 @@ PROTO types are mapped to `BYTEA` and ENUM types map to `VARCHAR`. If you see NU
 |------|---------|
 | `mod.rs` | Source properties (`SpannerCdcProperties`) and connector constants |
 | `enumerator/mod.rs` | Split enumeration (`SpannerCdcSplitEnumerator`) — creates single split with `split_id = source_id.as_raw_id()` |
-| `source/reader.rs` | CDC streaming reader — partition tasks → shared channel → ReorderBuffer → ordered emission. `PendingQueue` (BTreeMap by start_ts) provides BFS scheduling by construction |
+| `source/reader.rs` | CDC streaming reader — partition tasks → shared channel → PartitionCoordinator → eager emission; stamps the checkpoint watermark + frontier; resume-mode seeding + root-mode fallback. `PendingQueue` (BTreeMap by start_ts) provides BFS scheduling by construction |
 | `source/message.rs` | `TaggedChangeRecord → SourceMessage` conversion; uses `SourceMeta::DebeziumCdc` so messages flow through the standard Debezium CDC path in `PlainParser` |
-| `reorder_buffer.rs` | ReorderBuffer: BTreeMap buffer, global watermark, sibling-group gating, content-based schema tracking. Modeled after PostgreSQL's `ReorderBuffer` for logical replication |
-| `split.rs` | Split definition (`SpannerCdcSplit`) — simple single-offset split like other CDC sources. `PartitionState` enum defined here for reader-local use |
+| `coordinator.rs` | PartitionCoordinator: eager per-partition emission, scalar checkpoint watermark, per-partition checkpoint frontier, monotonic superset schema accumulator |
+| `split.rs` | Split definition (`SpannerCdcSplit`) — scalar offset + per-partition `partitions` frontier. `PartitionState` enum defined here for reader-local use |
 | `types.rs` | Spanner data type definitions, JSON serialization, and `spanner_type_name_to_rw_type` mapping used during schema change parsing |
 
 ### Backfill (Snapshot Read)
