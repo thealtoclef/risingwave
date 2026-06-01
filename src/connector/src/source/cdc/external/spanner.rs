@@ -16,9 +16,8 @@
 //!
 //! Provides snapshot reads using Spanner's [`BatchReadOnlyTransaction`] to ensure
 //! all reads observe the same consistent snapshot. The snapshot timestamp is
-//! obtained from Spanner at CREATE TABLE time (not at CREATE SOURCE time),
-//! following the same pattern as Postgres CDC (`pg_current_wal_lsn()`) and
-//! MySQL CDC (`SHOW MASTER STATUS`).
+//! set at CREATE TABLE time (not at CREATE SOURCE time), following the same
+//! pattern as Postgres CDC (`pg_current_wal_lsn()`) and MySQL CDC (`SHOW MASTER STATUS`).
 
 use std::str::FromStr;
 use anyhow::{Context, anyhow};
@@ -28,6 +27,7 @@ use futures_async_stream::try_stream;
 use google_cloud_spanner::client::{Client, ReadOnlyTransactionOption};
 use google_cloud_spanner::statement::Statement;
 use google_cloud_spanner::transaction::Transaction;
+use time::OffsetDateTime;
 use google_cloud_spanner::value::TimestampBound;
 
 use risingwave_common::bail;
@@ -261,7 +261,7 @@ impl ExternalTableReader for SpannerExternalTableReader {
         // Return the snapshot timestamp from config (set by frontend at table creation).
         // This serves as the CDC offset for filtering changes (commit_ts > snapshot_ts).
         let timestamp = self.snapshot_ts
-            .ok_or_else(|| anyhow!("spanner.snapshot_ts not found in connect_properties"))?;
+            .ok_or_else(|| anyhow!("spanner.snapshot_ts not found in connect_properties - table must be recreated"))?;
         Ok(CdcOffset::Spanner(SpannerOffset::new(timestamp)))
     }
 
@@ -280,15 +280,15 @@ impl ExternalTableReader for SpannerExternalTableReader {
         let backfill_num_rows_per_split = options.backfill_num_rows_per_split;
         if backfill_num_rows_per_split == 0 {
             return Err(
-                anyhow::anyhow!("invalid backfill_num_rows_per_split, must be greater than 0")
+                anyhow!("invalid backfill_num_rows_per_split, must be greater than 0")
                     .into(),
             );
         }
         if options.backfill_split_pk_column_index as usize >= self.pk_names.len() {
-            return Err(anyhow::anyhow!(format!(
+            return Err(anyhow!(
                 "invalid backfill_split_pk_column_index {}, out of bound",
                 options.backfill_split_pk_column_index
-            ))
+            )
             .into());
         }
 
@@ -454,10 +454,7 @@ impl SpannerExternalTableReader {
             "PK range enumeration started (even splits)"
         );
 
-        let timestamp = google_cloud_spanner::value::Timestamp {
-            seconds: snapshot_timestamp / 1_000_000,
-            nanos: ((snapshot_timestamp % 1_000_000) * 1000) as i32,
-        };
+        let timestamp = micros_to_spanner_ts(snapshot_timestamp);
         let tb = TimestampBound::read_timestamp(timestamp);
         let txn_options = ReadOnlyTransactionOption {
             timestamp_bound: tb,
@@ -539,10 +536,7 @@ impl SpannerExternalTableReader {
             "PK range enumeration started (uneven splits)"
         );
 
-        let timestamp = google_cloud_spanner::value::Timestamp {
-            seconds: snapshot_timestamp / 1_000_000,
-            nanos: ((snapshot_timestamp % 1_000_000) * 1000) as i32,
-        };
+        let timestamp = micros_to_spanner_ts(snapshot_timestamp);
         let tb = TimestampBound::read_timestamp(timestamp);
         let txn_options = ReadOnlyTransactionOption {
             timestamp_bound: tb,
@@ -703,13 +697,9 @@ impl SpannerExternalTableReader {
         // Note: We use regular read_only_transaction (not batch) because the query
         // has LIMIT clause which cannot be partitioned.
         let snapshot_timestamp = self.snapshot_ts
-            .ok_or_else(|| anyhow!("spanner.snapshot_ts not found in connect_properties"))?;
+            .ok_or_else(|| anyhow!("spanner.snapshot_ts not found in connect_properties - table must be recreated"))?;
 
-        // Convert i64 (microseconds) to Timestamp
-        let timestamp = google_cloud_spanner::value::Timestamp {
-            seconds: snapshot_timestamp / 1_000_000,
-            nanos: ((snapshot_timestamp % 1_000_000) * 1000) as i32,
-        };
+        let timestamp = micros_to_spanner_ts(snapshot_timestamp);
         let tb = TimestampBound::read_timestamp(timestamp);
         let options = ReadOnlyTransactionOption {
             timestamp_bound: tb,
@@ -765,9 +755,9 @@ impl SpannerExternalTableReader {
         let is_first_split = left[0].is_none();
         let is_last_split = right[0].is_none();
 
-        // Get snapshot timestamp from reader state (set from config.spanner_snapshot_ts)
+        // Snapshot timestamp is guaranteed to exist by the frontend.
         let split_snapshot_ts = self.snapshot_ts
-            .ok_or_else(|| anyhow!("spanner.snapshot_ts not found in connect_properties"))?;
+            .ok_or_else(|| anyhow!("spanner.snapshot_ts not found in connect_properties - table must be recreated"))?;
 
         tracing::info!(
             "split_snapshot_read: PK range=[{:?}, {:?}), snapshot_ts={}",
@@ -776,11 +766,7 @@ impl SpannerExternalTableReader {
 
         // Create a NEW BatchReadOnlyTransaction at the exact same snapshot timestamp
         // This is the key to snapshot consistency across all actors
-        use google_cloud_spanner::value::Timestamp;
-        let timestamp = Timestamp {
-            seconds: split_snapshot_ts / 1_000_000,
-            nanos: ((split_snapshot_ts % 1_000_000) * 1000) as i32,
-        };
+        let timestamp = micros_to_spanner_ts(split_snapshot_ts);
         let tb = TimestampBound::read_timestamp(timestamp);
         let options = ReadOnlyTransactionOption {
             timestamp_bound: tb,
@@ -917,7 +903,7 @@ fn try_increase_split_id(split_id: &mut i64) -> ConnectorResult<()> {
             *split_id = s;
             Ok(())
         }
-        None => Err(anyhow::anyhow!("too many CDC snapshot splits").into()),
+        None => Err(anyhow!("too many CDC snapshot splits").into()),
     }
 }
 
@@ -1016,6 +1002,40 @@ pub(crate) async fn create_spanner_client(
     Ok(Client::new(&dsn, client_config)
         .await
         .context("failed to create Spanner client")?)
+}
+
+/// Current time as microseconds since epoch.
+pub fn now_micros() -> ConnectorResult<i64> {
+    Ok(i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| anyhow!("system clock before Unix epoch: {}", e))?
+            .as_micros(),
+    )
+    .map_err(|_| anyhow!("timestamp out of i64 range"))?)
+}
+
+/// Convert RFC3339 string to microseconds since epoch.
+pub fn rfc3339_to_micros(s: &str) -> ConnectorResult<i64> {
+    let offset = time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339)
+        .map_err(|e| anyhow!("invalid RFC3339 timestamp '{}': {}", s, e))?;
+    let nanos = offset.unix_timestamp_nanos();
+    let micros = nanos.div_euclid(1000);
+    Ok(i64::try_from(micros).map_err(|_| anyhow!("timestamp out of i64 range: {} nanos", nanos))?)
+}
+
+/// Convert microseconds since epoch to OffsetDateTime.
+pub fn micros_to_offset_datetime(micros: i64) -> ConnectorResult<OffsetDateTime> {
+    Ok(OffsetDateTime::from_unix_timestamp_nanos((micros as i128) * 1000)
+        .map_err(|e| anyhow!("invalid microseconds timestamp {}: {}", micros, e))?)
+}
+
+/// Convert microseconds since epoch to a Spanner `Timestamp`.
+fn micros_to_spanner_ts(micros: i64) -> google_cloud_spanner::value::Timestamp {
+    google_cloud_spanner::value::Timestamp {
+        seconds: micros.div_euclid(1_000_000),
+        nanos: (micros.rem_euclid(1_000_000) * 1000) as i32,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1283,5 +1303,52 @@ mod tests {
             expr,
             "(`v1` > @pk0) OR (`v1` = @pk0 AND `v2` > @pk1) OR (`v1` = @pk0 AND `v2` = @pk1 AND `v3` > @pk2)"
         );
+    }
+
+    #[test]
+    fn test_micros_to_spanner_ts_positive() {
+        let ts = micros_to_spanner_ts(1_500_000); // 1.5 seconds
+        assert_eq!(ts.seconds, 1);
+        assert_eq!(ts.nanos, 500_000_000); // 500ms in nanos
+    }
+
+    #[test]
+    fn test_micros_to_spanner_ts_zero() {
+        let ts = micros_to_spanner_ts(0);
+        assert_eq!(ts.seconds, 0);
+        assert_eq!(ts.nanos, 0);
+    }
+
+    #[test]
+    fn test_micros_to_spanner_ts_negative() {
+        // -1.5 seconds: div_euclid gives -2, rem_euclid gives 500000
+        let ts = micros_to_spanner_ts(-1_500_000);
+        assert_eq!(ts.seconds, -2);
+        assert_eq!(ts.nanos, 500_000_000);
+    }
+
+    #[test]
+    fn test_micros_to_spanner_ts_exact_second() {
+        let ts = micros_to_spanner_ts(1_000_000);
+        assert_eq!(ts.seconds, 1);
+        assert_eq!(ts.nanos, 0);
+
+        let ts = micros_to_spanner_ts(-1_000_000);
+        assert_eq!(ts.seconds, -1);
+        assert_eq!(ts.nanos, 0);
+    }
+
+    #[test]
+    fn test_micros_to_spanner_ts_sub_second() {
+        let ts = micros_to_spanner_ts(999_999);
+        assert_eq!(ts.seconds, 0);
+        assert_eq!(ts.nanos, 999_999_000);
+    }
+
+    #[test]
+    fn test_micros_to_spanner_ts_negative_one() {
+        let ts = micros_to_spanner_ts(-1);
+        assert_eq!(ts.seconds, -1);
+        assert_eq!(ts.nanos, 999_999_000);
     }
 }

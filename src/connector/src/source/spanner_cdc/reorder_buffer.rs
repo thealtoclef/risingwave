@@ -301,8 +301,17 @@ impl ReorderBuffer {
                     .push(record.into());
                 let buffered = self.buffer_len();
                 if buffered > 0 && buffered % 10_000 == 0 {
+                    let total = self.partitions.len();
+                    let finished = self.partitions.values().filter(|e| e.finished).count();
+                    let active = total - finished;
+                    let wm = self.watermark();
+                    let highest_buffered = self.buffer.keys().last().copied();
                     tracing::warn!(
                         buffered,
+                        active_partitions = active,
+                        finished_partitions = finished,
+                        ?wm,
+                        ?highest_buffered,
                         "reorder buffer growing — unstarted partition pinning watermark or downstream backpressure"
                     );
                 }
