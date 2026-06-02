@@ -45,10 +45,10 @@ impl SplitEnumerator for SpannerCdcSplitEnumerator {
         let client = properties.create_client().await?;
 
         // Validate that the change stream exists.
-        let stmt = Statement::new(format!(
-            "SELECT 1 FROM INFORMATION_SCHEMA.CHANGE_STREAMS WHERE CHANGE_STREAM_NAME = '{}'",
-            properties.change_stream_name
-        ));
+        let mut stmt = Statement::new(
+            "SELECT 1 FROM INFORMATION_SCHEMA.CHANGE_STREAMS WHERE CHANGE_STREAM_NAME = @name",
+        );
+        stmt.add_param("name", &properties.change_stream_name);
         let mut txn = client
             .single()
             .await
@@ -79,28 +79,10 @@ impl SplitEnumerator for SpannerCdcSplitEnumerator {
     }
 
     async fn list_splits(&mut self) -> ConnectorResult<Vec<SpannerCdcSplit>> {
-        // Query CURRENT_TIMESTAMP() from Spanner so the CDC start offset is from
-        // the same clock domain as commit timestamps in the change stream.
-        let client = self.properties.create_client().await?;
-        let mut txn = client
-            .single()
-            .await
-            .map_err(|e| anyhow::anyhow!("transaction: {}", e))?;
-
-        let mut rows = txn
-            .query(Statement::new("SELECT CURRENT_TIMESTAMP()"))
-            .await
-            .map_err(|e| anyhow::anyhow!("CURRENT_TIMESTAMP query: {}", e))?;
-
-        let row = rows
-            .next()
-            .await
-            .map_err(|e| anyhow::anyhow!("timestamp read: {}", e))?
-            .ok_or_else(|| anyhow::anyhow!("CURRENT_TIMESTAMP returned no rows"))?;
-
-        let offset: OffsetDateTime = row
-            .column(0)
-            .map_err(|e| anyhow::anyhow!("timestamp column: {}", e))?;
+        // Use start_ts from properties (user-provided or auto-generated at CREATE SOURCE).
+        let start_ts = self.properties.start_ts
+            .ok_or_else(|| anyhow::anyhow!("spanner.start_timestamp must be set during CREATE SOURCE"))?;
+        let offset = crate::source::cdc::external::spanner::micros_to_offset_datetime(start_ts)?;
 
         let split = SpannerCdcSplit::new_root(
             self.properties.change_stream_name.clone(),
@@ -108,12 +90,32 @@ impl SplitEnumerator for SpannerCdcSplitEnumerator {
             offset,
         );
 
-        // Report change stream timestamp metric (like pg_cdc_confirmed_flush_lsn)
-        let ts_micros = (offset.unix_timestamp_nanos() / 1_000) as i64;
-        self.metrics
-            .spanner_cdc_change_stream_timestamp
-            .with_guarded_label_values(&[&self.source_id.to_string()])
-            .set(ts_micros);
+        // Report the current Spanner timestamp as the source position metric.
+        // This queries Spanner's CURRENT_TIMESTAMP() to reflect how far along the
+        // change stream source is, assuming the reader always catches up by design.
+        let client = self.properties.create_client().await?;
+        let mut txn = client
+            .single()
+            .await
+            .map_err(|e| anyhow::anyhow!("transaction: {}", e))?;
+        let mut rows = txn
+            .query(Statement::new("SELECT CURRENT_TIMESTAMP()"))
+            .await
+            .map_err(|e| anyhow::anyhow!("CURRENT_TIMESTAMP query: {}", e))?;
+        if let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| anyhow::anyhow!("timestamp read: {}", e))?
+        {
+            let now: OffsetDateTime = row
+                .column(0)
+                .map_err(|e| anyhow::anyhow!("timestamp column: {}", e))?;
+            let ts_micros = (now.unix_timestamp_nanos() / 1_000) as i64;
+            self.metrics
+                .spanner_cdc_change_stream_timestamp
+                .with_guarded_label_values(&[&self.source_id.to_string()])
+                .set(ts_micros);
+        }
 
         tracing::debug!(
             ?offset,

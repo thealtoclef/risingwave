@@ -1114,20 +1114,17 @@ fn derive_with_options_for_cdc_table(
                 // Insert table name into connect properties
                 with_options.insert(TABLE_NAME_KEY.into(), table_name.into());
 
-                // For Spanner CDC, generate snapshot_ts at table creation time.
-                // This timestamp is used for consistent snapshot reads and CDC filtering.
-                // It must remain the same across all splits and all recoveries.
-                use risingwave_connector::source::cdc::external::SPANNER_SNAPSHOT_TS_KEY;
-                let snapshot_ts = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_micros() as i64;
+                // For Spanner CDC, auto-generate spanner.snapshot_ts from current time.
+                use risingwave_connector::source::cdc::external::{
+                    SPANNER_DATABOOST_ENABLED_KEY, SPANNER_PARTITION_QUERY_PARALLELISM_KEY,
+                    SPANNER_SNAPSHOT_TS_KEY,
+                    spanner::now_micros,
+                };
+
+                let snapshot_ts = now_micros()?;
                 with_options.insert(SPANNER_SNAPSHOT_TS_KEY.to_string(), snapshot_ts.to_string());
 
                 // Inject table-level Spanner CDC properties
-                use risingwave_connector::source::cdc::external::{
-                    SPANNER_DATABOOST_ENABLED_KEY, SPANNER_PARTITION_QUERY_PARALLELISM_KEY,
-                };
                 if let Some(parallelism) = table_with_options.get(SPANNER_PARTITION_QUERY_PARALLELISM_KEY) {
                     with_options.insert(SPANNER_PARTITION_QUERY_PARALLELISM_KEY.to_string(), parallelism.clone());
                 }

@@ -157,7 +157,8 @@ pub const TABLE_NAME_KEY: &str = "table.name";
 pub const SCHEMA_NAME_KEY: &str = "schema.name";
 pub const DATABASE_NAME_KEY: &str = "database.name";
 
-/// Spanner-specific keys for table-level properties (injected by frontend at CREATE TABLE time)
+/// Spanner-specific keys for table-level properties
+pub const SPANNER_START_TS_KEY: &str = "spanner.start_timestamp";
 pub const SPANNER_SNAPSHOT_TS_KEY: &str = "spanner.snapshot_ts";
 pub const SPANNER_PARTITION_QUERY_PARALLELISM_KEY: &str = "spanner.partition_query.parallelism";
 pub const SPANNER_DATABOOST_ENABLED_KEY: &str = "spanner.databoost.enabled";

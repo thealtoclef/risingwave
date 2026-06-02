@@ -1546,33 +1546,24 @@ SpannerCdcProperties:
     field_type: u64
     comments: 'Retry backoff factor (default: 2, meaning double each time)'
     required: false
-  - name: auto.schema.change
+  - name: spanner.start_timestamp
     field_type: String
-    comments: |-
-      Auto schema change flag - user-provided option for automatic schema evolution.
-      This is parsed and validated at CREATE SOURCE time.
-      We skip it here as it's handled by the framework, not the connector itself.
+    comments: Start timestamp for the change stream query (RFC3339 format; stored internally as microseconds since epoch)
     required: false
     default: Default::default
-  - name: spanner.snapshot_ts
+  - name: auto.schema.change
     field_type: String
-    comments: |-
-      Snapshot timestamp for Spanner CDC (set by frontend at table creation).
-      This is stored in connect_properties and used by compute for consistent reads.
+    comments: Auto schema change flag
     required: false
     default: Default::default
   - name: spanner.partition_query.parallelism
     field_type: String
-    comments: |-
-      Partition query parallelism for Spanner CDC backfill (set by frontend at table creation).
-      This is stored in connect_properties and used by compute for parallel execution.
+    comments: Partition query parallelism for Spanner CDC backfill
     required: false
     default: Default::default
   - name: spanner.databoost.enabled
     field_type: String
-    comments: |-
-      Enable databoost for Spanner CDC backfill (set by frontend at table creation).
-      This is stored in connect_properties and used by compute for databoost execution.
+    comments: Enable databoost for Spanner CDC backfill
     required: false
     default: Default::default
 TestSourceProperties:
