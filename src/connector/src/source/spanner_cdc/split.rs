@@ -28,8 +28,6 @@ use crate::source::{SplitId, SplitMetaData};
 pub enum PartitionState {
     /// Discovered via `ChildPartitionsRecord` but waiting for all parents to finish.
     Pending,
-    /// Actively reading from this partition.
-    Running,
     /// Result set exhausted — all data consumed.
     Finished,
 }

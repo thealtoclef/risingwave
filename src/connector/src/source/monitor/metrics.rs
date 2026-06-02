@@ -169,6 +169,15 @@ pub struct SourceMetrics {
 
     /// Total ack failures (RPC errors and timeouts) during checkpoint for source connectors.
     pub connector_ack_failure_count: IntCounterVec,
+
+    // Spanner CDC reorder buffer — per-source visibility into drain health.
+    pub spanner_cdc_reorder_buffer_size: LabelGuardedIntGaugeVec,
+    pub spanner_cdc_reorder_buffer_active_partitions: LabelGuardedIntGaugeVec,
+    pub spanner_cdc_reorder_buffer_pending_partitions: LabelGuardedIntGaugeVec,
+    pub spanner_cdc_reorder_buffer_watermark: LabelGuardedIntGaugeVec,
+    pub spanner_cdc_reorder_buffer_highest_buffered: LabelGuardedIntGaugeVec,
+    pub spanner_cdc_reorder_buffer_records_buffered_count: LabelGuardedIntCounterVec,
+    pub spanner_cdc_reorder_buffer_records_drained_count: LabelGuardedIntCounterVec,
 }
 
 pub static GLOBAL_SOURCE_METRICS: LazyLock<SourceMetrics> =
@@ -313,6 +322,62 @@ impl SourceMetrics {
         )
         .unwrap();
 
+        let spanner_cdc_reorder_buffer_size = register_guarded_int_gauge_vec_with_registry!(
+            "spanner_cdc_reorder_buffer_size",
+            "Current number of records in the Spanner CDC reorder buffer",
+            &["source_id"],
+            registry,
+        )
+        .unwrap();
+
+        let spanner_cdc_reorder_buffer_active_partitions = register_guarded_int_gauge_vec_with_registry!(
+            "spanner_cdc_reorder_buffer_active_partitions",
+            "Number of concurrently spawned partition tasks for Spanner CDC",
+            &["source_id"],
+            registry,
+        )
+        .unwrap();
+
+        let spanner_cdc_reorder_buffer_pending_partitions = register_guarded_int_gauge_vec_with_registry!(
+            "spanner_cdc_reorder_buffer_pending_partitions",
+            "Number of partitions queued but not yet spawned for Spanner CDC",
+            &["source_id"],
+            registry,
+        )
+        .unwrap();
+
+        let spanner_cdc_reorder_buffer_watermark = register_guarded_int_gauge_vec_with_registry!(
+            "spanner_cdc_reorder_buffer_watermark",
+            "Current watermark (microseconds since epoch) of the Spanner CDC reorder buffer",
+            &["source_id"],
+            registry,
+        )
+        .unwrap();
+
+        let spanner_cdc_reorder_buffer_highest_buffered = register_guarded_int_gauge_vec_with_registry!(
+            "spanner_cdc_reorder_buffer_highest_buffered",
+            "Highest buffered commit timestamp (microseconds since epoch) in the Spanner CDC reorder buffer",
+            &["source_id"],
+            registry,
+        )
+        .unwrap();
+
+        let spanner_cdc_reorder_buffer_records_buffered_count = register_guarded_int_counter_vec_with_registry!(
+            "spanner_cdc_reorder_buffer_records_buffered_count",
+            "Cumulative number of records buffered by the Spanner CDC reorder buffer",
+            &["source_id"],
+            registry,
+        )
+        .unwrap();
+
+        let spanner_cdc_reorder_buffer_records_drained_count = register_guarded_int_counter_vec_with_registry!(
+            "spanner_cdc_reorder_buffer_records_drained_count",
+            "Cumulative number of records drained from the Spanner CDC reorder buffer",
+            &["source_id"],
+            registry,
+        )
+        .unwrap();
+
         SourceMetrics {
             partition_input_count,
             partition_input_bytes,
@@ -333,6 +398,14 @@ impl SourceMetrics {
             kinesis_lag_latency_ms,
 
             connector_ack_failure_count,
+
+            spanner_cdc_reorder_buffer_size,
+            spanner_cdc_reorder_buffer_active_partitions,
+            spanner_cdc_reorder_buffer_pending_partitions,
+            spanner_cdc_reorder_buffer_watermark,
+            spanner_cdc_reorder_buffer_highest_buffered,
+            spanner_cdc_reorder_buffer_records_buffered_count,
+            spanner_cdc_reorder_buffer_records_drained_count,
         }
     }
 }

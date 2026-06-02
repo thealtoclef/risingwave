@@ -212,6 +212,10 @@ pub(crate) struct ReorderBuffer {
     buffer: BTreeMap<OffsetDateTime, Vec<BufferedRecord>>,
     /// Total number of records in `buffer`.
     buffered_count: usize,
+    /// Cumulative since last take.
+    records_buffered_delta: usize,
+    /// Cumulative since last take.
+    records_drained_delta: usize,
     /// In-memory schema tracker (content-only, no watermarks).
     known_schemas: HashMap<String, TableSchema>,
     /// Hard floor: the watermark never goes below this.
@@ -225,6 +229,8 @@ impl ReorderBuffer {
             partitions: HashMap::new(),
             buffer: BTreeMap::new(),
             buffered_count: 0,
+            records_buffered_delta: 0,
+            records_drained_delta: 0,
             known_schemas: HashMap::new(),
             last_emitted_watermark: None,
         }
@@ -280,21 +286,7 @@ impl ReorderBuffer {
                     .or_default()
                     .push(record.into());
                 self.buffered_count += 1;
-                if self.buffered_count % 10_000 == 0 {
-                    let total = self.partitions.len();
-                    let finished = self.partitions.values().filter(|e| e.finished).count();
-                    let active = total - finished;
-                    let wm = self.watermark();
-                    let highest_buffered = self.buffer.keys().last().copied();
-                    tracing::warn!(
-                        buffered = self.buffered_count,
-                        active_partitions = active,
-                        finished_partitions = finished,
-                        ?wm,
-                        ?highest_buffered,
-                        "reorder buffer growing — unstarted partition pinning watermark or downstream backpressure"
-                    );
-                }
+                self.records_buffered_delta += 1;
             }
         }
     }
@@ -315,6 +307,35 @@ impl ReorderBuffer {
     /// Maintained incrementally by `handle` and `drain`.
     pub fn buffer_len(&self) -> usize {
         self.buffered_count
+    }
+
+    /// Current watermark in microseconds since epoch, if any.
+    pub fn watermark_micros(&self) -> Option<i64> {
+        self.watermark()
+            .map(|t| (t.unix_timestamp_nanos() / 1000) as i64)
+    }
+
+    /// Highest buffered commit timestamp in microseconds since epoch, if any.
+    /// Used with `watermark_micros` to compute the buffer gap for diagnostics.
+    pub fn highest_buffered_micros(&self) -> Option<i64> {
+        self.buffer
+            .keys()
+            .last()
+            .map(|t| (t.unix_timestamp_nanos() / 1000) as i64)
+    }
+
+    /// Take and reset the buffered delta since last call.
+    pub fn take_records_buffered_delta(&mut self) -> usize {
+        let val = self.records_buffered_delta;
+        self.records_buffered_delta = 0;
+        val
+    }
+
+    /// Take and reset the drain delta since last call.
+    pub fn take_records_drained_delta(&mut self) -> usize {
+        let val = self.records_drained_delta;
+        self.records_drained_delta = 0;
+        val
     }
 
     /// Compute the watermark: `min(partition.offset)` across all
@@ -361,7 +382,9 @@ impl ReorderBuffer {
                 break;
             }
             let (ts, records) = entry.remove_entry();
-            self.buffered_count -= records.len();
+            let drained = records.len();
+            self.buffered_count -= drained;
+            self.records_drained_delta += drained;
             for record in records {
                 match record {
                     BufferedRecord::DataChange {

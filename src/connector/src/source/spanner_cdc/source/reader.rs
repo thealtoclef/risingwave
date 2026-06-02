@@ -35,7 +35,8 @@
 //! This ensures schema changes are always seen in commit-ts order, making it
 //! impossible for a lagging partition to regress the tracked schema.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -59,6 +60,7 @@ use crate::source::spanner_cdc::reorder_buffer::{
 use crate::source::spanner_cdc::split::PartitionState;
 use crate::source::spanner_cdc::types::ChangeStreamRecord;
 use crate::source::spanner_cdc::{SpannerCdcProperties, SpannerCdcSplit};
+use crate::source::monitor::metrics::SourceMetrics;
 use crate::source::{
     BoxSourceChunkStream, Column, SourceContextRef, SourceMessage, SourceMeta, SplitId,
     SplitReader, into_chunk_stream,
@@ -125,6 +127,7 @@ impl SplitReader for SpannerCdcSplitReader {
             retry_backoff_factor: properties.get_retry_backoff_factor(),
             source_id,
             checkpointed_offset,
+            metrics: source_ctx.metrics.clone(),
         };
 
         // Spawn background task — like Debezium spawns the JNI thread
@@ -193,6 +196,7 @@ struct ReaderContext {
     retry_backoff_factor: u64,
     source_id: u32,
     checkpointed_offset: Option<OffsetDateTime>,
+    metrics: Arc<SourceMetrics>,
 }
 
 /// Result from each partition task.
@@ -213,9 +217,14 @@ async fn run_reader(ctx: ReaderContext, tx: mpsc::Sender<Vec<SourceMessage>>) ->
     // Local HashMap for dedup and parent coordination. Not used for recovery.
     let mut partition_progress: HashMap<String, PartitionState> = HashMap::new();
 
-    // Children waiting for their parents to finish.  Kept as a simple Vec;
-    // no priority scheduling needed since all children start immediately
-    // when their parents complete.
+    // Priority queue: partitions sorted by start_ts, spawned in order.
+    // Only up to DEFAULT_CHANNEL_SIZE partitions run concurrently,
+    // with lowest start_ts always spawned first so the watermark
+    // advances as fast as possible.
+    let mut ready_queue: BTreeMap<OffsetDateTime, Vec<SpannerCdcSplit>> = BTreeMap::new();
+    let mut active_count: usize = 0;
+
+    // Children whose parents haven't all finished yet — not ready to spawn.
     let mut waiting_children: Vec<SpannerCdcSplit> = Vec::new();
 
     // Track whether the root partition (token=None) has finished.
@@ -234,6 +243,7 @@ async fn run_reader(ctx: ReaderContext, tx: mpsc::Sender<Vec<SourceMessage>>) ->
         .checkpointed_offset
         .unwrap_or_else(OffsetDateTime::now_utc);
     let mut reorder_buf = ReorderBuffer::new();
+    let source_id_str = ctx.source_id.to_string();
 
     tracing::info!(starting_offset = ?root_offset, "starting Spanner CDC reader with root partition");
 
@@ -252,25 +262,12 @@ async fn run_reader(ctx: ReaderContext, tx: mpsc::Sender<Vec<SourceMessage>>) ->
         child_discovery_tx.clone(),
         &record_tx,
     );
+    active_count += 1;
 
     // Main event loop
     loop {
         if tx.is_closed() {
-            // Graceful shutdown: RisingWave cancelled us (source dropped, rebalance, etc).
-            // Drain the ReorderBuffer and attempt a final send so the downstream
-            // can checkpoint as far as possible before we exit.
-            let mut remaining = reorder_buf.drain();
-            stamp_watermark(&mut remaining, &reorder_buf);
-            if !remaining.is_empty() {
-                tracing::info!(
-                    count = remaining.len(),
-                    "graceful shutdown: emitting buffered records"
-                );
-                // tx is closed, so send will fail — but the try makes the intent clear.
-                // Records will be re-delivered from the last checkpoint on restart.
-                let _ = tx.send(remaining).await;
-            }
-            tracing::info!("reader channel closed, stopping");
+            tracing::info!(buffered = reorder_buf.buffer_len(), "reader channel closed, discarding buffered records");
             break;
         }
 
@@ -288,7 +285,6 @@ async fn run_reader(ctx: ReaderContext, tx: mpsc::Sender<Vec<SourceMessage>>) ->
                                 *state = PartitionState::Finished;
                             }
                         } else {
-                            // Root partition (token=None) finished
                             root_finished = true;
                         }
 
@@ -300,84 +296,127 @@ async fn run_reader(ctx: ReaderContext, tx: mpsc::Sender<Vec<SourceMessage>>) ->
                                     continue;
                                 }
                             }
-                            waiting_children.push(split);
+                            if parents_all_finished(&split.parent_partition_tokens, &partition_progress, root_finished) {
+                                enqueue_ready_child(
+                                    split,
+                                    root_offset,
+                                    &mut reorder_buf,
+                                    &mut ready_queue,
+                                );
+                            } else {
+                                waiting_children.push(split);
+                            }
                         }
 
-                        // Start ALL children whose parents are ALL finished.
-                        // Registration in the reorder buffer is atomic — all
-                        // siblings get PartitionStarted before any task is
-                        // spawned, so the watermark pins at start_ts until
-                        // all siblings advance past it.
+                        // Check ALL remaining waiting_children for readiness.
                         let ready: Vec<SpannerCdcSplit> = waiting_children
                             .drain(..)
                             .collect();
                         let mut still_waiting = Vec::new();
                         for child in ready {
                             if parents_all_finished(&child.parent_partition_tokens, &partition_progress, root_finished) {
-                                let start_ts = child.offset.unwrap_or(root_offset);
-                                reorder_buf.handle(ReorderBufferEvent::PartitionStarted {
-                                    token: child.partition_token.clone(),
-                                    start_ts,
-                                });
-                                if let Some(ref token) = child.partition_token {
-                                    set_running(&mut partition_progress, token);
-                                }
-                                spawn_partition_task(
-                                    &ctx,
+                                enqueue_ready_child(
                                     child,
-                                    &split_id,
-                                    &mut partition_streams,
-                                    child_discovery_tx.clone(),
-                                    &record_tx,
+                                    root_offset,
+                                    &mut reorder_buf,
+                                    &mut ready_queue,
                                 );
                             } else {
                                 still_waiting.push(child);
                             }
                         }
                         waiting_children = still_waiting;
+
+                        // One partition finished — try to spawn the next-lowest
+                        active_count -= 1;
+                        spawn_from_queue(
+                            &mut ready_queue,
+                            &mut active_count,
+                            DEFAULT_CHANNEL_SIZE,
+                            &ctx,
+                            &split_id,
+                            &mut partition_streams,
+                            &child_discovery_tx,
+                            &record_tx,
+                        );
                     }
-                    Some(Ok(Err(e))) => return Err(e),
+                    Some(Ok(Err(e))) => {
+                        // Function returns Err, tearing down the whole reader
+                        // — active_count cleanup is irrelevant.
+                        return Err(e);
+                    }
                     Some(Err(e)) => {
                         return Err(ConnectorError::from(anyhow::anyhow!("partition task panicked: {}", e)));
                     }
                     None => {
-                        tracing::warn!(%split_id, pending = waiting_children.len(), "all partitions finished");
-                        break;
+                        spawn_from_queue(
+                            &mut ready_queue,
+                            &mut active_count,
+                            DEFAULT_CHANNEL_SIZE,
+                            &ctx,
+                            &split_id,
+                            &mut partition_streams,
+                            &child_discovery_tx,
+                            &record_tx,
+                        );
+                        if ready_queue.is_empty() && waiting_children.is_empty() {
+                            tracing::info!(%split_id, "all partitions finished");
+                            break;
+                        }
+                        // Defensive: if we have waiting children but nothing is
+                        // running, something is stuck (parent tracking bug or
+                        // Spanner data issue). Break rather than spin.
+                        if active_count == 0 {
+                            tracing::error!(
+                                %split_id,
+                                waiting = waiting_children.len(),
+                                queued = ready_queue.len(),
+                                "no active tasks but children still waiting — aborting"
+                            );
+                            break;
+                        }
                     }
                 }
             }
 
             Some(child) = child_discovery_rx.recv() => {
-                if let Some(ref token) = child.partition_token {
-                    if !register_child(&mut partition_progress, token.clone()) {
-                        tracing::debug!(token = %token, "duplicate child partition, skipping");
-                        continue;
-                    }
+                // Batch-drain pending siblings: register all atomically
+                // before spawning any, so the watermark pins at the
+                // sibling group's shared start_ts before any task runs.
+                let mut batch = vec![child];
+                while let Ok(next) = child_discovery_rx.try_recv() {
+                    batch.push(next);
                 }
-
-                // If all parents are finished, start immediately.
-                // Otherwise, hold in waiting_children — the parent's
-                // offset naturally pins the watermark at >= start_ts.
-                if parents_all_finished(&child.parent_partition_tokens, &partition_progress, root_finished) {
-                    let start_ts = child.offset.unwrap_or(root_offset);
-                    reorder_buf.handle(ReorderBufferEvent::PartitionStarted {
-                        token: child.partition_token.clone(),
-                        start_ts,
-                    });
+                for child in batch {
                     if let Some(ref token) = child.partition_token {
-                        set_running(&mut partition_progress, token);
+                        if !register_child(&mut partition_progress, token.clone()) {
+                            tracing::debug!(token = %token, "duplicate child partition, skipping");
+                            continue;
+                        }
                     }
-                    spawn_partition_task(
-                        &ctx,
-                        child,
-                        &split_id,
-                        &mut partition_streams,
-                        child_discovery_tx.clone(),
-                        &record_tx,
-                    );
-                } else {
-                    waiting_children.push(child);
+                    if parents_all_finished(&child.parent_partition_tokens, &partition_progress, root_finished) {
+                        enqueue_ready_child(
+                            child,
+                            root_offset,
+                            &mut reorder_buf,
+                                &mut ready_queue,
+                            );
+                    } else {
+                        // Parent not done yet — hold until parent finishes.
+                        // The parent's offset naturally pins the watermark at >= start_ts.
+                        waiting_children.push(child);
+                    }
                 }
+                spawn_from_queue(
+                    &mut ready_queue,
+                    &mut active_count,
+                    DEFAULT_CHANNEL_SIZE,
+                    &ctx,
+                    &split_id,
+                    &mut partition_streams,
+                    &child_discovery_tx,
+                    &record_tx,
+                );
             }
 
             Some(tagged) = record_rx.recv() => {
@@ -385,7 +424,6 @@ async fn run_reader(ctx: ReaderContext, tx: mpsc::Sender<Vec<SourceMessage>>) ->
                     partition_token: tagged.partition_token,
                     record: tagged.record,
                 });
-                // Batch: drain remaining messages without blocking
                 while let Ok(tagged) = record_rx.try_recv() {
                     reorder_buf.handle(ReorderBufferEvent::Record {
                         partition_token: tagged.partition_token,
@@ -395,9 +433,47 @@ async fn run_reader(ctx: ReaderContext, tx: mpsc::Sender<Vec<SourceMessage>>) ->
             }
         }
 
-        // Drain and emit after every event — single drain point, no data loss
+        // Drain and emit after every event
         let mut batch = reorder_buf.drain();
         stamp_watermark(&mut batch, &reorder_buf);
+
+        // Report reorder buffer metrics
+        let metrics = &ctx.metrics;
+        metrics.spanner_cdc_reorder_buffer_size
+            .with_guarded_label_values(&[&source_id_str])
+            .set(reorder_buf.buffer_len() as i64);
+        metrics.spanner_cdc_reorder_buffer_active_partitions
+            .with_guarded_label_values(&[&source_id_str])
+            .set(active_count as i64);
+        let pending: usize = ready_queue.values().map(|v| v.len()).sum();
+        metrics.spanner_cdc_reorder_buffer_pending_partitions
+            .with_guarded_label_values(&[&source_id_str])
+            .set(pending as i64);
+        if let Some(wm) = reorder_buf.watermark_micros() {
+            metrics.spanner_cdc_reorder_buffer_watermark
+                .with_guarded_label_values(&[&source_id_str])
+                .set(wm);
+        }
+        if let Some(hb) = reorder_buf.highest_buffered_micros() {
+            metrics.spanner_cdc_reorder_buffer_highest_buffered
+                .with_guarded_label_values(&[&source_id_str])
+                .set(hb);
+        }
+
+        // Cumulative deltas → rate() in Prometheus
+        let buffered_delta = reorder_buf.take_records_buffered_delta();
+        let drained_delta = reorder_buf.take_records_drained_delta();
+        if buffered_delta > 0 {
+            metrics.spanner_cdc_reorder_buffer_records_buffered_count
+                .with_guarded_label_values(&[&source_id_str])
+                .inc_by(buffered_delta as u64);
+        }
+        if drained_delta > 0 {
+            metrics.spanner_cdc_reorder_buffer_records_drained_count
+                .with_guarded_label_values(&[&source_id_str])
+                .inc_by(drained_delta as u64);
+        }
+
         if !batch.is_empty() && tx.send(batch).await.is_err() {
             break;
         }
@@ -449,7 +525,7 @@ fn parents_all_finished(
                 // Unknown token — assume it's the root partition's
                 // Spanner-assigned token (root has token=None internally).
                 if !root_finished {
-                    tracing::debug!(
+                    tracing::trace!(
                         parent_token = %p,
                         "unknown parent token, assuming root partition (not yet finished)"
                     );
@@ -460,9 +536,50 @@ fn parents_all_finished(
     })
 }
 
-fn set_running(partition_progress: &mut HashMap<String, PartitionState>, token: &str) {
-    if let Some(state) = partition_progress.get_mut(token) {
-        *state = PartitionState::Running;
+/// Enqueue a ready child: register in the reorder buffer, then push into the priority queue.
+fn enqueue_ready_child(
+    child: SpannerCdcSplit,
+    root_offset: OffsetDateTime,
+    reorder_buf: &mut ReorderBuffer,
+    ready_queue: &mut BTreeMap<OffsetDateTime, Vec<SpannerCdcSplit>>,
+) {
+    let start_ts = child.offset.unwrap_or(root_offset);
+    // Register in reorder buffer at queue time — pins watermark correctly.
+    reorder_buf.handle(ReorderBufferEvent::PartitionStarted {
+        token: child.partition_token.clone(),
+        start_ts,
+    });
+    ready_queue.entry(start_ts).or_default().push(child);
+}
+
+/// Spawn up to max_active concurrently, always picking the lowest start_ts first.
+fn spawn_from_queue(
+    ready_queue: &mut BTreeMap<OffsetDateTime, Vec<SpannerCdcSplit>>,
+    active_count: &mut usize,
+    max_active: usize,
+    ctx: &ReaderContext,
+    split_id: &SplitId,
+    partition_streams: &mut FuturesUnordered<tokio::task::JoinHandle<Result<PartitionResult>>>,
+    child_discovery_tx: &tokio::sync::mpsc::UnboundedSender<SpannerCdcSplit>,
+    record_tx: &mpsc::Sender<TaggedPartitionRecord>,
+) {
+    while *active_count < max_active {
+        let Some(mut entry) = ready_queue.first_entry() else {
+            break;
+        };
+        let split = entry.get_mut().pop().unwrap();
+        if entry.get().is_empty() {
+            entry.remove();
+        }
+        spawn_partition_task(
+            ctx,
+            split,
+            split_id,
+            partition_streams,
+            child_discovery_tx.clone(),
+            record_tx,
+        );
+        *active_count += 1;
     }
 }
 
@@ -765,5 +882,136 @@ fn stamp_watermark(batch: &mut [SourceMessage], reorder_buf: &ReorderBuffer) {
         }
     } else if !batch.is_empty() {
         tracing::error!("stamp_watermark called with wm_micros=0 on non-empty batch — this indicates a logic error in drain/watermark coordination");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use time::OffsetDateTime;
+    use time::macros::datetime;
+
+    use super::*;
+    use crate::source::spanner_cdc::reorder_buffer::{ReorderBuffer, ReorderBufferEvent};
+
+    fn make_split(token: &str, offset: OffsetDateTime) -> SpannerCdcSplit {
+        SpannerCdcSplit::new_child(
+            token.to_string(),
+            vec![],
+            offset,
+            "test_stream".to_string(),
+            0,
+        )
+    }
+
+    #[test]
+    fn enqueue_ready_child_registers_in_reorder_buffer() {
+        let mut reorder_buf = ReorderBuffer::new();
+        let mut ready_queue: BTreeMap<OffsetDateTime, Vec<SpannerCdcSplit>> = BTreeMap::new();
+        let ts = datetime!(2026-01-01 0:00 UTC);
+        let split = make_split("token-a", ts);
+
+        enqueue_ready_child(split, ts, &mut reorder_buf, &mut ready_queue);
+
+        // Reorder buffer has the partition with offset == start_ts
+        assert_eq!(reorder_buf.buffer_len(), 0, "no records buffered");
+        assert_eq!(ready_queue.len(), 1, "one start_ts bucket");
+        assert_eq!(ready_queue.get(&ts).unwrap().len(), 1, "one split in bucket");
+        assert_eq!(
+            ready_queue
+                .get(&ts)
+                .unwrap()[0]
+                .partition_token,
+            Some("token-a".to_string()),
+            "correct token"
+        );
+    }
+
+    #[test]
+    fn enqueue_ready_child_falls_back_to_root_offset() {
+        let mut reorder_buf = ReorderBuffer::new();
+        let mut ready_queue: BTreeMap<OffsetDateTime, Vec<SpannerCdcSplit>> = BTreeMap::new();
+        let root_offset = datetime!(2026-01-01 0:00 UTC);
+        // Construct a split with offset=None — the fallback path
+        let split = SpannerCdcSplit {
+            partition_token: Some("no-offset".to_string()),
+            parent_partition_tokens: vec![],
+            offset: None,
+            change_stream_name: "test_stream".to_string(),
+            index: 0,
+        };
+
+        enqueue_ready_child(split, root_offset, &mut reorder_buf, &mut ready_queue);
+
+        assert_eq!(ready_queue.len(), 1);
+        assert!(ready_queue.contains_key(&root_offset), "fell back to root_offset");
+        assert_eq!(ready_queue.get(&root_offset).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn ready_queue_orders_lowest_start_ts_first() {
+        let mut reorder_buf = ReorderBuffer::new();
+        let mut ready_queue: BTreeMap<OffsetDateTime, Vec<SpannerCdcSplit>> = BTreeMap::new();
+        let root_offset = datetime!(2026-01-01 0:00 UTC);
+
+        let t1 = datetime!(2026-06-02 0:00 UTC); // latest
+        let t2 = datetime!(2026-05-29 0:00 UTC); // earliest
+        let t3 = datetime!(2026-06-01 0:00 UTC); // middle
+
+        enqueue_ready_child(make_split("late", t1), root_offset, &mut reorder_buf, &mut ready_queue);
+        enqueue_ready_child(make_split("early", t2), root_offset, &mut reorder_buf, &mut ready_queue);
+        enqueue_ready_child(make_split("mid", t3), root_offset, &mut reorder_buf, &mut ready_queue);
+
+        let entry = ready_queue.first_entry().unwrap();
+        assert_eq!(*entry.key(), t2, "first_entry is the lowest start_ts");
+        assert_eq!(entry.get().len(), 1, "one split at earliest ts");
+        assert_eq!(
+            entry.get()[0].partition_token,
+            Some("early".to_string()),
+            "earliest split is 'early'"
+        );
+
+        // Verify iteration order
+        let all_ts: Vec<OffsetDateTime> = ready_queue.keys().copied().collect();
+        assert_eq!(all_ts, vec![t2, t3, t1], "ascending order: May29, Jun1, Jun2");
+    }
+
+    #[test]
+    fn ready_queue_groups_siblings_same_start_ts() {
+        let mut reorder_buf = ReorderBuffer::new();
+        let mut ready_queue: BTreeMap<OffsetDateTime, Vec<SpannerCdcSplit>> = BTreeMap::new();
+        let root_offset = datetime!(2026-01-01 0:00 UTC);
+        let shared_ts = datetime!(2026-05-29 0:00 UTC);
+
+        enqueue_ready_child(make_split("sib-a", shared_ts), root_offset, &mut reorder_buf, &mut ready_queue);
+        enqueue_ready_child(make_split("sib-b", shared_ts), root_offset, &mut reorder_buf, &mut ready_queue);
+        enqueue_ready_child(make_split("sib-c", shared_ts), root_offset, &mut reorder_buf, &mut ready_queue);
+
+        assert_eq!(ready_queue.len(), 1, "single start_ts bucket for siblings");
+        let siblings = ready_queue.get(&shared_ts).unwrap();
+        assert_eq!(siblings.len(), 3, "three siblings grouped together");
+        assert!(siblings.iter().all(|s| s.offset == Some(shared_ts)), "all share same start_ts");
+    }
+
+    #[test]
+    fn enqueue_ready_child_registers_before_spawning_any_siblings() {
+        let mut reorder_buf = ReorderBuffer::new();
+        let mut ready_queue: BTreeMap<OffsetDateTime, Vec<SpannerCdcSplit>> = BTreeMap::new();
+        let root_offset = datetime!(2026-01-01 0:00 UTC);
+        let shared_ts = datetime!(2026-05-29 0:00 UTC);
+
+        // Enqueue sibling A — it registers, but B is not yet enqueued
+        let split_a = make_split("sib-a", shared_ts);
+        enqueue_ready_child(split_a, root_offset, &mut reorder_buf, &mut ready_queue);
+
+        // At this point, only sibling A is registered
+        assert_eq!(ready_queue.get(&shared_ts).unwrap().len(), 1);
+
+        // Enqueue sibling B — now both are registered, still no spawn
+        let split_b = make_split("sib-b", shared_ts);
+        enqueue_ready_child(split_b, root_offset, &mut reorder_buf, &mut ready_queue);
+
+        assert_eq!(ready_queue.get(&shared_ts).unwrap().len(), 2, "both siblings registered before any spawn");
     }
 }
