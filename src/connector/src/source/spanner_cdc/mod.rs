@@ -89,17 +89,6 @@ pub struct SpannerCdcProperties {
     #[serde(rename = "spanner.emulator_host")]
     pub emulator_host: Option<String>,
 
-    /// Maximum concurrent change stream partition queries per reader (default: 5).
-    ///
-    /// The shared reader reads from multiple partitions concurrently.
-    /// The default of 5 provides a balance between throughput and resource usage.
-    ///
-    /// Spanner enforces a hard limit on total concurrent change-stream queries per database.
-    /// Adjust this value based on your partition count and available query budget.
-    #[serde_as(as = "Option<DisplayFromStr>")]
-    #[serde(rename = "spanner.change_stream.max_concurrent_partitions")]
-    pub change_stream_max_concurrent_partitions: Option<u32>,
-
     /// Retry attempts for transient failures (default: 3)
     #[serde_as(as = "Option<DisplayFromStr>")]
     #[serde(rename = "spanner.retry_attempts")]
@@ -194,11 +183,6 @@ impl crate::source::UnknownFields for SpannerCdcProperties {
 }
 
 impl SpannerCdcProperties {
-    /// Get max concurrent partitions per reader (default: 5).
-    pub fn get_change_stream_max_concurrent_partitions(&self) -> usize {
-        self.change_stream_max_concurrent_partitions.unwrap_or(5) as usize
-    }
-
     /// Get retry attempts (default: 3)
     pub fn get_retry_attempts(&self) -> u32 {
         self.retry_attempts.unwrap_or(3)

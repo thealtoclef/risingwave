@@ -35,7 +35,7 @@
 //! This ensures schema changes are always seen in commit-ts order, making it
 //! impossible for a lagging partition to regress the tracked schema.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::HashMap;
 
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -118,7 +118,6 @@ impl SplitReader for SpannerCdcSplitReader {
             client,
             database_name: properties.database.clone(),
             change_stream_name: properties.change_stream_name.clone(),
-            max_concurrent_partitions: properties.get_change_stream_max_concurrent_partitions(),
             heartbeat_interval_ms,
             retry_attempts: properties.get_retry_attempts(),
             retry_backoff: properties.get_retry_backoff(),
@@ -187,7 +186,6 @@ struct ReaderContext {
     client: Client,
     database_name: String,
     change_stream_name: String,
-    max_concurrent_partitions: usize,
     heartbeat_interval_ms: i64,
     retry_attempts: u32,
     retry_backoff: std::time::Duration,
@@ -208,149 +206,23 @@ struct TaggedPartitionRecord {
     record: PartitionRecord,
 }
 
-/// Key for grouping child partitions by (parent_tokens, start_ts).
-/// Children from the same parent split/merge share the same (parents, start_timestamp).
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct ChildGroupKey {
-    parent_tokens: Vec<String>, // sorted
-    start_ts: OffsetDateTime,
-}
-
-/// A child partition waiting to be started.
-struct PendingChild {
-    split: SpannerCdcSplit,
-}
-
-/// Pending child partition queue ordered by start_ts for BFS scheduling.
-///
-/// Backed by a `BTreeMap<OffsetDateTime, VecDeque<PendingChild>>` so children
-/// are yielded in ascending start_ts order by construction — no explicit sort
-/// needed. Within the same start_ts bucket, deferred children (pushed via
-/// [`push_deferred`]) are at the front, newly discovered children at the back.
-///
-/// [`push_deferred`]: PendingQueue::push_deferred
-struct PendingQueue {
-    children: BTreeMap<OffsetDateTime, VecDeque<PendingChild>>,
-}
-
-impl PendingQueue {
-    fn new() -> Self {
-        Self {
-            children: BTreeMap::new(),
-        }
-    }
-
-    /// Total number of pending children across all start_ts buckets.
-    fn len(&self) -> usize {
-        self.children.values().map(|b| b.len()).sum()
-    }
-
-    /// Add a newly discovered child (back of its start_ts bucket).
-    fn push(&mut self, child: PendingChild) {
-        let ts = child.split.offset.unwrap_or_else(OffsetDateTime::now_utc);
-        self.children.entry(ts).or_default().push_back(child);
-    }
-
-    /// Add a deferred child (front of its start_ts bucket).
-    /// Deferred children are processed before newly discovered ones at the same start_ts.
-    fn push_deferred(&mut self, child: PendingChild) {
-        let ts = child.split.offset.unwrap_or_else(OffsetDateTime::now_utc);
-        self.children.entry(ts).or_default().push_front(child);
-    }
-
-    /// Drain all children whose parents are finished, in BFS order (ascending start_ts).
-    /// Not-ready children remain in the queue.
-    fn drain_ready(
-        &mut self,
-        partition_progress: &HashMap<String, PartitionState>,
-    ) -> Vec<PendingChild> {
-        let mut ready = Vec::new();
-        let keys: Vec<OffsetDateTime> = self.children.keys().copied().collect();
-        for key in keys {
-            let bucket = self.children.get_mut(&key).unwrap();
-            let mut still_pending = VecDeque::new();
-            for child in bucket.drain(..) {
-                if parents_all_finished(&child.split.parent_partition_tokens, partition_progress) {
-                    ready.push(child);
-                } else {
-                    still_pending.push_back(child);
-                }
-            }
-            if still_pending.is_empty() {
-                self.children.remove(&key);
-            } else {
-                // bucket is already drained, write back the not-ready ones
-                self.children.insert(key, still_pending);
-            }
-        }
-        ready
-    }
-
-    /// Pop the lowest-start_ts child whose parents are finished.
-    /// Returns `None` if no ready children exist.
-    ///
-    /// Scans buckets in key order; O(buckets) in the worst case but bounded by
-    /// `max_concurrent` in practice.
-    fn pop_ready(
-        &mut self,
-        partition_progress: &HashMap<String, PartitionState>,
-    ) -> Option<PendingChild> {
-        let mut found_child: Option<PendingChild> = None;
-        for bucket in self.children.values_mut() {
-            let mut not_ready = VecDeque::new();
-            while let Some(child) = bucket.pop_front() {
-                if parents_all_finished(&child.split.parent_partition_tokens, partition_progress) {
-                    found_child = Some(child);
-                    break;
-                } else {
-                    not_ready.push_back(child);
-                }
-            }
-            // Rebuild bucket: not_ready (front) + remaining items (back)
-            let remaining: VecDeque<_> = bucket.drain(..).collect();
-            *bucket = not_ready;
-            bucket.extend(remaining);
-            if found_child.is_some() {
-                break;
-            }
-        }
-        self.children.retain(|_, b| !b.is_empty());
-        found_child
-    }
-}
-
-/// Collect all ready children from `pending_children` and `child_discovery_rx`.
-/// Returns children in BFS order (ascending start_ts) by construction.
-fn collect_ready_children(
-    pending_children: &mut PendingQueue,
-    child_discovery_rx: &mut tokio::sync::mpsc::UnboundedReceiver<SpannerCdcSplit>,
-    partition_progress: &mut HashMap<String, PartitionState>,
-) -> Vec<PendingChild> {
-    // Register newly arrived children into the queue (goes to the right bucket by start_ts)
-    while let Ok(split) = child_discovery_rx.try_recv() {
-        if let Some(ref token) = split.partition_token {
-            if !register_child(partition_progress, token.clone()) {
-                continue; // duplicate
-            }
-        }
-        pending_children.push(PendingChild { split });
-    }
-
-    // Drain all ready children — BFS order by construction
-    pending_children.drain_ready(partition_progress)
-}
-
 async fn run_reader(ctx: ReaderContext, tx: mpsc::Sender<Vec<SourceMessage>>) -> Result<()> {
     let mut partition_streams: FuturesUnordered<tokio::task::JoinHandle<Result<PartitionResult>>> =
         FuturesUnordered::new();
 
-    let max_concurrent = ctx.max_concurrent_partitions;
-    let mut active_count: usize = 0;
-
     // Local HashMap for dedup and parent coordination. Not used for recovery.
     let mut partition_progress: HashMap<String, PartitionState> = HashMap::new();
 
-    let mut pending_children = PendingQueue::new();
+    // Children waiting for their parents to finish.  Kept as a simple Vec;
+    // no priority scheduling needed since all children start immediately
+    // when their parents complete.
+    let mut waiting_children: Vec<SpannerCdcSplit> = Vec::new();
+
+    // Track whether the root partition (token=None) has finished.
+    // The root is not tracked in partition_progress (which uses String keys),
+    // so we need a separate flag for parents_all_finished.
+    let mut root_finished: bool = false;
+
     let (child_discovery_tx, mut child_discovery_rx) =
         tokio::sync::mpsc::unbounded_channel::<SpannerCdcSplit>();
 
@@ -372,7 +244,6 @@ async fn run_reader(ctx: ReaderContext, tx: mpsc::Sender<Vec<SourceMessage>>) ->
         start_ts: root_offset,
     });
 
-    active_count += 1;
     spawn_partition_task(
         &ctx,
         root_split,
@@ -416,94 +287,63 @@ async fn run_reader(ctx: ReaderContext, tx: mpsc::Sender<Vec<SourceMessage>>) ->
                             if let Some(state) = partition_progress.get_mut(token) {
                                 *state = PartitionState::Finished;
                             }
+                        } else {
+                            // Root partition (token=None) finished
+                            root_finished = true;
                         }
 
-                        // Collect ready children — BFS order by construction (PendingQueue)
-                        let ready_children = collect_ready_children(
-                            &mut pending_children, &mut child_discovery_rx,
-                            &mut partition_progress,
-                        );
-
-                        // Group all ready children by (sorted parent tokens, start_ts)
-                        let mut groups: HashMap<ChildGroupKey, Vec<PendingChild>> = HashMap::new();
-                        for child in ready_children {
-                            let mut parents = child.split.parent_partition_tokens.clone();
-                            parents.sort();
-                            let key = ChildGroupKey {
-                                parent_tokens: parents,
-                                start_ts: child.split.offset.unwrap_or(root_offset),
-                            };
-                            groups.entry(key).or_default().push(child);
-                        }
-
-                        // Start children in each group
-                        for (_key, children) in groups {
-                            let tokens: Vec<Option<String>> = children
-                                .iter()
-                                .map(|c| c.split.partition_token.clone())
-                                .collect();
-                            // All children in this group share the same start_ts
-                            let group_start_ts = children
-                                .first()
-                                .and_then(|c| c.split.offset)
-                                .unwrap_or(root_offset);
-                            reorder_buf.handle(ReorderBufferEvent::DeclarePartitions {
-                                tokens,
-                                start_ts: group_start_ts,
-                            });
-
-                            for child in children {
-                                if active_count >= max_concurrent {
-                                    pending_children.push_deferred(child);
+                        // Drain child_discovery_rx (non-blocking) to collect
+                        // any children discovered while the parent was running.
+                        while let Ok(split) = child_discovery_rx.try_recv() {
+                            if let Some(ref token) = split.partition_token {
+                                if !register_child(&mut partition_progress, token.clone()) {
                                     continue;
                                 }
-                                let start_ts =
-                                    child.split.offset.unwrap_or(root_offset);
-                                if let Some(ref token) = child.split.partition_token {
-                                    set_running(&mut partition_progress, token);
-                                }
+                            }
+                            waiting_children.push(split);
+                        }
+
+                        // Start ALL children whose parents are ALL finished.
+                        // Registration in the reorder buffer is atomic — all
+                        // siblings get PartitionStarted before any task is
+                        // spawned, so the watermark pins at start_ts until
+                        // all siblings advance past it.
+                        let ready: Vec<SpannerCdcSplit> = waiting_children
+                            .drain(..)
+                            .collect();
+                        let mut still_waiting = Vec::new();
+                        for child in ready {
+                            if parents_all_finished(&child.parent_partition_tokens, &partition_progress, root_finished) {
+                                let start_ts = child.offset.unwrap_or(root_offset);
                                 reorder_buf.handle(ReorderBufferEvent::PartitionStarted {
-                                    token: child.split.partition_token.clone(),
+                                    token: child.partition_token.clone(),
                                     start_ts,
                                 });
-                                active_count += 1;
+                                if let Some(ref token) = child.partition_token {
+                                    set_running(&mut partition_progress, token);
+                                }
                                 spawn_partition_task(
                                     &ctx,
-                                    child.split,
+                                    child,
                                     &split_id,
                                     &mut partition_streams,
                                     child_discovery_tx.clone(),
                                     &record_tx,
                                 );
+                            } else {
+                                still_waiting.push(child);
                             }
                         }
+                        waiting_children = still_waiting;
                     }
                     Some(Ok(Err(e))) => return Err(e),
                     Some(Err(e)) => {
                         return Err(ConnectorError::from(anyhow::anyhow!("partition task panicked: {}", e)));
                     }
                     None => {
-                        tracing::warn!(%split_id, pending = pending_children.len(), "all partitions finished");
+                        tracing::warn!(%split_id, pending = waiting_children.len(), "all partitions finished");
                         break;
                     }
-                }
-
-                active_count = active_count.saturating_sub(1);
-
-                // Try starting pending children (non-parent-triggered path).
-                // These children were already declared via DeclarePartitions
-                // when their parent finished — placeholders are in place.
-                while active_count < max_concurrent {
-                    if let Some(child) = pending_children.pop_ready(&partition_progress) {
-                        if let Some(ref token) = child.split.partition_token { set_running(&mut partition_progress, token); }
-                        let start_ts = child.split.offset.unwrap_or(root_offset);
-                        reorder_buf.handle(ReorderBufferEvent::PartitionStarted {
-                            token: child.split.partition_token.clone(),
-                            start_ts,
-                        });
-                        active_count += 1;
-                        spawn_partition_task(&ctx, child.split, &split_id, &mut partition_streams, child_discovery_tx.clone(), &record_tx);
-                    } else { break; }
                 }
             }
 
@@ -514,12 +354,30 @@ async fn run_reader(ctx: ReaderContext, tx: mpsc::Sender<Vec<SourceMessage>>) ->
                         continue;
                     }
                 }
-                pending_children.push(PendingChild {
-                    split: child,
-                });
-                // Children are started by the PartitionFinished arm (Arm 1),
-                // which groups children by (parent_tokens, start_ts) and
-                // declares partitions with placeholders before starting them.
+
+                // If all parents are finished, start immediately.
+                // Otherwise, hold in waiting_children — the parent's
+                // offset naturally pins the watermark at >= start_ts.
+                if parents_all_finished(&child.parent_partition_tokens, &partition_progress, root_finished) {
+                    let start_ts = child.offset.unwrap_or(root_offset);
+                    reorder_buf.handle(ReorderBufferEvent::PartitionStarted {
+                        token: child.partition_token.clone(),
+                        start_ts,
+                    });
+                    if let Some(ref token) = child.partition_token {
+                        set_running(&mut partition_progress, token);
+                    }
+                    spawn_partition_task(
+                        &ctx,
+                        child,
+                        &split_id,
+                        &mut partition_streams,
+                        child_discovery_tx.clone(),
+                        &record_tx,
+                    );
+                } else {
+                    waiting_children.push(child);
+                }
             }
 
             Some(tagged) = record_rx.recv() => {
@@ -527,6 +385,13 @@ async fn run_reader(ctx: ReaderContext, tx: mpsc::Sender<Vec<SourceMessage>>) ->
                     partition_token: tagged.partition_token,
                     record: tagged.record,
                 });
+                // Batch: drain remaining messages without blocking
+                while let Ok(tagged) = record_rx.try_recv() {
+                    reorder_buf.handle(ReorderBufferEvent::Record {
+                        partition_token: tagged.partition_token,
+                        record: tagged.record,
+                    });
+                }
             }
         }
 
@@ -575,12 +440,23 @@ fn register_child(partition_progress: &mut HashMap<String, PartitionState>, toke
 fn parents_all_finished(
     parent_tokens: &[String],
     partition_progress: &HashMap<String, PartitionState>,
+    root_finished: bool,
 ) -> bool {
     parent_tokens.iter().all(|p| {
-        partition_progress
-            .get(p)
-            .map(|state| *state == PartitionState::Finished)
-            .unwrap_or(false)
+        match partition_progress.get(p) {
+            Some(state) => *state == PartitionState::Finished,
+            None => {
+                // Unknown token — assume it's the root partition's
+                // Spanner-assigned token (root has token=None internally).
+                if !root_finished {
+                    tracing::debug!(
+                        parent_token = %p,
+                        "unknown parent token, assuming root partition (not yet finished)"
+                    );
+                }
+                root_finished
+            }
+        }
     })
 }
 
@@ -888,248 +764,6 @@ fn stamp_watermark(batch: &mut [SourceMessage], reorder_buf: &ReorderBuffer) {
             msg.offset = offset_str.clone();
         }
     } else if !batch.is_empty() {
-        tracing::warn!("stamp_watermark called with wm_micros=0, messages will carry empty offset");
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Helper: make a split with given token, offset, and parent tokens.
-    fn make_split(token: &str, offset: OffsetDateTime, parents: Vec<&str>) -> SpannerCdcSplit {
-        SpannerCdcSplit {
-            partition_token: Some(token.to_string()),
-            parent_partition_tokens: parents.iter().map(|p| p.to_string()).collect(),
-            offset: Some(offset),
-            change_stream_name: String::new(),
-            index: 0,
-        }
-    }
-
-    /// Helper: mark a parent as Finished in partition_progress.
-    fn finish_parent(progress: &mut HashMap<String, PartitionState>, token: &str) {
-        progress.insert(token.to_string(), PartitionState::Finished);
-    }
-
-    fn ts(sec: i64) -> OffsetDateTime {
-        OffsetDateTime::from_unix_timestamp(sec).unwrap()
-    }
-
-    // ---------------------------------------------------------------
-    // BFS ordering: ascending start_ts by construction
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn pending_queue_yields_in_start_ts_order() {
-        let mut q = PendingQueue::new();
-        let mut progress = HashMap::new();
-        finish_parent(&mut progress, "P1");
-
-        // Push children at different start_ts, out of order
-        q.push(PendingChild {
-            split: make_split("C3", ts(300), vec!["P1"]),
-        });
-        q.push(PendingChild {
-            split: make_split("C1", ts(100), vec!["P1"]),
-        });
-        q.push(PendingChild {
-            split: make_split("C2", ts(200), vec!["P1"]),
-        });
-
-        let ready = q.drain_ready(&progress);
-        let tokens: Vec<&str> = ready
-            .iter()
-            .map(|c| c.split.partition_token.as_deref().unwrap())
-            .collect();
-        assert_eq!(
-            tokens,
-            vec!["C1", "C2", "C3"],
-            "should yield in ascending start_ts order"
-        );
-    }
-
-    // ---------------------------------------------------------------
-    // Deferred children go to front of their bucket
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn pending_queue_deferred_children_have_priority_within_same_ts() {
-        let mut q = PendingQueue::new();
-        let mut progress = HashMap::new();
-        finish_parent(&mut progress, "P1");
-
-        // New child at ts=100
-        q.push(PendingChild {
-            split: make_split("NEW", ts(100), vec!["P1"]),
-        });
-        // Deferred child at ts=100 (should come out first)
-        q.push_deferred(PendingChild {
-            split: make_split("DEFERRED", ts(100), vec!["P1"]),
-        });
-
-        let ready = q.drain_ready(&progress);
-        let tokens: Vec<&str> = ready
-            .iter()
-            .map(|c| c.split.partition_token.as_deref().unwrap())
-            .collect();
-        assert_eq!(
-            tokens,
-            vec!["DEFERRED", "NEW"],
-            "deferred should come before new at same ts"
-        );
-    }
-
-    // ---------------------------------------------------------------
-    // Not-ready children stay in queue
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn pending_queue_not_ready_children_stay() {
-        let mut q = PendingQueue::new();
-        let mut progress = HashMap::new();
-        // P1 not finished — children won't be ready
-
-        q.push(PendingChild {
-            split: make_split("C1", ts(100), vec!["P1"]),
-        });
-        q.push(PendingChild {
-            split: make_split("C2", ts(200), vec!["P1"]),
-        });
-
-        let ready = q.drain_ready(&progress);
-        assert!(ready.is_empty(), "no parents finished → nothing ready");
-        assert_eq!(q.len(), 2, "both children still pending");
-
-        // Now finish P1
-        finish_parent(&mut progress, "P1");
-        let ready = q.drain_ready(&progress);
-        assert_eq!(ready.len(), 2);
-        assert_eq!(q.len(), 0);
-    }
-
-    // ---------------------------------------------------------------
-    // pop_ready: single lowest-ts ready child
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn pending_queue_pop_ready_returns_lowest_ts() {
-        let mut q = PendingQueue::new();
-        let mut progress = HashMap::new();
-        finish_parent(&mut progress, "P1");
-
-        q.push(PendingChild {
-            split: make_split("C2", ts(200), vec!["P1"]),
-        });
-        q.push(PendingChild {
-            split: make_split("C1", ts(100), vec!["P1"]),
-        });
-
-        let child = q.pop_ready(&progress).unwrap();
-        assert_eq!(child.split.partition_token.as_deref(), Some("C1"));
-        assert_eq!(q.len(), 1);
-    }
-
-    // ---------------------------------------------------------------
-    // pop_ready: skips not-ready, returns next ready
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn pending_queue_pop_ready_skips_not_ready() {
-        let mut q = PendingQueue::new();
-        let mut progress = HashMap::new();
-        finish_parent(&mut progress, "P1");
-        // P2 NOT finished
-
-        q.push(PendingChild {
-            split: make_split("C1", ts(100), vec!["P2"]), // not ready
-        });
-        q.push(PendingChild {
-            split: make_split("C2", ts(200), vec!["P1"]), // ready
-        });
-
-        let child = q.pop_ready(&progress).unwrap();
-        assert_eq!(
-            child.split.partition_token.as_deref(),
-            Some("C2"),
-            "skip C1 (P2 not finished), return C2"
-        );
-        assert_eq!(q.len(), 1, "C1 still pending");
-    }
-
-    // ---------------------------------------------------------------
-    // Overflow: all children preserved when pushed via continue
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn pending_queue_overflow_preserves_all_children() {
-        // Simulates the overflow pattern from the reader loop:
-        // push_deferred(child) + continue (not break).
-        // All overflow children must survive.
-        let mut q = PendingQueue::new();
-        let mut progress = HashMap::new();
-        finish_parent(&mut progress, "P1");
-
-        // Push 4 children at ts=100 as deferred (overflow)
-        for i in 0..4 {
-            q.push_deferred(PendingChild {
-                split: make_split(&format!("OV{i}"), ts(100), vec!["P1"]),
-            });
-        }
-
-        // Plus 2 new children at ts=200
-        q.push(PendingChild {
-            split: make_split("NEW1", ts(200), vec!["P1"]),
-        });
-        q.push(PendingChild {
-            split: make_split("NEW2", ts(200), vec!["P1"]),
-        });
-
-        assert_eq!(q.len(), 6, "all 6 children must be in queue");
-
-        // Drain all — BFS order: ts=100 first, then ts=200
-        let ready = q.drain_ready(&progress);
-        assert_eq!(ready.len(), 6, "all 6 children drained");
-
-        // ts=100 bucket: all 4 deferred children must be present (order within
-        // bucket is an implementation detail of push_deferred, not a contract).
-        let ts100_tokens: Vec<&str> = ready[0..4]
-            .iter()
-            .map(|c| c.split.partition_token.as_deref().unwrap())
-            .collect();
-        let mut ts100_sorted = ts100_tokens.clone();
-        ts100_sorted.sort();
-        assert_eq!(ts100_sorted, vec!["OV0", "OV1", "OV2", "OV3"]);
-
-        // ts=200 bucket (new children, FIFO order):
-        let ts200_tokens: Vec<&str> = ready[4..6]
-            .iter()
-            .map(|c| c.split.partition_token.as_deref().unwrap())
-            .collect();
-        assert_eq!(ts200_tokens, vec!["NEW1", "NEW2"]);
-    }
-
-    #[test]
-    fn pending_queue_is_empty_and_len() {
-        let mut q = PendingQueue::new();
-        assert_eq!(q.len(), 0);
-
-        q.push(PendingChild {
-            split: make_split("C1", ts(100), vec!["P1"]),
-        });
-        assert!(q.len() > 0);
-        assert_eq!(q.len(), 1);
-
-        q.push(PendingChild {
-            split: make_split("C2", ts(200), vec!["P1"]),
-        });
-        assert_eq!(q.len(), 2);
-
-        // Drain everything
-        let mut progress = HashMap::new();
-        finish_parent(&mut progress, "P1");
-        let ready = q.drain_ready(&progress);
-        assert_eq!(ready.len(), 2);
-        assert_eq!(q.len(), 0);
+        tracing::error!("stamp_watermark called with wm_micros=0 on non-empty batch — this indicates a logic error in drain/watermark coordination");
     }
 }

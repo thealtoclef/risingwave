@@ -185,7 +185,6 @@ Example RisingWave SQL:
       spanner.instance = '{SPANNER_INSTANCE}',
       database.name = '{SPANNER_DATABASE}',
       spanner.change_stream.name = '{STREAM_NAME}',
-      spanner.change_stream.max_concurrent_partitions = 10,
       spanner.heartbeat_interval = '5s',
       auto.schema.change = 'true'
   );

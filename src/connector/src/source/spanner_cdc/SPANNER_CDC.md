@@ -167,21 +167,16 @@ global_watermark = max(
 
 When all partitions are finished and buffer is non-empty, returns the highest buffered timestamp to force-drain everything remaining.
 
-#### Sibling group gating
+#### Sibling group atomicity
 
-When a parent partition splits or merges, it produces child partitions that all share the same `start_timestamp`. These are **siblings**. The ReorderBuffer gates flushing on sibling-group completeness: no records from any member of a group participate in watermark computation until ALL members have been started.
+When a parent partition splits or merges, it produces child partitions that all share the same `start_timestamp`. These are **siblings**. The reader registers ALL siblings atomically with `PartitionStarted` before spawning any of their tasks, so the watermark naturally pins at `start_ts` until all siblings advance past it.
 
 This prevents the following race:
 ```
 Parent A splits → B1, B2, B3, B4 (all start at T0).
-max_concurrent=3 → B1,B2,B3 start. B4 queued.
 
-Without gating: global_wm = min(B1,B2,B3) → emits past T0.
-B4 starts at T0 → produces data@150 (pre-DDL schema).
-Already emitted data@400 (post-DDL schema). ORDER VIOLATION!
-
-With gating: group {B1,B2,B3,B4} incomplete → buffer, don't flush.
-B4 starts → group complete → watermark advances → flush in commit-ts order.
+All siblings registered atomically → watermark pinned at T0.
+B1..B4 start reading → advance past T0 → watermark advances → flush in order.
 data@150 emitted BEFORE data@400. Correct!
 ```
 
@@ -232,12 +227,8 @@ Identical to Debezium's pattern: in-flight records lost on cancellation are re-d
 │     Runtime Coordination (In-memory, NOT persisted)             │
 ├─────────────────────────────────────────────────────────────────┤
 │  • ReorderBuffer: BTreeMap buffer + global watermark            │
-│  • Sibling group tracking: groups declared on parent finish,    │
-│    gates emission until all members started                     │
-│  • PendingQueue: BTreeMap<start_ts, children> — BFS ordering   │
-│    by construction (siblings before children, no runtime sort)  │
-│    Deferred children (carrying group_id) at front of bucket so  │
-│    sibling groups complete faster                                │
+│  • Sibling atomicity: all children registered with              │
+│    PartitionStarted before any task spawned                     │
 │  • Schema tracking: content-only HashMap, no timestamps/locks   │
 │  • HashMap tracks per-partition progress (Pending/Running/Fin)  │
 │    for reader-local coordination only (not on executor split)  │
@@ -250,7 +241,7 @@ Identical to Debezium's pattern: in-flight records lost on cancellation are re-d
 |-------|---------|-----------|
 | `SpannerCdcSplit` | Full partition state | Yes (state table) |
 | `SpannerOffset` | Lightweight checkpoint | Yes (message offset) |
-| Runtime coordination | ReorderBuffer + sibling groups + PendingQueue + schema | No (recreated on restart) |
+| Runtime coordination | ReorderBuffer + sibling atomicity + schema tracking | No (recreated on restart) |
 
 ---
 
@@ -281,7 +272,6 @@ Identical to Debezium's pattern: in-flight records lost on cancellation are re-d
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `spanner.change_stream.max_concurrent_partitions` | `5` | Maximum concurrent change stream partitions to query per reader |
 | `spanner.heartbeat_interval` | `3s` | Heartbeat interval for partition health monitoring |
 | `spanner.start_timestamp` | current time | Start timestamp for the change stream query (RFC3339 format) |
 | `table.name` | - | Filter by upstream table (set via `TABLE 'name'` in CREATE TABLE) |
@@ -319,8 +309,7 @@ CREATE SOURCE spanner_cdc_source WITH (
     database.name = 'my-database',
     spanner.change_stream.name = 'my_stream',
     spanner.credentials_path = '/secrets/spanner-sa.json',
-    spanner.heartbeat_interval = '5s',
-    spanner.change_stream.max_concurrent_partitions = '10'
+    spanner.heartbeat_interval = '5s'
 ) FORMAT PLAIN ENCODE JSON;
 
 CREATE TABLE users FROM spanner_cdc_source TABLE 'users';
@@ -792,9 +781,9 @@ PROTO types are mapped to `BYTEA` and ENUM types map to `VARCHAR`. If you see NU
 |------|---------|
 | `mod.rs` | Source properties (`SpannerCdcProperties`) and connector constants |
 | `enumerator/mod.rs` | Split enumeration (`SpannerCdcSplitEnumerator`) — creates single split with `split_id = source_id.as_raw_id()` |
-| `source/reader.rs` | CDC streaming reader — partition tasks → shared channel → ReorderBuffer → ordered emission. `PendingQueue` (BTreeMap by start_ts) provides BFS scheduling by construction |
+| `source/reader.rs` | CDC streaming reader — partition tasks → shared channel → ReorderBuffer → ordered emission. Atomic sibling registration ensures ordering safety |
 | `source/message.rs` | `TaggedChangeRecord → SourceMessage` conversion; uses `SourceMeta::DebeziumCdc` so messages flow through the standard Debezium CDC path in `PlainParser` |
-| `reorder_buffer.rs` | ReorderBuffer: BTreeMap buffer, global watermark, sibling-group gating, content-based schema tracking. Modeled after PostgreSQL's `ReorderBuffer` for logical replication |
+| `reorder_buffer.rs` | ReorderBuffer: BTreeMap buffer, global watermark, content-based schema tracking. Modeled after PostgreSQL's `ReorderBuffer` for logical replication |
 | `split.rs` | Split definition (`SpannerCdcSplit`) — simple single-offset split like other CDC sources. `PartitionState` enum defined here for reader-local use |
 | `types.rs` | Spanner data type definitions, JSON serialization, and `spanner_type_name_to_rw_type` mapping used during schema change parsing |
 

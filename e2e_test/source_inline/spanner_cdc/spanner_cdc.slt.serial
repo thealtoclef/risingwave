@@ -63,7 +63,6 @@ statement ok
 CREATE SOURCE spanner_source WITH (
     ${RISEDEV_SPANNER_WITH_OPTIONS_COMMON},
     spanner.change_stream.name = 'test_stream',
-    spanner.change_stream.max_concurrent_partitions = 10,
     spanner.heartbeat_interval = '5s',
     auto.schema.change = 'true'
 );
