@@ -126,27 +126,46 @@ pub struct SpannerCdcProperties {
     #[serde(rename = "spanner.retry_backoff_factor")]
     pub retry_backoff_factor: Option<u64>,
 
-    /// Auto schema change flag - user-provided option for automatic schema evolution.
-    /// This is parsed and validated at CREATE SOURCE time.
-    /// We skip it here as it's handled by the framework, not the connector itself.
+    /// Start timestamp for the change stream query (RFC3339 format)
+    #[serde(rename = "spanner.start_timestamp", default)]
+    #[serde(deserialize_with = "crate::deserialize_i64_from_string_opt")]
+    pub start_ts: Option<i64>,
+
+    // ---------------------------------------------------------------------------
+    // Fields below are NOT read by the Spanner CDC connector itself.
+    //
+    // They exist because the meta service deserialises the combined
+    // source + table properties (built by `derive_with_options_for_cdc_table`
+    // in the frontend) into this struct via `ConnectorProperties::extract`.
+    // If a key present in the combined map has no matching serde field here,
+    // it lands in `unknown_fields` and gets rejected when
+    // `deny_unknown_fields = true`.
+    //
+    // Table-level options are set at CREATE TABLE time and injected into
+    // `CdcTableDesc.connect_properties` by `derive_with_options_for_cdc_table`.
+    //
+    // DO NOT REMOVE — removing any of these will break CREATE SOURCE or
+    // CREATE TABLE for Spanner CDC.
+    // ---------------------------------------------------------------------------
+
+    /// Auto schema change flag
     #[serde(rename = "auto.schema.change", default)]
     #[serde(skip_serializing)]
     _auto_schema_change: Option<String>,
 
-    /// Snapshot timestamp for Spanner CDC (set by frontend at table creation).
-    /// This is stored in connect_properties and used by compute for consistent reads.
+    /// Snapshot timestamp for Spanner CDC (microseconds since epoch).
+    /// i64 type provides a free validity check on the stored value.
     #[serde(rename = "spanner.snapshot_ts", default)]
+    #[serde(deserialize_with = "crate::deserialize_i64_from_string_opt")]
     #[serde(skip_serializing)]
-    _snapshot_ts: Option<String>,
+    _snapshot_ts: Option<i64>,
 
-    /// Partition query parallelism for Spanner CDC backfill (set by frontend at table creation).
-    /// This is stored in connect_properties and used by compute for parallel execution.
+    /// Partition query parallelism for Spanner CDC backfill
     #[serde(rename = "spanner.partition_query.parallelism", default)]
     #[serde(skip_serializing)]
     _partition_query_parallelism: Option<String>,
 
-    /// Enable databoost for Spanner CDC backfill (set by frontend at table creation).
-    /// This is stored in connect_properties and used by compute for databoost execution.
+    /// Enable databoost for Spanner CDC backfill
     #[serde(rename = "spanner.databoost.enabled", default)]
     #[serde(skip_serializing)]
     _databoost_enabled: Option<String>,
