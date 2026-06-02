@@ -234,6 +234,7 @@ Created → Scheduled → Running → Finished
 |-----------|---------|-------------|
 | `spanner.change_stream.max_concurrent_partitions` | `5` | Maximum concurrent change stream partitions to query per reader |
 | `spanner.heartbeat_interval` | `3s` | Heartbeat interval for partition health monitoring |
+| `spanner.start_timestamp` | current time | Start timestamp for the change stream query (RFC3339 format) |
 | `table.name` | - | Filter by upstream table (set via `TABLE 'name'` in CREATE TABLE) |
 
 #### Retry Configuration
@@ -521,8 +522,8 @@ When you create a table FROM a Spanner CDC source, RisingWave performs:
 - DataBoost can be enabled via `spanner.databoost.enabled` for large tables
 
 **Timestamp Coordination**:
-- Backfill uses its own snapshot timestamp from Spanner's TrueTime
-- CDC streaming starts from `CURRENT_TIMESTAMP()` at source creation time
+- Backfill uses `spanner.snapshot_ts` (auto-generated at table creation time)
+- CDC streaming starts from `spanner.start_timestamp` (user-provided or auto-generated at source creation time)
 - `CdcBackfillExecutor` coordinates the two phases automatically
 
 ### Rate Limiting
