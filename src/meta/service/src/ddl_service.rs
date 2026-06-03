@@ -1437,7 +1437,7 @@ impl DdlService for DdlServiceImpl {
                 let dropped: Vec<_> = original_columns.difference(&new_columns).collect();
                 if !dropped.is_empty() {
                     self.meta_metrics
-                        .auto_schema_change_drop_ignored_cnt
+                        .auto_schema_change_failure_cnt
                         .with_guarded_label_values(&[&table.id.to_string(), &table.name])
                         .inc();
                     tracing::warn!(target: "auto_schema_change",
