@@ -1356,16 +1356,6 @@ impl DdlService for DdlServiceImpl {
             for table in tables {
                 // Since we only support ADD COLUMN (add-only), we detect new columns
                 // via set difference and detect type changes by checking original columns.
-                let original_columns: HashSet<(String, DataType)> =
-                    HashSet::from_iter(table.columns.iter().filter_map(|col| {
-                        let col = ColumnCatalog::from(col.clone());
-                        if col.is_generated() || col.is_hidden() {
-                            None
-                        } else {
-                            Some((col.column_desc.name.clone(), col.data_type().clone()))
-                        }
-                    }));
-
                 let mut new_columns: HashSet<(String, DataType)> =
                     HashSet::from_iter(table_change.columns.iter().filter_map(|col| {
                         let col = ColumnCatalog::from(col.clone());
@@ -1376,10 +1366,10 @@ impl DdlService for DdlServiceImpl {
                         }
                     }));
 
-                // For difference computation, we need to add visible connector additional columns
-                // defined by INCLUDE in the original table to new_columns.
-                // This includes both _rw columns and user-defined INCLUDE columns
-                // (e.g., INCLUDE TIMESTAMP AS xxx).
+                // Build original columns and add visible connector additional columns
+                // defined by INCLUDE (e.g., INCLUDE TIMESTAMP AS xxx) to new_columns
+                // in a single pass over the existing table columns.
+                let mut original_columns: HashSet<(String, DataType)> = HashSet::new();
                 for col in &table.columns {
                     let col = ColumnCatalog::from(col.clone());
                     if col.is_connector_additional_column()
@@ -1387,6 +1377,10 @@ impl DdlService for DdlServiceImpl {
                         && !col.is_generated()
                     {
                         new_columns.insert((col.column_desc.name.clone(), col.data_type().clone()));
+                    }
+                    if !col.is_generated() && !col.is_hidden() {
+                        original_columns
+                            .insert((col.column_desc.name.clone(), col.data_type().clone()));
                     }
                 }
 
