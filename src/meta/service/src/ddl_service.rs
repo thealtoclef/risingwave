@@ -1424,6 +1424,7 @@ impl DdlService for DdlServiceImpl {
                             table_change.upstream_ddl.clone(),
                             &self.env.event_log_manager_ref(),
                             fail_info,
+                            "type_change",
                         );
                         return Err(Status::invalid_argument(
                             "CDC auto schema change does not support changing column type",
@@ -1438,7 +1439,7 @@ impl DdlService for DdlServiceImpl {
                 if !dropped.is_empty() {
                     self.meta_metrics
                         .auto_schema_change_failure_cnt
-                        .with_guarded_label_values(&[&table.id.to_string(), &table.name])
+                        .with_guarded_label_values(&[&table.id.to_string(), &table.name, "ignored_drop"])
                         .inc();
                     tracing::warn!(target: "auto_schema_change",
                                     table_id = %table.id,
@@ -1590,6 +1591,7 @@ impl DdlService for DdlServiceImpl {
                                         table_change.upstream_ddl.clone(),
                                         &self.env.event_log_manager_ref(),
                                         fail_info,
+                                        "replace_failed",
                                     );
                                 }
                             };
@@ -1613,6 +1615,7 @@ impl DdlService for DdlServiceImpl {
                             table_change.upstream_ddl.clone(),
                             &self.env.event_log_manager_ref(),
                             fail_info,
+                            "get_plan_failed",
                         );
                     }
                 };
@@ -1975,10 +1978,11 @@ fn add_auto_schema_change_fail_event_log(
     upstream_ddl: String,
     event_log_manager: &EventLogManagerRef,
     fail_info: String,
+    reason: &str,
 ) {
     meta_metrics
         .auto_schema_change_failure_cnt
-        .with_guarded_label_values(&[&table_id.to_string(), &table_name])
+        .with_guarded_label_values(&[&table_id.to_string(), &table_name, reason])
         .inc();
     let event = event_log::EventAutoSchemaChangeFail {
         table_id,
