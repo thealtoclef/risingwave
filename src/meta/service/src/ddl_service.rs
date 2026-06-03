@@ -1390,7 +1390,6 @@ impl DdlService for DdlServiceImpl {
                     }
                 }
 
-                // Pre-build name→type lookup from original columns for O(1) type checks.
                 let original_type_of: HashMap<&str, &DataType> = original_columns
                     .iter()
                     .map(|(n, dt)| (n.as_str(), dt))
