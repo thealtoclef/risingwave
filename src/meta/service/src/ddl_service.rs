@@ -1436,6 +1436,10 @@ impl DdlService for DdlServiceImpl {
                 // Ignore upstream dropped columns via the symmetric set difference.
                 let dropped: Vec<_> = original_columns.difference(&new_columns).collect();
                 if !dropped.is_empty() {
+                    self.meta_metrics
+                        .auto_schema_change_drop_ignored_cnt
+                        .with_guarded_label_values(&[&table.id.to_string(), &table.name])
+                        .inc();
                     tracing::warn!(target: "auto_schema_change",
                                     table_id = %table.id,
                                     cdc_table_id = table.cdc_table_id,

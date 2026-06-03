@@ -240,6 +240,7 @@ pub struct MetaMetrics {
     // ********************************** Auto Schema Change ************************************
     pub auto_schema_change_failure_cnt: LabelGuardedIntCounterVec,
     pub auto_schema_change_success_cnt: LabelGuardedIntCounterVec,
+    pub auto_schema_change_drop_ignored_cnt: LabelGuardedIntCounterVec,
     pub auto_schema_change_latency: LabelGuardedHistogramVec,
 
     pub time_travel_version_replay_latency: Histogram,
@@ -691,6 +692,14 @@ impl MetaMetrics {
         )
         .unwrap();
 
+        let auto_schema_change_drop_ignored_cnt = register_guarded_int_counter_vec_with_registry!(
+            "auto_schema_change_drop_ignored_cnt",
+            "Number of auto schema change events where upstream dropped columns were ignored",
+            &["table_id", "table_name"],
+            registry
+        )
+        .unwrap();
+
         let opts = histogram_opts!(
             "auto_schema_change_latency",
             "Latency of the auto schema change process",
@@ -1038,6 +1047,7 @@ impl MetaMetrics {
             compaction_event_loop_iteration_latency,
             auto_schema_change_failure_cnt,
             auto_schema_change_success_cnt,
+            auto_schema_change_drop_ignored_cnt,
             auto_schema_change_latency,
             merge_compaction_group_count,
             time_travel_version_replay_latency,
