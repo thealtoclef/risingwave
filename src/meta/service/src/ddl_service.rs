@@ -1390,14 +1390,18 @@ impl DdlService for DdlServiceImpl {
                     }
                 }
 
+                // Pre-build name→type lookup from original columns for O(1) type checks.
+                let original_type_of: HashMap<&str, &DataType> = original_columns
+                    .iter()
+                    .map(|(n, dt)| (n.as_str(), dt))
+                    .collect();
+
                 // Detect new columns and type changes via set difference on the
                 // original (name, type) pairs directly.
                 let mut added_column_names = HashSet::new();
                 for (name, incoming_type) in new_columns.difference(&original_columns) {
                     // Check if this column name already exists with a different type.
-                    if let Some((_, original_type)) =
-                        original_columns.iter().find(|(n, _)| n == name)
-                    {
+                    if let Some(original_type) = original_type_of.get(name.as_str()) {
                         // Same name, different type → type change is unsupported.
                         tracing::warn!(
                             target: "auto_schema_change",
