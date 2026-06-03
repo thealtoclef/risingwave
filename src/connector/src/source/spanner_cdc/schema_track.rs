@@ -12,282 +12,216 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Schema evolution for Spanner CDC using embedded schema in change records.
+//! Schema tracker for Spanner CDC.
 //!
 //! Spanner change streams include `column_types` metadata with every data change record.
-//! This module tracks schema by comparing the `column_types` in each record with the
-//! previously known schema, triggering schema evolution when differences are detected.
+//! This module tracks schema per table and emits Debezium-compatible schema change messages
+//! when the schema evolves.
 //!
-//! This approach is event-based (not polling) and ensures schema changes are detected
-//! immediately when the first data record with the new schema arrives, preventing any
-//! data loss from race conditions.
+//! Within a single partition, Spanner guarantees commit-timestamp order, so no
+//! cross-partition guard is needed. The tracker is per-partition (no locks, no sharing).
 
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::collections::HashMap;
 
-use tokio::sync::RwLock;
-
-use crate::error::ConnectorResult;
 use crate::source::spanner_cdc::types::{ColumnType, DataChangeRecord, SpannerType};
 
 /// Schema information derived from Spanner's column_types
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TableSchema {
-    pub table_name: String,
-    pub columns: Vec<ColumnSchema>,
+struct TableSchema {
+    columns: Vec<ColumnSchema>,
 }
 
 /// Column schema derived from Spanner ColumnType
-///
-/// This struct wraps ColumnType with additional comparison capabilities
-/// for schema evolution detection.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ColumnSchema {
-    pub name: String,
-    /// The Spanner type (directly from ColumnType)
-    pub spanner_type: SpannerType,
-    pub is_primary_key: bool,
-    pub ordinal_position: i64,
+struct ColumnSchema {
+    name: String,
+    spanner_type: SpannerType,
 }
 
 impl ColumnSchema {
-    /// Create a ColumnSchema from Spanner's ColumnType
-    pub fn from_column_type(ct: &ColumnType) -> ConnectorResult<Self> {
-        Ok(Self {
+    fn from_column_type(ct: &ColumnType) -> Self {
+        Self {
             name: ct.name.clone(),
             spanner_type: ct.spanner_type.clone(),
-            is_primary_key: ct.is_primary_key,
-            ordinal_position: ct.ordinal_position,
-        })
+        }
     }
 }
 
-/// Schema tracker that compares column_types from each record
-pub struct SchemaTracker {
-    /// Map of table_name -> known schema
-    known_schemas: Arc<RwLock<HashMap<String, TableSchema>>>,
+/// Schema tracker.
+///
+/// Owned by a single partition task — no locks, no sharing.
+/// Each partition task creates its own tracker.
+pub(crate) struct SchemaTracker {
+    /// table_name → schema
+    schemas: HashMap<String, TableSchema>,
 }
 
 impl SchemaTracker {
-    /// Create a new schema tracker
     pub fn new() -> Self {
         Self {
-            known_schemas: Arc::new(RwLock::new(HashMap::new())),
+            schemas: HashMap::new(),
         }
     }
 
     /// Check a data change record for schema changes.
     ///
-    /// Returns `Some(json_bytes)` if a schema change should be emitted, `None` otherwise.
-    ///
-    /// On first encounter with a table, always emits a schema change (false positive approach,
-    /// let meta deduplicate — same as Postgres).
-    /// On subsequent encounters, emits only if `compare_schemas` detects a change.
-    pub async fn check_and_evolve(
-        &self,
-        record: &DataChangeRecord,
-    ) -> ConnectorResult<Option<Vec<u8>>> {
-        let table_name = record.table_name.clone();
+    /// Returns `Some(SourceMessage)` if a schema change should be emitted before the data
+    /// records, `None` otherwise.
+    pub fn check_and_evolve(
+        &mut self,
+        data_change: &DataChangeRecord,
+    ) -> Option<SchemaChangePayload> {
+        let table_name = &data_change.table_name;
+        let new_columns: Vec<ColumnSchema> = data_change
+            .column_types
+            .iter()
+            .map(ColumnSchema::from_column_type)
+            .collect();
 
-        // Extract schema from column_types
-        let new_schema = Self::extract_schema_from_record(record)?;
-
-        // Get the old schema (if any)
-        let old_schema = {
-            let schemas = self.known_schemas.read().await;
-            schemas.get(&table_name).cloned()
-        };
-
-        match old_schema {
+        match self.schemas.get(table_name) {
             None => {
-                // First encounter: always emit schema change (false positive, let meta deduplicate)
-                let mut schemas = self.known_schemas.write().await;
-                schemas.insert(table_name.clone(), new_schema.clone());
-                let json = Self::format_as_debezium_json(&table_name, &new_schema)?;
-                Ok(Some(json))
+                // First encounter: always emit (false positive, let meta deduplicate — same as Postgres).
+                let payload = self.make_payload(table_name, &new_columns);
+                self.schemas.insert(
+                    table_name.to_string(),
+                    TableSchema {
+                        columns: new_columns,
+                    },
+                );
+                Some(payload)
             }
-            Some(old_schema) => {
-                // Subsequent encounter: emit only if schema changed
-                if Self::schemas_differ(&old_schema, &new_schema) {
-                    let mut schemas = self.known_schemas.write().await;
-                    schemas.insert(table_name.clone(), new_schema.clone());
-                    let json = Self::format_as_debezium_json(&table_name, &new_schema)?;
-                    Ok(Some(json))
-                } else {
-                    Ok(None)
+            Some(entry) => {
+                // Content check: emit only if schema actually changed.
+                if schemas_equal(&entry.columns, &new_columns) {
+                    return None;
                 }
+                let payload = self.make_payload(table_name, &new_columns);
+                self.schemas.insert(
+                    table_name.to_string(),
+                    TableSchema {
+                        columns: new_columns,
+                    },
+                );
+                Some(payload)
             }
         }
     }
 
-    /// Format the schema as a Debezium-compatible JSON schema change message.
-    ///
-    /// Emits a JSON structure compatible with the Debezium schema change format so that
-    /// `parse_schema_change` in `debezium.rs` can process it directly.
-    fn format_as_debezium_json(
-        table_name: &str,
-        schema: &TableSchema,
-    ) -> ConnectorResult<Vec<u8>> {
-        use serde_json::json;
-
-        let columns: Vec<serde_json::Value> = schema
-            .columns
+    /// Build a Debezium-compatible schema change JSON payload.
+    fn make_payload(&self, table_name: &str, columns: &[ColumnSchema]) -> SchemaChangePayload {
+        let cols: Vec<serde_json::Value> = columns
             .iter()
             .map(|col| {
-                json!({
+                serde_json::json!({
                     "name": col.name,
                     "typeName": col.spanner_type.to_type_string(),
                 })
             })
             .collect();
 
-        let payload = json!({
+        let payload = serde_json::json!({
             "ddl": "UNKNOWN_DDL",
             "tableChanges": [{
                 "id": table_name,
                 "type": "ALTER",
-                "table": {
-                    "columns": columns,
-                },
+                "table": { "columns": cols },
             }],
         });
 
-        serde_json::to_vec(&payload)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize schema change JSON: {}", e).into())
-    }
-
-    /// Extract schema from a data change record's column_types
-    fn extract_schema_from_record(record: &DataChangeRecord) -> ConnectorResult<TableSchema> {
-        let columns = record
-            .column_types
-            .iter()
-            .map(ColumnSchema::from_column_type)
-            .collect::<ConnectorResult<Vec<_>>>()?;
-
-        Ok(TableSchema {
-            table_name: record.table_name.clone(),
-            columns,
-        })
-    }
-
-    /// Compare two schemas. Returns `true` if any column was added, dropped, or changed type.
-    fn schemas_differ(old_schema: &TableSchema, new_schema: &TableSchema) -> bool {
-        let old_columns: HashMap<&str, &ColumnSchema> = old_schema
-            .columns
-            .iter()
-            .map(|col| (col.name.as_str(), col))
-            .collect();
-
-        let new_columns: HashMap<&str, &ColumnSchema> = new_schema
-            .columns
-            .iter()
-            .map(|col| (col.name.as_str(), col))
-            .collect();
-
-        let all_names: HashSet<&str> = old_columns
-            .keys()
-            .chain(new_columns.keys())
-            .copied()
-            .collect();
-
-        for name in all_names {
-            match (old_columns.get(name), new_columns.get(name)) {
-                (Some(old_col), Some(new_col)) => {
-                    if old_col.spanner_type != new_col.spanner_type {
-                        return true;
-                    }
-                }
-                (None, Some(_)) | (Some(_), None) => return true,
-                (None, None) => unreachable!(),
-            }
+        SchemaChangePayload {
+            json: serde_json::to_vec(&payload)
+                .expect("schema change JSON serialization is infallible"),
         }
-        false
-    }
-
-    /// Get the current known schema for a table (for testing/debugging)
-    pub async fn get_schema(&self, table_name: &str) -> Option<TableSchema> {
-        let schemas = self.known_schemas.read().await;
-        schemas.get(table_name).cloned()
-    }
-
-    /// Manually set a schema (useful for initialization or testing)
-    pub async fn set_schema(&self, schema: TableSchema) {
-        let mut schemas = self.known_schemas.write().await;
-        schemas.insert(schema.table_name.clone(), schema);
     }
 }
 
+/// Result from `SchemaTracker::check_and_evolve`.
+pub(crate) struct SchemaChangePayload {
+    pub json: Vec<u8>,
+}
 
-impl Default for SchemaTracker {
-    fn default() -> Self {
-        Self::new()
+/// Compare column schemas by name and type (cheap, no allocation).
+fn schemas_equal(old: &[ColumnSchema], new: &[ColumnSchema]) -> bool {
+    if old.len() != new.len() {
+        return false;
     }
+    old.iter()
+        .zip(new.iter())
+        .all(|(a, b)| a.name == b.name && a.spanner_type == b.spanner_type)
 }
 
 #[cfg(test)]
 mod tests {
+    use time::OffsetDateTime;
+
     use super::*;
     use crate::source::spanner_cdc::types::{SpannerType, TypeCode};
 
-    #[test]
-    fn test_schema_comparison() {
-        let old_schema = TableSchema {
-            table_name: "test_table".to_string(),
-            columns: vec![
-                ColumnSchema {
-                    name: "id".to_string(),
-                    spanner_type: SpannerType::simple(TypeCode::Int64),
-                    is_primary_key: true,
-                    ordinal_position: 1,
-                },
-                ColumnSchema {
-                    name: "name".to_string(),
-                    spanner_type: SpannerType::simple(TypeCode::String),
-                    is_primary_key: false,
-                    ordinal_position: 2,
-                },
-            ],
-        };
+    fn col(name: &str, code: TypeCode) -> ColumnType {
+        ColumnType {
+            name: name.to_string(),
+            spanner_type: SpannerType::simple(code),
+            is_primary_key: false,
+            ordinal_position: 0,
+        }
+    }
 
-        let new_schema = TableSchema {
-            table_name: "test_table".to_string(),
-            columns: vec![
-                ColumnSchema {
-                    name: "id".to_string(),
-                    spanner_type: SpannerType::simple(TypeCode::Int64),
-                    is_primary_key: true,
-                    ordinal_position: 1,
-                },
-                ColumnSchema {
-                    name: "name".to_string(),
-                    spanner_type: SpannerType::simple(TypeCode::String), // Same type
-                    is_primary_key: false,
-                    ordinal_position: 2,
-                },
-                ColumnSchema {
-                    name: "age".to_string(),
-                    spanner_type: SpannerType::simple(TypeCode::Int64), // New column
-                    is_primary_key: false,
-                    ordinal_position: 3,
-                },
-            ],
-        };
-
-        assert!(SchemaTracker::schemas_differ(&old_schema, &new_schema));
+    fn data_change(table: &str, ts: i64, cols: Vec<ColumnType>) -> DataChangeRecord {
+        DataChangeRecord {
+            commit_timestamp: OffsetDateTime::from_unix_timestamp(ts).unwrap(),
+            record_sequence: "0".to_string(),
+            server_transaction_id: "txn".to_string(),
+            is_last_record_in_transaction_in_partition: true,
+            table_name: table.to_string(),
+            value_capture_type: "NEW_ROW".to_string(),
+            column_types: cols,
+            mods: vec![],
+            mod_type: "INSERT".to_string(),
+            number_of_records_in_transaction: 1,
+            number_of_partitions_in_transaction: 1,
+            transaction_tag: String::new(),
+            is_system_transaction: false,
+        }
     }
 
     #[test]
-    fn test_schema_no_change() {
-        let schema = TableSchema {
-            table_name: "test_table".to_string(),
-            columns: vec![ColumnSchema {
-                name: "id".to_string(),
-                spanner_type: SpannerType::simple(TypeCode::Int64),
-                is_primary_key: true,
-                ordinal_position: 1,
-            }],
-        };
+    fn first_encounter_emits() {
+        let mut tracker = SchemaTracker::new();
+        let dc = data_change("t", 100, vec![col("id", TypeCode::Int64)]);
+        assert!(tracker.check_and_evolve(&dc).is_some());
+    }
 
-        assert!(!SchemaTracker::schemas_differ(&schema, &schema));
+    #[test]
+    fn same_schema_does_not_reemit() {
+        let mut tracker = SchemaTracker::new();
+        let cols = vec![col("id", TypeCode::Int64)];
+        let dc1 = data_change("t", 100, cols.clone());
+        let dc2 = data_change("t", 200, cols);
+        assert!(tracker.check_and_evolve(&dc1).is_some());
+        assert!(tracker.check_and_evolve(&dc2).is_none());
+    }
+
+    #[test]
+    fn schema_change_emits() {
+        let mut tracker = SchemaTracker::new();
+        let dc1 = data_change("t", 100, vec![col("id", TypeCode::Int64)]);
+        assert!(tracker.check_and_evolve(&dc1).is_some());
+
+        let dc2 = data_change(
+            "t",
+            200,
+            vec![col("id", TypeCode::Int64), col("name", TypeCode::String)],
+        );
+        assert!(tracker.check_and_evolve(&dc2).is_some());
+    }
+
+    #[test]
+    fn different_tables_independent() {
+        let mut tracker = SchemaTracker::new();
+
+        let dc_a = data_change("a", 100, vec![col("id", TypeCode::Int64)]);
+        let dc_b = data_change("b", 100, vec![col("id", TypeCode::String)]);
+        assert!(tracker.check_and_evolve(&dc_a).is_some());
+        assert!(tracker.check_and_evolve(&dc_b).is_some());
     }
 }
