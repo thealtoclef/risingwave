@@ -1433,23 +1433,15 @@ impl DdlService for DdlServiceImpl {
                     added_column_names.insert(name.as_str());
                 }
 
-                // Ignore upstream dropped columns: names in original but not in incoming.
-                {
-                    let incoming_names: HashSet<&str> =
-                        new_columns.iter().map(|(n, _)| n.as_str()).collect();
-                    let dropped: Vec<_> = original_columns
-                        .iter()
-                        .filter(|(n, _)| !incoming_names.contains(n.as_str()))
-                        .map(|(n, _)| n.as_str())
-                        .collect();
-                    if !dropped.is_empty() {
-                        tracing::warn!(target: "auto_schema_change",
-                                        table_id = %table.id,
-                                        cdc_table_id = table.cdc_table_id,
-                                        upstream_ddl = table_change.upstream_ddl,
-                                        ignored_columns = ?dropped,
-                                        "ignore upstream dropped columns in CDC auto schema change");
-                    }
+                // Ignore upstream dropped columns via the symmetric set difference.
+                let dropped: Vec<_> = original_columns.difference(&new_columns).collect();
+                if !dropped.is_empty() {
+                    tracing::warn!(target: "auto_schema_change",
+                                    table_id = %table.id,
+                                    cdc_table_id = table.cdc_table_id,
+                                    upstream_ddl = table_change.upstream_ddl,
+                                    ignored_columns = ?dropped,
+                                    "ignore upstream dropped columns in CDC auto schema change");
                 }
 
                 // Skip the schema change if there are no new columns to add.
