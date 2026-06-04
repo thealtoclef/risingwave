@@ -34,8 +34,7 @@ use crate::source::{SplitId, SplitMetaData};
 /// **RisingWave CDC Convention:**
 /// - `offset: Option<OffsetDateTime>` - single source of truth (timestamp)
 /// - `start_offset()` method - converts to String on-demand (matches other CDC sources)
-/// - `is_snapshot_done()` - whether backfill is complete (matches other CDC sources)
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Hash)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct SpannerCdcSplit {
     /// Partition token (None for root partition)
     pub partition_token: Option<String>,
@@ -48,54 +47,29 @@ pub struct SpannerCdcSplit {
     #[serde(default)]
     pub parent_partition_tokens: Vec<String>,
 
-    /// CDC offset - timestamp-based position for change stream queries
-    ///
-    /// Following RisingWave CDC convention:
-    /// - Set by enumerator (user-provided timestamp or current time)
-    /// - Used as `@start_timestamp` parameter for change stream queries
-    /// - Child partitions wait for parent offsets before starting (timestamp ordering)
-    ///
-    /// Type is `OffsetDateTime` (not String like Debezium) for type safety and efficiency.
-    /// Spanner CDC uses timestamps directly, not complex Debezium offset structures.
+    /// Per-partition CDC offset. Advances monotonically as records are processed.
+    /// The *watermark* (safe recovery point) is computed as `min(offset)` across
+    /// all un-finished partitions by `PartitionOffsets`.
     #[serde(with = "time::serde::rfc3339::option")]
     #[serde(default)]
     pub offset: Option<OffsetDateTime>,
-
-    /// Whether snapshot/backfill is done (RisingWave CDC convention)
-    ///
-    /// - false: Backfill in progress or not started
-    /// - true: Backfill complete, CDC streaming active
-    #[serde(default)]
-    pub snapshot_done: bool,
 
     /// Change stream name
     pub change_stream_name: String,
 
     /// Split index for identification
     pub index: u32,
-
-    /// Number of messages processed (for monitoring)
-    #[serde(default)]
-    pub messages_processed: u64,
 }
 
 impl SpannerCdcSplit {
     /// Create a new root partition (no parents).
-    ///
-    /// Offset is REQUIRED - set by enumerator using user-provided timestamp or current time.
-    pub fn new_root(
-        change_stream_name: String,
-        index: u32,
-        offset: OffsetDateTime,
-    ) -> Self {
+    pub fn new_root(change_stream_name: String, index: u32, offset: OffsetDateTime) -> Self {
         Self {
             partition_token: None,
             parent_partition_tokens: vec![],
             offset: Some(offset),
-            snapshot_done: false,
             change_stream_name,
             index,
-            messages_processed: 0,
         }
     }
 
@@ -111,10 +85,8 @@ impl SpannerCdcSplit {
             partition_token: Some(token),
             parent_partition_tokens: parent_tokens,
             offset: Some(offset),
-            snapshot_done: false,
             change_stream_name,
             index,
-            messages_processed: 0,
         }
     }
 
@@ -129,22 +101,13 @@ impl SpannerCdcSplit {
     }
 
     /// Get start_offset (RisingWave CDC convention)
-    ///
-    /// This returns the offset as a String, matching the interface used by other CDC sources.
-    /// The offset is the timestamp in microseconds since epoch.
     pub fn start_offset(&self) -> Option<String> {
-        self.offset
-            .map(|ts| (ts.unix_timestamp_nanos() / 1000).to_string())
-    }
-
-    /// Check if snapshot/backfill is done (RisingWave CDC convention)
-    pub fn is_snapshot_done(&self) -> bool {
-        self.snapshot_done
-    }
-
-    /// Mark snapshot as done (called after backfill completes)
-    pub fn mark_snapshot_done(&mut self) {
-        self.snapshot_done = true;
+        let micros = self.offset_as_micros();
+        if micros > 0 {
+            Some(micros.to_string())
+        } else {
+            None
+        }
     }
 
     /// Advance the offset to a higher timestamp (monotonically increasing)
@@ -160,56 +123,22 @@ impl SpannerCdcSplit {
         }
     }
 
-    /// Get the current offset as microseconds since epoch (for offset persistence).
-    ///
-    /// Returns 0 if offset is not yet set.
+    /// Returns the offset as microseconds since epoch.
     pub fn offset_as_micros(&self) -> i64 {
         self.offset
             .map(|ts| (ts.unix_timestamp_nanos() / 1000) as i64)
             .unwrap_or(0)
     }
 
-    /// Create a SpannerOffset from this split's current state (for checkpointing)
-    pub fn to_spanner_offset(&self) -> crate::source::cdc::external::spanner::SpannerOffset {
-        let mut spanner_offset = crate::source::cdc::external::spanner::SpannerOffset::with_partition(
-            self.offset_as_micros(),
-            self.partition_token.clone(),
-            self.parent_partition_tokens.clone(),
-            self.offset_as_micros(),
-            self.change_stream_name.clone(),
-            self.index,
-        );
-        if self.snapshot_done {
-            spanner_offset.mark_finished();
-        }
-        spanner_offset
-    }
-
     /// Update this split's offset from a SpannerOffset.
-    ///
-    /// This is called during checkpoint recovery to restore the resume position.
-    pub fn update_from_offset(&mut self, offset: &crate::source::cdc::external::spanner::SpannerOffset) {
-        // Update offset from the SpannerOffset (stored as microseconds, convert to OffsetDateTime)
-        if let Ok(offset_ts) = time::OffsetDateTime::from_unix_timestamp_nanos((offset.timestamp as i128) * 1000) {
-            self.offset = Some(offset_ts);
-        } else {
-            tracing::error!(timestamp = offset.timestamp, "failed to parse offset from microseconds");
-        }
-
-        // If the offset indicates this partition is finished, mark snapshot as done
-        if offset.is_finished {
-            self.snapshot_done = true;
-        }
-    }
-
-    /// Set the offset from backfill snapshot timestamp.
-    ///
-    /// This is called after backfill completes to set the initial position for CDC.
-    pub fn set_offset_from_backfill(&mut self, snapshot_timestamp_micros: i64) {
-        if let Ok(offset_ts) = time::OffsetDateTime::from_unix_timestamp_nanos((snapshot_timestamp_micros as i128) * 1000) {
-            self.offset = Some(offset_ts);
-            // Mark snapshot as done when setting offset from backfill
-            self.snapshot_done = true;
+    pub fn update_from_offset(
+        &mut self,
+        offset: &crate::source::cdc::external::spanner::SpannerOffset,
+    ) {
+        if let Ok(offset_ts) =
+            OffsetDateTime::from_unix_timestamp_nanos((offset.timestamp as i128) * 1000)
+        {
+            self.advance_offset(offset_ts);
         }
     }
 }
@@ -226,32 +155,30 @@ impl SplitMetaData for SpannerCdcSplit {
     }
 
     fn id(&self) -> SplitId {
-        // Return numeric ID (index) to satisfy CDC framework's requirement for parseable u64
-        // The partition token and stream name are still tracked internally in the split struct
         self.index.to_string().into()
     }
 
     fn update_offset(&mut self, last_seen_offset: String) -> ConnectorResult<()> {
-        // Parse as plain timestamp (microseconds as string) -- the framework convention.
-        // This is what current_cdc_offset() returns: timestamp as microseconds string.
+        // Parse as plain timestamp (microseconds as string)
         if let Ok(timestamp_micros) = last_seen_offset.trim().parse::<i64>() {
             if timestamp_micros > 0 {
-                if let Ok(offset_ts) = time::OffsetDateTime::from_unix_timestamp_nanos((timestamp_micros as i128) * 1000) {
-                    self.offset = Some(offset_ts);
+                if let Ok(offset_ts) =
+                    OffsetDateTime::from_unix_timestamp_nanos((timestamp_micros as i128) * 1000)
+                {
+                    self.advance_offset(offset_ts);
                     return Ok(());
                 }
             }
         }
 
-        // Fall back to parsing as CdcOffset enum format: {"Spanner": {...}}
-        // This is used for CDC checkpoint updates with full partition state
-        let cdc_offset: crate::source::cdc::external::CdcOffset = serde_json::from_str(&last_seen_offset)?;
+        // Fall back to CdcOffset enum format: {"Spanner": {...}}
+        let cdc_offset: crate::source::cdc::external::CdcOffset =
+            serde_json::from_str(&last_seen_offset)?;
         match cdc_offset {
             crate::source::cdc::external::CdcOffset::Spanner(spanner_offset) => {
                 self.update_from_offset(&spanner_offset);
             }
             _ => {
-                // Should not happen for Spanner CDC
                 tracing::warn!("Received non-Spanner CdcOffset: {:?}", cdc_offset);
             }
         }
@@ -266,41 +193,37 @@ mod tests {
     #[test]
     fn test_root_partition() {
         let offset = OffsetDateTime::now_utc();
-        let split = SpannerCdcSplit::new_root("test_stream".to_string(), 0, offset);
+        let split = SpannerCdcSplit::new_root("test_stream".into(), 0, offset);
 
         assert!(split.is_root());
         assert!(!split.has_parents());
         assert_eq!(split.offset, Some(offset));
-        assert_eq!(split.change_stream_name, "test_stream");
     }
 
     #[test]
     fn test_child_partition() {
         let start = OffsetDateTime::now_utc();
-        let parents = vec!["parent1".to_string(), "parent2".to_string()];
+        let parents = vec!["parent1".into(), "parent2".into()];
         let split = SpannerCdcSplit::new_child(
-            "child1".to_string(),
+            "child1".into(),
             parents.clone(),
             start,
-            "test_stream".to_string(),
+            "test_stream".into(),
             1,
         );
 
         assert!(!split.is_root());
         assert!(split.has_parents());
         assert_eq!(split.parent_partition_tokens, parents);
-        assert_eq!(split.change_stream_name, "test_stream");
     }
 
     #[test]
-    fn test_offset_update() {
+    fn test_offset_monotonic_advance() {
         let offset = OffsetDateTime::UNIX_EPOCH;
         let mut split = SpannerCdcSplit::new_root("test".to_string(), 0, offset);
 
-        // Offset is set at creation
         assert_eq!(split.offset, Some(offset));
 
-        // Update to a later timestamp
         let later = offset + time::Duration::seconds(100);
         split.advance_offset(later);
         assert_eq!(split.offset, Some(later));
@@ -309,5 +232,33 @@ mod tests {
         let earlier = offset + time::Duration::seconds(50);
         split.advance_offset(earlier);
         assert_eq!(split.offset, Some(later));
+    }
+
+    #[test]
+    fn test_encode_decode_roundtrip() {
+        let t0 = OffsetDateTime::from_unix_timestamp_nanos(1_000_000_000).unwrap();
+        let t100 = t0 + time::Duration::seconds(100);
+
+        let mut split = SpannerCdcSplit::new_root("test_stream".into(), 42, t0);
+        split.advance_offset(t100);
+
+        let json = split.encode_to_json();
+        let restored = SpannerCdcSplit::restore_from_json(json).unwrap();
+
+        assert_eq!(restored.offset, Some(t100));
+        assert_eq!(restored.index, 42);
+        assert_eq!(restored.change_stream_name, "test_stream");
+    }
+
+    #[test]
+    fn test_update_offset_plain_int_path() {
+        let t0 = OffsetDateTime::from_unix_timestamp_nanos(1_000_000_000).unwrap();
+        let t200 = t0 + time::Duration::seconds(200);
+
+        let mut split = SpannerCdcSplit::new_root("test".into(), 0, t0);
+
+        split.update_offset((t200.unix_timestamp_nanos() / 1000).to_string())
+            .unwrap();
+        assert_eq!(split.offset, Some(t200));
     }
 }

@@ -1515,21 +1515,6 @@ SpannerCdcProperties:
     field_type: String
     comments: Use Spanner emulator for testing
     required: false
-  - name: spanner.change_stream.max_concurrent_partitions
-    field_type: u32
-    comments: |-
-      Maximum concurrent change stream partition queries per reader (default: 5).
-
-      The shared reader reads from multiple partitions concurrently.
-      The default of 5 provides a balance between throughput and resource usage.
-
-      Spanner enforces a hard limit on total concurrent change-stream queries per database.
-      Adjust this value based on your partition count and available query budget.
-    required: false
-  - name: spanner.buffer_size
-    field_type: usize
-    comments: 'Buffer size for prefetching messages (default: 1024)'
-    required: false
   - name: spanner.retry_attempts
     field_type: u32
     comments: 'Retry attempts for transient failures (default: 3)'
