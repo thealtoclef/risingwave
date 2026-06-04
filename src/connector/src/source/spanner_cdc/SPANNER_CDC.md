@@ -12,7 +12,7 @@ This connector reads data from Google Cloud Spanner change streams and delivers 
 - **Debezium-Pattern Reader**: Same architecture as Postgres CDC — background task, mpsc channel, simple rx.recv()
 - **Full Type Support**: All Spanner types supported with data-preserving fallbacks
 - **Automatic Partition Management**: Handles parent-child partition splits and merges
-- **Watermark-Based Scheduling**: Ensures timestamp-ordered processing across partitions
+- **Per-Key Ordering**: Relies on Spanner's non-overlapping key ranges + parent-before-child spawning (no global reorder needed)
 - **Schema Evolution**: Automatic detection and propagation of schema changes (ADD COLUMN)
 - **Production Ready**: Retry logic, checkpointing, graceful shutdown
 
@@ -102,10 +102,10 @@ into_stream:        into_chunk_stream(...)            into_chunk_stream(...)
                             ▲
                             │ mpsc::Sender
               ┌─────────────────────────────┐
-              │   Background Reader Task     │
-              │  (partition management,      │
-              │   schema tracking,           │
-              │   retry logic)               │
+               │   Background Reader Task     │
+               │  (partition management,      │
+               │   shared schema registry,    │
+               │   retry logic)               │
               └──────────────┬──────────────┘
                              │
                              ▼
@@ -127,7 +127,7 @@ The `mpsc` channel provides natural **backpressure**: when the source executor i
 
 ---
 
-### Three-Layer State Architecture
+### Partition Model
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -137,22 +137,18 @@ The `mpsc` channel provides natural **backpressure**: when the source executor i
 │  │ SpannerCdcSplit  │ ← Persisted state, restored on restart    │
 │  │ - partition_token│                                           │
 │  │ - parent_tokens │                                           │
-│  │ - watermark      │ ← Resume position                         │
-│  │ - state: Enum    │ ← Created|Running|Finished                 │
+│  │ - offset         │ ← Resume position (commit timestamp)      │
 │  │ - index          │ ← source_id.as_raw_id() (unique per source)│
 │  └────────┬────────┘                                           │
 └───────────┼─────────────────────────────────────────────────────┘
-            │ update_from_offset()
+            │ update_split_offset()
             ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │              SourceMessage.offset (Checkpoint)                  │
 ├─────────────────────────────────────────────────────────────────┤
 │  ┌─────────────────┐                                           │
 │  │  SpannerOffset   │ ← Lightweight checkpoint format           │
-│  │ - timestamp      │                                           │
-│  │ - watermark      │                                           │
-│  │ - partition_token│                                           │
-│  │ - is_finished    │ ← Quick check without full state         │
+│  │ - timestamp      │ ← min(offset) across un-finished partitions│
 │  └─────────────────┘                                           │
 └───────────┼─────────────────────────────────────────────────────┘
             │ restored from checkpoint
@@ -160,48 +156,51 @@ The `mpsc` channel provides natural **backpressure**: when the source executor i
 ┌─────────────────────────────────────────────────────────────────┐
 │           Runtime Coordination (In-memory, NOT persisted)       │
 ├─────────────────────────────────────────────────────────────────┤
-│  • mpsc channel for child partition discovery                   │
-│  • HashSet tracks active parent partitions                      │
-│  • Watermark-based scheduling (start_timestamp >= min_watermark)│
-│  • Ensures children wait for ALL parents to finish             │
-│  • Recreated on restart from persisted splits                  │
+│  • PartitionOffsets: HashMap<Option<String>, OffsetDateTime>    │
+│  • finished: HashMap<Option<String>, bool>                      │
+│  • ready_pool: Vec<Split> (parents all finished, spawn all)     │
+│  • deferred_children: Vec<Split> (registered, waiting for parents)│
+│  • child_discovery_tx: unbounded mpsc channel                   │
+│  • Recreated on restart from checkpointed watermark             │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
 | Layer | Purpose | Persisted |
 |-------|---------|-----------|
-| `SpannerCdcSplit` | Full partition state | Yes (state table) |
-| `SpannerOffset` | Lightweight checkpoint | Yes (message offset) |
-| Runtime coordination | Child partition discovery via mpsc | No (recreated on restart) |
+| `SpannerCdcSplit` | Partition identity + offset | Yes (state table) |
+| `SpannerOffset` | Checkpoint watermark | Yes (message offset) |
+| Runtime coordination | Partition lifecycle (spawn, finish, discover) | No (recreated on restart) |
 
 ---
 
-### Watermark-Based Scheduling
+### Partition Coordination
 
-From Spanner's partition coordination design:
-> "To make sure changes for a key is processed in timestamp order, wait until
-> the records returned from all parents have been processed."
+From Spanner's documentation:
+> "Due to the parent-child partition lineage, in order to process changes for a particular key in commit timestamp order, records returned from child partitions should be processed only after records from all parent partitions have been processed."
 
-A child partition is scheduled only when:
-1. **ALL** parent partitions have finished (`state == Finished`)
-2. AND the child's `start_timestamp >= current_min_watermark`
+The reader implements this via:
 
-This ensures timestamp-ordered processing across the partition tree.
+1. **Parent-before-child spawning**: A child partition is only spawned after ALL its parent partitions have finished (returned `PartitionResult`)
+2. **Ready pool**: Children whose parents have finished are moved to `ready_pool` and spawned in batch
+3. **Deferred children**: Children whose parents haven't finished yet wait in `deferred_children`
 
-**Partition State Machine**:
+**Watermark & Checkpoint**:
+
+The watermark = `min(offset)` across all registered, un-finished partitions. It is the safe recovery point and used for metrics. On restart, the root query restarts from the checkpointed watermark — all partitions are re-discovered from scratch.
+
 ```
-Created → Scheduled → Running → Finished
+PartitionOffsets (shared via Arc<Mutex<HashMap>>):
+  root:     offset=100  (finished → removed)
+  child_a:  offset=150  (active)
+  child_b:  offset=120  (active)
+  watermark = min(150, 120) = 120
 ```
-
-- **Created**: Partition discovered but not yet scheduled
-- **Scheduled**: Partition queued for processing
-- **Running**: Partition actively being queried
-- **Finished**: Partition fully processed (will not be restarted)
 
 **Child Partition Discovery**:
 - Child partitions are discovered at runtime via `ChildPartitionsRecord` from Spanner
-- An mpsc channel (`child_discovery_tx`) sends discovered child partitions to the main loop
-- A `HashSet<String>` tracks active parent tokens that must finish before children start
+- An unbounded mpsc channel (`child_discovery_tx`) sends discovered child partitions to the main loop
+- `HashMap<Option<String>, bool` tracks which partitions have finished
+- Children whose parents haven't finished wait in `deferred_children` until promoted
 
 ---
 
@@ -232,7 +231,6 @@ Created → Scheduled → Running → Finished
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `spanner.change_stream.max_concurrent_partitions` | `5` | Maximum concurrent change stream partitions to query per reader |
 | `spanner.heartbeat_interval` | `3s` | Heartbeat interval for partition health monitoring |
 | `spanner.start_timestamp` | current time | Start timestamp for the change stream query (RFC3339 format) |
 | `table.name` | - | Filter by upstream table (set via `TABLE 'name'` in CREATE TABLE) |
@@ -252,7 +250,6 @@ Created → Scheduled → Running → Finished
 |-----------|---------|-------------|
 | `spanner.databoost.enabled` | `false` | Enable DataBoost for partitioned snapshot backfill (requires `spanner.databases.useDataBoost` IAM permission) |
 | `spanner.partition_query.parallelism` | `1` | Number of concurrent partition queries during snapshot backfill |
-| `spanner.buffer_size` | `16` | Buffer size for the mpsc channel between background reader and source executor (matches Debezium's channel size) |
 | `auto.schema.change` | `false` | Enable automatic schema change propagation |
 
 **Note**: `spanner.databoost.enabled` and `spanner.partition_query.parallelism` are table-level properties set automatically by the frontend during `CREATE TABLE FROM source`. They are passed internally and should not be set manually in `CREATE SOURCE`.
@@ -271,8 +268,7 @@ CREATE SOURCE spanner_cdc_source WITH (
     database.name = 'my-database',
     spanner.change_stream.name = 'my_stream',
     spanner.credentials_path = '/secrets/spanner-sa.json',
-    spanner.heartbeat_interval = '5s',
-    spanner.change_stream.max_concurrent_partitions = '10'
+    spanner.heartbeat_interval = '5s'
 ) FORMAT PLAIN ENCODE JSON;
 
 CREATE TABLE users FROM spanner_cdc_source TABLE 'users';
@@ -450,17 +446,20 @@ Type names use the Spanner type string (e.g., `"INT64"`, `"STRING"`) and are res
 
 ### How It Works
 
-Spanner embeds `column_types` metadata in every `DataChangeRecord`. The `SchemaTracker` (`schema_track.rs`) compares this against the previously seen schema on each record:
+Spanner embeds `column_types` metadata in every `DataChangeRecord`. A shared `SchemaTracker` (`schema_track.rs`) acts as a schema registry — one per source, shared across all partition tasks via `Arc<Mutex<>>`:
 
 ```
-DataChangeRecord arrives (contains column_types)
+DataChangeRecord arrives (contains column_types + commit_timestamp)
   │
-  ├── Table not yet seen (first encounter after startup/recovery)?
-  │     → Emit schema change event (false positive)
-  │       Meta deduplicates: if columns unchanged, no-op
+  ├── Table not yet in registry (first encounter)?
+  │     → Emit schema change event (type: "CREATE")
+  │     → Register schema + commit timestamp
   │
-  └── Table previously seen?
-        → Emit only if schemas_differ() detects an actual change
+  └── Table already in registry?
+        ├── Same schema? → Skip (no allocation on hot path)
+        └── Different schema?
+              ├── commit_timestamp > stored → Real DDL → Emit (type: "ALTER") + update
+              └── commit_timestamp <= stored → Stale partition → Skip, adopt stored schema
 ```
 
 **Debezium-Pattern Schema Change Emission**
@@ -477,13 +476,11 @@ Schema detected in DataChangeRecord
 
 The `mpsc` channel's backpressure ensures the data messages wait until the parser has finished processing the schema change.
 
-**False-Positive on First Encounter**
+**First Encounter After Restart**
 
-The `SchemaTracker` is in-memory and resets on every restart. This means the first `DataChangeRecord` for each table after any startup or recovery always triggers a schema change event, even if the schema hasn't changed.
+The `SchemaTracker` is in-memory and resets on every restart. This means the first `DataChangeRecord` for each table after any startup or recovery triggers a schema change event (type: `"CREATE"`). The downstream parser skips `"CREATE"` events — the initial schema is established by the user's `CREATE TABLE` DDL. The registry is then populated, and subsequent records with the same schema are skipped without emission.
 
-This mirrors how Postgres CDC (Debezium) works: a RELATION message is sent unconditionally at the start of each session, before any DML. RisingWave's meta service deduplicates by comparing the incoming column set against the current table columns — if they are identical, the replace job is skipped.
-
-This design closes the **recovery gap**: if a schema change happened while the reader was down, the first record after restart will carry the new `column_types`, meta will detect the difference, and the table will be updated automatically.
+This design closes the **recovery gap**: if a schema change happened while the reader was down, the first record after restart will carry the new `column_types`, the registry will see it as a new schema, and the table will be updated automatically.
 
 ### Enabling Schema Evolution
 
@@ -594,8 +591,8 @@ export GOOGLE_APPLICATION_CREDENTIALS="<path-to-service-account.json>"
 
 - **Full checkpoint support** via `SplitMetaData` trait
 - State persisted in RisingWave state table
-- Automatic recovery on restart from last committed offset
-- Partition state machine: `Created` → `Scheduled` → `Running` → `Finished`
+- Automatic recovery on restart from last committed watermark
+- On restart: root query restarts from watermark, all partitions re-discovered from scratch
 
 ### Retry with Exponential Backoff
 
@@ -716,8 +713,8 @@ PROTO types are mapped to `BYTEA` and ENUM types map to `VARCHAR`. If you see NU
 | `enumerator/mod.rs` | Split enumeration (`SpannerCdcSplitEnumerator`) — creates single split with `split_id = source_id.as_raw_id()` |
 | `source/reader.rs` | CDC streaming reader — follows Debezium pattern (background task → mpsc channel → rx.recv) |
 | `source/message.rs` | `TaggedChangeRecord → SourceMessage` conversion; uses `SourceMeta::DebeziumCdc` so messages flow through the standard Debezium CDC path in `PlainParser` |
-| `split.rs` | Split definition (`SpannerCdcSplit`) with partition state machine |
-| `schema_track.rs` | In-memory schema tracker for automatic schema evolution; emits Debezium-format JSON schema change messages |
+| `split.rs` | Split definition (`SpannerCdcSplit`) — partition token, parent tokens, offset, index |
+| `schema_track.rs` | Shared schema registry for automatic schema evolution; deduplicates schema change events across partitions; emits Debezium-format JSON schema change messages |
 | `types.rs` | Spanner data type definitions, JSON serialization, and `spanner_type_name_to_rw_type` mapping used during schema change parsing |
 
 ### Backfill (Snapshot Read)
