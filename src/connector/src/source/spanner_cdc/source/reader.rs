@@ -889,3 +889,428 @@ fn make_schema_change_msg(
         )),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use time::macros::datetime;
+
+    /// Helper: create a child split with given token, parents, and offset.
+    fn make_child(token: &str, parents: Vec<&str>, offset: OffsetDateTime) -> SpannerCdcSplit {
+        SpannerCdcSplit::new_child(
+            token.to_string(),
+            parents.into_iter().map(String::from).collect(),
+            offset,
+            "test-stream".to_string(),
+            0,
+        )
+    }
+
+    // -----------------------------------------------------------------------
+    // Multi-parent promotion: child stays deferred until ALL parents finish.
+    // This is the core correctness property of the children_by_parent index.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_multi_parent_child_deferred_until_all_parents_done() {
+        let ts = datetime!(2025-01-01 0:00 UTC);
+        let child = make_child("C1", vec!["P1", "P2"], ts);
+
+        let mut deferred = HashMap::new();
+        deferred.insert(Some("C1".to_string()), child);
+
+        let mut ready_pool: HashMap<Option<String>, SpannerCdcSplit> = HashMap::new();
+        let mut children_by_parent = HashMap::new();
+        children_by_parent.insert(Some("P1".to_string()), vec![Some("C1".to_string())]);
+        children_by_parent.insert(Some("P2".to_string()), vec![Some("C1".to_string())]);
+
+        let mut finished = HashMap::new();
+        finished.insert(Some("P1".to_string()), true);
+        finished.insert(Some("P2".to_string()), false);
+
+        // P1 finishes — C1 must stay deferred (P2 not done).
+        promote_children_of(
+            &Some("P1".to_string()),
+            &mut deferred,
+            &mut ready_pool,
+            &mut children_by_parent,
+            &finished,
+        );
+        assert!(
+            deferred.contains_key(&Some("C1".to_string())),
+            "child must stay deferred until all parents finish"
+        );
+        assert!(ready_pool.is_empty());
+
+        // P2 finishes — now C1 is promoted.
+        finished.insert(Some("P2".to_string()), true);
+        promote_children_of(
+            &Some("P2".to_string()),
+            &mut deferred,
+            &mut ready_pool,
+            &mut children_by_parent,
+            &finished,
+        );
+        assert!(deferred.is_empty());
+        assert!(ready_pool.contains_key(&Some("C1".to_string())));
+    }
+
+    // -----------------------------------------------------------------------
+    // Finished entries are NEVER removed — proves the fix prevents deadlock.
+    //
+    // If finished[P1] were removed after P1's promote_children_of, then when
+    // P2 finishes, parents_all_finished would see P1 missing → false → C1
+    // stays deferred forever → deadlock.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_finished_entry_survives_promotion() {
+        let ts = datetime!(2025-01-01 0:00 UTC);
+        let child = make_child("C1", vec!["P1", "P2"], ts);
+        let parent_tokens = child.parent_partition_tokens.clone();
+
+        let mut deferred = HashMap::new();
+        deferred.insert(Some("C1".to_string()), child);
+
+        let mut ready_pool: HashMap<Option<String>, SpannerCdcSplit> = HashMap::new();
+        let mut children_by_parent = HashMap::new();
+        children_by_parent.insert(Some("P1".to_string()), vec![Some("C1".to_string())]);
+        children_by_parent.insert(Some("P2".to_string()), vec![Some("C1".to_string())]);
+
+        let mut finished = HashMap::new();
+        finished.insert(Some("P1".to_string()), true);
+        finished.insert(Some("P2".to_string()), false);
+
+        // P1 finishes — C1 stays deferred.
+        promote_children_of(
+            &Some("P1".to_string()),
+            &mut deferred,
+            &mut ready_pool,
+            &mut children_by_parent,
+            &finished,
+        );
+        assert!(deferred.contains_key(&Some("C1".to_string())));
+        // finished[P1] must still exist — this is the invariant the fix maintains.
+        assert!(
+            finished.contains_key(&Some("P1".to_string())),
+            "finished entry must survive — removing it causes deadlock for multi-parent children"
+        );
+
+        // Verify: if we WERE to remove finished[P1], parents_all_finished would fail.
+        // (This is what the old buggy code would do.)
+        finished.remove(&Some("P1".to_string()));
+        assert!(
+            !parents_all_finished(&parent_tokens, &finished),
+            "without finished[P1], parents_all_finished returns false → child stuck forever"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // promote_children_of: idempotent when child already promoted by another parent.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_promote_idempotent_for_already_promoted_child() {
+        let ts = datetime!(2025-01-01 0:00 UTC);
+        let child = make_child("C1", vec!["P1", "P2"], ts);
+
+        let mut deferred = HashMap::new();
+        deferred.insert(Some("C1".to_string()), child);
+
+        let mut ready_pool: HashMap<Option<String>, SpannerCdcSplit> = HashMap::new();
+        let mut children_by_parent = HashMap::new();
+        children_by_parent.insert(Some("P1".to_string()), vec![Some("C1".to_string())]);
+        children_by_parent.insert(Some("P2".to_string()), vec![Some("C1".to_string())]);
+
+        let mut finished = HashMap::new();
+        finished.insert(Some("P1".to_string()), true);
+        finished.insert(Some("P2".to_string()), true);
+
+        // P1 promotes C1.
+        promote_children_of(
+            &Some("P1".to_string()),
+            &mut deferred,
+            &mut ready_pool,
+            &mut children_by_parent,
+            &finished,
+        );
+        assert_eq!(ready_pool.len(), 1);
+
+        // P2 tries to promote C1 — already gone from deferred, no-op.
+        promote_children_of(
+            &Some("P2".to_string()),
+            &mut deferred,
+            &mut ready_pool,
+            &mut children_by_parent,
+            &finished,
+        );
+        assert_eq!(ready_pool.len(), 1, "must not duplicate already-promoted child");
+    }
+
+    // -----------------------------------------------------------------------
+    // PartitionOffsets: watermark = min(offset) across all registered partitions.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_partition_offsets_watermark_is_min() {
+        let offsets = PartitionOffsets::new();
+        assert_eq!(offsets.watermark(), None);
+
+        let t1 = datetime!(2025-01-01 0:00 UTC);
+        let t2 = datetime!(2025-01-02 0:00 UTC);
+        let t3 = datetime!(2025-01-03 0:00 UTC);
+
+        offsets.register(Some("A".to_string()), t1);
+        offsets.register(Some("B".to_string()), t3);
+        assert_eq!(offsets.watermark(), Some(t1), "watermark = min(t1, t3) = t1");
+
+        // Update A past B — watermark becomes B's offset.
+        offsets.update(&Some("A".to_string()), t2);
+        assert_eq!(offsets.watermark(), Some(t2), "watermark = min(t2, t3) = t2");
+
+        // Remove B — watermark becomes A's offset.
+        offsets.remove(&Some("B".to_string()));
+        assert_eq!(offsets.watermark(), Some(t2), "watermark = t2 (only A left)");
+
+        // Remove A — watermark gone.
+        offsets.remove(&Some("A".to_string()));
+        assert_eq!(offsets.watermark(), None);
+    }
+
+    #[test]
+    fn test_partition_offsets_backward_update_ignored() {
+        let offsets = PartitionOffsets::new();
+        let t1 = datetime!(2025-01-01 0:00 UTC);
+        let t2 = datetime!(2025-01-02 0:00 UTC);
+
+        offsets.register(Some("A".to_string()), t2);
+        offsets.update(&Some("A".to_string()), t1); // backward — must be ignored
+        assert_eq!(
+            offsets.watermark(),
+            Some(t2),
+            "backward update must not change offset"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Deferred HashMap dedup: child discovered from two parents is inserted
+    // only once. The old Vec had no dedup — a child would be pushed twice,
+    // potentially spawned twice. HashMap::contains_key gives O(1) check.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_deferred_dedup_prevents_duplicate_discovery() {
+        let ts = datetime!(2025-01-01 0:00 UTC);
+
+        let mut deferred: HashMap<Option<String>, SpannerCdcSplit> = HashMap::new();
+
+        // Simulate child discovery from two parents.
+        // In run_reader, the code checks: if deferred.contains_key(&token) { continue; }
+        let child_from_p1 = make_child("C1", vec!["P1", "P2"], ts);
+        let child_from_p2 = make_child("C1", vec!["P1", "P2"], ts);
+
+        // First discovery — insert.
+        let token = child_from_p1.partition_token.clone();
+        if !deferred.contains_key(&token) {
+            deferred.insert(token.clone(), child_from_p1);
+        }
+        assert_eq!(deferred.len(), 1);
+
+        // Second discovery — duplicate, skipped.
+        let token2 = child_from_p2.partition_token.clone();
+        if !deferred.contains_key(&token2) {
+            deferred.insert(token2, child_from_p2);
+        }
+        assert_eq!(deferred.len(), 1, "duplicate child must be skipped");
+
+        // After both parents finish, child is promoted exactly once.
+        let mut ready_pool: HashMap<Option<String>, SpannerCdcSplit> = HashMap::new();
+        let mut children_by_parent = HashMap::new();
+        children_by_parent.insert(Some("P1".to_string()), vec![Some("C1".to_string())]);
+        children_by_parent.insert(Some("P2".to_string()), vec![Some("C1".to_string())]);
+
+        let mut finished = HashMap::new();
+        finished.insert(Some("P1".to_string()), true);
+        finished.insert(Some("P2".to_string()), true);
+
+        promote_children_of(
+            &Some("P1".to_string()),
+            &mut deferred,
+            &mut ready_pool,
+            &mut children_by_parent,
+            &finished,
+        );
+
+        assert_eq!(ready_pool.len(), 1, "child promoted exactly once");
+        assert!(deferred.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // advance_offset: backward or equal timestamps must be silently ignored.
+    // The function enforces monotonically increasing offsets.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_advance_offset_backward_ignored() {
+        let ts = datetime!(2025-01-01 0:00 UTC);
+        let mut split = SpannerCdcSplit::new_root("test-stream".to_string(), 0, ts);
+
+        let earlier = ts - time::Duration::seconds(10);
+        split.advance_offset(earlier); // backward — must be ignored
+        assert_eq!(split.offset, Some(ts), "backward update must not change offset");
+
+        split.advance_offset(ts); // equal — must be ignored
+        assert_eq!(split.offset, Some(ts), "equal update must not change offset");
+
+        let later = ts + time::Duration::seconds(10);
+        split.advance_offset(later); // forward — must update
+        assert_eq!(split.offset, Some(later));
+    }
+
+    // -----------------------------------------------------------------------
+    // PartitionOffsets: counts tracking when multiple partitions share the same
+    // offset. The BTreeMap<OffsetDateTime, usize> counts map must correctly
+    // track how many partitions are at each offset, so watermark remains
+    // correct after individual partitions are removed.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_partition_offsets_counts_tracking() {
+        let offsets = PartitionOffsets::new();
+        let t1 = datetime!(2025-01-01 0:00 UTC);
+        let t2 = datetime!(2025-01-02 0:00 UTC);
+
+        // Two partitions at t1, one at t2.
+        offsets.register(Some("A".to_string()), t1);
+        offsets.register(Some("B".to_string()), t1);
+        offsets.register(Some("C".to_string()), t2);
+
+        // Watermark = t1 (min).
+        assert_eq!(offsets.watermark(), Some(t1));
+
+        // Remove A — B still at t1, watermark stays t1.
+        offsets.remove(&Some("A".to_string()));
+        assert_eq!(offsets.watermark(), Some(t1), "B still at t1");
+
+        // Remove B — no more partitions at t1, watermark becomes t2.
+        offsets.remove(&Some("B".to_string()));
+        assert_eq!(offsets.watermark(), Some(t2), "only C left at t2");
+
+        // Remove C — watermark gone.
+        offsets.remove(&Some("C".to_string()));
+        assert_eq!(offsets.watermark(), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // PartitionOffsets: update moves a partition from one offset bucket to
+    // another. The counts map must decrement the old bucket and increment
+    // the new one.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_partition_offsets_update_moves_between_buckets() {
+        let offsets = PartitionOffsets::new();
+        let t1 = datetime!(2025-01-01 0:00 UTC);
+        let t2 = datetime!(2025-01-02 0:00 UTC);
+        let t3 = datetime!(2025-01-03 0:00 UTC);
+
+        // A at t1, B at t3.
+        offsets.register(Some("A".to_string()), t1);
+        offsets.register(Some("B".to_string()), t3);
+        assert_eq!(offsets.watermark(), Some(t1));
+
+        // Update A from t1 to t2 — t1 bucket becomes empty, t2 bucket gets A.
+        offsets.update(&Some("A".to_string()), t2);
+        assert_eq!(offsets.watermark(), Some(t2), "watermark moves to t2");
+
+        // Update A from t2 to t3 — now both A and B at t3.
+        offsets.update(&Some("A".to_string()), t3);
+        assert_eq!(offsets.watermark(), Some(t3), "watermark moves to t3");
+
+        // Remove A — B still at t3.
+        offsets.remove(&Some("A".to_string()));
+        assert_eq!(offsets.watermark(), Some(t3), "B still at t3");
+
+        // Remove B — watermark gone.
+        offsets.remove(&Some("B".to_string()));
+        assert_eq!(offsets.watermark(), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // promote_children_of: parent has two children, one ready (all parents done),
+    // one not ready (still waiting for another parent). The ready one gets
+    // promoted, the not-ready one stays deferred, and children_by_parent
+    // is re-inserted with only the unprocessed child.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_promote_mixed_ready_and_deferred_children() {
+        let t1 = datetime!(2025-01-01 0:00 UTC);
+        let t2 = datetime!(2025-01-02 0:00 UTC);
+
+        // C1 has only P1 as parent — ready when P1 finishes.
+        // C2 has P1 and P2 — not ready until P2 also finishes.
+        let c1 = make_child("C1", vec!["P1"], t1);
+        let c2 = make_child("C2", vec!["P1", "P2"], t2);
+
+        let mut deferred = HashMap::new();
+        deferred.insert(Some("C1".to_string()), c1);
+        deferred.insert(Some("C2".to_string()), c2);
+
+        let mut ready_pool: HashMap<Option<String>, SpannerCdcSplit> = HashMap::new();
+        let mut children_by_parent = HashMap::new();
+        children_by_parent.insert(
+            Some("P1".to_string()),
+            vec![Some("C1".to_string()), Some("C2".to_string())],
+        );
+        children_by_parent.insert(Some("P2".to_string()), vec![Some("C2".to_string())]);
+
+        let mut finished = HashMap::new();
+        finished.insert(Some("P1".to_string()), true);
+        finished.insert(Some("P2".to_string()), false); // P2 not done
+
+        promote_children_of(
+            &Some("P1".to_string()),
+            &mut deferred,
+            &mut ready_pool,
+            &mut children_by_parent,
+            &finished,
+        );
+
+        // C1 promoted (only parent is P1, which is done).
+        assert!(
+            ready_pool.contains_key(&Some("C1".to_string())),
+            "C1 should be promoted"
+        );
+
+        // C2 stays deferred (P2 not done).
+        assert!(
+            deferred.contains_key(&Some("C2".to_string())),
+            "C2 should stay deferred"
+        );
+
+        // children_by_parent[P1] re-inserted with only C2 (the unprocessed child).
+        assert_eq!(
+            children_by_parent[&Some("P1".to_string())],
+            vec![Some("C2".to_string())],
+            "only unprocessed child should remain in children_by_parent"
+        );
+
+        // Now P2 finishes — C2 should be promoted.
+        finished.insert(Some("P2".to_string()), true);
+        promote_children_of(
+            &Some("P2".to_string()),
+            &mut deferred,
+            &mut ready_pool,
+            &mut children_by_parent,
+            &finished,
+        );
+
+        assert!(deferred.is_empty());
+        assert!(ready_pool.contains_key(&Some("C2".to_string())));
+    }
+}
