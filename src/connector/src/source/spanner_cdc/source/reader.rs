@@ -264,6 +264,57 @@ impl PartitionOffsets {
     }
 }
 
+/// Process a single discovered child: dedup, register offset, route to
+/// `ready_pool` or `deferred`.
+fn process_child(
+    child: SpannerCdcSplit,
+    discovered: &mut HashMap<Option<String>, bool>,
+    deferred: &mut Vec<SpannerCdcSplit>,
+    ready_pool: &mut Vec<SpannerCdcSplit>,
+    offsets: &PartitionOffsets,
+    split_id: &SplitId,
+) {
+    let token = child.partition_token.clone();
+    if discovered.contains_key(&token) {
+        return;
+    }
+    tracing::debug!(
+        %split_id,
+        token = ?token,
+        parents = ?child.parent_partition_tokens,
+        "discovered child partition"
+    );
+    offsets.register(
+        token.clone(),
+        child.offset.expect("new_child always sets offset"),
+    );
+    discovered.insert(token, false);
+
+    if parents_all_finished(&child.parent_partition_tokens, discovered) {
+        ready_pool.push(child);
+    } else {
+        deferred.push(child);
+    }
+}
+
+/// Drain `child_discovery_rx` and register discovered children.
+///
+/// Batch-drains all pending children from the channel, deduplicates via
+/// `discovered`, registers offsets, and routes to `ready_pool` (if all
+/// parents finished) or `deferred` (otherwise).
+fn ingest_children(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<SpannerCdcSplit>,
+    discovered: &mut HashMap<Option<String>, bool>,
+    deferred: &mut Vec<SpannerCdcSplit>,
+    ready_pool: &mut Vec<SpannerCdcSplit>,
+    offsets: &PartitionOffsets,
+    split_id: &SplitId,
+) {
+    while let Ok(child) = rx.try_recv() {
+        process_child(child, discovered, deferred, ready_pool, offsets, split_id);
+    }
+}
+
 /// Main reader loop — equivalent to Debezium's JNI thread that reads from the WAL.
 async fn run_reader(ctx: ReaderContext, tx: mpsc::Sender<Vec<SourceMessage>>) -> Result<()> {
     let mut partition_streams: FuturesUnordered<tokio::task::JoinHandle<Result<PartitionResult>>> =
@@ -364,7 +415,24 @@ async fn run_reader(ctx: ReaderContext, tx: mpsc::Sender<Vec<SourceMessage>>) ->
                         )));
                     }
                     None => {
-                        // All tasks done — try pending children.
+                        // All tasks done — drain any children that arrived before
+                        // the last task's JoinHandle resolved. Without this,
+                        // biased select starves child_discovery_rx when
+                        // partition_streams is exhausted (returns Ready(None)
+                        // immediately, short-circuiting the channel branch).
+                        ingest_children(
+                            &mut child_discovery_rx,
+                            &mut discovered,
+                            &mut deferred,
+                            &mut ready_pool,
+                            &offsets,
+                            &split_id,
+                        );
+                        promote_deferred(
+                            &mut deferred,
+                            &mut ready_pool,
+                            &discovered,
+                        );
                         spawn_from_pool(
                             &mut ready_pool,
                             &mut active_count,
@@ -391,35 +459,24 @@ async fn run_reader(ctx: ReaderContext, tx: mpsc::Sender<Vec<SourceMessage>>) ->
             }
 
             Some(child) = child_discovery_rx.recv() => {
-                // Batch-drain pending siblings.
-                let mut batch = vec![child];
-                while let Ok(next) = child_discovery_rx.try_recv() {
-                    batch.push(next);
-                }
-                for child in batch {
-                    let token = child.partition_token.clone();
-                    // Dedup: have we already discovered this token?
-                    if discovered.contains_key(&token) {
-                        continue;
-                    }
-                    tracing::debug!(
-                        %split_id,
-                        token = ?token,
-                        parents = ?child.parent_partition_tokens,
-                        "discovered child partition"
-                    );
-                    offsets.register(
-                        token.clone(),
-                        child.offset.expect("new_child always sets offset"),
-                    );
-                    discovered.insert(token, false);
-
-                    if parents_all_finished(&child.parent_partition_tokens, &discovered) {
-                        ready_pool.push(child);
-                    } else {
-                        deferred.push(child);
-                    }
-                }
+                // First child already available — process it, then drain siblings.
+                process_child(
+                    child,
+                    &mut discovered,
+                    &mut deferred,
+                    &mut ready_pool,
+                    &offsets,
+                    &split_id,
+                );
+                // Drain any remaining siblings that arrived concurrently.
+                ingest_children(
+                    &mut child_discovery_rx,
+                    &mut discovered,
+                    &mut deferred,
+                    &mut ready_pool,
+                    &offsets,
+                    &split_id,
+                );
                 spawn_from_pool(
                     &mut ready_pool,
                     &mut active_count,
@@ -1089,62 +1146,203 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Batch-drain: multiple children arriving at once via child_discovery_rx.
-    // Tests that the batch-drain loop correctly processes all siblings.
+    // Batch-drain via ingest_children: multiple children arriving at once.
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_batch_drain_multiple_children() {
+    fn test_ingest_children_multiple_children() {
         let ts = datetime!(2025-01-01 0:00 UTC);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
-        // Simulate batch of 3 children arriving at once.
-        let children = vec![
-            make_child("C1", vec!["P1"], ts),
-            make_child("C2", vec!["P1"], ts),
-            make_child("C3", vec!["P1"], ts),
-        ];
-
-        let mut deferred: Vec<SpannerCdcSplit> = Vec::new();
         let mut discovered = HashMap::new();
+        let mut deferred: Vec<SpannerCdcSplit> = Vec::new();
+        let mut ready_pool: Vec<SpannerCdcSplit> = Vec::new();
+        let offsets = PartitionOffsets::new();
+        let split_id = SplitId::from("test".to_string());
+
         discovered.insert(Some("P1".to_string()), false); // P1 not done
 
-        // Simulate the batch-drain dedup + insert logic.
-        for child in children {
-            let token = child.partition_token.clone();
-            if discovered.contains_key(&token) {
-                continue;
-            }
-            discovered.insert(token, false);
-            deferred.push(child);
-        }
+        tx.send(make_child("C1", vec!["P1"], ts)).unwrap();
+        tx.send(make_child("C2", vec!["P1"], ts)).unwrap();
+        tx.send(make_child("C3", vec!["P1"], ts)).unwrap();
+
+        ingest_children(&mut rx, &mut discovered, &mut deferred, &mut ready_pool, &offsets, &split_id);
 
         assert_eq!(deferred.len(), 3, "all 3 children should be in deferred");
     }
 
     #[test]
-    fn test_batch_drain_dedup_within_batch() {
+    fn test_ingest_children_dedup_within_batch() {
         let ts = datetime!(2025-01-01 0:00 UTC);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
-        // Simulate batch with duplicate token "C1".
-        let children = vec![
-            make_child("C1", vec!["P1"], ts),
-            make_child("C2", vec!["P1"], ts),
-            make_child("C1", vec!["P1"], ts), // duplicate
-        ];
-
-        let mut deferred: Vec<SpannerCdcSplit> = Vec::new();
         let mut discovered = HashMap::new();
+        let mut deferred: Vec<SpannerCdcSplit> = Vec::new();
+        let mut ready_pool: Vec<SpannerCdcSplit> = Vec::new();
+        let offsets = PartitionOffsets::new();
+        let split_id = SplitId::from("test".to_string());
+
         discovered.insert(Some("P1".to_string()), false);
 
-        for child in children {
-            let token = child.partition_token.clone();
-            if discovered.contains_key(&token) {
-                continue;
-            }
-            discovered.insert(token, false);
-            deferred.push(child);
-        }
+        tx.send(make_child("C1", vec!["P1"], ts)).unwrap();
+        tx.send(make_child("C2", vec!["P1"], ts)).unwrap();
+        tx.send(make_child("C1", vec!["P1"], ts)).unwrap(); // duplicate
+
+        ingest_children(&mut rx, &mut discovered, &mut deferred, &mut ready_pool, &offsets, &split_id);
 
         assert_eq!(deferred.len(), 2, "duplicate C1 should be deduped");
+    }
+
+    #[test]
+    fn test_ingest_children_mixed_routing() {
+        let ts = datetime!(2025-01-01 0:00 UTC);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let mut discovered = HashMap::new();
+        let mut deferred: Vec<SpannerCdcSplit> = Vec::new();
+        let mut ready_pool: Vec<SpannerCdcSplit> = Vec::new();
+        let offsets = PartitionOffsets::new();
+        let split_id = SplitId::from("test".to_string());
+
+        // P1 finished, P2 not finished.
+        discovered.insert(Some("P1".to_string()), true);
+        discovered.insert(Some("P2".to_string()), false);
+
+        // C1's parent P1 done → ready_pool.
+        // C2's parent P2 not done → deferred.
+        tx.send(make_child("C1", vec!["P1"], ts)).unwrap();
+        tx.send(make_child("C2", vec!["P2"], ts)).unwrap();
+
+        ingest_children(&mut rx, &mut discovered, &mut deferred, &mut ready_pool, &offsets, &split_id);
+
+        assert_eq!(ready_pool.len(), 1, "C1 should be in ready_pool");
+        assert_eq!(ready_pool[0].partition_token, Some("C1".to_string()));
+        assert_eq!(deferred.len(), 1, "C2 should be in deferred");
+        assert_eq!(deferred[0].partition_token, Some("C2".to_string()));
+    }
+
+    #[test]
+    fn test_ingest_children_registers_offsets() {
+        let ts = datetime!(2025-01-01 0:00 UTC);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let mut discovered = HashMap::new();
+        let mut deferred: Vec<SpannerCdcSplit> = Vec::new();
+        let mut ready_pool: Vec<SpannerCdcSplit> = Vec::new();
+        let offsets = PartitionOffsets::new();
+        let split_id = SplitId::from("test".to_string());
+
+        discovered.insert(Some("P1".to_string()), true);
+
+        tx.send(make_child("C1", vec!["P1"], ts)).unwrap();
+
+        assert_eq!(offsets.watermark(), None);
+        ingest_children(&mut rx, &mut discovered, &mut deferred, &mut ready_pool, &offsets, &split_id);
+        assert_eq!(offsets.watermark(), Some(ts), "offset should be registered");
+    }
+
+    // -----------------------------------------------------------------------
+    // ingest_children: drains channel, dedup, registers, routes to deferred/ready_pool.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_ingest_children_routes_to_deferred_when_parents_not_done() {
+        let ts = datetime!(2025-01-01 0:00 UTC);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let mut discovered = HashMap::new();
+        let mut deferred: Vec<SpannerCdcSplit> = Vec::new();
+        let mut ready_pool: Vec<SpannerCdcSplit> = Vec::new();
+        let offsets = PartitionOffsets::new();
+        let split_id = SplitId::from("test".to_string());
+
+        // P1 discovered but not finished.
+        discovered.insert(Some("P1".to_string()), false);
+
+        // C1's parent P1 not finished → should go to deferred.
+        tx.send(make_child("C1", vec!["P1"], ts)).unwrap();
+
+        ingest_children(
+            &mut rx,
+            &mut discovered,
+            &mut deferred,
+            &mut ready_pool,
+            &offsets,
+            &split_id,
+        );
+
+        assert_eq!(deferred.len(), 1, "C1 should be in deferred");
+        assert!(ready_pool.is_empty());
+        assert!(discovered.contains_key(&Some("C1".to_string())));
+    }
+
+    #[test]
+    fn test_ingest_children_routes_to_ready_pool_when_parents_done() {
+        let ts = datetime!(2025-01-01 0:00 UTC);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let mut discovered = HashMap::new();
+        let mut deferred: Vec<SpannerCdcSplit> = Vec::new();
+        let mut ready_pool: Vec<SpannerCdcSplit> = Vec::new();
+        let offsets = PartitionOffsets::new();
+        let split_id = SplitId::from("test".to_string());
+
+        // P1 discovered and finished.
+        discovered.insert(Some("P1".to_string()), true);
+
+        // C1's parent P1 finished → should go to ready_pool.
+        tx.send(make_child("C1", vec!["P1"], ts)).unwrap();
+
+        ingest_children(
+            &mut rx,
+            &mut discovered,
+            &mut deferred,
+            &mut ready_pool,
+            &offsets,
+            &split_id,
+        );
+
+        assert!(deferred.is_empty());
+        assert_eq!(ready_pool.len(), 1, "C1 should be in ready_pool");
+    }
+
+    #[test]
+    fn test_ingest_children_dedup_across_calls() {
+        let ts = datetime!(2025-01-01 0:00 UTC);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let mut discovered = HashMap::new();
+        let mut deferred: Vec<SpannerCdcSplit> = Vec::new();
+        let mut ready_pool: Vec<SpannerCdcSplit> = Vec::new();
+        let offsets = PartitionOffsets::new();
+        let split_id = SplitId::from("test".to_string());
+
+        discovered.insert(Some("P1".to_string()), false);
+
+        // First call: C1 ingested.
+        tx.send(make_child("C1", vec!["P1"], ts)).unwrap();
+        ingest_children(&mut rx, &mut discovered, &mut deferred, &mut ready_pool, &offsets, &split_id);
+        assert_eq!(deferred.len(), 1);
+
+        // Second call: same C1 again — should be deduped.
+        tx.send(make_child("C1", vec!["P1"], ts)).unwrap();
+        ingest_children(&mut rx, &mut discovered, &mut deferred, &mut ready_pool, &offsets, &split_id);
+        assert_eq!(deferred.len(), 1, "duplicate C1 should be deduped");
+    }
+
+    #[test]
+    fn test_ingest_children_empty_channel() {
+        let (_, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let mut discovered = HashMap::new();
+        let mut deferred: Vec<SpannerCdcSplit> = Vec::new();
+        let mut ready_pool: Vec<SpannerCdcSplit> = Vec::new();
+        let offsets = PartitionOffsets::new();
+        let split_id = SplitId::from("test".to_string());
+
+        ingest_children(&mut rx, &mut discovered, &mut deferred, &mut ready_pool, &offsets, &split_id);
+
+        assert!(deferred.is_empty());
+        assert!(ready_pool.is_empty());
     }
 }
