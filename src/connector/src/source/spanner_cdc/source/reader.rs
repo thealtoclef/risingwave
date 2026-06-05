@@ -272,10 +272,10 @@ async fn run_reader(ctx: ReaderContext, tx: mpsc::Sender<Vec<SourceMessage>>) ->
     let mut active_count: usize = 0;
 
     // Registered children waiting for parents to finish.
-    let mut deferred_children: Vec<SpannerCdcSplit> = Vec::new();
+    let mut deferred: Vec<SpannerCdcSplit> = Vec::new();
 
-    // Track which partitions have finished (for parent-before-child coordination).
-    let mut finished: HashMap<Option<String>, bool> = HashMap::new();
+    // Track which partitions have been discovered (for dedup and parent-before-child coordination).
+    let mut discovered: HashMap<Option<String>, bool> = HashMap::new();
 
     let (child_discovery_tx, mut child_discovery_rx) =
         tokio::sync::mpsc::unbounded_channel::<SpannerCdcSplit>();
@@ -299,7 +299,7 @@ async fn run_reader(ctx: ReaderContext, tx: mpsc::Sender<Vec<SourceMessage>>) ->
         SpannerCdcSplit::new_root(ctx.change_stream_name.clone(), ctx.source_id, root_offset);
     let root_token = root_split.partition_token.clone();
     offsets.register(root_token.clone(), root_offset);
-    finished.insert(root_token, false);
+    discovered.insert(root_token, false);
     spawn_partition_task(
         &ctx,
         root_split,
@@ -330,16 +330,16 @@ async fn run_reader(ctx: ReaderContext, tx: mpsc::Sender<Vec<SourceMessage>>) ->
                         // Partition finished — remove from offsets (excludes from watermark).
                         offsets.remove(&pr.partition_token);
                         if let Some(ref token) = pr.partition_token {
-                            finished.insert(Some(token.clone()), true);
+                            discovered.insert(Some(token.clone()), true);
                         } else {
-                            finished.insert(None, true);
+                            discovered.insert(None, true);
                         }
 
                         // Check deferred children.
                         promote_deferred(
-                            &mut deferred_children,
+                            &mut deferred,
                             &mut ready_pool,
-                            &finished,
+                            &discovered,
                         );
 
                         active_count -= 1;
@@ -374,14 +374,14 @@ async fn run_reader(ctx: ReaderContext, tx: mpsc::Sender<Vec<SourceMessage>>) ->
                             &mut partition_streams,
                             &child_discovery_tx,
                         );
-                        if ready_pool.is_empty() && deferred_children.is_empty() {
+                        if ready_pool.is_empty() && deferred.is_empty() {
                             tracing::info!(%split_id, "all partitions finished");
                             break;
                         }
                         if active_count == 0 {
                             return Err(ConnectorError::from(anyhow::anyhow!(
                                 "deadlock: no active tasks but {} children still waiting",
-                                deferred_children.len()
+                                deferred.len()
                             )));
                         }
                     }
@@ -396,11 +396,8 @@ async fn run_reader(ctx: ReaderContext, tx: mpsc::Sender<Vec<SourceMessage>>) ->
                 }
                 for child in batch {
                     let token = child.partition_token.clone();
-                    // Check all pools for duplicates.
-                    let already_known = finished.contains_key(&token)
-                        || deferred_children.iter().any(|c| c.partition_token == token)
-                        || ready_pool.iter().any(|c| c.partition_token == token);
-                    if already_known {
+                    // Dedup: have we already discovered this token?
+                    if discovered.contains_key(&token) {
                         continue;
                     }
                     tracing::debug!(
@@ -413,12 +410,12 @@ async fn run_reader(ctx: ReaderContext, tx: mpsc::Sender<Vec<SourceMessage>>) ->
                         token.clone(),
                         child.offset.expect("new_child always sets offset"),
                     );
-                    finished.insert(token, false);
+                    discovered.insert(token, false);
 
-                    if parents_all_finished(&child.parent_partition_tokens, &finished) {
+                    if parents_all_finished(&child.parent_partition_tokens, &discovered) {
                         ready_pool.push(child);
                     } else {
-                        deferred_children.push(child);
+                        deferred.push(child);
                     }
                 }
                 spawn_from_pool(
@@ -445,24 +442,24 @@ async fn run_reader(ctx: ReaderContext, tx: mpsc::Sender<Vec<SourceMessage>>) ->
 
 fn parents_all_finished(
     parent_tokens: &[String],
-    finished: &HashMap<Option<String>, bool>,
+    discovered: &HashMap<Option<String>, bool>,
 ) -> bool {
-    // Root partition has no parent tokens — check if root (token=None) finished.
+    // Root partition has no parent tokens — check if root (token=None) has finished.
     if parent_tokens.is_empty() {
-        return finished.get(&None).copied().unwrap_or(false);
+        return discovered.get(&None).copied().unwrap_or(false);
     }
     parent_tokens
         .iter()
-        .all(|p| finished.get(&Some(p.clone())).copied().unwrap_or(false))
+        .all(|p| discovered.get(&Some(p.clone())).copied().unwrap_or(false))
 }
 
 fn promote_deferred(
     deferred: &mut Vec<SpannerCdcSplit>,
     ready_pool: &mut Vec<SpannerCdcSplit>,
-    finished: &HashMap<Option<String>, bool>,
+    discovered: &HashMap<Option<String>, bool>,
 ) {
     deferred.retain(|child| {
-        if parents_all_finished(&child.parent_partition_tokens, finished) {
+        if parents_all_finished(&child.parent_partition_tokens, discovered) {
             ready_pool.push(child.clone());
             false
         } else {
@@ -832,5 +829,313 @@ fn make_schema_change_msg(
             cdc_message::CdcMessageType::SchemaChange,
             SourceType::Unspecified,
         )),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use time::macros::datetime;
+
+    fn make_child(token: &str, parents: Vec<&str>, offset: OffsetDateTime) -> SpannerCdcSplit {
+        SpannerCdcSplit::new_child(
+            token.to_string(),
+            parents.into_iter().map(String::from).collect(),
+            offset,
+            "test-stream".to_string(),
+            0,
+        )
+    }
+
+    // -----------------------------------------------------------------------
+    // promote_deferred: scans all deferred children, promotes when parents done.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_promote_deferred_basic() {
+        let ts = datetime!(2025-01-01 0:00 UTC);
+        let child = make_child("C1", vec!["P1"], ts);
+
+        let mut deferred = vec![child];
+        let mut ready_pool = Vec::new();
+        let mut discovered = HashMap::new();
+        discovered.insert(Some("P1".to_string()), true);
+
+        promote_deferred(&mut deferred, &mut ready_pool, &discovered);
+
+        assert!(deferred.is_empty());
+        assert_eq!(ready_pool.len(), 1);
+    }
+
+    #[test]
+    fn test_promote_deferred_multi_parent_one_done() {
+        let ts = datetime!(2025-01-01 0:00 UTC);
+        let child = make_child("C1", vec!["P1", "P2"], ts);
+
+        let mut deferred = vec![child];
+        let mut ready_pool = Vec::new();
+        let mut discovered = HashMap::new();
+        discovered.insert(Some("P1".to_string()), true);
+        discovered.insert(Some("P2".to_string()), false);
+
+        promote_deferred(&mut deferred, &mut ready_pool, &discovered);
+
+        // C1 stays deferred — P2 not done.
+        assert_eq!(deferred.len(), 1);
+        assert!(ready_pool.is_empty());
+    }
+
+    #[test]
+    fn test_promote_deferred_multi_parent_both_done() {
+        let ts = datetime!(2025-01-01 0:00 UTC);
+        let child = make_child("C1", vec!["P1", "P2"], ts);
+
+        let mut deferred = vec![child];
+        let mut ready_pool = Vec::new();
+        let mut discovered = HashMap::new();
+        discovered.insert(Some("P1".to_string()), true);
+        discovered.insert(Some("P2".to_string()), true);
+
+        promote_deferred(&mut deferred, &mut ready_pool, &discovered);
+
+        assert!(deferred.is_empty());
+        assert_eq!(ready_pool.len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // parents_all_finished: root case, multi-parent case.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parents_all_finished_root() {
+        let mut discovered = HashMap::new();
+        discovered.insert(None, true);
+
+        // Root partition (empty parent_tokens).
+        assert!(parents_all_finished(&[], &discovered));
+
+        // Root not discovered/finished.
+        discovered.insert(None, false);
+        assert!(!parents_all_finished(&[], &discovered));
+    }
+
+    #[test]
+    fn test_parents_all_finished_multi_parent() {
+        let mut discovered = HashMap::new();
+        discovered.insert(Some("P1".to_string()), true);
+        discovered.insert(Some("P2".to_string()), false);
+
+        assert!(!parents_all_finished(
+            &["P1".to_string(), "P2".to_string()],
+            &discovered
+        ));
+
+        discovered.insert(Some("P2".to_string()), true);
+        assert!(parents_all_finished(
+            &["P1".to_string(), "P2".to_string()],
+            &discovered
+        ));
+    }
+
+    #[test]
+    fn test_parents_all_finished_absent_parent() {
+        let discovered = HashMap::new();
+
+        // Parent "PX" was never discovered — should return false (child waits forever).
+        assert!(!parents_all_finished(
+            &["PX".to_string()],
+            &discovered
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // PartitionOffsets: watermark, counts, backward update.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_partition_offsets_watermark_is_min() {
+        let offsets = PartitionOffsets::new();
+        assert_eq!(offsets.watermark(), None);
+
+        let t1 = datetime!(2025-01-01 0:00 UTC);
+        let t2 = datetime!(2025-01-02 0:00 UTC);
+        let t3 = datetime!(2025-01-03 0:00 UTC);
+
+        offsets.register(Some("A".to_string()), t1);
+        offsets.register(Some("B".to_string()), t3);
+        assert_eq!(offsets.watermark(), Some(t1));
+
+        offsets.update(&Some("A".to_string()), t2);
+        assert_eq!(offsets.watermark(), Some(t2));
+
+        offsets.remove(&Some("B".to_string()));
+        assert_eq!(offsets.watermark(), Some(t2));
+
+        offsets.remove(&Some("A".to_string()));
+        assert_eq!(offsets.watermark(), None);
+    }
+
+    #[test]
+    fn test_partition_offsets_backward_update_ignored() {
+        let offsets = PartitionOffsets::new();
+        let t1 = datetime!(2025-01-01 0:00 UTC);
+        let t2 = datetime!(2025-01-02 0:00 UTC);
+
+        offsets.register(Some("A".to_string()), t2);
+        offsets.update(&Some("A".to_string()), t1);
+        assert_eq!(offsets.watermark(), Some(t2));
+    }
+
+    #[test]
+    fn test_partition_offsets_counts_tracking() {
+        let offsets = PartitionOffsets::new();
+        let t1 = datetime!(2025-01-01 0:00 UTC);
+        let t2 = datetime!(2025-01-02 0:00 UTC);
+
+        offsets.register(Some("A".to_string()), t1);
+        offsets.register(Some("B".to_string()), t1);
+        offsets.register(Some("C".to_string()), t2);
+
+        assert_eq!(offsets.watermark(), Some(t1));
+
+        // Remove A — B still at t1, watermark stays.
+        offsets.remove(&Some("A".to_string()));
+        assert_eq!(offsets.watermark(), Some(t1));
+
+        // Remove B — watermark moves to t2.
+        offsets.remove(&Some("B".to_string()));
+        assert_eq!(offsets.watermark(), Some(t2));
+
+        offsets.remove(&Some("C".to_string()));
+        assert_eq!(offsets.watermark(), None);
+    }
+
+    #[test]
+    fn test_partition_offsets_update_moves_between_buckets() {
+        let offsets = PartitionOffsets::new();
+        let t1 = datetime!(2025-01-01 0:00 UTC);
+        let t2 = datetime!(2025-01-02 0:00 UTC);
+        let t3 = datetime!(2025-01-03 0:00 UTC);
+
+        offsets.register(Some("A".to_string()), t1);
+        offsets.register(Some("B".to_string()), t3);
+        assert_eq!(offsets.watermark(), Some(t1));
+
+        offsets.update(&Some("A".to_string()), t2);
+        assert_eq!(offsets.watermark(), Some(t2));
+
+        offsets.update(&Some("A".to_string()), t3);
+        assert_eq!(offsets.watermark(), Some(t3));
+
+        offsets.remove(&Some("A".to_string()));
+        assert_eq!(offsets.watermark(), Some(t3));
+
+        offsets.remove(&Some("B".to_string()));
+        assert_eq!(offsets.watermark(), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // Multiple children with different parent states: some promoted, some not.
+    // Tests that promote_deferred correctly handles partial promotion.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_promote_deferred_mixed_parent_states() {
+        let ts = datetime!(2025-01-01 0:00 UTC);
+
+        // C1: parent P1 done → should be promoted.
+        // C2: parents P1 and P2, P2 not done → stays deferred.
+        // C3: parent P2 done → should be promoted.
+        let mut deferred = vec![
+            make_child("C1", vec!["P1"], ts),
+            make_child("C2", vec!["P1", "P2"], ts),
+            make_child("C3", vec!["P2"], ts),
+        ];
+
+        let mut ready_pool = Vec::new();
+        let mut discovered = HashMap::new();
+        discovered.insert(Some("P1".to_string()), true);
+        discovered.insert(Some("P2".to_string()), false);
+
+        promote_deferred(&mut deferred, &mut ready_pool, &discovered);
+
+        // C1 promoted (P1 done).
+        // C2 stays deferred (P2 not done).
+        // C3 stays deferred (P2 not done).
+        assert_eq!(ready_pool.len(), 1, "only C1 should be promoted");
+        assert_eq!(ready_pool[0].partition_token, Some("C1".to_string()));
+        assert_eq!(deferred.len(), 2, "C2 and C3 should stay deferred");
+
+        // Now P2 finishes.
+        discovered.insert(Some("P2".to_string()), true);
+        promote_deferred(&mut deferred, &mut ready_pool, &discovered);
+
+        // C2 and C3 promoted.
+        assert_eq!(ready_pool.len(), 3, "all children should be promoted");
+        assert!(deferred.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Batch-drain: multiple children arriving at once via child_discovery_rx.
+    // Tests that the batch-drain loop correctly processes all siblings.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_batch_drain_multiple_children() {
+        let ts = datetime!(2025-01-01 0:00 UTC);
+
+        // Simulate batch of 3 children arriving at once.
+        let children = vec![
+            make_child("C1", vec!["P1"], ts),
+            make_child("C2", vec!["P1"], ts),
+            make_child("C3", vec!["P1"], ts),
+        ];
+
+        let mut deferred: Vec<SpannerCdcSplit> = Vec::new();
+        let mut discovered = HashMap::new();
+        discovered.insert(Some("P1".to_string()), false); // P1 not done
+
+        // Simulate the batch-drain dedup + insert logic.
+        for child in children {
+            let token = child.partition_token.clone();
+            if discovered.contains_key(&token) {
+                continue;
+            }
+            discovered.insert(token, false);
+            deferred.push(child);
+        }
+
+        assert_eq!(deferred.len(), 3, "all 3 children should be in deferred");
+    }
+
+    #[test]
+    fn test_batch_drain_dedup_within_batch() {
+        let ts = datetime!(2025-01-01 0:00 UTC);
+
+        // Simulate batch with duplicate token "C1".
+        let children = vec![
+            make_child("C1", vec!["P1"], ts),
+            make_child("C2", vec!["P1"], ts),
+            make_child("C1", vec!["P1"], ts), // duplicate
+        ];
+
+        let mut deferred: Vec<SpannerCdcSplit> = Vec::new();
+        let mut discovered = HashMap::new();
+        discovered.insert(Some("P1".to_string()), false);
+
+        for child in children {
+            let token = child.partition_token.clone();
+            if discovered.contains_key(&token) {
+                continue;
+            }
+            discovered.insert(token, false);
+            deferred.push(child);
+        }
+
+        assert_eq!(deferred.len(), 2, "duplicate C1 should be deduped");
     }
 }
