@@ -25,7 +25,7 @@ mod tests {
         let split = SpannerCdcSplit::new_root("test-stream".to_string(), 0, OffsetDateTime::now_utc());
 
         assert!(split.is_root());
-        assert!(split.partition_token.is_none());
+        assert!(split.partition_token.is_empty());
         assert!(split.parent_partition_tokens.is_empty());
         assert!(split.offset.is_some());
         // Root split ID is the index
@@ -43,7 +43,7 @@ mod tests {
         );
 
         assert!(!split.is_root());
-        assert_eq!(split.partition_token, Some("child-token".to_string()));
+        assert_eq!(split.partition_token, "child-token".to_string());
         assert_eq!(split.parent_partition_tokens, vec!["parent-token".to_string()]);
         assert_eq!(split.id().to_string(), "1");
     }

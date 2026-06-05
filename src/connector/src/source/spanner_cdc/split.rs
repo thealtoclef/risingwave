@@ -36,8 +36,8 @@ use crate::source::{SplitId, SplitMetaData};
 /// - `start_offset()` method - converts to String on-demand (matches other CDC sources)
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct SpannerCdcSplit {
-    /// Partition token (None for root partition)
-    pub partition_token: Option<String>,
+    /// Partition token (empty string for root partition)
+    pub partition_token: String,
 
     /// Parent partition tokens (empty for root partition)
     ///
@@ -65,7 +65,7 @@ impl SpannerCdcSplit {
     /// Create a new root partition (no parents).
     pub fn new_root(change_stream_name: String, index: u32, offset: OffsetDateTime) -> Self {
         Self {
-            partition_token: None,
+            partition_token: String::new(),
             parent_partition_tokens: vec![],
             offset: Some(offset),
             change_stream_name,
@@ -82,7 +82,7 @@ impl SpannerCdcSplit {
         index: u32,
     ) -> Self {
         Self {
-            partition_token: Some(token),
+            partition_token: token,
             parent_partition_tokens: parent_tokens,
             offset: Some(offset),
             change_stream_name,
@@ -92,7 +92,7 @@ impl SpannerCdcSplit {
 
     /// Returns true if this is a root partition (no parents)
     pub fn is_root(&self) -> bool {
-        self.partition_token.is_none() && self.parent_partition_tokens.is_empty()
+        self.partition_token.is_empty() && self.parent_partition_tokens.is_empty()
     }
 
     /// Returns true if this partition has parents that must finish before it can start
