@@ -21,6 +21,7 @@ use await_tree::InstrumentAwait;
 use parking_lot::{Mutex, MutexGuard};
 use risingwave_common::array::StreamChunk;
 use risingwave_common::bitmap::Bitmap;
+use risingwave_common::hash::VirtualNode;
 use risingwave_common_estimate_size::EstimateSize;
 use risingwave_connector::sink::log_store::{ChunkId, LogStoreResult, TruncateOffset};
 use risingwave_pb::stream_plan::PbSinkSchemaChange;
@@ -47,6 +48,14 @@ pub(crate) enum LogStoreBufferItem {
         chunk_id: ChunkId,
     },
 
+    FlushedBlob {
+        vnode: VirtualNode,
+        start_seq_id: SeqId,
+        end_seq_id: SeqId,
+        chunk_id: ChunkId,
+        blob_size: usize,
+    },
+
     Barrier {
         is_checkpoint: bool,
         next_epoch: u64,
@@ -60,6 +69,7 @@ impl EstimateSize for LogStoreBufferItem {
         match self {
             LogStoreBufferItem::StreamChunk { chunk, .. } => chunk.estimated_heap_size(),
             LogStoreBufferItem::Flushed { vnode_bitmap, .. } => vnode_bitmap.estimated_heap_size(),
+            LogStoreBufferItem::FlushedBlob { blob_size, .. } => *blob_size,
             LogStoreBufferItem::Barrier { .. } => 0,
         }
     }
@@ -96,6 +106,11 @@ impl LogStoreBufferInner {
                     row_count += chunk.cardinality();
                 }
                 LogStoreBufferItem::Flushed {
+                    start_seq_id,
+                    end_seq_id,
+                    ..
+                }
+                | LogStoreBufferItem::FlushedBlob {
                     start_seq_id,
                     end_seq_id,
                     ..
@@ -226,6 +241,29 @@ impl LogStoreBufferInner {
         self.update_buffer_metrics();
     }
 
+    fn add_flushed_blob(
+        &mut self,
+        epoch: u64,
+        vnode: VirtualNode,
+        start_seq_id: SeqId,
+        end_seq_id: SeqId,
+        blob_size: usize,
+    ) {
+        let chunk_id = self.next_chunk_id;
+        self.next_chunk_id += 1;
+        self.add_item(
+            epoch,
+            LogStoreBufferItem::FlushedBlob {
+                vnode,
+                start_seq_id,
+                end_seq_id,
+                chunk_id,
+                blob_size,
+            },
+        );
+        self.update_buffer_metrics();
+    }
+
     fn add_truncate_offset(&mut self, (epoch, seq_id): ReaderTruncationOffsetType) {
         if let Some((prev_epoch, prev_seq_id)) = self.truncation_list.back_mut()
             && *prev_epoch == epoch
@@ -295,6 +333,20 @@ impl LogStoreBufferSender {
         self.buffer
             .inner()
             .add_flushed(epoch, start_seq_id, end_seq_id, vnode_bitmap);
+        self.update_notify.notify_waiters();
+    }
+
+    pub(crate) fn add_flushed_blob(
+        &self,
+        epoch: u64,
+        vnode: VirtualNode,
+        start_seq_id: SeqId,
+        end_seq_id: SeqId,
+        blob_size: usize,
+    ) {
+        self.buffer
+            .inner()
+            .add_flushed_blob(epoch, vnode, start_seq_id, end_seq_id, blob_size);
         self.update_notify.notify_waiters();
     }
 
@@ -463,6 +515,11 @@ impl LogStoreBufferReceiver {
                     }
                 }
                 LogStoreBufferItem::Flushed {
+                    chunk_id,
+                    end_seq_id,
+                    ..
+                }
+                | LogStoreBufferItem::FlushedBlob {
                     chunk_id,
                     end_seq_id,
                     ..

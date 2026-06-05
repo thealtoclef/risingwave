@@ -179,6 +179,10 @@ pub struct StreamingMetrics {
     pub kv_log_store_buffer_unconsumed_epoch_count: LabelGuardedIntGaugeVec,
     pub kv_log_store_buffer_unconsumed_min_epoch: LabelGuardedIntGaugeVec,
     pub kv_log_store_buffer_memory_bytes: LabelGuardedIntGaugeVec,
+    pub kv_log_store_blob_write_count: LabelGuardedIntCounterVec,
+    pub kv_log_store_blob_write_bytes: LabelGuardedIntCounterVec,
+    pub kv_log_store_blob_read_count: LabelGuardedIntCounterVec,
+    pub kv_log_store_blob_read_bytes: LabelGuardedIntCounterVec,
 
     pub crossdb_last_consumed_min_epoch: LabelGuardedIntGaugeVec,
 
@@ -1166,6 +1170,38 @@ impl StreamingMetrics {
             )
             .unwrap();
 
+        let kv_log_store_blob_write_count = register_guarded_int_counter_vec_with_registry!(
+            "kv_log_store_blob_write_count",
+            "Blob write count throughput of kv log store",
+            &["actor_id", "connector", "sink_id", "sink_name"],
+            registry
+        )
+        .unwrap();
+
+        let kv_log_store_blob_write_bytes = register_guarded_int_counter_vec_with_registry!(
+            "kv_log_store_blob_write_bytes",
+            "Blob write bytes throughput of kv log store",
+            &["actor_id", "connector", "sink_id", "sink_name"],
+            registry
+        )
+        .unwrap();
+
+        let kv_log_store_blob_read_count = register_guarded_int_counter_vec_with_registry!(
+            "kv_log_store_blob_read_count",
+            "Blob read count throughput of kv log store",
+            &["actor_id", "connector", "sink_id", "sink_name"],
+            registry
+        )
+        .unwrap();
+
+        let kv_log_store_blob_read_bytes = register_guarded_int_counter_vec_with_registry!(
+            "kv_log_store_blob_read_bytes",
+            "Blob read bytes throughput of kv log store",
+            &["actor_id", "connector", "sink_id", "sink_name"],
+            registry
+        )
+        .unwrap();
+
         let lru_runtime_loop_count = register_int_counter_with_registry!(
             "lru_runtime_loop_count",
             "The counts of the eviction loop in LRU manager per second",
@@ -1405,6 +1441,10 @@ impl StreamingMetrics {
             kv_log_store_buffer_unconsumed_epoch_count,
             kv_log_store_buffer_unconsumed_min_epoch,
             kv_log_store_buffer_memory_bytes,
+            kv_log_store_blob_write_count,
+            kv_log_store_blob_write_bytes,
+            kv_log_store_blob_read_count,
+            kv_log_store_blob_read_bytes,
             crossdb_last_consumed_min_epoch,
             sync_kv_log_store_read_count,
             sync_kv_log_store_read_size,

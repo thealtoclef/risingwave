@@ -303,10 +303,14 @@ pub mod metrics {
                 persistent_log_read_metrics: KvLogStoreReadMetrics {
                     storage_read_size: persistent_log_read_size,
                     storage_read_count: persistent_log_read_count,
+                    blob_read_count: None,
+                    blob_read_bytes: None,
                 },
                 flushed_buffer_read_metrics: KvLogStoreReadMetrics {
                     storage_read_count: flushed_buffer_read_count,
                     storage_read_size: flushed_buffer_read_size,
+                    blob_read_count: None,
+                    blob_read_bytes: None,
                 },
             }
         }
@@ -1032,6 +1036,9 @@ impl<S: StateStoreRead> ReadFuture<S> {
                         *self = ReadFuture::ReadingFlushedChunk { future, end_seq_id };
                         break;
                     }
+                    LogStoreBufferItem::FlushedBlob { .. } => {
+                        unreachable!("synced kv log store should not produce blob WAL items")
+                    }
                     LogStoreBufferItem::Barrier { .. } => {
                         tracing::trace!(item_epoch, "read buffer barrier");
                         progress.apply_aligned(read_state.vnodes().clone(), item_epoch, None);
@@ -1095,7 +1102,9 @@ impl<S: StateStore> SyncedKvLogStoreExecutor<S> {
                             break;
                         }
                     }
-                    LogStoreBufferItem::Flushed { .. } | LogStoreBufferItem::Barrier { .. } => {}
+                    LogStoreBufferItem::Flushed { .. }
+                    | LogStoreBufferItem::FlushedBlob { .. }
+                    | LogStoreBufferItem::Barrier { .. } => {}
                 }
             }
         }
@@ -1272,7 +1281,8 @@ impl SyncedLogStoreBuffer {
     fn pop_front(&mut self) -> Option<(u64, LogStoreBufferItem)> {
         let item = self.buffer.pop_front();
         match &item {
-            Some((_, LogStoreBufferItem::Flushed { .. })) => {
+            Some((_, LogStoreBufferItem::Flushed { .. }))
+            | Some((_, LogStoreBufferItem::FlushedBlob { .. })) => {
                 self.flushed_count -= 1;
             }
             Some((_, LogStoreBufferItem::StreamChunk { chunk, .. })) => {
@@ -1294,6 +1304,11 @@ impl SyncedLogStoreBuffer {
                     row_count += chunk.cardinality();
                 }
                 LogStoreBufferItem::Flushed {
+                    start_seq_id,
+                    end_seq_id,
+                    ..
+                }
+                | LogStoreBufferItem::FlushedBlob {
                     start_seq_id,
                     end_seq_id,
                     ..
