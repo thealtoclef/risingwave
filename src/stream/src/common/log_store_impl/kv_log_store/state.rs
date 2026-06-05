@@ -18,7 +18,7 @@ use std::sync::Arc;
 use risingwave_common::array::StreamChunk;
 use risingwave_common::bitmap::{Bitmap, BitmapBuilder};
 use risingwave_common::catalog::TableId;
-use risingwave_common::hash::VnodeBitmapExt;
+use risingwave_common::hash::{VirtualNode, VnodeBitmapExt};
 use risingwave_common::util::epoch::EpochPair;
 use risingwave_common_estimate_size::EstimateSize;
 use risingwave_connector::sink::log_store::LogStoreResult;
@@ -26,11 +26,13 @@ use risingwave_hummock_sdk::table_watermark::{
     VnodeWatermark, WatermarkDirection, WatermarkSerdeType,
 };
 use risingwave_storage::store::{
-    InitOptions, LocalStateStore, SealCurrentEpochOptions, StateStoreRead,
+    InitOptions, LocalStateStore, ReadOptions, SealCurrentEpochOptions, StateStoreGet,
+    StateStoreRead,
 };
 
 use crate::common::log_store_impl::kv_log_store::serde::LogStoreRowSerde;
 use crate::common::log_store_impl::kv_log_store::{FlushInfo, LogStoreVnodeProgress, SeqId};
+
 
 pub(crate) struct LogStoreReadState<S: StateStoreRead> {
     pub(super) table_id: TableId,
@@ -245,6 +247,32 @@ impl<S: LocalStateStore> LogStoreStateWriter<'_, S> {
         Ok(())
     }
 
+    pub(crate) fn write_chunk_blob(
+        &mut self,
+        chunk: &StreamChunk,
+        epoch: u64,
+        start_seq_id: SeqId,
+        end_seq_id: SeqId,
+    ) -> LogStoreResult<(VirtualNode, usize)> {
+        let vnode = self.inner.serde.blob_vnode();
+        let key = self
+            .inner
+            .serde
+            .serialize_log_store_blob_pk(vnode, epoch, start_seq_id);
+        let value = self.inner.serde.serialize_stream_chunk_blob(chunk);
+        tracing::trace!(
+            epoch,
+            start_seq_id,
+            end_seq_id,
+            bytes = value.len(),
+            "write_chunk_blob"
+        );
+        self.flush_info
+            .flush_one(key.estimated_size() + value.estimated_size());
+        self.inner.state_store.insert(key, value, None)?;
+        Ok((vnode, value.len()))
+    }
+
     pub(crate) fn write_barrier(&mut self, epoch: u64, is_checkpoint: bool) -> LogStoreResult<()> {
         for vnode in self.inner.serde.vnodes().iter_vnodes() {
             let (key, value) = self
@@ -264,6 +292,35 @@ impl<S: LocalStateStore> LogStoreStateWriter<'_, S> {
             self.flush_info,
             self.written_vnodes.map(|vnodes| vnodes.finish()),
         ))
+    }
+}
+
+impl<S: StateStoreRead> LogStoreReadState<S> {
+    pub(crate) async fn read_flushed_blob(
+        &self,
+        vnode: VirtualNode,
+        start_seq_id: SeqId,
+        item_epoch: u64,
+    ) -> LogStoreResult<(StreamChunk, usize)> {
+        let key = self
+            .serde
+            .serialize_log_store_blob_pk(vnode, item_epoch, start_seq_id);
+        let blob = self
+            .state_store
+            .on_key_value(key, ReadOptions::default(), |_, value| {
+                Ok(bytes::Bytes::copy_from_slice(value))
+            })
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "blob log store chunk not found: epoch {}, start seq id {}",
+                    item_epoch,
+                    start_seq_id
+                )
+            })?;
+        let blob_size = blob.len();
+        let chunk = self.serde.deserialize_stream_chunk_blob(&blob)?;
+        Ok((chunk, blob_size))
     }
 }
 

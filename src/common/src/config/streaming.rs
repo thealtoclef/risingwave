@@ -278,6 +278,14 @@ pub struct StreamingDeveloperConfig {
     #[serde(default = "default::developer::sync_log_store_buffer_size")]
     pub sync_log_store_buffer_size: usize,
 
+    /// The max in-memory row count for sink kv log store, before overflowed chunks are flushed.
+    #[serde(default = "default::developer::kv_log_store_buffer_size")]
+    pub kv_log_store_buffer_size: usize,
+
+    /// Enable chunk-level blob WAL for overflowed sink kv log store chunks.
+    #[serde(default = "default::developer::enable_kv_log_store_v3")]
+    pub enable_kv_log_store_v3: bool,
+
     /// Disable the optimized dispatcher path for sync log store.
     #[serde(default = "default::developer::disable_sync_log_store_dispatcher")]
     pub disable_sync_log_store_dispatcher: bool,

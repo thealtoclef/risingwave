@@ -130,6 +130,7 @@ enum KvLogStoreReaderFutureState<S: StateStoreRead> {
         Option<OwnedSemaphorePermit>,
     ),
     ReadFlushedChunk(BoxFuture<'static, LogStoreResult<(ChunkId, StreamChunk, u64)>>),
+    ReadFlushedBlob(BoxFuture<'static, LogStoreResult<(ChunkId, StreamChunk, u64, usize)>>),
     Reset,
     Empty,
 }
@@ -412,6 +413,28 @@ impl<S: StateStoreRead> LogReader for KvLogStoreReader<S> {
                     LogStoreReadItem::StreamChunk { chunk, chunk_id },
                 ));
             }
+            KvLogStoreReaderFutureState::ReadFlushedBlob(future) => {
+                let (chunk_id, chunk, item_epoch, blob_size) = future.await?;
+                self.future_state = KvLogStoreReaderFutureState::Empty;
+                if let Some(c) = &self.metrics.persistent_log_read_metrics.blob_read_count {
+                    c.inc();
+                }
+                if let Some(c) = &self.metrics.persistent_log_read_metrics.blob_read_bytes {
+                    c.inc_by(blob_size as _);
+                }
+                let offset = TruncateOffset::Chunk {
+                    epoch: item_epoch,
+                    chunk_id,
+                };
+                if let Some(latest_offset) = &self.latest_offset {
+                    assert!(offset > *latest_offset);
+                }
+                self.latest_offset = Some(offset);
+                return Ok((
+                    item_epoch,
+                    LogStoreReadItem::StreamChunk { chunk, chunk_id },
+                ));
+            }
             KvLogStoreReaderFutureState::Empty => {}
             KvLogStoreReaderFutureState::Reset => {
                 unreachable!("Must call log_reader.start_from() for a Reset reader.")
@@ -470,6 +493,50 @@ impl<S: StateStoreRead> LogReader for KvLogStoreReader<S> {
                     read_flushed_chunk_future
                 )
                 .await?;
+
+                let offset = TruncateOffset::Chunk {
+                    epoch: item_epoch,
+                    chunk_id,
+                };
+                if let Some(latest_offset) = &self.latest_offset {
+                    assert!(offset > *latest_offset);
+                }
+                self.latest_offset = Some(offset);
+                (
+                    item_epoch,
+                    LogStoreReadItem::StreamChunk { chunk, chunk_id },
+                )
+            }
+            LogStoreBufferItem::FlushedBlob {
+                vnode,
+                start_seq_id,
+                end_seq_id: _,
+                chunk_id,
+                ..
+            } => {
+                let read_flushed_blob_future = {
+                    self.state
+                        .read_flushed_blob(vnode, start_seq_id, item_epoch)
+                        .map(move |result| {
+                            result.map(|(chunk, blob_size)| {
+                                (chunk_id, chunk, item_epoch, blob_size)
+                            })
+                        })
+                        .boxed()
+                };
+
+                let (_, chunk, _, blob_size) = set_and_drive_future!(
+                    &mut self.future_state,
+                    ReadFlushedBlob,
+                    read_flushed_blob_future
+                )
+                .await?;
+                if let Some(c) = &self.metrics.persistent_log_read_metrics.blob_read_count {
+                    c.inc();
+                }
+                if let Some(c) = &self.metrics.persistent_log_read_metrics.blob_read_bytes {
+                    c.inc_by(blob_size as _);
+                }
 
                 let offset = TruncateOffset::Chunk {
                     epoch: item_epoch,

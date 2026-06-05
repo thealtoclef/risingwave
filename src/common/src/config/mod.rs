@@ -440,6 +440,14 @@ pub mod default {
             2048
         }
 
+        pub fn kv_log_store_buffer_size() -> usize {
+            65536
+        }
+
+        pub fn enable_kv_log_store_v3() -> bool {
+            false
+        }
+
         pub fn disable_sync_log_store_dispatcher() -> bool {
             false
         }

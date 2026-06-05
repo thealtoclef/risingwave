@@ -50,6 +50,8 @@ pub struct KvLogStoreWriter<LS: LocalStateStore> {
     identity: String,
 
     last_truncate_offset: Option<ReaderTruncationOffsetType>,
+
+    enable_blob_wal: bool,
 }
 
 impl<LS: LocalStateStore> KvLogStoreWriter<LS> {
@@ -61,6 +63,7 @@ impl<LS: LocalStateStore> KvLogStoreWriter<LS> {
         metrics: KvLogStoreMetrics,
         paused_notifier: watch::Sender<bool>,
         identity: String,
+        enable_blob_wal: bool,
     ) -> Self {
         Self {
             seq_id: FIRST_SEQ_ID,
@@ -73,6 +76,7 @@ impl<LS: LocalStateStore> KvLogStoreWriter<LS> {
             identity,
             is_paused: false,
             last_truncate_offset: None,
+            enable_blob_wal,
         }
     }
 }
@@ -117,18 +121,30 @@ impl<LS: LocalStateStore> LogWriter for KvLogStoreWriter<LS> {
         {
             // When enter this branch, the chunk cannot be added directly, and should be add to
             // state store and flush
-            let mut writer = self.state.start_writer(true);
-            writer.write_chunk(&chunk, epoch, start_seq_id, end_seq_id)?;
-            let (flush_info, vnode_bitmap) = writer.finish().await?;
-            flush_info.report(&self.metrics);
+            if self.enable_blob_wal {
+                let mut writer = self.state.start_writer(false);
+                let (blob_vnode, blob_size) =
+                    writer.write_chunk_blob(&chunk, epoch, start_seq_id, end_seq_id)?;
+                let (flush_info, _) = writer.finish().await?;
+                flush_info.report(&self.metrics);
+                self.metrics.blob_write_count.inc();
+                self.metrics.blob_write_bytes.inc_by(blob_size as _);
+                self.tx
+                    .add_flushed_blob(epoch, blob_vnode, start_seq_id, end_seq_id, blob_size);
+            } else {
+                let mut writer = self.state.start_writer(true);
+                writer.write_chunk(&chunk, epoch, start_seq_id, end_seq_id)?;
+                let (flush_info, vnode_bitmap) = writer.finish().await?;
+                flush_info.report(&self.metrics);
 
-            self.tx.add_flushed(
-                epoch,
-                start_seq_id,
-                end_seq_id,
-                vnode_bitmap
-                    .expect("should exist since we set record_vnodes as true when start_writer"),
-            );
+                self.tx.add_flushed(
+                    epoch,
+                    start_seq_id,
+                    end_seq_id,
+                    vnode_bitmap
+                        .expect("should exist since we set record_vnodes as true when start_writer"),
+                );
+            }
         }
         Ok(())
     }
@@ -146,12 +162,25 @@ impl<LS: LocalStateStore> LogWriter for KvLogStoreWriter<LS> {
         if !self.is_paused {
             writer.write_barrier(epoch, options.is_checkpoint)?;
         }
+        let enable_blob_wal = self.enable_blob_wal;
+        let mut flush_blob_count: u64 = 0;
+        let mut flush_blob_bytes: u64 = 0;
         self.tx
             .flush_all_unflushed(|chunk, epoch, start_seq_id, end_seq_id| {
-                writer.write_chunk(chunk, epoch, start_seq_id, end_seq_id)?;
-
+                if enable_blob_wal {
+                    let (_, blob_size) =
+                        writer.write_chunk_blob(chunk, epoch, start_seq_id, end_seq_id)?;
+                    flush_blob_count += 1;
+                    flush_blob_bytes += blob_size as u64;
+                } else {
+                    writer.write_chunk(chunk, epoch, start_seq_id, end_seq_id)?;
+                }
                 Ok(())
             })?;
+        if flush_blob_count > 0 {
+            self.metrics.blob_write_count.inc_by(flush_blob_count);
+            self.metrics.blob_write_bytes.inc_by(flush_blob_bytes);
+        }
 
         let (flush_info, _) = writer.finish().await?;
 

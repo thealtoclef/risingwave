@@ -456,6 +456,20 @@ pub struct SessionConfig {
     #[parameter(default = None)]
     streaming_sync_log_store_buffer_size: OptionConfig<usize>,
 
+    /// The max in-memory row count for sink kv log store, before overflowed chunks are flushed.
+    ///
+    /// This overrides the corresponding entry from the `[streaming.developer]` section in the config file,
+    /// taking effect for new streaming jobs created in the current session.
+    #[parameter(default = None)]
+    streaming_kv_log_store_buffer_size: OptionConfig<usize>,
+
+    /// Enable chunk-level blob WAL for overflowed sink kv log store chunks.
+    ///
+    /// This overrides the corresponding entry from the `[streaming.developer]` section in the config file,
+    /// taking effect for new streaming jobs created in the current session.
+    #[parameter(default = None)]
+    streaming_enable_kv_log_store_v3: OptionConfig<bool>,
+
     /// Whether to disable purifying the definition of the table or source upon retrieval.
     /// Only set this if encountering issues with functionalities like `SHOW` or `ALTER TABLE/SOURCE`.
     /// This config may be removed in the future.
@@ -644,6 +658,16 @@ impl SessionConfig {
         if let Some(v) = self.streaming_sync_log_store_buffer_size.as_ref() {
             table
                 .upsert("streaming.developer.sync_log_store_buffer_size", v)
+                .unwrap();
+        }
+        if let Some(v) = self.streaming_kv_log_store_buffer_size.as_ref() {
+            table
+                .upsert("streaming.developer.kv_log_store_buffer_size", v)
+                .unwrap();
+        }
+        if let Some(v) = self.streaming_enable_kv_log_store_v3.as_ref() {
+            table
+                .upsert("streaming.developer.enable_kv_log_store_v3", v)
                 .unwrap();
         }
         if let Some(v) = self.streaming_over_window_cache_policy.as_ref() {

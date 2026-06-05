@@ -339,18 +339,32 @@ impl ExecutorBuilder for SinkExecutorBuilder {
                 let input_schema = input_executor.schema();
                 let pk_info = resolve_pk_info(input_schema, &table)?;
 
-                // TODO: support setting max row count in config
-                let factory = KvLogStoreFactory::new(
-                    state_store,
-                    table,
-                    params.vnode_bitmap.clone().map(Arc::new),
-                    65536,
-                    params.config.developer.chunk_size,
-                    metrics,
-                    log_store_identity,
-                    params.env.kv_log_store_historical_read_semaphore(),
-                    pk_info,
-                );
+                let max_buffer_row_count = params.config.developer.kv_log_store_buffer_size;
+                let factory = if params.config.developer.enable_kv_log_store_v3 {
+                    KvLogStoreFactory::new_with_blob_wal(
+                        state_store,
+                        table,
+                        params.vnode_bitmap.clone().map(Arc::new),
+                        max_buffer_row_count,
+                        params.config.developer.chunk_size,
+                        metrics,
+                        log_store_identity,
+                        params.env.kv_log_store_historical_read_semaphore(),
+                        pk_info,
+                    )
+                } else {
+                    KvLogStoreFactory::new(
+                        state_store,
+                        table,
+                        params.vnode_bitmap.clone().map(Arc::new),
+                        max_buffer_row_count,
+                        params.config.developer.chunk_size,
+                        metrics,
+                        log_store_identity,
+                        params.env.kv_log_store_historical_read_semaphore(),
+                        pk_info,
+                    )
+                };
 
                 SinkExecutor::new(
                     params.actor_context,

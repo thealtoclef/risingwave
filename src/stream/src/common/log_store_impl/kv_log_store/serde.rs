@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use std::collections::HashMap;
-use std::mem::{replace, take};
+use std::mem::{replace, size_of, take};
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -23,6 +23,7 @@ use futures::stream::{FuturesUnordered, Peekable, StreamFuture};
 use futures::{Stream, StreamExt, TryStreamExt, pin_mut};
 use futures_async_stream::try_stream;
 use itertools::Itertools;
+use prost::Message;
 use risingwave_common::array::{Op, StreamChunk};
 use risingwave_common::bitmap::{Bitmap, BitmapBuilder};
 use risingwave_common::catalog::ColumnDesc;
@@ -39,8 +40,11 @@ use risingwave_connector::sink::log_store::LogStoreResult;
 use risingwave_hummock_sdk::HummockEpoch;
 use risingwave_hummock_sdk::key::{TableKey, next_key};
 use risingwave_pb::catalog::Table;
+use risingwave_pb::data::PbStreamChunk;
 use risingwave_storage::error::StorageResult;
-use risingwave_storage::row_serde::row_serde_util::{serialize_pk, serialize_pk_with_vnode};
+use risingwave_storage::row_serde::row_serde_util::{
+    deserialize_pk_with_vnode, serialize_pk, serialize_pk_with_vnode,
+};
 use risingwave_storage::row_serde::value_serde::ValueRowSerdeNew;
 use risingwave_storage::store::{StateStoreIterExt, StateStoreReadIter};
 use risingwave_storage::table::{SINGLETON_VNODE, compute_vnode};
@@ -57,6 +61,9 @@ const UPDATE_INSERT_OP_CODE: RowOpCodeType = 3;
 const UPDATE_DELETE_OP_CODE: RowOpCodeType = 4;
 const BARRIER_OP_CODE: RowOpCodeType = 5;
 const CHECKPOINT_BARRIER_OP_CODE: RowOpCodeType = 6;
+const BLOB_CHUNK_OP_CODE: RowOpCodeType = 7;
+
+const BLOB_CHUNK_OP_CODE_BYTES: usize = size_of::<RowOpCodeType>();
 
 struct ReadInfo {
     read_size: usize,
@@ -96,17 +103,27 @@ enum LogStoreRowOp {
         op: Op,
         row: OwnedRow,
     },
+    Blob {
+        start_seq_id: SeqId,
+        chunk: StreamChunk,
+        blob_size: usize,
+    },
     Barrier {
         is_checkpoint: bool,
     },
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug)]
 enum LogStoreOp {
     Row {
         seq_id: SeqId,
         op: Op,
         row: OwnedRow,
+    },
+    Blob {
+        start_seq_id: SeqId,
+        chunk: StreamChunk,
+        blob_size: usize,
     },
     Update {
         seq_id: SeqId,
@@ -118,13 +135,19 @@ enum LogStoreOp {
     },
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug)]
 enum AlignedLogStoreOp {
     Row {
         vnode: VirtualNode,
         seq_id: SeqId,
         op: Op,
         row: OwnedRow,
+    },
+    Blob {
+        vnode: VirtualNode,
+        start_seq_id: SeqId,
+        chunk: StreamChunk,
+        blob_size: usize,
     },
     Update {
         vnode: VirtualNode,
@@ -150,6 +173,15 @@ impl From<LogStoreRowOp> for LogStoreOp {
                 }
                 Self::Row { seq_id, op, row }
             }
+            LogStoreRowOp::Blob {
+                start_seq_id,
+                chunk,
+                blob_size,
+            } => Self::Blob {
+                start_seq_id,
+                chunk,
+                blob_size,
+            },
             LogStoreRowOp::Barrier { is_checkpoint } => Self::Barrier { is_checkpoint },
         }
     }
@@ -359,6 +391,47 @@ impl LogStoreRowSerde {
         )
     }
 
+    pub(crate) fn blob_vnode(&self) -> VirtualNode {
+        self.vnodes.iter_vnodes().next().unwrap_or(SINGLETON_VNODE)
+    }
+
+    pub(crate) fn serialize_log_store_blob_pk(
+        &self,
+        vnode: VirtualNode,
+        epoch: u64,
+        seq_id: SeqId,
+    ) -> TableKey<Bytes> {
+        self.serialize_log_store_pk(vnode, epoch, Some(seq_id))
+    }
+
+    pub(crate) fn serialize_stream_chunk_blob(&self, chunk: &StreamChunk) -> Bytes {
+        let protobuf = chunk.to_protobuf().encode_to_vec();
+        let mut value = Vec::with_capacity(BLOB_CHUNK_OP_CODE_BYTES + protobuf.len());
+        value.extend_from_slice(&BLOB_CHUNK_OP_CODE.to_be_bytes());
+        value.extend_from_slice(&protobuf);
+        Bytes::from(value)
+    }
+
+    pub(crate) fn deserialize_stream_chunk_blob(
+        &self,
+        value_bytes: &[u8],
+    ) -> LogStoreResult<StreamChunk> {
+        if value_bytes.len() < BLOB_CHUNK_OP_CODE_BYTES {
+            return Err(anyhow!("invalid blob chunk value: missing op code header"));
+        }
+        let (op_code_bytes, protobuf) = value_bytes.split_at(BLOB_CHUNK_OP_CODE_BYTES);
+        let op_code = RowOpCodeType::from_be_bytes(op_code_bytes.try_into().unwrap());
+        if op_code != BLOB_CHUNK_OP_CODE {
+            return Err(anyhow!(
+                "invalid blob chunk op code: expected {}, got {}",
+                BLOB_CHUNK_OP_CODE,
+                op_code
+            ));
+        }
+        let pb_chunk = PbStreamChunk::decode(protobuf)?;
+        Ok(StreamChunk::from_protobuf(&pb_chunk)?)
+    }
+
     pub(crate) fn serialize_truncation_offset_watermark(
         &self,
         offset: ReaderTruncationOffsetType,
@@ -434,6 +507,49 @@ impl LogStoreRowSerde {
         Ok((epoch, op))
     }
 
+    fn deserialize_blob_record(
+        &self,
+        key_bytes: &[u8],
+        value_bytes: &[u8],
+    ) -> LogStoreResult<(Epoch, LogStoreRowOp)> {
+        let (_, pk) = deserialize_pk_with_vnode(key_bytes, &self.pk_serde)?;
+        let epoch = Self::decode_epoch(
+            *pk[self.pk_info.epoch_column_index]
+                .as_ref()
+                .ok_or_else(|| anyhow!("blob chunk key missing epoch"))?
+                .as_int64(),
+        );
+        let start_seq_id = *pk[self.pk_info.seq_id_column_index]
+            .as_ref()
+            .ok_or_else(|| anyhow!("blob chunk key missing seq id"))?
+            .as_int32();
+        let chunk = self.deserialize_stream_chunk_blob(value_bytes)?;
+        Ok((
+            epoch,
+            LogStoreRowOp::Blob {
+                start_seq_id,
+                chunk,
+                blob_size: value_bytes.len(),
+            },
+        ))
+    }
+
+    fn deserialize_log_store_record(
+        &self,
+        key_bytes: &[u8],
+        value_bytes: &[u8],
+    ) -> LogStoreResult<(Epoch, LogStoreRowOp)> {
+        if value_bytes.len() >= BLOB_CHUNK_OP_CODE_BYTES {
+            let op_code = RowOpCodeType::from_be_bytes(
+                value_bytes[..BLOB_CHUNK_OP_CODE_BYTES].try_into().unwrap(),
+            );
+            if op_code == BLOB_CHUNK_OP_CODE {
+                return self.deserialize_blob_record(key_bytes, value_bytes);
+            }
+        }
+        Ok(self.deserialize(value_bytes)?)
+    }
+
     pub(crate) async fn deserialize_stream_chunk<I: StateStoreReadIter>(
         &self,
         iters: impl IntoIterator<Item = (VirtualNode, I)>,
@@ -476,6 +592,9 @@ impl LogStoreRowSerde {
                         ));
                     }
                     assert!(data_chunk_builder.append_one_row(row).is_none());
+                }
+                (_, LogStoreOp::Blob { .. }) => {
+                    return Err(anyhow!("should not get blob when decoding flushed row chunk"));
                 }
                 (
                     epoch,
@@ -647,6 +766,44 @@ impl<S: StateStoreReadIter> LogStoreRowOpStream<S> {
             }
 
             match row_op {
+                AlignedLogStoreOp::Blob {
+                    vnode,
+                    start_seq_id,
+                    chunk,
+                    blob_size,
+                } => {
+                    read_info.read_one_row(row_read_size);
+                    if let Some(c) = &this.metrics.blob_read_count {
+                        c.inc();
+                    }
+                    if let Some(c) = &this.metrics.blob_read_bytes {
+                        c.inc_by(blob_size as _);
+                    }
+                    if let Some(buffered_chunk) = data_chunk_builder.consume_all() {
+                        let ops = replace(&mut ops, Vec::with_capacity(chunk_size));
+                        read_info.report(&this.metrics);
+                        yield (
+                            epoch,
+                            KvLogStoreItem::StreamChunk {
+                                chunk: StreamChunk::from_parts(ops, buffered_chunk),
+                                progress: take(&mut progress),
+                            },
+                        );
+                    }
+
+                    let end_seq_id = start_seq_id + chunk.cardinality() as SeqId - 1;
+                    if let Some(previous_seq_id) = progress.insert(vnode, end_seq_id) {
+                        assert!(previous_seq_id < end_seq_id);
+                    }
+                    read_info.report(&this.metrics);
+                    yield (
+                        epoch,
+                        KvLogStoreItem::StreamChunk {
+                            chunk,
+                            progress: take(&mut progress),
+                        },
+                    );
+                }
                 AlignedLogStoreOp::Row { op, row, .. } => {
                     read_info.read_one_row(row_read_size);
                     ops.push(op);
@@ -732,7 +889,12 @@ pub(crate) fn merge_log_store_item_stream<S: StateStoreReadIter>(
     chunk_size: usize,
     metrics: KvLogStoreReadMetrics,
 ) -> LogStoreItemMergeStream<S> {
-    LogStoreRowOpStream::new(iters, serde, metrics).into_vnode_log_store_item_stream(chunk_size)
+    LogStoreRowOpStream::new(
+        iters,
+        serde,
+        metrics,
+    )
+    .into_vnode_log_store_item_stream(chunk_size)
 }
 
 mod stream_de {
@@ -774,14 +936,21 @@ mod stream_de {
         serde: LogStoreRowSerde,
     ) -> LogStoreItemStream<S> {
         may_merge_update(
-            iter.into_stream(move |(key, value)| -> StorageResult<RawLogStoreRow> {
-                let size = key.user_key.table_key.len() + value.len();
-                let (epoch, op) = serde.deserialize(value)?;
-                let row_meta = RowMeta { vnode, epoch, size };
-                tracing::trace!(?row_meta, ?op, "read_row");
-                Ok(RawLogStoreRow { op, row_meta })
+            iter.into_stream(move |(key, value)| -> StorageResult<(TableKey<Bytes>, Bytes)> {
+                Ok((key.user_key.table_key.copy_into(), Bytes::copy_from_slice(value)))
             })
-            .map_err(Into::into),
+            .map_err(Into::into)
+            .and_then(move |(key, value)| {
+                let serde = serde.clone();
+                async move {
+                    let size = key.len() + value.len();
+                    let (epoch, op) =
+                        serde.deserialize_log_store_record(key.as_ref(), value.as_ref())?;
+                    let row_meta = RowMeta { vnode, epoch, size };
+                    tracing::trace!(?row_meta, ?op, "read_row");
+                    Ok(RawLogStoreRow { op, row_meta })
+                }
+            }),
         )
         .boxed()
         // The `boxed` call was unnecessary in usual build. But when doing cargo doc,
@@ -1012,6 +1181,25 @@ impl<S: StateStoreReadIter> LogStoreRowOpStream<S> {
                     };
                     return Ok(Some(row));
                 }
+                LogStoreOp::Blob {
+                    start_seq_id,
+                    chunk,
+                    blob_size,
+                } => {
+                    self.row_streams.push(stream.into_future());
+                    let op = AlignedLogStoreOp::Blob {
+                        vnode,
+                        start_seq_id,
+                        chunk,
+                        blob_size,
+                    };
+                    let row = AlignedLogStoreRow {
+                        op,
+                        size,
+                        epoch: decoded_epoch,
+                    };
+                    return Ok(Some(row));
+                }
                 LogStoreOp::Update {
                     seq_id,
                     old_value,
@@ -1215,6 +1403,21 @@ mod tests {
                 assert_eq!(expected_row, actual_row);
             }
             (
+                AlignedLogStoreOp::Blob {
+                    start_seq_id: expected_start_seq_id,
+                    chunk: expected_chunk,
+                    ..
+                },
+                AlignedLogStoreOp::Blob {
+                    start_seq_id: actual_start_seq_id,
+                    chunk: actual_chunk,
+                    ..
+                },
+            ) => {
+                assert_eq!(expected_start_seq_id, actual_start_seq_id);
+                assert_eq!(expected_chunk.to_protobuf(), actual_chunk.to_protobuf());
+            }
+            (
                 AlignedLogStoreOp::Update {
                     old_value: expected_old_value,
                     new_value: expected_new_value,
@@ -1288,6 +1491,7 @@ mod tests {
                     assert_eq!(&op, &deserialized_op);
                     assert_eq!(row.to_owned_row(), deserialized_row);
                 }
+                LogStoreRowOp::Blob { .. } => unreachable!(),
                 LogStoreRowOp::Barrier { .. } => unreachable!(),
             }
             seq_id += 1;
@@ -1327,6 +1531,7 @@ mod tests {
                     assert_eq!(&op, &deserialized_op);
                     assert_eq!(row.to_owned_row(), deserialized_row);
                 }
+                LogStoreRowOp::Blob { .. } => unreachable!(),
                 LogStoreRowOp::Barrier { .. } => unreachable!(),
             }
             seq_id += 1;
@@ -1528,7 +1733,8 @@ mod tests {
             rows.push(row_list);
         }
 
-        let stream = LogStoreRowOpStream::new(streams, serde, KvLogStoreReadMetrics::for_test());
+        let stream =
+            LogStoreRowOpStream::new(streams, serde, KvLogStoreReadMetrics::for_test());
 
         for i in 0..size {
             let (o, r) = gen_test_data((100 * i) as _);
