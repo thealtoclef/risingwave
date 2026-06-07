@@ -92,6 +92,10 @@ struct LogStoreBufferInner {
 
     next_chunk_id: ChunkId,
 
+    /// Number of items at the back (oldest end) of `unconsumed_queue` that have been
+    /// examined by the reader's blob prefetcher. Decremented on pop, reset on rewind.
+    prefetch_examined_count: usize,
+
     metrics: KvLogStoreMetrics,
 }
 
@@ -185,6 +189,7 @@ impl LogStoreBufferInner {
 
     fn pop_item(&mut self) -> Option<(u64, LogStoreBufferItem)> {
         if let Some((epoch, item)) = self.unconsumed_queue.pop_back() {
+            self.prefetch_examined_count = self.prefetch_examined_count.saturating_sub(1);
             self.consumed_queue.push_front((epoch, item.clone()));
             self.update_buffer_metrics();
             Some((epoch, item))
@@ -281,6 +286,9 @@ impl LogStoreBufferInner {
                 self.unconsumed_queue.push_back((epoch, item));
             }
         }
+        // Rewound items re-enter at the back of the unconsumed queue, invalidating
+        // the prefetch cursor. The reader clears its prefetch state correspondingly.
+        self.prefetch_examined_count = 0;
         self.update_buffer_metrics();
     }
 
@@ -290,6 +298,7 @@ impl LogStoreBufferInner {
         self.next_chunk_id = 0;
         self.truncation_list.clear();
         self.row_count = 0;
+        self.prefetch_examined_count = 0;
     }
 }
 
@@ -471,7 +480,54 @@ pub(crate) struct LogStoreBufferReceiver {
     truncate_notify: Arc<Notify>,
 }
 
+/// Descriptor of a flushed blob WAL chunk eligible for prefetching.
+pub(crate) struct BlobPrefetchDescriptor {
+    pub epoch: u64,
+    pub vnode: VirtualNode,
+    pub start_seq_id: SeqId,
+    pub chunk_id: ChunkId,
+}
+
 impl LogStoreBufferReceiver {
+    /// Reset the prefetch cursor so that the next [`Self::peek_blobs_to_prefetch`]
+    /// re-examines from the oldest unconsumed item. Called when the reader drops its
+    /// prefetch state; re-examination is safe because blob reads are idempotent.
+    pub(crate) fn reset_prefetch_cursor(&self) {
+        self.buffer.inner().prefetch_examined_count = 0;
+    }
+
+    /// Scan unexamined items from the oldest end of the unconsumed queue and return
+    /// up to `max_new` `FlushedBlob` descriptors for prefetching. All scanned items
+    /// (blob or not) advance the cursor, so each item is examined exactly once.
+    pub(crate) fn peek_blobs_to_prefetch(&self, max_new: usize) -> Vec<BlobPrefetchDescriptor> {
+        let mut found = Vec::new();
+        if max_new == 0 {
+            return found;
+        }
+        let mut inner = self.buffer.inner();
+        let len = inner.unconsumed_queue.len();
+        while inner.prefetch_examined_count < len && found.len() < max_new {
+            // Index from the back: the oldest unexamined item.
+            let idx = len - 1 - inner.prefetch_examined_count;
+            if let (epoch, LogStoreBufferItem::FlushedBlob {
+                vnode,
+                start_seq_id,
+                chunk_id,
+                ..
+            }) = &inner.unconsumed_queue[idx]
+            {
+                found.push(BlobPrefetchDescriptor {
+                    epoch: *epoch,
+                    vnode: *vnode,
+                    start_seq_id: *start_seq_id,
+                    chunk_id: *chunk_id,
+                });
+            }
+            inner.prefetch_examined_count += 1;
+        }
+        found
+    }
+
     pub(crate) async fn next_item(&self) -> (u64, LogStoreBufferItem) {
         let notified = self.update_notify.notified();
         if let Some(item) = { self.buffer.inner().pop_item() } {
@@ -578,6 +634,7 @@ pub(crate) fn new_log_store_buffer(
         chunk_size,
         truncation_list: VecDeque::new(),
         next_chunk_id: 0,
+        prefetch_examined_count: 0,
         metrics,
     });
     let update_notify = Arc::new(Notify::new());

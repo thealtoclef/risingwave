@@ -286,6 +286,12 @@ pub struct StreamingDeveloperConfig {
     #[serde(default = "default::developer::enable_kv_log_store_v3")]
     pub enable_kv_log_store_v3: bool,
 
+    /// Number of flushed blob WAL chunks to prefetch concurrently in the sink kv log
+    /// store reader. Only effective when `enable_kv_log_store_v3` is true. Set to 0 to
+    /// disable prefetching and read blobs serially.
+    #[serde(default = "default::developer::kv_log_store_blob_prefetch_depth")]
+    pub kv_log_store_blob_prefetch_depth: usize,
+
     /// Disable the optimized dispatcher path for sync log store.
     #[serde(default = "default::developer::disable_sync_log_store_dispatcher")]
     pub disable_sync_log_store_dispatcher: bool,

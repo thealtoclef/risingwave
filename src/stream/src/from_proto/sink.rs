@@ -351,6 +351,7 @@ impl ExecutorBuilder for SinkExecutorBuilder {
                         log_store_identity,
                         params.env.kv_log_store_historical_read_semaphore(),
                         pk_info,
+                        params.config.developer.kv_log_store_blob_prefetch_depth,
                     )
                 } else {
                     KvLogStoreFactory::new(

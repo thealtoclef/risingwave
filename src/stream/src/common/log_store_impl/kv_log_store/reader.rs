@@ -12,21 +12,24 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::future::Future;
+use std::collections::VecDeque;
+use std::future::{Future, poll_fn};
 use std::mem::replace;
 use std::ops::Bound::{Excluded, Included, Unbounded};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::task::Poll;
 use std::time::Duration;
 
 use anyhow::anyhow;
 use await_tree::InstrumentAwait;
 use foyer::Hint;
 use futures::future::{BoxFuture, try_join_all};
+use futures::stream::FuturesOrdered;
 use futures::{FutureExt, TryFutureExt};
 use risingwave_common::array::StreamChunk;
 use risingwave_common::bitmap::Bitmap;
-use risingwave_common::hash::VnodeBitmapExt;
+use risingwave_common::hash::{VirtualNode, VnodeBitmapExt};
 use risingwave_common::metrics::{LabelGuardedHistogram, LabelGuardedIntCounter};
 use risingwave_common::util::epoch::{EpochExt, EpochPair};
 use risingwave_connector::sink::log_store::{
@@ -44,7 +47,7 @@ use tokio::time::sleep;
 use tokio_stream::StreamExt;
 
 use crate::common::log_store_impl::kv_log_store::buffer::{
-    LogStoreBufferItem, LogStoreBufferReceiver,
+    BlobPrefetchDescriptor, LogStoreBufferItem, LogStoreBufferReceiver,
 };
 use crate::common::log_store_impl::kv_log_store::serde::{
     KvLogStoreItem, LogStoreItemMergeStream, merge_log_store_item_stream,
@@ -172,6 +175,9 @@ macro_rules! set_and_drive_future {
     };
 }
 
+/// A prefetched blob read result: (epoch, chunk_id, read result).
+type PrefetchedBlob = (u64, ChunkId, LogStoreResult<(StreamChunk, usize)>);
+
 pub struct KvLogStoreReader<S: StateStoreRead> {
     state: LogStoreReadState<S>,
 
@@ -199,6 +205,22 @@ pub struct KvLogStoreReader<S: StateStoreRead> {
     /// Shared semaphore to limit concurrent historical reads across the compute node.
     /// `None` means unlimited.
     historical_read_semaphore: Option<Arc<Semaphore>>,
+
+    /// Max number of concurrent in-flight blob WAL prefetch reads. 0 disables prefetch.
+    blob_prefetch_depth: usize,
+
+    /// In-flight prefetched blob reads, in buffer queue order. Stored in the reader so
+    /// that progress is not lost when `next_item` is cancelled.
+    blob_prefetch: FuturesOrdered<BoxFuture<'static, PrefetchedBlob>>,
+
+    /// Resolved prefetch results not yet matched to a consumed buffer item.
+    ready_blobs: VecDeque<PrefetchedBlob>,
+
+    /// A `FlushedBlob` item popped from the buffer but not yet delivered, as
+    /// `(epoch, chunk_id, vnode, start_seq_id)`. Set before awaiting its (possibly
+    /// in-flight) read so that a cancelled `next_item` can resume delivering it
+    /// instead of losing the item.
+    pending_blob_item: Option<(u64, ChunkId, VirtualNode, SeqId)>,
 }
 
 impl<S: StateStoreRead> KvLogStoreReader<S> {
@@ -212,6 +234,7 @@ impl<S: StateStoreRead> KvLogStoreReader<S> {
         is_paused: watch::Receiver<bool>,
         identity: String,
         historical_read_semaphore: Option<Arc<Semaphore>>,
+        blob_prefetch_depth: usize,
     ) -> Self {
         let rewind_delay = RewindDelay::new(&metrics);
         Self {
@@ -228,6 +251,10 @@ impl<S: StateStoreRead> KvLogStoreReader<S> {
             identity,
             rewind_delay,
             historical_read_semaphore,
+            blob_prefetch_depth,
+            blob_prefetch: FuturesOrdered::new(),
+            ready_blobs: VecDeque::new(),
+            pending_blob_item: None,
         }
     }
 }
@@ -242,6 +269,147 @@ impl<S: StateStoreRead> KvLogStoreReader<S> {
             self.metrics.persistent_log_read_metrics.clone(),
             self.first_write_epoch.expect("should have init"),
             range_start,
+        )
+    }
+
+    /// Drop all prefetch state and reset the buffer-side cursor, so that the next
+    /// [`Self::try_fill_blob_prefetch`] realigns with the oldest unconsumed item.
+    /// Dropped in-flight reads are harmless: blob reads are idempotent point-gets,
+    /// and unconsumed blobs are never truncated from storage.
+    fn clear_blob_prefetch(&mut self) {
+        self.blob_prefetch = FuturesOrdered::new();
+        self.ready_blobs.clear();
+        self.rx.reset_prefetch_cursor();
+    }
+
+    /// Top up the prefetch window with reads for upcoming `FlushedBlob` items in the
+    /// buffer queue, up to `blob_prefetch_depth` in flight (including resolved ones).
+    fn try_fill_blob_prefetch(&mut self) {
+        if self.blob_prefetch_depth == 0 {
+            return;
+        }
+        let in_flight = self.blob_prefetch.len() + self.ready_blobs.len();
+        if in_flight >= self.blob_prefetch_depth {
+            return;
+        }
+        for BlobPrefetchDescriptor {
+            epoch,
+            vnode,
+            start_seq_id,
+            chunk_id,
+        } in self
+            .rx
+            .peek_blobs_to_prefetch(self.blob_prefetch_depth - in_flight)
+        {
+            let read_future = self.state.read_flushed_blob(vnode, start_seq_id, epoch);
+            self.blob_prefetch
+                .push_back(async move { (epoch, chunk_id, read_future.await) }.boxed());
+        }
+    }
+
+    /// Get the next prefetched blob result in queue order, awaiting the front in-flight
+    /// read if none has resolved yet. Returns `None` if no prefetch is pending.
+    /// Cancellation-safe: futures live in `self.blob_prefetch`, and a resolved value is
+    /// returned synchronously within a single poll.
+    async fn next_ready_blob(&mut self) -> Option<PrefetchedBlob> {
+        if let Some(ready) = self.ready_blobs.pop_front() {
+            return Some(ready);
+        }
+        if self.blob_prefetch.is_empty() {
+            return None;
+        }
+        poll_fn(|cx| futures::Stream::poll_next(Pin::new(&mut self.blob_prefetch), cx))
+            .instrument_await("Wait Prefetched Blob")
+            .await
+    }
+
+    /// Read a flushed blob, serving from the prefetch pipeline when possible. By FIFO
+    /// order over the same buffer queue, the next prefetched result must correspond to
+    /// the requested item; on mismatch (e.g. cursor desync), prefetch state is discarded
+    /// and the read falls back to a direct storage read via `future_state`.
+    async fn read_blob_with_prefetch(
+        &mut self,
+        item_epoch: u64,
+        chunk_id: ChunkId,
+        vnode: VirtualNode,
+        start_seq_id: SeqId,
+    ) -> LogStoreResult<(StreamChunk, usize)> {
+        let prefetched = match self.next_ready_blob().await {
+            Some((epoch, id, result)) if epoch == item_epoch && id == chunk_id => match result {
+                Ok(prefetched) => {
+                    self.metrics.blob_prefetch_hit_count.inc();
+                    Some(prefetched)
+                }
+                Err(e) => {
+                    // Drop the remaining prefetch state so that a retry of this item
+                    // takes a clean direct-read path instead of a mismatch fallback.
+                    self.clear_blob_prefetch();
+                    return Err(e);
+                }
+            },
+            Some((epoch, id, _)) => {
+                tracing::warn!(
+                    prefetched_epoch = epoch,
+                    prefetched_chunk_id = id,
+                    item_epoch,
+                    chunk_id,
+                    identity = %self.identity,
+                    "prefetched blob mismatch, falling back to direct read"
+                );
+                self.clear_blob_prefetch();
+                None
+            }
+            None => None,
+        };
+        match prefetched {
+            Some(prefetched) => Ok(prefetched),
+            None => {
+                let read_flushed_blob_future = {
+                    self.state
+                        .read_flushed_blob(vnode, start_seq_id, item_epoch)
+                        .map(move |result| {
+                            result
+                                .map(|(chunk, blob_size)| (chunk_id, chunk, item_epoch, blob_size))
+                        })
+                        .boxed()
+                };
+
+                let (_, chunk, _, blob_size) = set_and_drive_future!(
+                    &mut self.future_state,
+                    ReadFlushedBlob,
+                    read_flushed_blob_future
+                )
+                .await?;
+                Ok((chunk, blob_size))
+            }
+        }
+    }
+
+    /// Update metrics and offset bookkeeping for a blob item about to be delivered.
+    fn deliver_blob_item(
+        &mut self,
+        item_epoch: u64,
+        chunk_id: ChunkId,
+        chunk: StreamChunk,
+        blob_size: usize,
+    ) -> (u64, LogStoreReadItem) {
+        if let Some(c) = &self.metrics.persistent_log_read_metrics.blob_read_count {
+            c.inc();
+        }
+        if let Some(c) = &self.metrics.persistent_log_read_metrics.blob_read_bytes {
+            c.inc_by(blob_size as _);
+        }
+        let offset = TruncateOffset::Chunk {
+            epoch: item_epoch,
+            chunk_id,
+        };
+        if let Some(latest_offset) = &self.latest_offset {
+            assert!(offset > *latest_offset);
+        }
+        self.latest_offset = Some(offset);
+        (
+            item_epoch,
+            LogStoreReadItem::StreamChunk { chunk, chunk_id },
         )
     }
 }
@@ -344,6 +512,8 @@ impl<S: StateStoreRead> LogReader for KvLogStoreReader<S> {
         self.latest_offset = None;
         self.truncate_offset = None;
         self.rewind_delay = RewindDelay::new(&self.metrics);
+        self.clear_blob_prefetch();
+        self.pending_blob_item = None;
 
         Ok(())
     }
@@ -416,24 +586,10 @@ impl<S: StateStoreRead> LogReader for KvLogStoreReader<S> {
             KvLogStoreReaderFutureState::ReadFlushedBlob(future) => {
                 let (chunk_id, chunk, item_epoch, blob_size) = future.await?;
                 self.future_state = KvLogStoreReaderFutureState::Empty;
-                if let Some(c) = &self.metrics.persistent_log_read_metrics.blob_read_count {
-                    c.inc();
-                }
-                if let Some(c) = &self.metrics.persistent_log_read_metrics.blob_read_bytes {
-                    c.inc_by(blob_size as _);
-                }
-                let offset = TruncateOffset::Chunk {
-                    epoch: item_epoch,
-                    chunk_id,
-                };
-                if let Some(latest_offset) = &self.latest_offset {
-                    assert!(offset > *latest_offset);
-                }
-                self.latest_offset = Some(offset);
-                return Ok((
-                    item_epoch,
-                    LogStoreReadItem::StreamChunk { chunk, chunk_id },
-                ));
+                // The blob item is delivered here; drop any pending-delivery marker
+                // set before the direct read was issued.
+                self.pending_blob_item = None;
+                return Ok(self.deliver_blob_item(item_epoch, chunk_id, chunk, blob_size));
             }
             KvLogStoreReaderFutureState::Empty => {}
             KvLogStoreReaderFutureState::Reset => {
@@ -441,12 +597,43 @@ impl<S: StateStoreRead> LogReader for KvLogStoreReader<S> {
             }
         }
 
+        // Resume delivering a blob item whose await was cancelled after the item had
+        // already been popped from the buffer.
+        if let Some((item_epoch, chunk_id, vnode, start_seq_id)) = self.pending_blob_item {
+            let (chunk, blob_size) = self
+                .read_blob_with_prefetch(item_epoch, chunk_id, vnode, start_seq_id)
+                .await?;
+            self.pending_blob_item = None;
+            return Ok(self.deliver_blob_item(item_epoch, chunk_id, chunk, blob_size));
+        }
+
         // Now the historical state store has been consumed.
-        let (item_epoch, item) = self
-            .rx
-            .next_item()
+        // Issue prefetch reads for upcoming flushed blobs before waiting, and keep
+        // driving them while waiting for the next buffer item, so that blob reads
+        // proceed concurrently instead of one storage round-trip per consumed item.
+        self.try_fill_blob_prefetch();
+        let (item_epoch, item) = {
+            let Self {
+                rx,
+                blob_prefetch,
+                ready_blobs,
+                ..
+            } = &mut *self;
+            let next_item = rx.next_item();
+            let mut next_item = std::pin::pin!(next_item);
+            poll_fn(|cx| {
+                if !blob_prefetch.is_empty() {
+                    while let Poll::Ready(Some(ready)) =
+                        futures::Stream::poll_next(Pin::new(&mut *blob_prefetch), cx)
+                    {
+                        ready_blobs.push_back(ready);
+                    }
+                }
+                next_item.as_mut().poll(cx)
+            })
             .instrument_await("Wait Next Item from Buffer")
-            .await;
+            .await
+        };
         if let Some(latest_offset) = &self.latest_offset {
             latest_offset.check_next_item_epoch(item_epoch)?;
         }
@@ -514,42 +701,15 @@ impl<S: StateStoreRead> LogReader for KvLogStoreReader<S> {
                 chunk_id,
                 ..
             } => {
-                let read_flushed_blob_future = {
-                    self.state
-                        .read_flushed_blob(vnode, start_seq_id, item_epoch)
-                        .map(move |result| {
-                            result.map(|(chunk, blob_size)| {
-                                (chunk_id, chunk, item_epoch, blob_size)
-                            })
-                        })
-                        .boxed()
-                };
-
-                let (_, chunk, _, blob_size) = set_and_drive_future!(
-                    &mut self.future_state,
-                    ReadFlushedBlob,
-                    read_flushed_blob_future
-                )
-                .await?;
-                if let Some(c) = &self.metrics.persistent_log_read_metrics.blob_read_count {
-                    c.inc();
-                }
-                if let Some(c) = &self.metrics.persistent_log_read_metrics.blob_read_bytes {
-                    c.inc_by(blob_size as _);
-                }
-
-                let offset = TruncateOffset::Chunk {
-                    epoch: item_epoch,
-                    chunk_id,
-                };
-                if let Some(latest_offset) = &self.latest_offset {
-                    assert!(offset > *latest_offset);
-                }
-                self.latest_offset = Some(offset);
-                (
-                    item_epoch,
-                    LogStoreReadItem::StreamChunk { chunk, chunk_id },
-                )
+                // The item is already popped from the buffer. Record it as pending
+                // before any await point so that a cancelled `next_item` resumes
+                // delivering it instead of losing it.
+                self.pending_blob_item = Some((item_epoch, chunk_id, vnode, start_seq_id));
+                let (chunk, blob_size) = self
+                    .read_blob_with_prefetch(item_epoch, chunk_id, vnode, start_seq_id)
+                    .await?;
+                self.pending_blob_item = None;
+                self.deliver_blob_item(item_epoch, chunk_id, chunk, blob_size)
             }
             LogStoreBufferItem::Barrier {
                 is_checkpoint,
@@ -620,6 +780,10 @@ impl<S: StateStoreRead> LogReader for KvLogStoreReader<S> {
         self.rewind_delay.rewind_delay(self.truncate_offset).await;
         self.latest_offset = None;
         self.future_state = KvLogStoreReaderFutureState::Reset;
+        // Rewind invalidates the consumption order assumed by the prefetch pipeline.
+        // Any undelivered pending blob item will be re-delivered after the rewind.
+        self.clear_blob_prefetch();
+        self.pending_blob_item = None;
         Ok(())
     }
 }
@@ -921,6 +1085,7 @@ mod tests {
                 pause_rx,
                 identity.to_owned(),
                 Some(semaphore),
+                0,
             ),
             tx,
         )

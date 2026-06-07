@@ -226,6 +226,7 @@ pub(crate) struct KvLogStoreMetrics {
     pub flushed_buffer_read_metrics: KvLogStoreReadMetrics,
     pub blob_write_count: LabelGuardedIntCounter,
     pub blob_write_bytes: LabelGuardedIntCounter,
+    pub blob_prefetch_hit_count: LabelGuardedIntCounter,
 }
 
 impl KvLogStoreMetrics {
@@ -311,6 +312,9 @@ impl KvLogStoreMetrics {
         let blob_write_bytes = metrics
             .kv_log_store_blob_write_bytes
             .with_guarded_label_values(labels);
+        let blob_prefetch_hit_count = metrics
+            .kv_log_store_blob_prefetch_hit_count
+            .with_guarded_label_values(labels);
 
         let rewind_count = metrics
             .kv_log_store_rewind_count
@@ -367,6 +371,7 @@ impl KvLogStoreMetrics {
             },
             blob_write_count,
             blob_write_bytes,
+            blob_prefetch_hit_count,
             rewind_delay,
         }
     }
@@ -385,6 +390,7 @@ impl KvLogStoreMetrics {
             rewind_delay: LabelGuardedHistogram::test_histogram::<4>(),
             blob_write_count: LabelGuardedIntCounter::test_int_counter::<4>(),
             blob_write_bytes: LabelGuardedIntCounter::test_int_counter::<4>(),
+            blob_prefetch_hit_count: LabelGuardedIntCounter::test_int_counter::<4>(),
             persistent_log_read_metrics: KvLogStoreReadMetrics {
                 storage_read_count: LabelGuardedIntCounter::test_int_counter::<5>(),
                 storage_read_size: LabelGuardedIntCounter::test_int_counter::<5>(),
@@ -559,6 +565,10 @@ pub struct KvLogStoreFactory<S: StateStore> {
     historical_read_semaphore: Option<Arc<tokio::sync::Semaphore>>,
 
     enable_blob_wal: bool,
+
+    /// Max number of concurrent in-flight blob WAL prefetch reads in the reader.
+    /// 0 disables prefetch. Only effective when `enable_blob_wal` is true.
+    blob_prefetch_depth: usize,
 }
 
 impl<S: StateStore> KvLogStoreFactory<S> {
@@ -585,6 +595,7 @@ impl<S: StateStore> KvLogStoreFactory<S> {
             historical_read_semaphore,
             pk_info,
             false,
+            0,
         )
     }
 
@@ -599,6 +610,7 @@ impl<S: StateStore> KvLogStoreFactory<S> {
         identity: impl Into<String>,
         historical_read_semaphore: Option<Arc<tokio::sync::Semaphore>>,
         pk_info: &'static KvLogStorePkInfo,
+        blob_prefetch_depth: usize,
     ) -> Self {
         Self::new_inner(
             state_store,
@@ -611,6 +623,7 @@ impl<S: StateStore> KvLogStoreFactory<S> {
             historical_read_semaphore,
             pk_info,
             true,
+            blob_prefetch_depth,
         )
     }
 
@@ -626,6 +639,7 @@ impl<S: StateStore> KvLogStoreFactory<S> {
         historical_read_semaphore: Option<Arc<tokio::sync::Semaphore>>,
         pk_info: &'static KvLogStorePkInfo,
         enable_blob_wal: bool,
+        blob_prefetch_depth: usize,
     ) -> Self {
         Self {
             state_store,
@@ -638,6 +652,7 @@ impl<S: StateStore> KvLogStoreFactory<S> {
             pk_info,
             historical_read_semaphore,
             enable_blob_wal,
+            blob_prefetch_depth,
         }
     }
 }
@@ -691,6 +706,7 @@ impl<S: StateStore> LogStoreFactory for KvLogStoreFactory<S> {
             pause_rx,
             self.identity.clone(),
             self.historical_read_semaphore,
+            self.blob_prefetch_depth,
         );
 
         let writer = KvLogStoreWriter::new(
@@ -889,6 +905,7 @@ mod tests {
             "test_blob_wal",
             None,
             pk_info,
+            4,
         );
         let (mut reader, mut writer) = factory.build().await;
 
@@ -955,6 +972,7 @@ mod tests {
             "test_blob_wal_multiple_blobs",
             None,
             pk_info,
+            4,
         );
         let (mut reader, mut writer) = factory.build().await;
 
@@ -996,6 +1014,181 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_blob_wal_prefetch_across_barriers() {
+        // Blobs interleaved with barriers across two epochs. The prefetch cursor must
+        // skip barrier items, and matching must stay correct even though chunk ids
+        // reset at each barrier ((epoch, chunk_id) is unique across epochs).
+        let pk_info: &'static KvLogStorePkInfo = &KV_LOG_STORE_V2_INFO;
+        let test_env = prepare_hummock_test_env().await;
+        let table = gen_test_log_store_table(pk_info);
+        test_env.register_table(table.clone()).await;
+
+        let chunk1 = gen_stream_chunk_with_info(0, pk_info);
+        let chunk2 = gen_stream_chunk_with_info(100, pk_info);
+        let chunk3 = gen_stream_chunk_with_info(200, pk_info);
+        let bitmap =
+            calculate_vnode_bitmap(chunk1.rows().chain(chunk2.rows()).chain(chunk3.rows()));
+
+        let metrics = KvLogStoreMetrics::for_test();
+        let factory = KvLogStoreFactory::new_with_blob_wal(
+            test_env.storage.clone(),
+            table.clone(),
+            Some(Arc::new(bitmap)),
+            0,
+            1024,
+            metrics.clone(),
+            "test_blob_wal_prefetch_across_barriers",
+            None,
+            pk_info,
+            4,
+        );
+        let (mut reader, mut writer) = factory.build().await;
+
+        let epoch1 = test_env
+            .storage
+            .get_pinned_version()
+            .table_committed_epoch(table.id)
+            .unwrap()
+            .next_epoch();
+        test_env
+            .storage
+            .start_epoch(epoch1, HashSet::from_iter([table.id]));
+        writer
+            .init(EpochPair::new_test_epoch(epoch1), false)
+            .await
+            .unwrap();
+        writer.write_chunk(chunk1.clone()).await.unwrap();
+        let epoch2 = epoch1.next_epoch();
+        test_env
+            .storage
+            .start_epoch(epoch2, HashSet::from_iter([table.id]));
+        writer
+            .flush_current_epoch_for_test(epoch2, false)
+            .await
+            .unwrap();
+        writer.write_chunk(chunk2.clone()).await.unwrap();
+        writer.write_chunk(chunk3.clone()).await.unwrap();
+        let epoch3 = epoch2.next_epoch();
+        writer
+            .flush_current_epoch_for_test(epoch3, true)
+            .await
+            .unwrap();
+
+        reader.init().await.unwrap();
+        reader.start_from(None).await.unwrap();
+        for (expected_chunk, expected_epoch) in
+            [(&chunk1, epoch1), (&chunk2, epoch2), (&chunk3, epoch2)]
+        {
+            match reader.next_item().await.unwrap() {
+                (
+                    epoch,
+                    LogStoreReadItem::StreamChunk {
+                        chunk: read_stream_chunk,
+                        ..
+                    },
+                ) => {
+                    assert_eq!(epoch, expected_epoch);
+                    assert!(check_stream_chunk_eq(expected_chunk, &read_stream_chunk));
+                }
+                _ => unreachable!(),
+            }
+            // The barrier between epoch1 and epoch2 is delivered after chunk1.
+            if expected_epoch == epoch1 {
+                match reader.next_item().await.unwrap() {
+                    (epoch, LogStoreReadItem::Barrier { is_checkpoint, .. }) => {
+                        assert_eq!(epoch, epoch1);
+                        assert!(!is_checkpoint);
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        }
+        match reader.next_item().await.unwrap() {
+            (epoch, LogStoreReadItem::Barrier { is_checkpoint, .. }) => {
+                assert_eq!(epoch, epoch2);
+                assert!(is_checkpoint);
+            }
+            _ => unreachable!(),
+        }
+        // All three blobs were known before consumption started, so all reads must be
+        // served from the prefetch pipeline.
+        assert_eq!(metrics.blob_prefetch_hit_count.get(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_blob_wal_prefetch_disabled_serial() {
+        // With prefetch depth 0, blobs must be read via the original serial path with
+        // identical results and zero prefetch hits.
+        let pk_info: &'static KvLogStorePkInfo = &KV_LOG_STORE_V2_INFO;
+        let test_env = prepare_hummock_test_env().await;
+        let table = gen_test_log_store_table(pk_info);
+        test_env.register_table(table.clone()).await;
+
+        let chunk1 = gen_stream_chunk_with_info(0, pk_info);
+        let chunk2 = gen_stream_chunk_with_info(100, pk_info);
+        let bitmap = calculate_vnode_bitmap(chunk1.rows().chain(chunk2.rows()));
+
+        let metrics = KvLogStoreMetrics::for_test();
+        let factory = KvLogStoreFactory::new_with_blob_wal(
+            test_env.storage.clone(),
+            table.clone(),
+            Some(Arc::new(bitmap)),
+            0,
+            1024,
+            metrics.clone(),
+            "test_blob_wal_prefetch_disabled",
+            None,
+            pk_info,
+            0,
+        );
+        let (mut reader, mut writer) = factory.build().await;
+
+        let epoch1 = test_env
+            .storage
+            .get_pinned_version()
+            .table_committed_epoch(table.id)
+            .unwrap()
+            .next_epoch();
+        test_env
+            .storage
+            .start_epoch(epoch1, HashSet::from_iter([table.id]));
+        writer
+            .init(EpochPair::new_test_epoch(epoch1), false)
+            .await
+            .unwrap();
+        writer.write_chunk(chunk1.clone()).await.unwrap();
+        writer.write_chunk(chunk2.clone()).await.unwrap();
+
+        reader.init().await.unwrap();
+        reader.start_from(None).await.unwrap();
+        for expected_chunk in [&chunk1, &chunk2] {
+            match reader.next_item().await.unwrap() {
+                (
+                    epoch,
+                    LogStoreReadItem::StreamChunk {
+                        chunk: read_stream_chunk,
+                        ..
+                    },
+                ) => {
+                    assert_eq!(epoch, epoch1);
+                    assert!(check_stream_chunk_eq(expected_chunk, &read_stream_chunk));
+                }
+                _ => unreachable!(),
+            }
+        }
+        assert_eq!(metrics.blob_prefetch_hit_count.get(), 0);
+        assert_eq!(
+            metrics
+                .persistent_log_read_metrics
+                .blob_read_count
+                .as_ref()
+                .unwrap()
+                .get(),
+            2
+        );
+    }
+
+    #[tokio::test]
     async fn test_blob_wal_rewind_and_truncate_live_buffer() {
         let pk_info: &'static KvLogStorePkInfo = &KV_LOG_STORE_V2_INFO;
         let test_env = prepare_hummock_test_env().await;
@@ -1015,6 +1208,7 @@ mod tests {
             "test_blob_wal_rewind_truncate",
             None,
             pk_info,
+            4,
         );
         let (mut reader, mut writer) = factory.build().await;
 
@@ -1100,6 +1294,7 @@ mod tests {
             "test_blob_wal_recovery",
             None,
             pk_info,
+            4,
         );
         let (_reader, mut writer) = factory.build().await;
 
@@ -1139,6 +1334,7 @@ mod tests {
             "test_blob_wal_recovery",
             None,
             pk_info,
+            4,
         );
         let (mut reader, mut writer) = factory.build().await;
         test_env
@@ -1255,6 +1451,7 @@ mod tests {
             "test_blob_wal_mixed_recovery_v3",
             None,
             pk_info,
+            4,
         );
         let (_reader, mut writer) = factory.build().await;
         writer
@@ -1283,6 +1480,7 @@ mod tests {
             "test_blob_wal_mixed_recovery",
             None,
             pk_info,
+            4,
         );
         let (mut reader, mut writer) = factory.build().await;
         test_env

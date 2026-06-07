@@ -448,6 +448,10 @@ pub mod default {
             true
         }
 
+        pub fn kv_log_store_blob_prefetch_depth() -> usize {
+            8
+        }
+
         pub fn disable_sync_log_store_dispatcher() -> bool {
             false
         }
