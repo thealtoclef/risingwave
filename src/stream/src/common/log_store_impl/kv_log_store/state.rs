@@ -253,7 +253,7 @@ impl<S: LocalStateStore> LogStoreStateWriter<'_, S> {
         start_seq_id: SeqId,
         end_seq_id: SeqId,
     ) -> LogStoreResult<(VirtualNode, usize)> {
-        let vnode = self.inner.serde.blob_vnode();
+        let vnode = self.inner.serde.blob_vnode_for_seq(start_seq_id);
         let key = self
             .inner
             .serde

@@ -391,8 +391,13 @@ impl LogStoreRowSerde {
         )
     }
 
-    pub(crate) fn blob_vnode(&self) -> VirtualNode {
-        self.vnodes.iter_vnodes().next().unwrap_or(SINGLETON_VNODE)
+    pub(crate) fn blob_vnode_for_seq(&self, start_seq_id: SeqId) -> VirtualNode {
+        let vnodes: Vec<VirtualNode> = self.vnodes.iter_vnodes().collect();
+        if vnodes.is_empty() {
+            SINGLETON_VNODE
+        } else {
+            vnodes[start_seq_id as usize % vnodes.len()]
+        }
     }
 
     pub(crate) fn serialize_log_store_blob_pk(

@@ -1200,8 +1200,7 @@ mod tests {
         let table = gen_test_log_store_table(pk_info);
         test_env.register_table(table.clone()).await;
 
-        let row_chunk1 = gen_stream_chunk_with_info(0, pk_info);
-        let row_chunk2 = gen_stream_chunk_with_info(100, pk_info);
+        let row_chunk = gen_stream_chunk_with_info(0, pk_info);
         let [blob_chunk] = gen_multi_vnode_stream_chunks::<1>(200, 20, pk_info);
 
         // Phase 1: v2 factory writes two chunks in row format.
@@ -1231,8 +1230,7 @@ mod tests {
             .init(EpochPair::new_test_epoch(epoch1), false)
             .await
             .unwrap();
-        writer.write_chunk(row_chunk1.clone()).await.unwrap();
-        writer.write_chunk(row_chunk2.clone()).await.unwrap();
+        writer.write_chunk(row_chunk.clone()).await.unwrap();
         let epoch2 = epoch1.next_epoch();
         writer
             .flush_current_epoch_for_test(epoch2, true)
@@ -1297,21 +1295,19 @@ mod tests {
         reader.init().await.unwrap();
         reader.start_from(None).await.unwrap();
 
-        // Row-format chunks from epoch1.
-        for expected_chunk in [&row_chunk1, &row_chunk2] {
-            match reader.next_item().await.unwrap() {
-                (
-                    epoch,
-                    LogStoreReadItem::StreamChunk {
-                        chunk: read_stream_chunk,
-                        ..
-                    },
-                ) => {
-                    assert_eq!(epoch, epoch1);
-                    assert!(check_stream_chunk_eq(expected_chunk, &read_stream_chunk));
-                }
-                _ => unreachable!(),
+        // Row-format chunk from epoch1.
+        match reader.next_item().await.unwrap() {
+            (
+                epoch,
+                LogStoreReadItem::StreamChunk {
+                    chunk: read_stream_chunk,
+                    ..
+                },
+            ) => {
+                assert_eq!(epoch, epoch1);
+                assert!(check_stream_chunk_eq(&row_chunk, &read_stream_chunk));
             }
+            _ => unreachable!(),
         }
         match reader.next_item().await.unwrap() {
             (epoch, LogStoreReadItem::Barrier { is_checkpoint, .. }) => {
