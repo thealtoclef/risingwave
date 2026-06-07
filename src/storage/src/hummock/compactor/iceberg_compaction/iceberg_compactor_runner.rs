@@ -24,9 +24,9 @@ use iceberg_compaction_core::compaction::{
     CompactionPlanner, CompactionResult,
 };
 use iceberg_compaction_core::config::{
-    CompactionExecutionConfigBuilder, CompactionPlanningConfig, FileGroupScope,
-    FilesWithDeletesConfigBuilder, FullCompactionConfigBuilder, GroupFilters,
-    SmallFilesConfigBuilder,
+    CompactionExecutionConfigBuilder, CompactionPlanningConfig,
+    FilesWithDeletesConfigBuilder, FullCompactionConfigBuilder,
+    FullCompactionConfigBuilderError, GroupFilters, SmallFilesConfigBuilder,
 };
 use iceberg_compaction_core::executor::RewriteFilesStat;
 use mixtrics::registry::prometheus::PrometheusMetricsRegistry;
@@ -322,6 +322,7 @@ impl IcebergCompactionPlanRunner {
             data_files,
             stats,
             table,
+            manifest_rewrite: _,
         } = compaction_result;
 
         if let Some(committed_table) = table
@@ -484,7 +485,7 @@ pub async fn create_task_execution(
 
     let parsed_task_type = TaskType::try_from(task_type)
         .map_err(|e| HummockError::compaction_executor(e.as_report()))?;
-    let should_use_cow =
+    let _should_use_cow =
         should_enable_iceberg_cow(iceberg_config.r#type.as_str(), iceberg_config.write_mode);
 
     let planning_config = match parsed_task_type {
@@ -511,11 +512,6 @@ pub async fn create_task_execution(
             CompactionPlanningConfig::SmallFiles(config)
         }
         TaskType::Full => {
-            let file_group_scope = if should_use_cow {
-                FileGroupScope::Table
-            } else {
-                FileGroupScope::Partition
-            };
             let config = FullCompactionConfigBuilder::default()
                 .max_input_parallelism(config.max_parallelism as usize)
                 .max_output_parallelism(config.max_parallelism as usize)
@@ -524,9 +520,10 @@ pub async fn create_task_execution(
                 .target_file_size_bytes(iceberg_config.target_file_size_mb() * 1024 * 1024)
                 .enable_heuristic_output_parallelism(config.enable_heuristic_output_parallelism)
                 .grouping_strategy(grouping_strategy)
-                .file_group_scope(file_group_scope)
                 .build()
-                .map_err(|e| HummockError::compaction_executor(e.as_report()))?;
+                .map_err(|e: FullCompactionConfigBuilderError| {
+                    HummockError::compaction_executor(e.as_report())
+                })?;
 
             CompactionPlanningConfig::Full(config)
         }
