@@ -26,8 +26,7 @@ use risingwave_hummock_sdk::table_watermark::{
     VnodeWatermark, WatermarkDirection, WatermarkSerdeType,
 };
 use risingwave_storage::store::{
-    InitOptions, LocalStateStore, ReadOptions, SealCurrentEpochOptions, StateStoreGet,
-    StateStoreRead,
+    InitOptions, LocalStateStore, ReadOptions, SealCurrentEpochOptions, StateStoreRead,
 };
 
 use crate::common::log_store_impl::kv_log_store::serde::LogStoreRowSerde;
@@ -269,8 +268,9 @@ impl<S: LocalStateStore> LogStoreStateWriter<'_, S> {
         );
         self.flush_info
             .flush_one(key.estimated_size() + value.estimated_size());
+        let blob_size = value.len();
         self.inner.state_store.insert(key, value, None)?;
-        Ok((vnode, value.len()))
+        Ok((vnode, blob_size))
     }
 
     pub(crate) fn write_barrier(&mut self, epoch: u64, is_checkpoint: bool) -> LogStoreResult<()> {
@@ -296,31 +296,32 @@ impl<S: LocalStateStore> LogStoreStateWriter<'_, S> {
 }
 
 impl<S: StateStoreRead> LogStoreReadState<S> {
-    pub(crate) async fn read_flushed_blob(
+    pub(crate) fn read_flushed_blob(
         &self,
         vnode: VirtualNode,
         start_seq_id: SeqId,
         item_epoch: u64,
-    ) -> LogStoreResult<(StreamChunk, usize)> {
-        let key = self
-            .serde
-            .serialize_log_store_blob_pk(vnode, item_epoch, start_seq_id);
-        let blob = self
-            .state_store
-            .on_key_value(key, ReadOptions::default(), |_, value| {
-                Ok(bytes::Bytes::copy_from_slice(value))
-            })
-            .await?
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "blob log store chunk not found: epoch {}, start seq id {}",
-                    item_epoch,
-                    start_seq_id
-                )
-            })?;
-        let blob_size = blob.len();
-        let chunk = self.serde.deserialize_stream_chunk_blob(&blob)?;
-        Ok((chunk, blob_size))
+    ) -> impl Future<Output = LogStoreResult<(StreamChunk, usize)>> + 'static {
+        let state_store = self.state_store.clone();
+        let serde = self.serde.clone();
+        async move {
+            let key = serde.serialize_log_store_blob_pk(vnode, item_epoch, start_seq_id);
+            let blob = state_store
+                .on_key_value(key, ReadOptions::default(), |_, value| {
+                    Ok(bytes::Bytes::copy_from_slice(value))
+                })
+                .await?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "blob log store chunk not found: epoch {}, start seq id {}",
+                        item_epoch,
+                        start_seq_id
+                    )
+                })?;
+            let blob_size = blob.len();
+            let chunk = serde.deserialize_stream_chunk_blob(&blob)?;
+            Ok((chunk, blob_size))
+        }
     }
 }
 
