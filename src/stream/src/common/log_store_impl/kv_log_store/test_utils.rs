@@ -137,7 +137,7 @@ pub(crate) fn gen_multi_vnode_stream_chunks<const MOD_COUNT: usize>(
                         .iter()
                         .map(|col| col.data_type.clone())
                         .collect_vec(),
-                    max_count,
+                    1_000_000,
                 ),
             )
         })
