@@ -93,7 +93,7 @@ impl SpillOp {
             .layer(RetryLayer::default())
             .finish();
 
-        op.remove_all("/").await
+        op.delete_with("/").recursive(true).await
     }
 
     pub async fn writer_with(&self, name: &str) -> Result<opendal::Writer> {
@@ -149,7 +149,7 @@ impl Drop for SpillOp {
     fn drop(&mut self) {
         let op = self.op.clone();
         tokio::task::spawn(async move {
-            let result = op.remove_all("/").await;
+            let result = op.delete_with("/").recursive(true).await;
             if let Err(error) = result {
                 error!(
                     error = %error.as_report(),

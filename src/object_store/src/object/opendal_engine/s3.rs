@@ -13,11 +13,9 @@
 // limitations under the License.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use opendal::Operator;
-use opendal::layers::{HttpClientLayer, LoggingLayer};
-use opendal::raw::HttpClient;
+use opendal::layers::LoggingLayer;
 use opendal::services::S3;
 use risingwave_common::config::ObjectStoreConfig;
 
@@ -43,13 +41,9 @@ impl OpendalObjectStore {
             builder = builder.enable_virtual_host_style();
         }
 
-        let http_client = Self::new_http_client(&config)?;
-
         let op = new_operator(
             &config,
-            Operator::new(builder)?
-                .layer(HttpClientLayer::new(http_client))
-                .layer(LoggingLayer::default()),
+            Operator::new(builder)?.layer(LoggingLayer::default()),
         );
 
         Ok(Self {
@@ -88,10 +82,7 @@ impl OpendalObjectStore {
             .endpoint(&format!("{}{}", endpoint_prefix, address))
             .disable_config_load();
 
-        let http_client = Self::new_http_client(&config)?;
-
         let op: Operator = Operator::new(builder)?
-            .layer(HttpClientLayer::new(http_client))
             .layer(LoggingLayer::default())
             .finish();
 
@@ -101,19 +92,5 @@ impl OpendalObjectStore {
             config,
             metrics,
         })
-    }
-
-    pub fn new_http_client(config: &ObjectStoreConfig) -> ObjectResult<HttpClient> {
-        let mut client_builder = reqwest::ClientBuilder::new();
-
-        if let Some(keepalive_ms) = config.s3.keepalive_ms.as_ref() {
-            client_builder = client_builder.tcp_keepalive(Duration::from_millis(*keepalive_ms));
-        }
-
-        if let Some(nodelay) = config.s3.nodelay.as_ref() {
-            client_builder = client_builder.tcp_nodelay(*nodelay);
-        }
-        #[expect(deprecated)]
-        Ok(HttpClient::build(client_builder)?)
     }
 }
