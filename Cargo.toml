@@ -160,15 +160,14 @@ hashbrown0_15 = { package = "hashbrown", version = "0.15", features = [
     "nightly",
 ] }
 hytra = "0.1"
-# branch dev_rebase_main_20251111
-iceberg = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "c034b19105fa0f540256fbe4859be8121c5c0551", features = [
+iceberg = { git = "https://github.com/thealtoclef/rw-iceberg-rust.git", rev = "70ce9cc66391a535f28a437954814cb462e47f48", features = [
     "storage-s3",
     "storage-gcs",
     "storage-azblob",
     "storage-azdls",
 ] }
-iceberg-catalog-glue = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "c034b19105fa0f540256fbe4859be8121c5c0551" }
-iceberg-catalog-rest = { git = "https://github.com/risingwavelabs/iceberg-rust.git", rev = "c034b19105fa0f540256fbe4859be8121c5c0551" }
+iceberg-catalog-glue = { git = "https://github.com/thealtoclef/rw-iceberg-rust.git", rev = "70ce9cc66391a535f28a437954814cb462e47f48" }
+iceberg-catalog-rest = { git = "https://github.com/thealtoclef/rw-iceberg-rust.git", rev = "70ce9cc66391a535f28a437954814cb462e47f48" }
 
 adbc_core = { version = "0.23" }
 adbc_snowflake = { version = "0.23", default-features = false }
@@ -185,7 +184,7 @@ mysql_async = { version = "0.36", features = [
     "native-tls-tls",
     "rust_decimal",
 ] }
-opendal = "0.55"
+opendal = "0.57"
 openssl = "0.10.80"
 opentelemetry = "0.31"
 opentelemetry-otlp = { version = "0.31", features = ["grpc-tonic"] }
