@@ -445,7 +445,7 @@ pub mod default {
         }
 
         pub fn enable_kv_log_store_v3() -> bool {
-            false
+            true
         }
 
         pub fn disable_sync_log_store_dispatcher() -> bool {
