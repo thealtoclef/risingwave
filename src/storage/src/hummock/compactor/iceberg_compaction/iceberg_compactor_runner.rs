@@ -12,12 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Debug;
 use std::sync::{Arc, LazyLock};
 
 use derive_builder::Builder;
-use iceberg::spec::MAIN_BRANCH;
+use iceberg::spec::{Struct, MAIN_BRANCH};
 use iceberg::{Catalog, TableIdent};
 use iceberg_compaction_core::compaction::{
     CommitConsistencyParams, CommitManagerRetryConfig, CompactionBuilder, CompactionPlan,
@@ -125,6 +125,7 @@ pub struct IcebergCompactionPlanRunner {
     pub task_type: TaskType,
     branch: String,
     compaction_plan: CompactionPlan,
+    snapshot_props: HashMap<String, String>,
 }
 
 impl IcebergCompactionPlanRunner {
@@ -192,6 +193,7 @@ impl IcebergCompactionPlanRunner {
             self.task_type,
             self.branch,
             self.compaction_plan,
+            self.snapshot_props,
         );
 
         tokio::select! {
@@ -239,6 +241,7 @@ impl IcebergCompactionPlanRunner {
         task_type: TaskType,
         branch: String,
         compaction_plan: CompactionPlan,
+        snapshot_props: HashMap<String, String>,
     ) -> HummockResult<RewriteFilesStat> {
         if !compaction_plan.has_files() {
             tracing::info!(
@@ -292,6 +295,7 @@ impl IcebergCompactionPlanRunner {
             .with_registry(ICEBERG_COMPACTION_METRICS_REGISTRY.clone())
             .with_retry_config(retry_config)
             .with_to_branch(branch.clone())
+            .with_snapshot_properties(snapshot_props.clone())
             .build();
 
         metrics.compact_task_pending_num.inc();
@@ -443,7 +447,19 @@ pub async fn create_task_execution(
         sink_id,
         props,
         task_type,
+        dirty_partitions,
     } = iceberg_compaction_task;
+
+    let dirty_partitions: Vec<Struct> = dirty_partitions
+        .iter()
+        .filter_map(|bytes| match serde_json::from_slice(bytes) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to deserialize dirty partition");
+                None
+            }
+        })
+        .collect();
 
     let iceberg_config = IcebergConfig::from_btreemap(BTreeMap::from_iter(props.into_iter()))
         .map_err(|e| HummockError::compaction_executor(e.as_report()))?;
@@ -559,10 +575,25 @@ pub async fn create_task_execution(
 
     let planner = CompactionPlanner::new(planning_config.clone());
 
+    let planner = if !dirty_partitions.is_empty() {
+        planner.with_partition_filter(dirty_partitions.clone())
+    } else {
+        planner
+    };
+
     let table = catalog
         .load_table(&table_ident)
         .await
         .map_err(|e| HummockError::compaction_executor(e.as_report()))?;
+
+    let base_seq = table
+        .metadata()
+        .snapshot_for_ref(&branch)
+        .map(|s| s.sequence_number())
+        .unwrap_or(0);
+
+    let mut snapshot_props = HashMap::new();
+    snapshot_props.insert("rw.last-compaction-seq".to_owned(), base_seq.to_string());
 
     let compaction_plans = planner
         .plan_compaction_with_branch(&table, &branch)
@@ -595,6 +626,7 @@ pub async fn create_task_execution(
             task_type: parsed_task_type,
             branch: branch.clone(),
             compaction_plan,
+            snapshot_props: snapshot_props.clone(),
         });
     }
 

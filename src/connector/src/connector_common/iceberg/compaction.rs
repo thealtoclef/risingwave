@@ -12,10 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use iceberg::spec::Struct;
+
 use crate::sink::catalog::SinkId;
 
 pub struct IcebergSinkCompactionUpdate {
     // runtime event information
     pub sink_id: SinkId,
     pub force_compaction: bool,
+    pub dirty_partitions: Vec<Struct>,
+    pub commit_sequence_number: i64,
 }

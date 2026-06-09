@@ -33,7 +33,7 @@ futures = { version = "0.3", default-features = false, features = ["alloc"] }
 futures-async-stream = { workspace = true }
 hex = "0.4"
 iceberg = { workspace = true }
-iceberg-compaction-core = { git = "https://github.com/nimtable/iceberg-compaction.git", rev = "4c2bf2ecdf53cbe53aa4c82746682f5bf21bdcf8" }
+iceberg-compaction-core = { git = "https://github.com/tuantran0910/iceberg-compaction.git", rev = "cdac309375645ae9885271825c22258e8012316e" }
 itertools = { workspace = true }
 libc = "0.2"
 lz4 = "1.28.0"
@@ -61,6 +61,7 @@ risingwave_rpc_client = { workspace = true }
 scopeguard = "1"
 serde = { workspace = true }
 serde_bytes = "0.11"
+serde_json = "1"
 sled = "0.34.7"
 spin = "0.10"
 sync-point = { path = "../utils/sync-point" }

@@ -12,10 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use iceberg::spec::Struct;
 use itertools::Itertools;
 use parking_lot::RwLock;
 use risingwave_connector::connector_common::IcebergSinkCompactionUpdate;
@@ -31,6 +33,9 @@ use risingwave_pb::iceberg_compaction::subscribe_iceberg_compaction_event_reques
 use thiserror_ext::AsReport;
 
 use super::*;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct PartitionKey(Struct);
 
 /// Compaction track states using type-safe state machine pattern
 #[derive(Debug, Clone)]
@@ -55,13 +60,14 @@ enum CompactionTrackState {
 pub(super) struct CompactionTrack {
     task_type: TaskType,
     trigger_interval_sec: u64,
-    /// Minimum pending commit threshold to trigger compaction early.
-    /// Compaction triggers when `pending_commit_count` >= this threshold, even before interval expires.
     trigger_snapshot_count: usize,
     report_timeout: Duration,
     last_config_refresh_at: Instant,
     pending_commit_count: usize,
     state: CompactionTrackState,
+    dirty: HashMap<PartitionKey, i64>,
+    dispatched_dirty: HashMap<PartitionKey, i64>,
+    dirty_cutoff_seq: i64,
 }
 
 impl CompactionTrack {
@@ -82,6 +88,9 @@ impl CompactionTrack {
             state: CompactionTrackState::Idle {
                 next_compaction_time: now + Duration::from_secs(trigger_interval_sec),
             },
+            dirty: HashMap::new(),
+            dispatched_dirty: HashMap::new(),
+            dirty_cutoff_seq: 0,
         }
     }
 
@@ -246,6 +255,13 @@ impl CompactionTrack {
                 self.state = CompactionTrackState::Idle {
                     next_compaction_time: *next_compaction_time_on_failure,
                 };
+                // Restore dispatched dirty partitions back into the active dirty set.
+                for (key, seq) in std::mem::take(&mut self.dispatched_dirty) {
+                    self.dirty
+                        .entry(key)
+                        .and_modify(|e| *e = (*e).max(seq))
+                        .or_insert(seq);
+                }
             }
             CompactionTrackState::Idle { .. } => {
                 unreachable!("Cannot revert a pre-dispatch failure when idle")
@@ -273,6 +289,16 @@ impl CompactionTrack {
             | CompactionTrackState::InFlight { .. } => {}
         }
     }
+
+    fn union_dirty(&mut self, partitions: Vec<Struct>, seq: i64) {
+        for p in partitions {
+            let key = PartitionKey(p);
+            self.dirty
+                .entry(key)
+                .and_modify(|existing| *existing = (*existing).max(seq))
+                .or_insert(seq);
+        }
+    }
 }
 
 pub(crate) struct IcebergCompactionHandle {
@@ -281,6 +307,7 @@ pub(crate) struct IcebergCompactionHandle {
     inner: Arc<RwLock<IcebergCompactionManagerInner>>,
     metadata_manager: MetadataManager,
     handle_success: bool,
+    dirty_partitions: Vec<Struct>,
 }
 
 impl IcebergCompactionHandle {
@@ -289,6 +316,7 @@ impl IcebergCompactionHandle {
         task_type: TaskType,
         inner: Arc<RwLock<IcebergCompactionManagerInner>>,
         metadata_manager: MetadataManager,
+        dirty_partitions: Vec<Struct>,
     ) -> Self {
         Self {
             sink_id,
@@ -296,6 +324,7 @@ impl IcebergCompactionHandle {
             inner,
             metadata_manager,
             handle_success: false,
+            dirty_partitions,
         }
     }
 
@@ -318,12 +347,25 @@ impl IcebergCompactionHandle {
         let sink_catalog = SinkCatalog::from(prost_sink_catalog);
         let param = SinkParam::try_from_sink_catalog(sink_catalog)?;
 
+        let dirty_bytes: Vec<Vec<u8>> = self
+            .dirty_partitions
+            .iter()
+            .filter_map(|s| match serde_json::to_vec(s) {
+                Ok(bytes) => Some(bytes),
+                Err(e) => {
+                    tracing::warn!(error = %e.as_report(), "Failed to serialize dirty partition");
+                    None
+                }
+            })
+            .collect();
+
         let result =
             compactor.send_event(IcebergResponseEvent::CompactTask(IcebergCompactionTask {
                 task_id,
                 sink_id: self.sink_id.as_raw_id(),
                 props: param.properties,
                 task_type: self.task_type as i32,
+                dirty_partitions: dirty_bytes,
             }));
 
         if result.is_ok() {
@@ -391,6 +433,8 @@ struct PreparedSinkUpdate {
     now: Instant,
     allow_track_initialization: bool,
     loaded_config: Option<IcebergConfig>,
+    dirty_partitions: Vec<Struct>,
+    commit_sequence_number: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -435,6 +479,8 @@ impl IcebergCompactionManager {
         let IcebergSinkCompactionUpdate {
             sink_id,
             force_compaction,
+            dirty_partitions,
+            commit_sequence_number,
         } = msg;
         let kind = if force_compaction {
             SinkUpdateKind::ForceCompaction
@@ -472,6 +518,8 @@ impl IcebergCompactionManager {
             now,
             allow_track_initialization,
             loaded_config,
+            dirty_partitions,
+            commit_sequence_number,
         }
     }
 
@@ -486,6 +534,8 @@ impl IcebergCompactionManager {
             now,
             allow_track_initialization,
             loaded_config,
+            dirty_partitions,
+            commit_sequence_number,
         } = prepared_update;
         let refresh_interval = self.config_refresh_interval();
 
@@ -512,6 +562,7 @@ impl IcebergCompactionManager {
                 }
 
                 kind.apply_to_track(track, now);
+                track.union_dirty(dirty_partitions, commit_sequence_number);
             }
             Entry::Vacant(entry) => {
                 if !allow_track_initialization {
@@ -532,6 +583,7 @@ impl IcebergCompactionManager {
 
                 let track = entry.insert(self.create_compaction_track(config, now));
                 kind.apply_to_track(track, now);
+                track.union_dirty(dirty_partitions, commit_sequence_number);
             }
         }
     }
@@ -603,11 +655,23 @@ impl IcebergCompactionManager {
                 let track = guard.sink_schedules.get_mut(&sink_id)?;
                 track.start_processing();
 
+                let dispatched = std::mem::take(&mut track.dirty);
+                let cutoff_seq = dispatched.values().max().copied().unwrap_or(0);
+                track.dispatched_dirty = dispatched;
+                track.dirty_cutoff_seq = cutoff_seq;
+
+                let dirty_partitions: Vec<Struct> = track
+                    .dispatched_dirty
+                    .keys()
+                    .map(|k| k.0.clone())
+                    .collect();
+
                 Some(IcebergCompactionHandle::new(
                     sink_id,
                     task_type,
                     self.inner.clone(),
                     self.metadata_manager.clone(),
+                    dirty_partitions,
                 ))
             })
             .collect()
@@ -692,6 +756,16 @@ impl IcebergCompactionManager {
         match status {
             IcebergReportTaskStatus::Success => {
                 track.finish_success(now);
+                let cutoff = track.dirty_cutoff_seq;
+                for (key, seq) in std::mem::take(&mut track.dispatched_dirty) {
+                    if seq > cutoff {
+                        track
+                            .dirty
+                            .entry(key)
+                            .and_modify(|e| *e = (*e).max(seq))
+                            .or_insert(seq);
+                    }
+                }
             }
             IcebergReportTaskStatus::Failed | IcebergReportTaskStatus::Unspecified => {
                 tracing::warn!(
@@ -701,6 +775,13 @@ impl IcebergCompactionManager {
                     "Iceberg compaction task reported failure"
                 );
                 track.finish_failed(now);
+                for (key, seq) in std::mem::take(&mut track.dispatched_dirty) {
+                    track
+                        .dirty
+                        .entry(key)
+                        .and_modify(|e| *e = (*e).max(seq))
+                        .or_insert(seq);
+                }
             }
         }
     }

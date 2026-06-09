@@ -55,6 +55,9 @@ fn new_track(
         state: CompactionTrackState::Idle {
             next_compaction_time: now + Duration::from_secs(trigger_interval_sec),
         },
+        dirty: HashMap::new(),
+        dispatched_dirty: HashMap::new(),
+        dirty_cutoff_seq: 0,
     }
 }
 
@@ -395,6 +398,8 @@ async fn test_apply_sink_update_refreshes_existing_idle_track() {
             now: refresh_at,
             allow_track_initialization: false,
             loaded_config: Some(config),
+            dirty_partitions: vec![],
+            commit_sequence_number: 0,
         },
     );
 
@@ -423,6 +428,8 @@ async fn test_update_iceberg_commit_info_skips_missing_track_on_load_failure() {
         .update_iceberg_commit_info(IcebergSinkCompactionUpdate {
             sink_id,
             force_compaction: false,
+            dirty_partitions: vec![],
+            commit_sequence_number: 0,
         })
         .await;
 
@@ -444,6 +451,8 @@ async fn test_update_iceberg_commit_info_refresh_failure_keeps_refresh_deadline_
         .update_iceberg_commit_info(IcebergSinkCompactionUpdate {
             sink_id,
             force_compaction: false,
+            dirty_partitions: vec![],
+            commit_sequence_number: 0,
         })
         .await;
 
@@ -465,6 +474,7 @@ async fn test_apply_sink_update_creates_missing_track() {
         sink_schedules: HashMap::new(),
         snapshot_expiration_sink_ids: HashSet::new(),
         manual_task_waiters: HashMap::new(),
+        reseeded_sinks: HashSet::new(),
     };
 
     manager.apply_sink_update(
@@ -475,6 +485,8 @@ async fn test_apply_sink_update_creates_missing_track() {
             now,
             allow_track_initialization: true,
             loaded_config: Some(config),
+            dirty_partitions: vec![],
+            commit_sequence_number: 0,
         },
     );
 
@@ -499,6 +511,7 @@ async fn test_apply_sink_update_tracks_snapshot_expiration_without_compaction() 
         sink_schedules: HashMap::new(),
         snapshot_expiration_sink_ids: HashSet::new(),
         manual_task_waiters: HashMap::new(),
+        reseeded_sinks: HashSet::new(),
     };
 
     manager.apply_sink_update(
@@ -509,6 +522,8 @@ async fn test_apply_sink_update_tracks_snapshot_expiration_without_compaction() 
             now,
             allow_track_initialization: true,
             loaded_config: Some(config),
+            dirty_partitions: vec![],
+            commit_sequence_number: 0,
         },
     );
 
@@ -526,6 +541,7 @@ async fn test_apply_sink_update_does_not_resurrect_disappeared_track() {
         sink_schedules: HashMap::new(),
         snapshot_expiration_sink_ids: HashSet::new(),
         manual_task_waiters: HashMap::new(),
+        reseeded_sinks: HashSet::new(),
     };
 
     manager.apply_sink_update(
@@ -536,6 +552,8 @@ async fn test_apply_sink_update_does_not_resurrect_disappeared_track() {
             now,
             allow_track_initialization: false,
             loaded_config: Some(config),
+            dirty_partitions: vec![],
+            commit_sequence_number: 0,
         },
     );
 

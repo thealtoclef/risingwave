@@ -524,6 +524,13 @@ impl IcebergSinkCommitter {
                 })
             })
             .collect::<Result<Vec<DataFile>>>()?;
+
+        let dirty_partitions: Vec<iceberg::spec::Struct> = data_files
+            .iter()
+            .map(|df| df.partition().clone())
+            .unique()
+            .collect();
+
         // # TODO:
         // This retry behavior should be revert and do in iceberg-rust when it supports retry(Track in: https://github.com/apache/iceberg-rust/issues/964)
         // because retry logic involved reapply the commit metadata.
@@ -615,15 +622,26 @@ impl IcebergSinkCommitter {
 
         tracing::debug!("Succeeded to commit to iceberg table in epoch {epoch}.");
 
-        if let Some(iceberg_compact_stat_sender) = &self.iceberg_compact_stat_sender
-            && iceberg_compact_stat_sender
+        if let Some(iceberg_compact_stat_sender) = &self.iceberg_compact_stat_sender {
+            let branch = commit_branch(self.config.r#type.as_str(), self.config.write_mode);
+            let commit_sequence_number = self
+                .table
+                .metadata()
+                .snapshot_for_ref(&branch)
+                .map(|s| s.sequence_number())
+                .unwrap_or(0);
+
+            if iceberg_compact_stat_sender
                 .send(IcebergSinkCompactionUpdate {
                     sink_id: self.sink_id,
                     force_compaction: false,
+                    dirty_partitions,
+                    commit_sequence_number,
                 })
                 .is_err()
-        {
-            warn!("failed to send iceberg compaction stats");
+            {
+                warn!("failed to send iceberg compaction stats");
+            }
         }
 
         Ok(())
@@ -871,6 +889,8 @@ impl IcebergSinkCommitter {
                         .send(IcebergSinkCompactionUpdate {
                             sink_id: self.sink_id,
                             force_compaction: true,
+                            dirty_partitions: vec![],
+                            commit_sequence_number: 0,
                         })
                         .is_err()
                 {

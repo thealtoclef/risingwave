@@ -66,6 +66,7 @@ struct IcebergCompactionManagerInner {
     sink_schedules: HashMap<SinkId, CompactionTrack>,
     snapshot_expiration_sink_ids: HashSet<SinkId>,
     manual_task_waiters: HashMap<u64, ManualTaskWaiter>,
+    reseeded_sinks: HashSet<SinkId>,
 }
 
 impl IcebergCompactionManager {
@@ -92,6 +93,7 @@ impl IcebergCompactionManager {
                     sink_schedules: HashMap::default(),
                     snapshot_expiration_sink_ids: HashSet::default(),
                     manual_task_waiters: HashMap::default(),
+                    reseeded_sinks: HashSet::default(),
                 })),
                 metadata_manager,
                 iceberg_compactor_manager,
