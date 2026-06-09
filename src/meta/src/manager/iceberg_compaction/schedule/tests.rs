@@ -400,6 +400,7 @@ async fn test_apply_sink_update_refreshes_existing_idle_track() {
             loaded_config: Some(config),
             dirty_partitions: vec![],
             commit_sequence_number: 0,
+            reseeded_dirty: None,
         },
     );
 
@@ -487,6 +488,7 @@ async fn test_apply_sink_update_creates_missing_track() {
             loaded_config: Some(config),
             dirty_partitions: vec![],
             commit_sequence_number: 0,
+            reseeded_dirty: None,
         },
     );
 
@@ -524,6 +526,7 @@ async fn test_apply_sink_update_tracks_snapshot_expiration_without_compaction() 
             loaded_config: Some(config),
             dirty_partitions: vec![],
             commit_sequence_number: 0,
+            reseeded_dirty: None,
         },
     );
 
@@ -554,6 +557,7 @@ async fn test_apply_sink_update_does_not_resurrect_disappeared_track() {
             loaded_config: Some(config),
             dirty_partitions: vec![],
             commit_sequence_number: 0,
+            reseeded_dirty: None,
         },
     );
 

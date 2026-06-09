@@ -23,8 +23,9 @@ use parking_lot::RwLock;
 use risingwave_connector::connector_common::IcebergSinkCompactionUpdate;
 use risingwave_connector::sink::SinkParam;
 use risingwave_connector::sink::catalog::{SinkCatalog, SinkId};
+use risingwave_connector::sink::SinkError;
 use risingwave_connector::sink::iceberg::{
-    CompactionType, IcebergConfig, should_enable_iceberg_cow,
+    CompactionType, IcebergConfig, commit_branch, should_enable_iceberg_cow,
 };
 use risingwave_pb::iceberg_compaction::IcebergCompactionTask;
 use risingwave_pb::iceberg_compaction::iceberg_compaction_task::TaskType;
@@ -435,6 +436,7 @@ struct PreparedSinkUpdate {
     loaded_config: Option<IcebergConfig>,
     dirty_partitions: Vec<Struct>,
     commit_sequence_number: i64,
+    reseeded_dirty: Option<HashMap<PartitionKey, i64>>,
 }
 
 #[derive(Debug, Clone)]
@@ -465,7 +467,30 @@ impl IcebergCompactionManager {
     }
 
     pub async fn update_iceberg_commit_info(&self, msg: IcebergSinkCompactionUpdate) {
-        let prepared_update = self.prepare_sink_update(msg, Instant::now()).await;
+        let mut prepared_update = self.prepare_sink_update(msg, Instant::now()).await;
+
+        if prepared_update.allow_track_initialization {
+            let needs_reseed = {
+                let guard = self.inner.read();
+                !guard.reseeded_sinks.contains(&prepared_update.sink_id)
+            };
+            if needs_reseed {
+                if let Some(config) = &prepared_update.loaded_config {
+                    match self.reseed_from_branch(config).await {
+                        Ok(reseeded) => {
+                            prepared_update.reseeded_dirty = Some(reseeded);
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e.as_report(),
+                                sink_id = %prepared_update.sink_id,
+                                "Failed to reseed dirty partitions from snapshot history"
+                            );
+                        }
+                    }
+                }
+            }
+        }
 
         let mut guard = self.inner.write();
         self.apply_sink_update(&mut guard, prepared_update);
@@ -520,6 +545,7 @@ impl IcebergCompactionManager {
             loaded_config,
             dirty_partitions,
             commit_sequence_number,
+            reseeded_dirty: None,
         }
     }
 
@@ -536,6 +562,7 @@ impl IcebergCompactionManager {
             loaded_config,
             dirty_partitions,
             commit_sequence_number,
+            reseeded_dirty,
         } = prepared_update;
         let refresh_interval = self.config_refresh_interval();
 
@@ -583,6 +610,18 @@ impl IcebergCompactionManager {
 
                 let track = entry.insert(self.create_compaction_track(config, now));
                 kind.apply_to_track(track, now);
+
+                if let Some(reseeded) = reseeded_dirty {
+                    for (key, seq) in reseeded {
+                        track
+                            .dirty
+                            .entry(key)
+                            .and_modify(|existing| *existing = (*existing).max(seq))
+                            .or_insert(seq);
+                    }
+                }
+                guard.reseeded_sinks.insert(sink_id);
+
                 track.union_dirty(dirty_partitions, commit_sequence_number);
             }
         }
@@ -677,10 +716,107 @@ impl IcebergCompactionManager {
             .collect()
     }
 
+    /// Walk the writer's branch backward from HEAD, collecting dirty partitions
+    /// from all snapshots between HEAD and the last snapshot carrying
+    /// `rw.last-compaction-seq` (the compaction boundary).
+    async fn reseed_from_branch(
+        &self,
+        iceberg_config: &IcebergConfig,
+    ) -> MetaResult<HashMap<PartitionKey, i64>> {
+        let catalog = iceberg_config
+            .create_catalog()
+            .await
+            .map_err(|e| SinkError::Iceberg(e.into()))?;
+        let table = catalog
+            .load_table(&iceberg_config.full_table_name()?)
+            .await
+            .map_err(|e| SinkError::Iceberg(e.into()))?;
+
+        let branch = commit_branch(
+            iceberg_config.r#type.as_str(),
+            iceberg_config.write_mode,
+        );
+
+        let mut dirty: HashMap<PartitionKey, i64> = HashMap::new();
+
+        let Some(head_snapshot) = table.metadata().snapshot_for_ref(&branch) else {
+            return Ok(dirty);
+        };
+
+        let mut current_id = Some(head_snapshot.snapshot_id());
+        while let Some(snap_id) = current_id {
+            let Some(snapshot) = table.metadata().snapshot_by_id(snap_id) else {
+                break;
+            };
+
+            if snapshot.summary().additional_properties.contains_key("rw.last-compaction-seq") {
+                break;
+            }
+
+            match snapshot
+                .load_manifest_list(table.file_io(), table.metadata())
+                .await
+            {
+                Ok(manifest_list) => {
+                    for manifest_file in manifest_list.entries() {
+                        if manifest_file.added_snapshot_id != snap_id {
+                            continue;
+                        }
+                        if !manifest_file.has_added_files() && !manifest_file.has_existing_files()
+                        {
+                            continue;
+                        }
+                        match manifest_file.load_manifest(table.file_io()).await {
+                            Ok(manifest) => {
+                                let (entries, _) = manifest.into_parts();
+                                for entry in entries {
+                                    let partition = entry.data_file().partition();
+                                    let key = PartitionKey(partition.clone());
+                                    dirty
+                                        .entry(key)
+                                        .and_modify(|existing| {
+                                            *existing = (*existing).max(snapshot.sequence_number())
+                                        })
+                                        .or_insert(snapshot.sequence_number());
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    error = %e.as_report(),
+                                    snapshot_id = %snap_id,
+                                    "Failed to load manifest during reseed, skipping"
+                                );
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e.as_report(),
+                        snapshot_id = %snap_id,
+                        "Failed to load manifest list during reseed, skipping"
+                    );
+                }
+            }
+
+            current_id = snapshot.parent_snapshot_id();
+        }
+
+        tracing::info!(
+            sink_type = %iceberg_config.r#type,
+            table = %iceberg_config.full_table_name().map(|t| t.to_string()).unwrap_or_default(),
+            dirty_count = dirty.len(),
+            "Reseeded dirty partitions from snapshot history",
+        );
+
+        Ok(dirty)
+    }
+
     pub fn clear_iceberg_maintenance_by_sink_id(&self, sink_id: SinkId) {
         let mut guard = self.inner.write();
         guard.sink_schedules.remove(&sink_id);
         guard.snapshot_expiration_sink_ids.remove(&sink_id);
+        guard.reseeded_sinks.remove(&sink_id);
     }
 
     pub fn list_compaction_statuses(&self) -> Vec<IcebergCompactionScheduleStatus> {
