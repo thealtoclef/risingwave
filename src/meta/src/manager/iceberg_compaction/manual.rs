@@ -97,6 +97,7 @@ impl IcebergCompactionManager {
                 sink_id: sink_id.as_raw_id(),
                 props: sink_param.properties,
                 task_type: TaskType::Full as i32,
+                dirty_partitions: vec![],
             }))
         {
             self.clear_manual_task_waiter(task_id);
