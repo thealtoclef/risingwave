@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use iceberg::spec::Struct;
 use itertools::Itertools;
 use parking_lot::RwLock;
-use risingwave_connector::connector_common::IcebergSinkCompactionUpdate;
+use risingwave_connector::connector_common::{IcebergSinkCompactionUpdate, struct_to_bytes};
 use risingwave_connector::sink::SinkParam;
 use risingwave_connector::sink::catalog::{SinkCatalog, SinkId};
 use risingwave_connector::sink::SinkError;
@@ -348,16 +348,22 @@ impl IcebergCompactionHandle {
         let sink_catalog = SinkCatalog::from(prost_sink_catalog);
         let param = SinkParam::try_from_sink_catalog(sink_catalog)?;
 
+        let iceberg_config = IcebergConfig::from_btreemap(param.properties.clone())
+            .map_err(|e| anyhow!("Failed to parse iceberg config: {}", e))?;
+        let catalog = iceberg_config
+            .create_catalog()
+            .await
+            .map_err(|e| SinkError::Iceberg(e.into()))?;
+        let table = catalog
+            .load_table(&iceberg_config.full_table_name()?)
+            .await
+            .map_err(|e| SinkError::Iceberg(e.into()))?;
+        let partition_type = table.metadata().default_partition_type();
+
         let dirty_bytes: Vec<Vec<u8>> = self
             .dirty_partitions
             .iter()
-            .filter_map(|s| match serde_json::to_vec(s) {
-                Ok(bytes) => Some(bytes),
-                Err(e) => {
-                    tracing::warn!(error = %e.as_report(), "Failed to serialize dirty partition");
-                    None
-                }
-            })
+            .filter_map(|s| struct_to_bytes(s, partition_type))
             .collect();
 
         let result =
@@ -619,8 +625,8 @@ impl IcebergCompactionManager {
                             .and_modify(|existing| *existing = (*existing).max(seq))
                             .or_insert(seq);
                     }
+                    guard.reseeded_sinks.insert(sink_id);
                 }
-                guard.reseeded_sinks.insert(sink_id);
 
                 track.union_dirty(dirty_partitions, commit_sequence_number);
             }

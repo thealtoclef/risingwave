@@ -37,6 +37,7 @@ use risingwave_common::config::storage::default::storage::{
     iceberg_compaction_enable_prefetch,
 };
 use risingwave_common::monitor::GLOBAL_METRICS_REGISTRY;
+use risingwave_connector::connector_common::bytes_to_struct;
 use risingwave_connector::sink::iceberg::{
     IcebergConfig, IcebergWriteMode, commit_branch, should_enable_iceberg_cow,
 };
@@ -450,17 +451,6 @@ pub async fn create_task_execution(
         dirty_partitions,
     } = iceberg_compaction_task;
 
-    let dirty_partitions: Vec<Struct> = dirty_partitions
-        .iter()
-        .filter_map(|bytes| match serde_json::from_slice(bytes) {
-            Ok(s) => Some(s),
-            Err(e) => {
-                tracing::warn!(error = %e, "Failed to deserialize dirty partition");
-                None
-            }
-        })
-        .collect();
-
     let iceberg_config = IcebergConfig::from_btreemap(BTreeMap::from_iter(props.into_iter()))
         .map_err(|e| HummockError::compaction_executor(e.as_report()))?;
 
@@ -472,6 +462,17 @@ pub async fn create_task_execution(
     let table_ident = iceberg_config
         .full_table_name()
         .map_err(|e| HummockError::compaction_executor(e.as_report()))?;
+
+    let table = catalog
+        .load_table(&table_ident)
+        .await
+        .map_err(|e| HummockError::compaction_executor(e.as_report()))?;
+
+    let partition_type = table.metadata().default_partition_type();
+    let dirty_partitions: Vec<Struct> = dirty_partitions
+        .iter()
+        .filter_map(|bytes| bytes_to_struct(bytes, partition_type))
+        .collect();
 
     let grouping_strategy = match iceberg_config.write_mode {
         IcebergWriteMode::CopyOnWrite => iceberg_compaction_core::config::GroupingStrategy::Single,
@@ -580,11 +581,6 @@ pub async fn create_task_execution(
     } else {
         planner
     };
-
-    let table = catalog
-        .load_table(&table_ident)
-        .await
-        .map_err(|e| HummockError::compaction_executor(e.as_report()))?;
 
     let base_seq = table
         .metadata()
