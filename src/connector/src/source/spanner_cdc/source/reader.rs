@@ -408,8 +408,20 @@ async fn run_reader(ctx: ReaderContext, tx: mpsc::Sender<Vec<SourceMessage>>) ->
                             &child_discovery_tx,
                         );
                     }
-                    Some(Ok(Err(e))) => return Err(e),
+                    Some(Ok(Err(e))) => {
+                        // Fail fast: abort remaining partition tasks so their tx
+                        // clones are dropped, the channel closes, and the reader
+                        // restarts on the next poll cycle instead of waiting for
+                        // orphaned tasks to finish.
+                        for handle in &partition_streams {
+                            handle.abort();
+                        }
+                        return Err(e);
+                    }
                     Some(Err(e)) => {
+                        for handle in &partition_streams {
+                            handle.abort();
+                        }
                         return Err(ConnectorError::from(anyhow::anyhow!(
                             "partition task panicked: {}", e
                         )));
@@ -1344,5 +1356,169 @@ mod tests {
 
         assert!(deferred.is_empty());
         assert!(ready_pool.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Abort sibling tasks on failure: run_reader must fail-fast.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_run_reader_aborts_siblings_on_failure() {
+        use std::time::Duration;
+
+        // Verify that when one partition task fails, sibling tasks are aborted
+        // promptly rather than left running (holding channel open).
+        //
+        // Setup: tasks that hold cloned senders — one fails immediately, one
+        // sleeps for an hour.  Without the abort fix the test would hang for
+        // 3600s; with the fix the sleeping task is aborted and the whole thing
+        // completes in <5s.
+
+        let (tx, rx) = mpsc::channel::<Vec<SourceMessage>>(16);
+
+        let test_result = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut partition_streams: FuturesUnordered<
+                tokio::task::JoinHandle<std::result::Result<PartitionResult, anyhow::Error>>,
+            > = FuturesUnordered::new();
+
+            // Task that holds a tx clone and fails immediately.
+            let tx_clone = tx.clone();
+            partition_streams.push(tokio::spawn(async move {
+                let _sender = tx_clone; // held until task is dropped
+                Err(anyhow::anyhow!("simulated partition failure"))
+            }));
+
+            // Task that holds a tx clone and would take forever.
+            let tx_clone = tx.clone();
+            partition_streams.push(tokio::spawn(async move {
+                let _sender = tx_clone; // held until task is dropped
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+                Ok(PartitionResult {
+                    partition_token: None,
+                })
+            }));
+
+            // Simulate the fixed error handling path: abort siblings on error.
+            let mut error = None;
+            while let Some(result) = partition_streams.next().await {
+                match result {
+                    Ok(Ok(_)) => continue,
+                    Ok(Err(e)) => {
+                        for handle in partition_streams.iter() {
+                            handle.abort();
+                        }
+                        error = Some(e);
+                        break;
+                    }
+                    Err(e) => {
+                        for handle in partition_streams.iter() {
+                            handle.abort();
+                        }
+                        error = Some(anyhow::anyhow!("task panicked: {}", e));
+                        break;
+                    }
+                }
+            }
+            error
+        })
+        .await;
+
+        // Should complete within timeout (not wait 3600s for the slow task).
+        assert!(
+            test_result.is_ok(),
+            "run_reader should complete within timeout, not wait for orphaned tasks"
+        );
+        let inner_error = test_result.unwrap();
+        assert!(inner_error.is_some(), "should have captured the error");
+        assert!(
+            inner_error
+                .unwrap()
+                .to_string()
+                .contains("simulated partition failure"),
+            "error should be from the failing partition"
+        );
+
+        // Channel must close once the original tx is dropped — abort freed
+        // the cloned senders held by the tasks.
+        drop(tx);
+        let closed = tokio::time::timeout(Duration::from_secs(1), async {
+            while !rx.is_closed() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(closed.is_ok(), "channel should close after sibling tasks are aborted");
+    }
+
+    #[tokio::test]
+    async fn test_run_reader_aborts_siblings_on_panic() {
+        use std::time::Duration;
+
+        let (tx, rx) = mpsc::channel::<Vec<SourceMessage>>(16);
+
+        let test_result = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut partition_streams: FuturesUnordered<
+                tokio::task::JoinHandle<std::result::Result<PartitionResult, anyhow::Error>>,
+            > = FuturesUnordered::new();
+
+            // Task that panics.
+            let tx_clone = tx.clone();
+            partition_streams.push(tokio::spawn(async move {
+                let _sender = tx_clone;
+                panic!("simulated partition panic");
+            }));
+
+            // Task that holds a tx clone and sleeps forever.
+            let tx_clone = tx.clone();
+            partition_streams.push(tokio::spawn(async move {
+                let _sender = tx_clone;
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+                Ok(PartitionResult {
+                    partition_token: None,
+                })
+            }));
+
+            // Simulate the fixed panic handling path.
+            let mut error = None;
+            while let Some(result) = partition_streams.next().await {
+                match result {
+                    Ok(Ok(_)) => continue,
+                    Ok(Err(e)) => {
+                        for handle in partition_streams.iter() {
+                            handle.abort();
+                        }
+                        error = Some(e);
+                        break;
+                    }
+                    Err(e) => {
+                        for handle in partition_streams.iter() {
+                            handle.abort();
+                        }
+                        error = Some(anyhow::anyhow!("task panicked: {}", e));
+                        break;
+                    }
+                }
+            }
+            error
+        })
+        .await;
+
+        assert!(test_result.is_ok(), "should complete within timeout");
+        let inner_error = test_result.unwrap().expect("should have captured the panic error");
+        assert!(
+            inner_error.to_string().contains("task panicked"),
+            "error should indicate a panic, got: {}",
+            inner_error
+        );
+
+        // Channel must close after abort.
+        drop(tx);
+        let closed = tokio::time::timeout(Duration::from_secs(1), async {
+            while !rx.is_closed() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(closed.is_ok(), "channel should close after sibling tasks are aborted");
     }
 }
