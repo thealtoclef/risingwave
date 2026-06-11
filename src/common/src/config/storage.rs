@@ -1189,7 +1189,7 @@ pub mod default {
         }
 
         pub fn iceberg_compaction_min_group_file_count() -> Option<usize> {
-            None
+            Some(2)
         }
     }
 

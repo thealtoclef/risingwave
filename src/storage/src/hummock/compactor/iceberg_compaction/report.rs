@@ -70,14 +70,7 @@ impl IcebergTaskTracker {
     }
 
     pub(crate) fn into_report(self, task_id: u64) -> IcebergTaskReport {
-        let error_message = if self.successful_plans > 0 {
-            None
-        } else {
-            Some(
-                self.first_error
-                    .unwrap_or_else(|| "All admitted iceberg compaction plans failed".to_owned()),
-            )
-        };
+        let error_message = self.first_error;
         build_iceberg_task_report(task_id, self.sink_id, error_message)
     }
 }

@@ -564,7 +564,7 @@ pub async fn create_task_execution(
         .await
         .map_err(|e| HummockError::compaction_executor(e.as_report()))?;
 
-    let compaction_plans = planner
+    let mut compaction_plans = planner
         .plan_compaction_with_branch(&table, &branch)
         .await
         .map_err(|e| HummockError::compaction_executor(e.as_report()))?;
@@ -582,6 +582,8 @@ pub async fn create_task_execution(
     }
 
     let mut runners = Vec::with_capacity(compaction_plans.len());
+
+    compaction_plans.sort_by(|a, b| b.file_count().cmp(&a.file_count()));
 
     for (plan_index, compaction_plan) in compaction_plans.into_iter().enumerate() {
         runners.push(IcebergCompactionPlanRunner {

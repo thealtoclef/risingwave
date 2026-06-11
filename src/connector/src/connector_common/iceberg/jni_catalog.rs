@@ -476,11 +476,32 @@ impl Catalog for JniCatalog {
                 .build()?)
         })
         .map_err(|e| {
-            iceberg::Error::new(
-                iceberg::ErrorKind::Unexpected,
-                "Failed to update iceberg table.",
-            )
-            .with_source(e)
+            let msg = e.to_string();
+            // Match commit-conflict patterns from Iceberg's UpdateRequirement
+            // ("Requirement failed: branch main has changed ...") and REST
+            // ErrorHandlers HTTP 409 ("Commit failed: ...").  We match on the
+            // message string because execute_with_jni_env only preserves
+            // getMessage() - the exception class is lost at the JNI boundary.
+            let is_commit_conflict = msg.contains("Requirement failed:")
+                || msg.contains("Commit failed:");
+
+            let mut error = if is_commit_conflict {
+                iceberg::Error::new(
+                    iceberg::ErrorKind::CatalogCommitConflicts,
+                    "Failed to update iceberg table.",
+                )
+            } else {
+                iceberg::Error::new(
+                    iceberg::ErrorKind::Unexpected,
+                    "Failed to update iceberg table.",
+                )
+            };
+
+            if is_commit_conflict {
+                error = error.with_retryable(true);
+            }
+
+            error.with_source(e)
         })
     }
 }
