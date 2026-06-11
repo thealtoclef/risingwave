@@ -90,7 +90,7 @@ pub struct SpannerCdcProperties {
     #[serde(rename = "spanner.emulator_host")]
     pub emulator_host: Option<String>,
 
-    /// Retry attempts for transient failures (default: 3)
+    /// Retry attempts for transient failures (default: 5)
     #[serde_as(as = "Option<DisplayFromStr>")]
     #[serde(rename = "spanner.retry_attempts")]
     pub retry_attempts: Option<u32>,
@@ -184,9 +184,9 @@ impl crate::source::UnknownFields for SpannerCdcProperties {
 }
 
 impl SpannerCdcProperties {
-    /// Get retry attempts (default: 3)
+    /// Get retry attempts (default: 5)
     pub fn get_retry_attempts(&self) -> u32 {
-        self.retry_attempts.unwrap_or(3)
+        self.retry_attempts.unwrap_or(5)
     }
 
     /// Get retry backoff duration

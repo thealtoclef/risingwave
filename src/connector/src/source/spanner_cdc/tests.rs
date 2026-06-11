@@ -116,7 +116,7 @@ mod tests {
         }))
         .unwrap();
 
-        assert_eq!(props.get_retry_attempts(), 3);
+        assert_eq!(props.get_retry_attempts(), 5);
     }
 
     use crate::source::spanner_cdc::SpannerCdcProperties;
