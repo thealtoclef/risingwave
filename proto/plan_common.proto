@@ -276,6 +276,8 @@ message AdditionalSubject {}
 
 message AdditionalColumnPulsarMessageIdData {}
 
+message AdditionalColumnIngestionTimestamp {}
+
 message AdditionalColumn {
   oneof column_type {
     AdditionalColumnKey key = 1;
@@ -292,6 +294,7 @@ message AdditionalColumn {
     AdditionalColumnPayload payload = 12;
     AdditionalSubject subject = 13;
     AdditionalColumnPulsarMessageIdData pulsar_message_id_data = 14;
+    AdditionalColumnIngestionTimestamp ingestion_timestamp = 15;
   }
 }
 
