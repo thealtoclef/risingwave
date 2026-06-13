@@ -372,6 +372,11 @@ impl SourceStreamChunkRowWriter<'_> {
                     ))),
                     None => parse_field(desc), // parse from payload
                 },
+                (_, &Some(AdditionalColumnType::IngestionTimestamp(_))) => {
+                    Ok(A::output_for(Some(ScalarRefImpl::Timestamptz(
+                        risingwave_common::types::Timestamptz::now(),
+                    ))))
+                }
                 (_, &Some(AdditionalColumnType::CollectionName(_))) => {
                     // collection name for `mongodb-cdc` should be parsed from the message payload
                     parse_field(desc)
