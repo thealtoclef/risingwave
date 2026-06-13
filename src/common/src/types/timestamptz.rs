@@ -97,6 +97,11 @@ impl Timestamptz {
         timestamp_millis.checked_mul(1000).map(Self)
     }
 
+    /// Returns the current wall-clock time.
+    pub fn now() -> Self {
+        chrono::Utc::now().into()
+    }
+
     /// Creates a `Timestamptz` from microseconds.
     pub fn from_micros(timestamp_micros: i64) -> Self {
         Self(timestamp_micros)

@@ -21,7 +21,7 @@ use risingwave_common::types::{DataType, StructType};
 use risingwave_pb::plan_common::additional_column::ColumnType as AdditionalColumnType;
 use risingwave_pb::plan_common::{
     AdditionalCollectionName, AdditionalColumn, AdditionalColumnFilename, AdditionalColumnHeader,
-    AdditionalColumnHeaders, AdditionalColumnKey, AdditionalColumnOffset,
+    AdditionalColumnHeaders, AdditionalColumnIngestionTimestamp, AdditionalColumnKey, AdditionalColumnOffset,
     AdditionalColumnPartition, AdditionalColumnPayload, AdditionalColumnPulsarMessageIdData,
     AdditionalColumnTimestamp, AdditionalDatabaseName, AdditionalSchemaName, AdditionalSubject,
     AdditionalTableName,
@@ -36,7 +36,7 @@ use crate::source::{
 
 // Hidden additional columns connectors which do not support `include` syntax.
 pub static COMMON_COMPATIBLE_ADDITIONAL_COLUMNS: LazyLock<HashSet<&'static str>> =
-    LazyLock::new(|| HashSet::from(["partition", "offset"]));
+    LazyLock::new(|| HashSet::from(["partition", "offset", "ingestion_timestamp"]));
 
 pub static COMPATIBLE_ADDITIONAL_COLUMNS: LazyLock<HashMap<&'static str, HashSet<&'static str>>> =
     LazyLock::new(|| {
@@ -50,32 +50,33 @@ pub static COMPATIBLE_ADDITIONAL_COLUMNS: LazyLock<HashMap<&'static str, HashSet
                     "offset",
                     "header",
                     "payload",
+                    "ingestion_timestamp",
                 ]),
             ),
             (
                 PULSAR_CONNECTOR,
-                HashSet::from(["key", "partition", "offset", "payload", "message_id_data"]),
+                HashSet::from(["key", "partition", "offset", "payload", "message_id_data", "ingestion_timestamp"]),
             ),
             (
                 KINESIS_CONNECTOR,
-                HashSet::from(["key", "partition", "offset", "timestamp", "payload"]),
+                HashSet::from(["key", "partition", "offset", "timestamp", "payload", "ingestion_timestamp"]),
             ),
             (
                 NATS_CONNECTOR,
-                HashSet::from(["partition", "offset", "payload", "subject"]),
+                HashSet::from(["partition", "offset", "payload", "subject", "ingestion_timestamp"]),
             ),
             (
                 OPENDAL_S3_CONNECTOR,
-                HashSet::from(["file", "offset", "payload"]),
+                HashSet::from(["file", "offset", "payload", "ingestion_timestamp"]),
             ),
-            (GCS_CONNECTOR, HashSet::from(["file", "offset", "payload"])),
+            (GCS_CONNECTOR, HashSet::from(["file", "offset", "payload", "ingestion_timestamp"])),
             (
                 AZBLOB_CONNECTOR,
-                HashSet::from(["file", "offset", "payload"]),
+                HashSet::from(["file", "offset", "payload", "ingestion_timestamp"]),
             ),
             (
                 POSIX_FS_CONNECTOR,
-                HashSet::from(["file", "offset", "payload"]),
+                HashSet::from(["file", "offset", "payload", "ingestion_timestamp"]),
             ),
             // mongodb-cdc doesn't support cdc backfill table
             (
@@ -86,9 +87,10 @@ pub static COMPATIBLE_ADDITIONAL_COLUMNS: LazyLock<HashMap<&'static str, HashSet
                     "offset",
                     "database_name",
                     "collection_name",
+                    "ingestion_timestamp",
                 ]),
             ),
-            (MQTT_CONNECTOR, HashSet::from(["offset", "partition"])),
+            (MQTT_CONNECTOR, HashSet::from(["offset", "partition", "ingestion_timestamp"])),
         ])
     });
 
@@ -97,6 +99,7 @@ pub static CDC_BACKFILL_TABLE_ADDITIONAL_COLUMNS: LazyLock<Option<HashSet<&'stat
     LazyLock::new(|| {
         Some(HashSet::from([
             "timestamp",
+            "ingestion_timestamp",
             "database_name",
             "schema_name",
             "table_name",
@@ -205,6 +208,16 @@ pub fn build_additional_column_desc(
             AdditionalColumn {
                 column_type: Some(AdditionalColumnType::Partition(
                     AdditionalColumnPartition {},
+                )),
+            },
+        ),
+        "ingestion_timestamp" => ColumnDesc::named_with_additional_column(
+            column_name,
+            column_id,
+            DataType::Timestamptz,
+            AdditionalColumn {
+                column_type: Some(AdditionalColumnType::IngestionTimestamp(
+                    AdditionalColumnIngestionTimestamp {},
                 )),
             },
         ),
