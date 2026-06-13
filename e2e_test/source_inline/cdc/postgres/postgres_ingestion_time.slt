@@ -1,0 +1,129 @@
+-- Test INCLUDE ingestion_timestamp on a Postgres CDC source.
+-- Verifies that ingestion_timestamp is populated for both:
+--   1. Snapshot backfill rows (initial data in the upstream table)
+--   2. Incremental CDC rows (new inserts after table creation)
+
+system ok
+PGDATABASE=${PGDATABASE:-postgres} psql -c "
+    SELECT pg_terminate_backend(active_pid)
+    FROM pg_replication_slots
+    WHERE slot_name = 'pg_ingestion_timestamp_slot' AND active_pid IS NOT NULL;
+    SELECT pg_sleep(1);
+    SELECT pg_drop_replication_slot(slot_name)
+    FROM pg_replication_slots
+    WHERE slot_name = 'pg_ingestion_timestamp_slot';
+    DROP PUBLICATION IF EXISTS pg_ingestion_timestamp_pub;
+    DROP TABLE IF EXISTS public.ingestion_timestamp_test CASCADE;
+    CREATE TABLE public.ingestion_timestamp_test (
+        id INT PRIMARY KEY,
+        name TEXT NOT NULL
+    );
+    INSERT INTO public.ingestion_timestamp_test (id, name) VALUES (1, 'snapshot_row');
+    "
+
+statement ok
+create source pg_ingest_time_src with (
+    connector = 'postgres-cdc',
+    hostname = '${PGHOST:localhost}',
+    port = '${PGPORT:5432}',
+    username = '${PGUSER:$USER}',
+    password = '${PGPASSWORD:}',
+    database.name = '${PGDATABASE:postgres}',
+    schema.name = 'public',
+    publication.name = 'pg_ingestion_timestamp_pub',
+    slot.name = 'pg_ingestion_timestamp_slot'
+);
+
+-- Create CDC table with wildcard + INCLUDE ingestion_timestamp AS alias
+statement ok
+create table rw_ingest_time_test (*)
+    include ingestion_timestamp as loaded_at
+from pg_ingest_time_src table 'public.ingestion_timestamp_test';
+
+-- Verify the alias column exists
+query TT
+SELECT name, type FROM rw_columns WHERE table_name = 'rw_ingest_time_test' AND name = 'loaded_at';
+----
+loaded_at	timestamp with time zone
+
+-- Verify snapshot backfill row has ingestion_timestamp populated (not NULL)
+query TI retry 30 backoff 1s
+SELECT name, loaded_at IS NOT NULL FROM rw_ingest_time_test WHERE id = 1;
+----
+snapshot_row	1
+
+-- Insert a new row in upstream Postgres
+system ok
+PGDATABASE=${PGDATABASE:-postgres} psql -c "
+    INSERT INTO public.ingestion_timestamp_test (id, name) VALUES (2, 'incremental_row');
+    "
+
+-- Verify incremental CDC row has ingestion_timestamp populated
+query TI retry 30 backoff 1s
+SELECT name, loaded_at IS NOT NULL FROM rw_ingest_time_test WHERE id = 2;
+----
+incremental_row	1
+
+-- Verify ingestion_timestamp is approximately current time for both rows
+query II retry 30 backoff 1s
+SELECT
+    count(*),
+    count(*) FILTER (WHERE loaded_at > now() - interval '5 minutes')
+FROM rw_ingest_time_test;
+----
+2	2
+
+-- Verify ingestion_timestamp differs between snapshot and incremental rows
+-- (they should have been processed at different times)
+query T retry 30 backoff 1s
+SELECT loaded_at IS NOT NULL AND loaded_at > '2000-01-01' FROM rw_ingest_time_test WHERE id = 1;
+----
+t
+
+-- Update a row in upstream Postgres to verify UPDATE path works
+system ok
+PGDATABASE=${PGDATABASE:-postgres} psql -c "
+    UPDATE public.ingestion_timestamp_test SET name = 'updated_row' WHERE id = 1;
+    "
+
+query TI retry 30 backoff 1s
+SELECT name, loaded_at IS NOT NULL FROM rw_ingest_time_test WHERE id = 1;
+----
+updated_row	1
+
+-- Delete a row in upstream Postgres to verify DELETE path works
+system ok
+PGDATABASE=${PGDATABASE:-postgres} psql -c "
+    DELETE FROM public.ingestion_timestamp_test WHERE id = 2;
+    "
+
+-- Row should be gone from RisingWave
+query I retry 30 backoff 1s
+SELECT count(*) FROM rw_ingest_time_test WHERE id = 2;
+----
+0
+
+-- Remaining row should still have ingestion_timestamp
+query TI retry 30 backoff 1s
+SELECT count(*), count(loaded_at) FROM rw_ingest_time_test;
+----
+1	1
+
+-- Clean up
+statement ok
+drop source pg_ingest_time_src cascade;
+
+sleep 2s
+
+system ok
+PGDATABASE=${PGDATABASE:-postgres} psql -c "
+    SELECT pg_terminate_backend(active_pid)
+    FROM pg_replication_slots
+    WHERE slot_name = 'pg_ingestion_timestamp_slot' AND active_pid IS NOT NULL;
+    SELECT pg_sleep(1);
+    SELECT pg_drop_replication_slot(slot_name)
+    FROM pg_replication_slots
+    WHERE slot_name = 'pg_ingestion_timestamp_slot';
+    DROP PUBLICATION IF EXISTS pg_ingestion_timestamp_pub;
+    DROP TABLE IF EXISTS public.ingestion_timestamp_test CASCADE;
+    "

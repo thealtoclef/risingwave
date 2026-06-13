@@ -163,6 +163,10 @@ fn with_additional_columns(
                     Some(ScalarImpl::from(schema_table_name.table_name.clone())),
                 );
             }
+            ColumnType::IngestionTimestamp(_) => {
+                let now = Timestamptz::now();
+                builder.append_n(visibility.len(), Some(now.to_scalar_value()));
+            }
             // set null for other additional columns
             _ => {
                 builder.append_n_null(visibility.len());

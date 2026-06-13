@@ -99,6 +99,11 @@ impl Timestamptz {
             .and_then(Self::from_micros)
     }
 
+    /// Returns the current wall-clock time.
+    pub fn now() -> Self {
+        chrono::Utc::now().into()
+    }
+
     /// Creates a `Timestamptz` from microseconds. Returns `None` if the value does not convert to
     /// [`chrono::DateTime`], which formatting and time zone operations require.
     pub fn from_micros(timestamp_micros: i64) -> Option<Self> {
