@@ -85,7 +85,7 @@ select id,ubig,v1,v2,name from rw_customers order by id;
 1 18446744073709551615 hello 88.9 John
 2 0 hello 88.9 Doe
 
-# rename column on upstream will not be replicated, since we do not support rename column
+# rename/change on upstream is treated as add-only: keep old columns and add new names
 system ok
 mysql -e "
   USE mytest;
@@ -94,7 +94,7 @@ mysql -e "
 "
 
 
-# table schema unchanges, since we reject rename column
+# table schema keeps the old columns and adds the new upstream names
 query TTTT retry 4 backoff 1s
 describe rw_customers;
 ----
@@ -105,6 +105,8 @@ name character varying false NULL
 custinfo jsonb false NULL
 v1 character varying false NULL
 v2 double precision false NULL
+v11 character varying false NULL
+v22 numeric false NULL
 _rw_timestamp timestamp with time zone true NULL
 primary key id NULL NULL
 distribution key id NULL NULL
@@ -128,18 +130,49 @@ mysql -e "
 "
 
 
-# modified column should be dropped
+# upstream dropped columns should be ignored
 query TTTT retry 4 backoff 1s
 describe rw_customers;
 ----
 id bigint false NULL
 ubig numeric false NULL
+modified timestamp without time zone false NULL
 name character varying false NULL
 custinfo jsonb false NULL
+v1 character varying false NULL
+v2 double precision false NULL
+v11 character varying false NULL
+v22 numeric false NULL
 _rw_timestamp timestamp with time zone true NULL
 primary key id NULL NULL
 distribution key id NULL NULL
 table description rw_customers NULL NULL
+
+# add a column after the ignored drop; this should still work instead of failing
+# because the upstream schema is neither a subset nor a superset of the RW schema.
+system ok
+mysql -e "
+  USE mytest;
+  ALTER TABLE customers ADD COLUMN v3 INT DEFAULT 42;
+  INSERT INTO customers (id, ubig, name, custinfo, v3) VALUES (3, 1, 'Smith', NULL, 42);
+"
+
+query TT retry 4 backoff 1s
+select c.name, c.data_type
+from rw_catalog.rw_columns c
+join rw_catalog.rw_tables t on c.relation_id = t.id
+where t.name = 'rw_customers' and c.name in ('modified', 'v1', 'v2', 'v3')
+order by c.name;
+----
+modified timestamp without time zone
+v1 character varying
+v2 double precision
+v3 integer
+
+query ITTTI retry 4 backoff 1s
+select id, modified, v1, v2, v3 from rw_customers where id = 3;
+----
+3 NULL NULL NULL 42
 
 statement ok
 drop source mysql_source cascade;
