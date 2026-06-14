@@ -680,7 +680,7 @@ impl MetaMetrics {
         let auto_schema_change_failure_cnt = register_guarded_int_counter_vec_with_registry!(
             "auto_schema_change_failure_cnt",
             "Number of failed auto schema change",
-            &["table_id", "table_name"],
+            &["table_id", "table_name", "reason"],
             registry
         )
         .unwrap();
