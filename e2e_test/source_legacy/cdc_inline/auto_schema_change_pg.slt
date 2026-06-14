@@ -136,6 +136,8 @@ describe rw_test_schema_change;
 id integer false NULL
 name character varying false NULL
 age integer false NULL
+v1 real false NULL
+v2 double precision false NULL
 v3 numeric false NULL
 v4 boolean false NULL
 v5 date false NULL
@@ -152,15 +154,34 @@ distribution key id NULL NULL
 table description rw_test_schema_change NULL NULL
 
 
-query TTTTTTTTTTTTTTT retry 4 backoff 1s
-SELECT * from rw_test_schema_change order by id;
+query ITTT retry 4 backoff 1s
+SELECT id, v1, v2, v11 from rw_test_schema_change where id = 12;
 ----
-1 name1 20 3.3 f 2020-01-01 12:34:56 <slt:ignore> <slt:ignore> 2020-01-01 12:34:56+00:00 1 day {} hello 1.2345
-2 name2 21 3.3 f 2020-01-01 12:34:56 <slt:ignore> <slt:ignore> 2020-01-01 12:34:56+00:00 1 day {} hello 1.2345
-3 name3 22 3.3 f 2020-01-01 12:34:56 <slt:ignore> <slt:ignore> 2020-01-01 12:34:56+00:00 1 day {} hello 1.2345
-11 aaa 11 3.3 f 2020-01-01 12:34:56 <slt:ignore> <slt:ignore> 2020-01-01 12:34:56+00:00 1 day {} hello 1.2345
-12 bbb 12 3.3 f 2020-01-01 12:34:56 <slt:ignore> <slt:ignore> 2020-01-01 12:34:56+00:00 1 day {} hello 1.2345
+12 NULL NULL hello
 
+# add a column after the ignored drop; this should still work instead of failing
+# because the upstream schema is neither a subset nor a superset of the RW schema.
+system ok
+psql -c "
+    ALTER TABLE test_schema_change ADD COLUMN v13 int DEFAULT 13;
+    INSERT INTO test_schema_change (id,name,age) values (13,'ccc', 13);
+"
+
+query TT retry 4 backoff 1s
+select c.name, c.data_type
+from rw_catalog.rw_columns c
+join rw_catalog.rw_tables t on c.relation_id = t.id
+where t.name = 'rw_test_schema_change' and c.name in ('v1', 'v2', 'v13')
+order by c.name;
+----
+v1 real
+v13 integer
+v2 double precision
+
+query ITTTI retry 4 backoff 1s
+SELECT id, v1, v2, v11, v13 from rw_test_schema_change where id = 13;
+----
+13 NULL NULL hello 13
 
 statement ok
 drop source pg_source cascade;
