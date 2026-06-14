@@ -1354,8 +1354,8 @@ impl DdlService for DdlServiceImpl {
                 .await?;
 
             for table in tables {
-                // Since we only support `ADD` and `DROP` column, we check whether the new columns and the original columns
-                // is a subset of the other.
+                // Since we only support ADD COLUMN (add-only), we detect new columns
+                // via set difference and detect type changes by checking original columns.
                 let original_columns: HashSet<(String, DataType)> =
                     HashSet::from_iter(table.columns.iter().filter_map(|col| {
                         let col = ColumnCatalog::from(col.clone());
@@ -1376,8 +1376,10 @@ impl DdlService for DdlServiceImpl {
                         }
                     }));
 
-                // For subset/superset check, we need to add visible connector additional columns defined by INCLUDE in the original table to new_columns
-                // This includes both _rw columns and user-defined INCLUDE columns (e.g., INCLUDE TIMESTAMP AS xxx)
+                // For difference computation, we need to add visible connector additional columns
+                // defined by INCLUDE in the original table to new_columns.
+                // This includes both _rw columns and user-defined INCLUDE columns
+                // (e.g., INCLUDE TIMESTAMP AS xxx).
                 for col in &table.columns {
                     let col = ColumnCatalog::from(col.clone());
                     if col.is_connector_additional_column()
@@ -1388,43 +1390,99 @@ impl DdlService for DdlServiceImpl {
                     }
                 }
 
-                if !(original_columns.is_subset(&new_columns)
-                    || original_columns.is_superset(&new_columns))
-                {
+                let original_column_types: HashMap<&str, &DataType> = original_columns
+                    .iter()
+                    .map(|(n, dt)| (n.as_str(), dt))
+                    .collect();
+
+                // Detect new columns and type changes via set difference on the
+                // original (name, type) pairs directly.
+                let mut added_column_names = HashSet::new();
+                for (name, incoming_type) in new_columns.difference(&original_columns) {
+                    // Check if this column name already exists with a different type.
+                    if let Some(original_type) = original_column_types.get(name.as_str()) {
+                        // Same name, different type → type change is unsupported.
+                        tracing::warn!(
+                            target: "auto_schema_change",
+                            table_id = %table.id,
+                            cdc_table_id = table.cdc_table_id,
+                            upstream_ddl = table_change.upstream_ddl,
+                            column = name,
+                            original_type = %original_type,
+                            incoming_type = %incoming_type,
+                            "CDC auto schema change does not support changing column type"
+                        );
+                        let fail_info = format!(
+                            "CDC auto schema change does not support changing column type: column {}, original type {}, incoming type {}",
+                            name, original_type, incoming_type
+                        );
+                        add_auto_schema_change_fail_event_log(
+                            &self.meta_metrics,
+                            table.id,
+                            table.name.clone(),
+                            table_change.cdc_table_id.clone(),
+                            table_change.upstream_ddl.clone(),
+                            &self.env.event_log_manager_ref(),
+                            fail_info,
+                            "type_change",
+                        );
+                        return Err(Status::invalid_argument(
+                            "CDC auto schema change does not support changing column type",
+                        ));
+                    }
+                    // Name not in original → truly new column.
+                    added_column_names.insert(name.as_str());
+                }
+
+                // Ignore upstream dropped columns via the symmetric set difference.
+                let dropped: Vec<_> = original_columns.difference(&new_columns).collect();
+                if !dropped.is_empty() {
+                    self.meta_metrics
+                        .auto_schema_change_failure_cnt
+                        .with_guarded_label_values(&[table.id.to_string().as_str(), table.name.as_str(), "ignored_drop"])
+                        .inc();
                     tracing::warn!(target: "auto_schema_change",
                                     table_id = %table.id,
                                     cdc_table_id = table.cdc_table_id,
-                                    upstraem_ddl = table_change.upstream_ddl,
-                                    original_columns = ?original_columns,
-                                    new_columns = ?new_columns,
-                                    "New columns should be a subset or superset of the original columns (including hidden columns), since only `ADD COLUMN` and `DROP COLUMN` is supported");
-
-                    let fail_info = "New columns should be a subset or superset of the original columns (including hidden columns), since only `ADD COLUMN` and `DROP COLUMN` is supported".to_owned();
-                    add_auto_schema_change_fail_event_log(
-                        &self.meta_metrics,
-                        table.id,
-                        table.name.clone(),
-                        table_change.cdc_table_id.clone(),
-                        table_change.upstream_ddl.clone(),
-                        &self.env.event_log_manager_ref(),
-                        fail_info,
-                    );
-
-                    return Err(Status::invalid_argument(
-                        "New columns should be a subset or superset of the original columns (including hidden columns)",
-                    ));
+                                    upstream_ddl = table_change.upstream_ddl,
+                                    ignored_columns = ?dropped,
+                                    "ignore upstream dropped columns in CDC auto schema change");
                 }
-                // skip the schema change if there is no change to original columns
-                if original_columns == new_columns {
+
+                // Skip the schema change if there are no new columns to add.
+                if added_column_names.is_empty() {
                     tracing::warn!(target: "auto_schema_change",
                                    table_id = %table.id,
                                    cdc_table_id = table.cdc_table_id,
-                                   upstraem_ddl = table_change.upstream_ddl,
-                                    original_columns = ?original_columns,
-                                    new_columns = ?new_columns,
-                                   "No change to columns, skipping the schema change");
+                                   upstream_ddl = table_change.upstream_ddl,
+                                   original_columns = ?original_columns,
+                                   new_columns = ?new_columns,
+                                   "No new columns to add, skipping CDC auto schema change");
                     continue;
                 }
+
+                // Build merged columns: keep existing columns in original order,
+                // append only the newly added columns from the schema change.
+                let mut merged_columns: Vec<ColumnCatalog> = vec![];
+                for col in &table.columns {
+                    let col = ColumnCatalog::from(col.clone());
+                    if !col.is_generated() && !col.is_hidden() {
+                        merged_columns.push(col);
+                    }
+                }
+                for col in &table_change.columns {
+                    let col = ColumnCatalog::from(col.clone());
+                    if !col.is_generated()
+                        && !col.is_hidden()
+                        && added_column_names.contains(col.column_desc.name.as_str())
+                    {
+                        merged_columns.push(col);
+                    }
+                }
+
+                let mut table_change_for_replace = table_change.clone();
+                table_change_for_replace.columns =
+                    merged_columns.iter().map(|c| c.to_protobuf()).collect();
 
                 let latency_timer = self
                     .meta_metrics
@@ -1437,7 +1495,7 @@ impl DdlService for DdlServiceImpl {
                     .get_table_replace_plan(GetTableReplacePlanRequest {
                         database_id: table.database_id,
                         table_id: table.id,
-                        cdc_table_change: Some(table_change.clone()),
+                        cdc_table_change: Some(table_change_for_replace),
                     })
                     .await;
 
@@ -1533,6 +1591,7 @@ impl DdlService for DdlServiceImpl {
                                         table_change.upstream_ddl.clone(),
                                         &self.env.event_log_manager_ref(),
                                         fail_info,
+                                        "replace_failed",
                                     );
                                 }
                             };
@@ -1556,6 +1615,7 @@ impl DdlService for DdlServiceImpl {
                             table_change.upstream_ddl.clone(),
                             &self.env.event_log_manager_ref(),
                             fail_info,
+                            "get_plan_failed",
                         );
                     }
                 };
@@ -1918,10 +1978,11 @@ fn add_auto_schema_change_fail_event_log(
     upstream_ddl: String,
     event_log_manager: &EventLogManagerRef,
     fail_info: String,
+    reason: &str,
 ) {
     meta_metrics
         .auto_schema_change_failure_cnt
-        .with_guarded_label_values(&[&table_id.to_string(), &table_name])
+        .with_guarded_label_values(&[table_id.to_string().as_str(), table_name.as_str(), reason])
         .inc();
     let event = event_log::EventAutoSchemaChangeFail {
         table_id,
