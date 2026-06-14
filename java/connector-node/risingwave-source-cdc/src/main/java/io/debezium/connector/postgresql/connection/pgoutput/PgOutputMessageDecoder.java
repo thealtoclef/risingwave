@@ -48,7 +48,6 @@ import io.debezium.relational.TableId;
 import io.debezium.schema.SchemaChangeEvent;
 import io.debezium.util.HexConverter;
 import io.debezium.util.Strings;
-import java.math.BigDecimal;
 import java.nio.ByteBuffer;
 import java.nio.charset.Charset;
 import java.sql.DatabaseMetaData;
@@ -863,156 +862,6 @@ public class PgOutputMessageDecoder extends AbstractMessageDecoder {
     }
 
     /**
-     * Parses a Postgres text array representation into a Java List of the appropriate element type.
-     * The upstream Debezium resolveValue() loses array type context when recursing from array types
-     * (e.g. _float4) to their parent element types (e.g. float4). This method handles the
-     * conversion directly.
-     *
-     * @param rawValue the raw text array (e.g. "{1.5,2.3,NULL}")
-     * @param arrayType the PostgresType for the array (e.g. _float4); must have {@code
-     *     isArrayType() == true}
-     * @param columnName the column name for logging
-     * @return a List of boxed Java objects, or null if parsing fails
-     */
-    private static List<Object> parsePostgresTextArray(
-            String rawValue, PostgresType arrayType, String columnName) {
-
-        if (rawValue == null || rawValue.trim().isEmpty()) {
-            return Collections.emptyList();
-        }
-
-        String trimmed = rawValue.trim();
-
-        if ("{}".equals(trimmed)) {
-            return Collections.emptyList();
-        }
-
-        if (!trimmed.startsWith("{") || !trimmed.endsWith("}")) {
-            LOGGER.warn("Malformed Postgres text array for column '{}': {}", columnName, rawValue);
-            return null;
-        }
-
-        String inner = trimmed.substring(1, trimmed.length() - 1);
-
-        List<String> elements;
-        try {
-            elements = splitArrayElements(inner);
-        } catch (Exception e) {
-            LOGGER.warn(
-                    "Failed to parse array elements for column '{}': {}", columnName, rawValue, e);
-            return null;
-        }
-
-        PostgresType elementType = arrayType.getElementType();
-        String elementTypeName = elementType != null ? elementType.getName().toLowerCase() : "text";
-
-        List<Object> result = new ArrayList<>(elements.size());
-        for (String elem : elements) {
-            result.add(parseArrayElement(elem, elementTypeName, columnName));
-        }
-        return result;
-    }
-
-    /**
-     * Splits the inner content of a Postgres text array into individual elements, respecting
-     * double-quoted strings, escape sequences, and nested braces.
-     */
-    private static List<String> splitArrayElements(String inner) {
-        List<String> result = new ArrayList<>();
-        StringBuilder current = new StringBuilder();
-        boolean inQuotes = false;
-        int braceDepth = 0;
-
-        for (int i = 0; i < inner.length(); i++) {
-            char c = inner.charAt(i);
-
-            if (c == '"' && (i == 0 || inner.charAt(i - 1) != '\\')) {
-                inQuotes = !inQuotes;
-            } else if (c == '{' && !inQuotes) {
-                braceDepth++;
-                current.append(c);
-            } else if (c == '}' && !inQuotes) {
-                braceDepth--;
-                current.append(c);
-            } else if (c == ',' && !inQuotes && braceDepth == 0) {
-                result.add(current.toString().trim());
-                current.setLength(0);
-            } else {
-                if (c == '\\' && i + 1 < inner.length()) {
-                    char next = inner.charAt(i + 1);
-                    if (next == '"' || next == '\\') {
-                        current.append(next);
-                        i++;
-                        continue;
-                    }
-                }
-                current.append(c);
-            }
-        }
-        result.add(current.toString().trim());
-        return result;
-    }
-
-    /**
-     * Converts a single Postgres text array element string to the appropriate boxed Java type based
-     * on the element type name.
-     */
-    private static Object parseArrayElement(
-            String rawElement, String elementTypeName, String columnName) {
-
-        if (rawElement == null || rawElement.equalsIgnoreCase("NULL")) {
-            return null;
-        }
-
-        String element = rawElement;
-        if (element.startsWith("\"") && element.endsWith("\"") && element.length() >= 2) {
-            element = element.substring(1, element.length() - 1);
-        }
-
-        try {
-            switch (elementTypeName) {
-                case "float4":
-                case "real":
-                    return Float.valueOf(element);
-                case "float8":
-                case "double precision":
-                    return Double.valueOf(element);
-                case "int2":
-                case "smallint":
-                    return Short.valueOf(element);
-                case "int4":
-                case "int":
-                case "integer":
-                    return Integer.valueOf(element);
-                case "int8":
-                case "bigint":
-                    return Long.valueOf(element);
-                case "numeric":
-                case "decimal":
-                case "money":
-                    return new BigDecimal(element);
-                case "bool":
-                case "boolean":
-                    return "t".equalsIgnoreCase(element)
-                            || "true".equalsIgnoreCase(element)
-                            || "1".equals(element)
-                            || "yes".equalsIgnoreCase(element);
-                default:
-                    return element;
-            }
-        } catch (NumberFormatException e) {
-            LOGGER.warn(
-                    "Failed to parse array element '{}' as type '{}' for column '{}', "
-                            + "returning as string",
-                    element,
-                    elementTypeName,
-                    columnName,
-                    e);
-            return element;
-        }
-    }
-
-    /**
      * Resolve the replication stream's tuple data to a list of replication message columns.
      *
      * @param buffer The replication stream buffer
@@ -1051,21 +900,6 @@ public class PgOutputMessageDecoder extends AbstractMessageDecoder {
                             public Object getValue(
                                     PgConnectionSupplier connection,
                                     boolean includeUnknownDatatypes) {
-                                // When columnType is an array (_float4, _int4,
-                                // etc.), the upstream resolveValue() can lose
-                                // the array context when recursing to the
-                                // element type. Parse the Postgres text array
-                                // representation directly into a List<Object>
-                                // which Kafka Connect's JsonConverter correctly
-                                // serializes as a JSON array.
-                                if (columnType.isArrayType()) {
-                                    List<Object> listValue =
-                                            parsePostgresTextArray(
-                                                    valueStr, columnType, columnName);
-                                    if (listValue != null) {
-                                        return listValue;
-                                    }
-                                }
                                 return PgOutputReplicationMessage.getValue(
                                         columnName,
                                         columnType,
@@ -1085,29 +919,6 @@ public class PgOutputMessageDecoder extends AbstractMessageDecoder {
                 replicationMessageColumn =
                         new UnchangedToastedReplicationMessageColumn(
                                 columnName, columnType, typeExpression, optional) {
-                            @Override
-                            public Object getValue(
-                                    PgConnectionSupplier connection,
-                                    boolean includeUnknownDatatypes) {
-                                // For array types in the TOAST path, the upstream
-                                // UnchangedToastedPlaceholder maps the generic
-                                // UNCHANGED_TOAST_VALUE marker to a String (line 42),
-                                // which leaks through PostgresValueConverter
-                                // .handleUnknownData() and fails Struct.put() for
-                                // ARRAY schemas with:
-                                //   DataException: Invalid Java object for schema
-                                //   with type ARRAY: class java.lang.String
-                                //
-                                // Return null to bypass this entirely. The
-                                // PostgresValueConverter.convertArray() fallback
-                                // produces Collections.emptyList() for non-optional
-                                // array columns, which is a safe default.
-                                if (columnType != null && columnType.isArrayType()) {
-                                    return null;
-                                }
-                                return super.getValue(connection, includeUnknownDatatypes);
-                            }
-
                             @Override
                             public String toString() {
                                 return columnName

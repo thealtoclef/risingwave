@@ -117,6 +117,15 @@ pub static DEBEZIUM_UNAVAILABLE_JSON: std::sync::LazyLock<JsonbVal> =
         JsonbVal(builder.finish())
     });
 
+/// Magic element values used to build the Debezium unchanged-TOAST sentinel for floating-point
+/// array columns (`real[]`, `double precision[]`). A string placeholder cannot be embedded in a
+/// numeric list, so we encode the sentinel as a single-element list holding this value. `f32::MAX`
+/// / `f64::MAX` are valid floats (so they pass `check_datum_type`) yet effectively never appear in
+/// real data, mirroring the pgvector sentinel. Integer arrays have no such impossible value, so
+/// they are not covered — use `REPLICA IDENTITY FULL` for full-fidelity TOAST on those columns.
+pub const DEBEZIUM_UNAVAILABLE_FLOAT32_ELEM: f32 = f32::MAX;
+pub const DEBEZIUM_UNAVAILABLE_FLOAT64_ELEM: f64 = f64::MAX;
+
 /// The set of datatypes that are supported in RisingWave.
 ///
 /// # Trait implementations
