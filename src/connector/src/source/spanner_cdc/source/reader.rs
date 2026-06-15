@@ -656,7 +656,6 @@ async fn read_partition(
         stmt.add_param("start_timestamp", &start_ts);
         return execute_query(
             &client,
-            &database_name,
             &stmt,
             &mut split,
             &split_id,
@@ -790,7 +789,6 @@ async fn execute_query(
                         split_id,
                         schema_payload.json,
                         data_change,
-                        database_name,
                         &offset_str,
                     );
                     if tx.send(vec![schema_msg]).await.is_err() {
@@ -884,7 +882,6 @@ fn make_schema_change_msg(
     split_id: &SplitId,
     payload: Vec<u8>,
     data_change: &crate::source::spanner_cdc::types::DataChangeRecord,
-    database_name: &str,
     offset_str: &str,
 ) -> SourceMessage {
     SourceMessage {
