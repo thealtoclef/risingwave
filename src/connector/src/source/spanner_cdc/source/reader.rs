@@ -107,6 +107,7 @@ impl SplitReader for SpannerCdcSplitReader {
 
         let ctx = ReaderContext {
             client,
+            database: properties.database.clone(),
             change_stream_name: properties.change_stream_name.clone(),
             heartbeat_interval_ms,
             retry_attempts: properties.get_retry_attempts(),
@@ -170,6 +171,7 @@ impl SpannerCdcSplitReader {
 
 struct ReaderContext {
     client: Client,
+    database: String,
     change_stream_name: String,
     heartbeat_interval_ms: i64,
     retry_attempts: u32,
@@ -578,6 +580,7 @@ fn spawn_partition_task(
     child_discovery_tx: tokio::sync::mpsc::UnboundedSender<SpannerCdcSplit>,
 ) {
     let client = ctx.client.clone();
+    let database = ctx.database.clone();
     let change_stream_name = ctx.change_stream_name.clone();
     let heartbeat_interval_ms = ctx.heartbeat_interval_ms;
     let retry_attempts = ctx.retry_attempts;
@@ -593,6 +596,7 @@ fn spawn_partition_task(
     partition_streams.push(tokio::spawn(async move {
         read_partition(
             client,
+            database,
             split,
             change_stream_name,
             heartbeat_interval_ms,
@@ -617,6 +621,7 @@ fn spawn_partition_task(
 
 async fn read_partition(
     client: Client,
+    database: String,
     mut split: SpannerCdcSplit,
     change_stream_name: String,
     heartbeat_interval_ms: i64,
@@ -660,6 +665,7 @@ async fn read_partition(
             &stmt,
             &mut split,
             &split_id,
+            &database,
             &offsets,
             &shared_schema,
             &tx,
@@ -687,6 +693,7 @@ async fn read_partition(
             &stmt,
             &mut split,
             &split_id,
+            &database,
             &offsets,
             &shared_schema,
             &tx,
@@ -724,6 +731,7 @@ async fn execute_query(
     stmt: &Statement,
     split: &mut SpannerCdcSplit,
     split_id: &SplitId,
+    database: &str,
     offsets: &PartitionOffsets,
     shared_schema: &std::sync::Mutex<SchemaTracker>,
     tx: &mpsc::Sender<Vec<SourceMessage>>,
@@ -801,6 +809,7 @@ async fn execute_query(
                 for modification in &data_change.mods {
                     let tagged = TaggedChangeRecord {
                         split_id: split_id.clone(),
+                        database_name: database.to_owned(),
                         data_change: data_change.clone(),
                         modification: modification.clone(),
                     };
