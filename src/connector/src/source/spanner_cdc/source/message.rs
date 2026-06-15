@@ -24,6 +24,7 @@ use crate::source::{SplitId};
 #[derive(Debug, Clone)]
 pub struct TaggedChangeRecord {
     pub split_id: SplitId,
+    pub database_name: String,
     pub data_change: DataChangeRecord,
     pub modification: Mod,
 }
@@ -34,22 +35,34 @@ impl From<TaggedChangeRecord> for SourceMessage {
         // The offset will be set by the reader to include full partition state
         // Default to the commit timestamp nanos
         let offset = commit_timestamp.unix_timestamp_nanos().to_string();
-        // Wrap in a Debezium-compatible envelope: {"payload": {"before":..,"after":..,"op":..}}
+        let source_ts_ms = (commit_timestamp.unix_timestamp_nanos() / 1_000_000) as i64;
+        // Wrap in a Debezium-compatible envelope: {"payload": {"before":..,"after":..,"op":..,"source":..}}
         // The shared CDC source schema has a `payload` JSONB column; the parser extracts
         // the top-level "payload" field.  Without this wrapper the field is missing and the
         // column is padded with NULL, which causes the backfill executor to panic.
+        // The `source` sub-object mirrors the Debezium source envelope so that INCLUDE TIMESTAMP,
+        // INCLUDE database_name, and INCLUDE table_name columns resolve correctly when
+        // parse_debezium_chunk re-parses the stored payload without row_meta.
         let mod_json = record
             .modification
             .to_json_map(&record.data_change.mod_type, &record.data_change)
-            .and_then(|inner| {
+            .and_then(|mut inner| {
+                let mut source = serde_json::Map::new();
+                source.insert("ts_ms".to_string(), serde_json::Value::from(source_ts_ms));
+                source.insert(
+                    "db".to_string(),
+                    serde_json::Value::String(record.database_name.clone()),
+                );
+                source.insert(
+                    "table".to_string(),
+                    serde_json::Value::String(record.data_change.table_name.clone()),
+                );
+                inner.insert("source".to_string(), serde_json::Value::Object(source));
                 let mut envelope = serde_json::Map::new();
                 envelope.insert("payload".to_string(), serde_json::Value::Object(inner));
                 serde_json::to_vec(&envelope).map_err(Into::into)
             })
             .expect("Spanner change record serialization to JSON should never fail");
-
-        let source_ts_ms =
-            (commit_timestamp.unix_timestamp_nanos() / 1_000_000) as i64;
 
         SourceMessage {
             key: None,
