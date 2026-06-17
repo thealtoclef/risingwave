@@ -1,6 +1,20 @@
 control substitution on
 
 # =============================================================================
+# PART 0: TEARDOWN - Drop any leftover RisingWave objects from previous runs.
+# Idempotent: re-running the SLT does not require manual cleanup of the
+# RisingWave side; only the Spanner side needs explicit cleanup (handled by
+# `prepare-data.rs cleanup` in PART 1 below).
+# Dropping a CDC source with CASCADE removes its dependent tables.
+# =============================================================================
+
+statement ok
+DROP SOURCE IF EXISTS spanner_source CASCADE;
+
+statement ok
+DROP SOURCE IF EXISTS s CASCADE;
+
+# =============================================================================
 # PART 1: SETUP - THREE TABLES BEFORE CHANGE STREAM
 # =============================================================================
 
@@ -35,8 +49,16 @@ e2e_test/source_inline/spanner_cdc/prepare-data.rs create-change-stream
 
 # Insert products and inventory data AFTER the change stream exists.
 # This data will be in BOTH the snapshot and the CDC stream when we create the RW tables later.
+# Idempotent: clear rows first, then insert. Re-runs of the SLT will not fail
+# on duplicate primary keys.
+system ok
+e2e_test/source_inline/spanner_cdc/prepare-data.rs dml "DELETE FROM products WHERE true"
+
 system ok
 e2e_test/source_inline/spanner_cdc/prepare-data.rs dml "INSERT INTO products (id, name, price, category) VALUES ('p1', 'Widget', 9.99, 'gadgets'), ('p2', 'Gizmo', 24.50, 'gadgets'), ('p3', 'Thingamajig', 4.99, 'misc')"
+
+system ok
+e2e_test/source_inline/spanner_cdc/prepare-data.rs dml "DELETE FROM inventory WHERE true"
 
 system ok
 e2e_test/source_inline/spanner_cdc/prepare-data.rs dml "INSERT INTO inventory (id, name, quantity) VALUES (1, 'Bolt', 100), (2, 'Nut', 200), (3, 'Washer', 150), (4, 'Screw', 300), (5, 'Nail', 250)"
@@ -63,7 +85,7 @@ statement ok
 CREATE SOURCE spanner_source WITH (
     ${RISEDEV_SPANNER_WITH_OPTIONS_COMMON},
     spanner.change_stream.name = 'test_stream',
-    spanner.heartbeat_interval = '5s',
+    spanner.heartbeat_milliseconds = 5000,
     auto.schema.change = 'true'
 );
 
@@ -140,7 +162,7 @@ category
 # =============================================================================
 # PART 6: PARALLEL BACKFILL - EVEN SPLITS - inventory table (INT64 PK)
 # INT64 PK → even (numeric range-based) splits
-# databoost enabled → uses partition_query with DataBoost
+# databoost disabled → uses regular read_only_transaction path
 # num_rows_per_split=2 to force multiple splits with small data (PK range 1-5)
 # =============================================================================
 
@@ -148,12 +170,13 @@ statement ok
 CREATE TABLE t_inventory (*) WITH (
     backfill.parallelism = 3,
     backfill.num_rows_per_split = 2,
-    spanner.databoost.enabled = 'true',
+    spanner.databoost.enabled = 'false',
 )
 FROM spanner_source
 TABLE 'inventory';
 
-sleep 30s
+# 60s needed for real-Spanner parallel backfill with 3 splits × 2 rows; emulator would suffice with <5s.
+sleep 60s
 
 query IT
 select id, name from t_inventory order by id limit 10;
@@ -214,10 +237,9 @@ system ok
 grep -q "Using uneven splits" .risingwave/log/*.log
 
 # --- Verify databoost config pass-through via logs ---
-# split_snapshot_read_inner logs "partition_query with databoost=true/false"
-system ok
-grep -q "databoost=true" .risingwave/log/*.log
-
+# split_snapshot_read_inner logs "partition_query with databoost=false".
+# Note: databoost=true path is not exercised in this test (requires
+# `roles/spanner.databases.useDataBoost` IAM permission).
 system ok
 grep -q "databoost=false" .risingwave/log/*.log
 
@@ -229,7 +251,7 @@ grep -q "databoost=false" .risingwave/log/*.log
 system ok
 e2e_test/source_inline/spanner_cdc/prepare-data.rs dml "INSERT INTO users (id, name, email, age) VALUES ('3', 'Charlie', 'charlie@example.com', 35), ('4', 'Diana', 'diana@example.com', 28)"
 
-sleep 10s
+sleep 30s
 
 query T
 select id from t_users order by id limit 10;
@@ -330,7 +352,10 @@ select count(*) from t_users;
 system ok
 e2e_test/source_inline/spanner_cdc/prepare-data.rs ddl "CREATE TABLE IF NOT EXISTS orders (id STRING(MAX) NOT NULL, product_id STRING(MAX), quantity INT64, status STRING(MAX)) PRIMARY KEY (id)"
 
-# Insert data into the new table
+# Insert data into the new table (idempotent: clear rows first to allow re-runs)
+system ok
+e2e_test/source_inline/spanner_cdc/prepare-data.rs dml "DELETE FROM orders WHERE true"
+
 system ok
 e2e_test/source_inline/spanner_cdc/prepare-data.rs dml "INSERT INTO orders (id, product_id, quantity, status) VALUES ('o1', 'p1', 2, 'pending'), ('o2', 'p3', 1, 'shipped')"
 
@@ -338,7 +363,7 @@ e2e_test/source_inline/spanner_cdc/prepare-data.rs dml "INSERT INTO orders (id, 
 statement ok
 CREATE TABLE t_orders (*) WITH (
     backfill.parallelism = 3,
-    spanner.databoost.enabled = 'true',
+    spanner.databoost.enabled = 'false',
 )
 FROM spanner_source
 TABLE 'orders';

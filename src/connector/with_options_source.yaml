@@ -1443,10 +1443,13 @@ SpannerCdcProperties:
       Table name to filter change records (optional for shared source)
       When creating a table FROM a source, this specifies which upstream table to track
     required: false
-  - name: spanner.heartbeat_interval
-    field_type: String
-    comments: 'Heartbeat interval for partition health monitoring (default: 3s)'
-    required: true
+  - name: spanner.heartbeat_milliseconds
+    field_type: i64
+    comments: |-
+      Heartbeat interval in milliseconds for partition health monitoring.
+      Maps to the `heartbeat_milliseconds` argument of the `READ_<change_stream>` TVF.
+      Valid range: 1,000–300,000. Defaults to 2000.
+    required: false
   - name: spanner.credentials
     field_type: String
     comments: |-
