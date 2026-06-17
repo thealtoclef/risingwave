@@ -8,7 +8,7 @@ license = { workspace = true }
 repository = { workspace = true }
 
 [package.metadata.cargo-machete]
-ignored = []
+ignored = ["google-cloud-wkt"]
 
 [features]
 default = []
@@ -77,10 +77,10 @@ either = "1"
 elasticsearch = { version = "8.17.0-alpha.1", features = ["rustls-tls"] }
 enum-as-inner = "0.7"
 futures = { version = "0.3", default-features = false, features = ["alloc"] }
-parse-display = "0.10"
 futures-async-stream = { workspace = true }
 gcp-bigquery-client = { version = "0.28.0", optional = true }
 glob = "0.3"
+google-cloud-auth = { git = "https://github.com/googleapis/google-cloud-rust", rev = "20b85b29b2b641099096e8a405ccedec3171d345" }
 google-cloud-bigquery = { package = "gcloud-bigquery", version = "1.6", features = [
     "auth",
 ], optional = true }
@@ -91,7 +91,8 @@ google-cloud-googleapis = { package = "gcloud-googleapis", version = "1", featur
     "spanner",
 ], optional = true }
 google-cloud-pubsub = { package = "gcloud-pubsub", version = "1.5" }
-google-cloud-spanner = { package = "gcloud-spanner", version = "1" }
+google-cloud-spanner = { git = "https://github.com/googleapis/google-cloud-rust", rev = "20b85b29b2b641099096e8a405ccedec3171d345" }
+google-cloud-wkt = { git = "https://github.com/googleapis/google-cloud-rust", rev = "20b85b29b2b641099096e8a405ccedec3171d345" }
 iceberg = { workspace = true }
 iceberg-catalog-glue = { workspace = true }
 iceberg-catalog-rest = { workspace = true }
@@ -120,6 +121,7 @@ opensearch = { version = "2.3.0", features = ["rustls-tls"] }
 openssl = { workspace = true }
 parking_lot = { workspace = true }
 parquet = { version = "58", features = ["async"] }
+parse-display = "0.10"
 paste = "1"
 pg_bigdecimal = { git = "https://github.com/risingwavelabs/rust-pg_bigdecimal", rev = "0b7893d88894ca082b4525f94f812da034486f7c" }
 phf = { version = "0.13", features = ["macros"] }

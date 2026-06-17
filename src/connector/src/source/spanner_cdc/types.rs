@@ -14,14 +14,14 @@
 
 //! Spanner CDC data types
 //!
-//! This module defines all Spanner change stream data structures following the official
-//! Spanner API specification at:
-//! https://cloud.google.com/spanner/docs/change-streams/details
+//! Parses change-stream records returned by the `READ_<stream>` TVF into
+//! strongly-typed AST nodes. Each row contains a single `ChangeRecord`
+//! column of type `ARRAY<STRUCT<...>>`; the googleapis SDK decodes it to
+//! a `serde_json::Value` preserving STRUCT field names via runtime `Type`
+//! metadata.
 //!
-//! The reader parses change stream data directly into these structs, providing a
-//! strongly-typed interface that matches Spanner's API exactly.
+//! Reference: <https://cloud.google.com/spanner/docs/change-streams/details>
 
-use google_cloud_spanner::row::{Error as RowError, Struct, TryFromStruct};
 use parse_display::{Display, FromStr};
 use risingwave_common::types::{DataType, ListType};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -34,7 +34,7 @@ use time::OffsetDateTime;
 
 /// TypeCode represents the type code for a Spanner type.
 ///
-/// See: https://cloud.google.com/spanner/docs/reference/rest/v1/Type#TypeCode
+/// See: <https://cloud.google.com/spanner/docs/reference/rest/v1/Type#TypeCode>
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Display, FromStr)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum TypeCode {
@@ -72,8 +72,6 @@ pub enum TypeCode {
 }
 
 /// TypeAnnotationCode disambiguates SQL types for Spanner values.
-///
-/// See: https://cloud.google.com/spanner/docs/reference/rest/v1/Type#TypeAnnotationCode
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum TypeAnnotationCode {
@@ -85,47 +83,32 @@ pub enum TypeAnnotationCode {
 }
 
 /// Spanner Type represents the type of a Cloud Spanner value.
-///
-/// See: https://cloud.google.com/spanner/docs/reference/rest/v1/Type
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpannerType {
-    /// Required. The TypeCode for this type
     pub code: TypeCode,
-    /// If code == ARRAY, then arrayElementType is the type of the array elements
     #[serde(skip_serializing_if = "Option::is_none")]
     pub array_element_type: Option<Box<SpannerType>>,
-    /// If code == STRUCT, then structType provides type information for the struct's fields
     #[serde(skip_serializing_if = "Option::is_none")]
     pub struct_type: Option<StructType>,
-    /// The TypeAnnotationCode that disambiguates SQL type
     #[serde(skip_serializing_if = "Option::is_none")]
     pub type_annotation: Option<TypeAnnotationCode>,
-    /// If code == PROTO or code == ENUM, then protoTypeFqn is the fully qualified name
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proto_type_fqn: Option<String>,
 }
 
-/// StructType provides type information for STRUCT types.
-///
-/// See: https://cloud.google.com/spanner/docs/reference/rest/v1/Type#StructType
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StructType {
-    /// The fields of the struct
     pub fields: Vec<StructField>,
 }
 
-/// A field in a STRUCT type
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StructField {
-    /// The field name
     pub name: String,
-    /// The field type
     #[serde(rename = "type")]
     pub field_type: SpannerType,
 }
 
 impl SpannerType {
-    /// Create a simple type from a TypeCode
     pub fn simple(code: TypeCode) -> Self {
         Self {
             code,
@@ -136,7 +119,6 @@ impl SpannerType {
         }
     }
 
-    /// Create an ARRAY type with the given element type
     pub fn array(element_type: SpannerType) -> Self {
         Self {
             code: TypeCode::Array,
@@ -147,10 +129,6 @@ impl SpannerType {
         }
     }
 
-    /// Get a string representation of this type for use in DDL/upstream formatting
-    ///
-    /// This returns the Spanner type name as a string (e.g., "STRING", "INT64", "ARRAY<STRING>")
-    /// which matches the format used in Spanner DDL statements.
     pub fn to_type_string(&self) -> String {
         match &self.code {
             TypeCode::Array => {
@@ -176,9 +154,6 @@ impl SpannerType {
         }
     }
 
-    /// Convert SpannerType to RisingWave DataType.
-    ///
-    /// This handles complex types (Array, Struct) properly by recursively converting.
     pub fn to_rw_type(&self) -> DataType {
         match &self.code {
             TypeCode::Bool => DataType::Boolean,
@@ -199,22 +174,18 @@ impl SpannerType {
                     DataType::List(ListType::new(DataType::Varchar))
                 }
             }
-            TypeCode::Struct => {
-                // Struct types - for now map to JSONB as a fallback
-                // In the future, we might want to create proper StructType
-                DataType::Jsonb
-            }
+            TypeCode::Struct => DataType::Jsonb,
             TypeCode::Proto | TypeCode::Enum => DataType::Varchar,
         }
     }
 }
 
 /// Map a Spanner type name string (as produced by `SpannerType::to_type_string()`) to a RisingWave DataType.
-///
-/// Returns `None` for unsupported types (STRUCT, PROTO, ENUM).
 pub fn spanner_type_name_to_rw_type(type_name: &str) -> Option<DataType> {
-    // Handle ARRAY<element_type>
-    if let Some(inner) = type_name.strip_prefix("ARRAY<").and_then(|s| s.strip_suffix('>')) {
+    if let Some(inner) = type_name
+        .strip_prefix("ARRAY<")
+        .and_then(|s| s.strip_suffix('>'))
+    {
         return spanner_type_name_to_rw_type(inner)
             .map(|elem_type| DataType::List(ListType::new(elem_type)));
     }
@@ -233,10 +204,11 @@ pub fn spanner_type_name_to_rw_type(type_name: &str) -> Option<DataType> {
     }
 }
 
-/// Custom serializer/deserializer for SpannerType in ColumnType
+/// Custom serializer/deserializer for `SpannerType` in `ColumnType`.
 ///
-/// The Google Cloud Spanner library returns the type field as a JSON string,
-/// but we want to work with SpannerType directly. This module handles the conversion.
+/// The googleapis SDK returns the `type` cell of a `column_types` row as
+/// either a JSON object (when the type metadata is available) or a JSON
+/// string. We accept both.
 mod spanner_type_serde {
     use super::*;
 
@@ -244,7 +216,6 @@ mod spanner_type_serde {
     where
         S: Serializer,
     {
-        // Serialize SpannerType directly as a JSON object
         spanner_type.serialize(serializer)
     }
 
@@ -252,30 +223,31 @@ mod spanner_type_serde {
     where
         D: Deserializer<'de>,
     {
-        // The Spanner library returns a JSON string, deserialize it first then parse to SpannerType
-        let json_string = String::deserialize(deserializer)?;
-        serde_json::from_str(&json_string).map_err(serde::de::Error::custom)
+        let v = JsonValue::deserialize(deserializer)?;
+        match v {
+            JsonValue::Object(_) => serde_json::from_value(v).map_err(serde::de::Error::custom),
+            JsonValue::String(s) => serde_json::from_str(&s).map_err(serde::de::Error::custom),
+            other => Err(serde::de::Error::custom(format!(
+                "expected JSON object or string for SpannerType, got: {}",
+                other
+            ))),
+        }
     }
 }
 
 // ============================================================================
 // Spanner Change Stream Data Types
 // ============================================================================
-// Documentation: https://cloud.google.com/spanner/docs/change-streams/details
 //
-// Change stream records are returned as:
-// STRUCT<
-//   data_change_record ARRAY<STRUCT<...>>,
-//   heartbeat_record ARRAY<STRUCT<...>>,
-//   child_partitions_record ARRAY<STRUCT<...>>
-// >
-// Only one of these three fields contains data in any given record.
+// Change-stream TVF result row shape:
+//   STRUCT<
+//     data_change_record ARRAY<STRUCT<...>>,
+//     heartbeat_record ARRAY<STRUCT<...>>,
+//     child_partitions_record ARRAY<STRUCT<...>>
+//   >
+// One element per row. Only one of the three arrays is non-empty per record.
 // ============================================================================
 
-/// Spanner change stream record
-///
-/// This is the top-level record returned by change stream queries.
-/// Only one of the three record arrays will be non-empty in any given record.
 #[derive(Debug, Clone)]
 pub struct ChangeStreamRecord {
     pub data_change_record: Vec<DataChangeRecord>,
@@ -283,165 +255,379 @@ pub struct ChangeStreamRecord {
     pub child_partitions_record: Vec<ChildPartitionsRecord>,
 }
 
-impl TryFromStruct for ChangeStreamRecord {
-    fn try_from_struct(s: Struct<'_>) -> Result<Self, RowError> {
-        Ok(Self {
-            data_change_record: s.column_by_name("data_change_record")?,
-            heartbeat_record: s.column_by_name("heartbeat_record").unwrap_or_default(),
-            child_partitions_record: s.column_by_name("child_partitions_record")?,
-        })
-    }
-}
-
-/// Data change record representing a change to a table
-///
-/// Contains all changes to a table with the same modification type (insert, update, or delete)
-/// committed at the same commit timestamp in one change stream partition for the same transaction.
-///
-/// See: https://cloud.google.com/spanner/docs/change-streams/details#data_change_records
 #[derive(Debug, Clone)]
 pub struct DataChangeRecord {
-    /// Indicates the timestamp in which the change was committed
     pub commit_timestamp: OffsetDateTime,
-    /// Sequence number for the record within the transaction
-    /// Unique and monotonically increasing (but not necessarily contiguous) within a transaction
     pub record_sequence: String,
-    /// Globally unique string representing the transaction
     pub server_transaction_id: String,
-    /// Whether this is the last record for a transaction in the current partition
     pub is_last_record_in_transaction_in_partition: bool,
-    /// Name of the table affected by the change
     pub table_name: String,
-    /// Describes the value capture type specified in the change stream configuration
-    /// One of: OLD_AND_NEW_VALUES, NEW_ROW, NEW_VALUES, NEW_ROW_AND_OLD_VALUES
     pub value_capture_type: String,
-    /// Column types for this table - critical for schema evolution
     pub column_types: Vec<ColumnType>,
-    /// The actual data changes (keys, old values, new values)
     pub mods: Vec<Mod>,
-    /// Type of change: INSERT, UPDATE, or DELETE
     pub mod_type: String,
-    /// Number of data change records in this transaction across all partitions
     pub number_of_records_in_transaction: i64,
-    /// Number of partitions returning data for this transaction
     pub number_of_partitions_in_transaction: i64,
-    /// Transaction tag associated with this transaction
     pub transaction_tag: String,
-    /// Whether this is a system transaction
     pub is_system_transaction: bool,
 }
 
-impl TryFromStruct for DataChangeRecord {
-    fn try_from_struct(s: Struct<'_>) -> Result<Self, RowError> {
-        Ok(Self {
-            commit_timestamp: s.column_by_name("commit_timestamp")?,
-            record_sequence: s.column_by_name("record_sequence")?,
-            server_transaction_id: s.column_by_name("server_transaction_id")?,
-            is_last_record_in_transaction_in_partition: s
-                .column_by_name("is_last_record_in_transaction_in_partition")?,
-            table_name: s.column_by_name("table_name")?,
-            value_capture_type: s.column_by_name("value_capture_type")?,
-            column_types: s.column_by_name("column_types")?,
-            mods: s.column_by_name("mods")?,
-            mod_type: s.column_by_name("mod_type")?,
-            number_of_records_in_transaction: s
-                .column_by_name("number_of_records_in_transaction")?,
-            number_of_partitions_in_transaction: s
-                .column_by_name("number_of_partitions_in_transaction")?,
-            transaction_tag: s.column_by_name("transaction_tag")?,
-            is_system_transaction: s.column_by_name("is_system_transaction")?,
-        })
-    }
-}
-
-/// Column type information from Spanner change stream column_types array
+/// `column_types` row in a `data_change_record`. JSON shape:
 ///
-/// This struct matches the Spanner API specification exactly:
-/// https://cloud.google.com/spanner/docs/change-streams/details#data_change_records
-///
-/// The column_types array contains:
 /// ```json
-/// [
-///   {
-///     "name": "column_name",
-///     "type": {
-///       "code": "STRING"
-///     },
-///     "is_primary_key": false,
-///     "ordinal_position": 1
-///   }
-/// ]
+/// {
+///   "name": "column_name",
+///   "type": {"code": "STRING"},
+///   "is_primary_key": false,
+///   "ordinal_position": 1
+/// }
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ColumnType {
-    /// Name of the column
     pub name: String,
-    /// The column type as a SpannerType struct
-    ///
-    /// Uses custom serde to handle JSON string <-> JSON object conversion
-    /// since the Spanner library returns this as a JSON string.
     #[serde(with = "spanner_type_serde")]
     pub spanner_type: SpannerType,
-    /// Whether this column is a primary key
     pub is_primary_key: bool,
-    /// Position of the column as defined in the schema (1-indexed)
     pub ordinal_position: i64,
 }
 
 impl ColumnType {
-    /// Get the type code for this column
     pub fn type_code(&self) -> TypeCode {
         self.spanner_type.code.clone()
     }
 }
 
-impl TryFromStruct for ColumnType {
-    fn try_from_struct(s: Struct<'_>) -> Result<Self, RowError> {
-        // Read the type field as a JSON string, then deserialize to SpannerType
-        let type_json: String = s.column_by_name("type")?;
-        let spanner_type: SpannerType = serde_json::from_str(&type_json)
-            .map_err(|e| RowError::CustomParseError(format!("Failed to parse SpannerType: {}", e)))?;
+/// `mods` row in a `data_change_record`. The change-stream TVF encodes all
+/// cell values as JSON strings (regardless of column type). `keys`/`new_values`/
+/// `old_values` are each `MAP<column_name, value>` serialized as a JSON
+/// object-as-string.
+///
+/// `action_id`-style columns are preserved: they appear as keys in the map
+/// and pass through `to_json_map` unmodified.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Mod {
+    pub keys: Option<String>,
+    pub new_values: Option<String>,
+    pub old_values: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct HeartbeatRecord {
+    pub timestamp: OffsetDateTime,
+}
+
+#[derive(Debug, Clone)]
+pub struct ChildPartitionsRecord {
+    pub start_timestamp: OffsetDateTime,
+    pub record_sequence: String,
+    pub child_partitions: Vec<ChildPartition>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ChildPartition {
+    pub token: String,
+    pub parent_partition_tokens: Vec<String>,
+}
+
+// ============================================================================
+// Parsing
+// ============================================================================
+
+/// Parse the `ChangeRecord` column of a change-stream result row.
+///
+/// The SDK returns `ARRAY<STRUCT<...>>` as a `JsonValue::Array` of objects
+/// with at most one element per row (Spanner emits at most one record per
+/// change-stream TVF row).
+pub fn parse_change_record_column(
+    row: &google_cloud_spanner::result::Row,
+    idx: usize,
+) -> anyhow::Result<Vec<ChangeStreamRecord>> {
+    let json: JsonValue = row
+        .try_get(idx)
+        .map_err(|e| anyhow::anyhow!("failed to get ChangeRecord column: {}", e))?;
+    let inner = match json {
+        JsonValue::Array(mut arr) if !arr.is_empty() => arr.remove(0),
+        JsonValue::Object(_) => json,
+        other => {
+            return Err(anyhow::anyhow!(
+                "ChangeRecord is neither ARRAY<STRUCT> nor STRUCT, got: {}",
+                other
+            ));
+        }
+    };
+    let obj = inner
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("ChangeRecord inner element is not an object: {}", inner))?;
+
+    Ok(vec![ChangeStreamRecord::from_json_object(obj)?])
+}
+
+impl ChangeStreamRecord {
+    fn from_json_object(obj: &serde_json::Map<String, JsonValue>) -> anyhow::Result<Self> {
+        let parse_array = |key: &str| -> anyhow::Result<JsonValue> {
+            Ok(obj.get(key).cloned().unwrap_or(JsonValue::Array(vec![])))
+        };
+
+        let mut data_change_record = Vec::new();
+        for v in parse_array("data_change_record")?
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+        {
+            data_change_record.push(DataChangeRecord::from_json(&v)?);
+        }
+
+        let mut heartbeat_record = Vec::new();
+        for v in parse_array("heartbeat_record")?
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+        {
+            heartbeat_record.push(HeartbeatRecord::from_json(&v)?);
+        }
+
+        let mut child_partitions_record = Vec::new();
+        for v in parse_array("child_partitions_record")?
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+        {
+            child_partitions_record.push(ChildPartitionsRecord::from_json(&v)?);
+        }
 
         Ok(Self {
-            name: s.column_by_name("name")?,
-            spanner_type,
-            is_primary_key: s.column_by_name("is_primary_key")?,
-            ordinal_position: s.column_by_name("ordinal_position")?,
+            data_change_record,
+            heartbeat_record,
+            child_partitions_record,
         })
     }
 }
 
-/// Modification record containing keys and values
-///
-/// Describes the changes made, including primary key values, old values, and new values.
-/// The availability and content of old and new values depends on value_capture_type.
-///
-/// IMPORTANT: According to Spanner change stream documentation:
-/// - `keys` contains the primary key values
-/// - `new_values` and `old_values` only contain NON-KEY columns
-/// - We MUST merge keys with new_values/old_values to get the full row
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Mod {
-    /// Primary key values as JSON string
-    pub keys: Option<String>,
-    /// Non-key column new values as JSON string
-    pub new_values: Option<String>,
-    /// Non-key column old values as JSON string
-    pub old_values: Option<String>,
+impl DataChangeRecord {
+    fn from_json(v: &JsonValue) -> anyhow::Result<Self> {
+        let obj = v
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("DataChangeRecord is not an object, got: {}", v))?;
+        let get_str = |k: &str| -> anyhow::Result<String> {
+            obj.get(k)
+                .and_then(|v| v.as_str())
+                .map(String::from)
+                .ok_or_else(|| anyhow::anyhow!("DataChangeRecord.{}: missing or not a string", k))
+        };
+        let get_bool = |k: &str| -> anyhow::Result<bool> {
+            obj.get(k)
+                .and_then(|v| v.as_bool())
+                .ok_or_else(|| anyhow::anyhow!("DataChangeRecord.{}: missing or not a bool", k))
+        };
+        let get_i64 = |k: &str| -> anyhow::Result<i64> {
+            obj.get(k)
+                .and_then(|v| {
+                    v.as_i64()
+                        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                })
+                .ok_or_else(|| anyhow::anyhow!("DataChangeRecord.{}: missing or not an i64", k))
+        };
+
+        let commit_ts_str = get_str("commit_timestamp")?;
+        let commit_timestamp = OffsetDateTime::parse(
+            &commit_ts_str,
+            &time::format_description::well_known::Rfc3339,
+        )
+        .map_err(|e| anyhow::anyhow!("invalid commit_timestamp '{}': {}", commit_ts_str, e))?;
+
+        let column_types = match obj.get("column_types") {
+            Some(JsonValue::Array(a)) => a
+                .iter()
+                .map(ColumnType::from_json)
+                .collect::<anyhow::Result<Vec<_>>>()?,
+            _ => vec![],
+        };
+        let mods = match obj.get("mods") {
+            Some(JsonValue::Array(a)) => a
+                .iter()
+                .map(Mod::from_json)
+                .collect::<anyhow::Result<Vec<_>>>()?,
+            _ => vec![],
+        };
+
+        Ok(Self {
+            commit_timestamp,
+            record_sequence: get_str("record_sequence")?,
+            server_transaction_id: get_str("server_transaction_id")?,
+            is_last_record_in_transaction_in_partition: get_bool(
+                "is_last_record_in_transaction_in_partition",
+            )?,
+            table_name: get_str("table_name")?,
+            value_capture_type: get_str("value_capture_type")?,
+            column_types,
+            mods,
+            mod_type: get_str("mod_type")?,
+            number_of_records_in_transaction: get_i64("number_of_records_in_transaction")?,
+            number_of_partitions_in_transaction: get_i64("number_of_partitions_in_transaction")?,
+            transaction_tag: get_str("transaction_tag")?,
+            is_system_transaction: get_bool("is_system_transaction")?,
+        })
+    }
 }
 
-impl TryFromStruct for Mod {
-    fn try_from_struct(s: Struct<'_>) -> Result<Self, RowError> {
+impl ColumnType {
+    fn from_json(v: &JsonValue) -> anyhow::Result<Self> {
+        let obj = v
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("ColumnType is not an object, got: {}", v))?;
+        let get_str = |k: &str| -> anyhow::Result<String> {
+            obj.get(k)
+                .and_then(|v| v.as_str())
+                .map(String::from)
+                .ok_or_else(|| anyhow::anyhow!("ColumnType.{}: missing or not a string", k))
+        };
+        let get_bool = |k: &str| -> anyhow::Result<bool> {
+            obj.get(k)
+                .and_then(|v| v.as_bool())
+                .ok_or_else(|| anyhow::anyhow!("ColumnType.{}: missing or not a bool", k))
+        };
+        let get_i64 = |k: &str| -> anyhow::Result<i64> {
+            obj.get(k)
+                .and_then(|v| {
+                    v.as_i64()
+                        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                })
+                .ok_or_else(|| anyhow::anyhow!("ColumnType.{}: missing or not an i64", k))
+        };
+
+        // `type` may arrive as a JSON object (TypeCode) or a JSON-string-encoded
+        // TypeCode object. The Spanner SDK emits JSON objects for STRUCT-typed
+        // values, but change-stream columns may also emit the type as a string.
+        let spanner_type = match obj.get("type") {
+            Some(JsonValue::Object(_)) => serde_json::from_value(obj.get("type").unwrap().clone())
+                .map_err(|e| anyhow::anyhow!("ColumnType.type: invalid TypeCode: {}", e))?,
+            Some(JsonValue::String(s)) => serde_json::from_str(s)
+                .map_err(|e| anyhow::anyhow!("ColumnType.type: invalid TypeCode string: {}", e))?,
+            other => {
+                return Err(anyhow::anyhow!(
+                    "ColumnType.type: expected JSON object or string, got: {:?}",
+                    other
+                ));
+            }
+        };
+
         Ok(Self {
-            keys: s.column_by_name("keys").ok(),
-            new_values: s.column_by_name("new_values").ok(),
-            old_values: s.column_by_name("old_values").ok(),
+            name: get_str("name")?,
+            spanner_type,
+            is_primary_key: get_bool("is_primary_key")?,
+            ordinal_position: get_i64("ordinal_position")?,
         })
     }
 }
 
 impl Mod {
-    /// Convert Mod to a JSON map for the payload column.
+    fn from_json(v: &JsonValue) -> anyhow::Result<Self> {
+        let obj = v
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("Mod is not an object, got: {}", v))?;
+        let cell_to_string = |k: &str| -> Option<String> {
+            // Cell values arrive as JSON objects (MAP<name, value>) from the
+            // SDK's STRUCT decoding, or as JSON-string-encoded objects from
+            // older wire formats. Preserve the existing string-of-JSON shape
+            // because `to_json_map` parses it as JSON.
+            match obj.get(k) {
+                Some(JsonValue::String(s)) => Some(s.clone()),
+                Some(v @ JsonValue::Object(_)) => Some(v.to_string()),
+                Some(JsonValue::Null) | None => None,
+                Some(other) => Some(other.to_string()),
+            }
+        };
+
+        Ok(Self {
+            keys: cell_to_string("keys"),
+            new_values: cell_to_string("new_values"),
+            old_values: cell_to_string("old_values"),
+        })
+    }
+}
+
+impl HeartbeatRecord {
+    fn from_json(v: &JsonValue) -> anyhow::Result<Self> {
+        let obj = v
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("HeartbeatRecord is not an object, got: {}", v))?;
+        let s = obj
+            .get("timestamp")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("HeartbeatRecord.timestamp: missing or not a string"))?;
+        let timestamp = OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339)
+            .map_err(|e| anyhow::anyhow!("HeartbeatRecord.timestamp: invalid RFC3339: {}", e))?;
+        Ok(Self { timestamp })
+    }
+}
+
+impl ChildPartitionsRecord {
+    fn from_json(v: &JsonValue) -> anyhow::Result<Self> {
+        let obj = v
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("ChildPartitionsRecord is not an object, got: {}", v))?;
+        let get_str = |k: &str| -> anyhow::Result<String> {
+            obj.get(k)
+                .and_then(|v| v.as_str())
+                .map(String::from)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("ChildPartitionsRecord.{}: missing or not a string", k)
+                })
+        };
+        let start_ts_str = get_str("start_timestamp")?;
+        let start_timestamp = OffsetDateTime::parse(
+            &start_ts_str,
+            &time::format_description::well_known::Rfc3339,
+        )
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "ChildPartitionsRecord.start_timestamp: invalid RFC3339: {}",
+                e
+            )
+        })?;
+
+        let child_partitions = match obj.get("child_partitions") {
+            Some(JsonValue::Array(a)) => a
+                .iter()
+                .map(ChildPartition::from_json)
+                .collect::<anyhow::Result<Vec<_>>>()?,
+            _ => vec![],
+        };
+
+        Ok(Self {
+            start_timestamp,
+            record_sequence: get_str("record_sequence")?,
+            child_partitions,
+        })
+    }
+}
+
+impl ChildPartition {
+    fn from_json(v: &JsonValue) -> anyhow::Result<Self> {
+        let obj = v
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("ChildPartition is not an object, got: {}", v))?;
+        let token = obj
+            .get("token")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("ChildPartition.token: missing or not a string"))?
+            .to_string();
+        let parent_partition_tokens = match obj.get("parent_partition_tokens") {
+            Some(JsonValue::Array(a)) => a
+                .iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect(),
+            _ => vec![],
+        };
+        Ok(Self {
+            token,
+            parent_partition_tokens,
+        })
+    }
+}
+
+impl Mod {
+    /// Convert `Mod` to a JSON map for the payload column.
     ///
     /// The payload column uses Debezium envelope format with:
     /// - `before`: old values (null for INSERT, populated for UPDATE/DELETE)
@@ -524,27 +710,28 @@ impl Mod {
         // Spanner change streams encode ALL values as JSON strings regardless of the
         // underlying column type (INT64, FLOAT64, BOOL, etc.). We use `convert_value`
         // to restore proper JSON types based on the `column_types` metadata.
-        let merge_keys_and_values = |keys: &Option<String>,
-                                     values: &Option<String>|
-         -> Result<serde_json::Map<String, JsonValue>, serde_json::Error> {
-            let mut merged = serde_json::Map::new();
+        let merge_keys_and_values =
+            |keys: &Option<String>,
+             values: &Option<String>|
+             -> Result<serde_json::Map<String, JsonValue>, serde_json::Error> {
+                let mut merged = serde_json::Map::new();
 
-            if let Some(k) = keys {
-                let keys_map: serde_json::Map<String, JsonValue> = serde_json::from_str(k)?;
-                for (key, value) in keys_map {
-                    merged.insert(key.clone(), convert_value(&key, value));
+                if let Some(k) = keys {
+                    let keys_map: serde_json::Map<String, JsonValue> = serde_json::from_str(k)?;
+                    for (key, value) in keys_map {
+                        merged.insert(key.clone(), convert_value(&key, value));
+                    }
                 }
-            }
 
-            if let Some(v) = values {
-                let values_map: serde_json::Map<String, JsonValue> = serde_json::from_str(v)?;
-                for (key, value) in values_map {
-                    merged.insert(key.clone(), convert_value(&key, value));
+                if let Some(v) = values {
+                    let values_map: serde_json::Map<String, JsonValue> = serde_json::from_str(v)?;
+                    for (key, value) in values_map {
+                        merged.insert(key.clone(), convert_value(&key, value));
+                    }
                 }
-            }
 
-            Ok(merged)
-        };
+                Ok(merged)
+            };
 
         // Parse before and after values based on operation type
         let (before, after, op) = match mod_type {
@@ -560,11 +747,10 @@ impl Mod {
                 // For NEW_ROW capture type, old_values is None, empty string, or empty JSON object.
                 // In this case, set before to null AND change op to "c" (CREATE) to ensure
                 // the DebeziumParser treats this as an INSERT operation, not an UPDATE with retract.
-                let has_old_values = self.old_values.as_ref()
-                    .map_or(false, |v| {
-                        // Check if the JSON string is non-empty and not just "{}"
-                        !v.is_empty() && v != "{}"
-                    });
+                let has_old_values = self.old_values.as_ref().map_or(false, |v| {
+                    // Check if the JSON string is non-empty and not just "{}"
+                    !v.is_empty() && v != "{}"
+                });
 
                 let (before_data, op_val) = if has_old_values {
                     let merged = merge_keys_and_values(&self.keys, &self.old_values)?;
@@ -596,96 +782,23 @@ impl Mod {
     }
 }
 
-/// Heartbeat record for partition health monitoring
-///
-/// Indicates that all changes with commit_timestamp less than or equal to
-/// the heartbeat timestamp have been returned. Used to synchronize readers
-/// across all partitions.
-///
-/// See: https://cloud.google.com/spanner/docs/change-streams/details#heartbeat_records
-#[derive(Debug, Clone)]
-pub struct HeartbeatRecord {
-    /// The heartbeat timestamp
-    pub timestamp: OffsetDateTime,
-}
-
-impl TryFromStruct for HeartbeatRecord {
-    fn try_from_struct(s: Struct<'_>) -> Result<Self, RowError> {
-        Ok(Self {
-            timestamp: s.column_by_name("timestamp")?,
-        })
-    }
-}
-
-/// Child partitions record for partition splits
-///
-/// Returns information about child partitions: their partition tokens,
-/// the tokens of their parent partitions, and the start_timestamp.
-///
-/// See: https://cloud.google.com/spanner/docs/change-streams/details#child_partition_records
-#[derive(Debug, Clone)]
-pub struct ChildPartitionsRecord {
-    /// Indicates that data change records returned from child partitions
-    /// have a commit timestamp greater than or equal to start_timestamp
-    pub start_timestamp: OffsetDateTime,
-    /// Monotonically increasing sequence number for ordering
-    /// when multiple child partition records have the same start_timestamp
-    pub record_sequence: String,
-    /// Set of child partitions and their information
-    pub child_partitions: Vec<ChildPartition>,
-}
-
-impl TryFromStruct for ChildPartitionsRecord {
-    fn try_from_struct(s: Struct<'_>) -> Result<Self, RowError> {
-        Ok(Self {
-            start_timestamp: s.column_by_name("start_timestamp")?,
-            record_sequence: s.column_by_name("record_sequence")?,
-            child_partitions: s.column_by_name("child_partitions")?,
-        })
-    }
-}
-
-/// Child partition information
-///
-/// Contains the partition token string used to identify the child partition
-/// in queries, as well as the tokens of its parent partitions.
-#[derive(Debug, Clone)]
-pub struct ChildPartition {
-    /// Partition token string used to identify this child partition in queries
-    pub token: String,
-    /// Tokens of this partition's parent partitions
-    pub parent_partition_tokens: Vec<String>,
-}
-
-impl TryFromStruct for ChildPartition {
-    fn try_from_struct(s: Struct<'_>) -> Result<Self, RowError> {
-        Ok(Self {
-            token: s.column_by_name("token")?,
-            parent_partition_tokens: s.column_by_name("parent_partition_tokens")?,
-        })
-    }
-}
-
 // ============================================================================
 // Helper Methods
 // ============================================================================
 
 impl DataChangeRecord {
-    /// Get commit timestamp
     pub fn commit_time(&self) -> OffsetDateTime {
         self.commit_timestamp
     }
 }
 
 impl ChildPartitionsRecord {
-    /// Get start timestamp
     pub fn start_time(&self) -> OffsetDateTime {
         self.start_timestamp
     }
 }
 
 impl HeartbeatRecord {
-    /// Get heartbeat timestamp
     pub fn heartbeat_time(&self) -> OffsetDateTime {
         self.timestamp
     }
