@@ -20,19 +20,24 @@
 //! pattern as Postgres CDC (`pg_current_wal_lsn()`) and MySQL CDC (`SHOW MASTER STATUS`).
 
 use std::str::FromStr;
+
 use anyhow::{Context, anyhow};
-use futures::stream::BoxStream;
 use futures::pin_mut;
+use futures::stream::BoxStream;
+use futures::StreamExt;
 use futures_async_stream::try_stream;
-use google_cloud_spanner::client::{Client, ReadOnlyTransactionOption};
+use google_cloud_auth::credentials::service_account;
+use google_cloud_auth::credentials::Credentials;
+use google_cloud_spanner::client::{DatabaseClient, Spanner};
+use google_cloud_spanner::model::PartitionOptions;
+use google_cloud_spanner::result::Row as SpannerRow;
 use google_cloud_spanner::statement::Statement;
-use google_cloud_spanner::transaction::Transaction;
+use google_cloud_spanner::transaction::{MultiUseReadOnlyTransaction, TimestampBound};
 use time::OffsetDateTime;
-use google_cloud_spanner::value::TimestampBound;
 
 use risingwave_common::bail;
 use risingwave_common::catalog::{ColumnDesc, ColumnId, Field, Schema};
-use risingwave_common::row::{OwnedRow, Row};
+use risingwave_common::row::{OwnedRow, Row as OwnedRowTrait};
 use risingwave_common::types::{DataType, Datum, F32, F64, ListType, ScalarImpl};
 
 use crate::error::{ConnectorError, ConnectorResult};
@@ -42,6 +47,9 @@ use crate::source::cdc::external::{
     ExternalTableReader, SchemaTableName,
 };
 
+/// Upper bound on intra-actor partition concurrency for snapshot reads.
+///
+/// Each partition executes against a dedicated gRPC stream and buffers its
 /// Spanner offset representing a position in the change stream.
 ///
 /// Uses the commit timestamp (microseconds since epoch) as the ordering key.
@@ -109,47 +117,53 @@ pub struct SpannerExternalTable {
 }
 
 impl SpannerExternalTable {
-    pub async fn connect(config: ExternalTableConfig) -> ConnectorResult<Self> {
+    pub async fn connect(
+        db_client: &DatabaseClient,
+        config: ExternalTableConfig,
+    ) -> ConnectorResult<Self> {
         let table_name = config.table.clone();
-        let client = create_spanner_client(
-            &config.spanner_project,
-            &config.spanner_instance,
-            &config.database,
-            config.emulator_host.as_deref(),
-            config.credentials.as_deref(),
-            config.credentials_path.as_deref(),
-        )
-        .await?;
 
-        let column_descs = Self::discover_columns(&client, &table_name).await?;
-        let pk_names = Self::discover_primary_keys(&client, &table_name).await?;
+        let column_descs = Self::discover_columns(db_client, &table_name).await?;
+        let pk_names = Self::discover_primary_keys(db_client, &table_name).await?;
 
         if pk_names.is_empty() {
-            bail!("table '{}' has no primary key (required for backfill)", table_name);
+            bail!(
+                "table '{}' has no primary key (required for backfill)",
+                table_name
+            );
         }
 
-        Ok(Self { column_descs, pk_names, table_name })
+        Ok(Self {
+            column_descs,
+            pk_names,
+            table_name,
+        })
     }
 
     async fn discover_columns(
-        client: &Client,
+        db_client: &DatabaseClient,
         table_name: &str,
     ) -> ConnectorResult<Vec<ColumnDesc>> {
-        let mut stmt = Statement::new(
+        let stmt = Statement::builder(
             "SELECT COLUMN_NAME, SPANNER_TYPE \
              FROM INFORMATION_SCHEMA.COLUMNS \
              WHERE TABLE_SCHEMA = '' AND TABLE_NAME = @p1 \
              ORDER BY ORDINAL_POSITION",
-        );
-        stmt.add_param("p1", &table_name);
+        )
+        .add_param("p1", &table_name)
+        .build();
 
-        let mut txn = client.single().await.context("snapshot txn")?;
-        let mut rows = txn.query(stmt).await.context("column query")?;
+        let mut rows = db_client
+            .single_use()
+            .build()
+            .execute_query(stmt)
+            .await
+            .context("column query")?;
 
         let mut descs = Vec::new();
-        while let Some(row) = rows.next().await.context("column row")? {
-            let name: String = row.column_by_name("COLUMN_NAME").context("COLUMN_NAME")?;
-            let spanner_type: String = row.column_by_name("SPANNER_TYPE").context("SPANNER_TYPE")?;
+        while let Some(row) = rows.next().await.transpose().context("column row")? {
+            let name: String = row.try_get(0).context("COLUMN_NAME")?;
+            let spanner_type: String = row.try_get(1).context("SPANNER_TYPE")?;
             let dt = spanner_type_to_rw_type(&spanner_type)?;
             descs.push(ColumnDesc::named(name, ColumnId::placeholder(), dt));
         }
@@ -161,23 +175,28 @@ impl SpannerExternalTable {
     }
 
     async fn discover_primary_keys(
-        client: &Client,
+        db_client: &DatabaseClient,
         table_name: &str,
     ) -> ConnectorResult<Vec<String>> {
-        let mut stmt = Statement::new(
+        let stmt = Statement::builder(
             "SELECT COLUMN_NAME \
              FROM INFORMATION_SCHEMA.INDEX_COLUMNS \
              WHERE TABLE_SCHEMA = '' AND TABLE_NAME = @p1 AND INDEX_TYPE = 'PRIMARY_KEY' \
              ORDER BY ORDINAL_POSITION",
-        );
-        stmt.add_param("p1", &table_name);
+        )
+        .add_param("p1", &table_name)
+        .build();
 
-        let mut txn = client.single().await.context("snapshot txn")?;
-        let mut rows = txn.query(stmt).await.context("pk query")?;
+        let mut rows = db_client
+            .single_use()
+            .build()
+            .execute_query(stmt)
+            .await
+            .context("pk query")?;
 
         let mut names = Vec::new();
-        while let Some(row) = rows.next().await.context("pk row")? {
-            let name: String = row.column_by_name("COLUMN_NAME").context("COLUMN_NAME")?;
+        while let Some(row) = rows.next().await.transpose().context("pk row")? {
+            let name: String = row.try_get(0).context("COLUMN_NAME")?;
             names.push(name);
         }
         Ok(names)
@@ -224,8 +243,8 @@ pub struct SpannerExternalTableReader {
     /// Snapshot timestamp from config (set by frontend at table creation).
     /// Used for consistent snapshot reads and CDC filtering.
     snapshot_ts: Option<i64>,
-    /// Client for creating transactions. Transactions are created lazily per-operation.
-    client: Client,
+    /// Database client. Shared across transactions and partition executions.
+    db_client: DatabaseClient,
 }
 
 impl SpannerExternalTableReader {
@@ -235,13 +254,10 @@ impl SpannerExternalTableReader {
         format!("`{}`", name)
     }
 
-    pub async fn new(
-        config: ExternalTableConfig,
-        schema: Schema,
-    ) -> ConnectorResult<Self> {
+    pub async fn new(config: ExternalTableConfig, schema: Schema) -> ConnectorResult<Self> {
         let enable_databoost = config.spanner_databoost_enabled;
         let snapshot_ts = config.spanner_snapshot_ts;
-        let client = create_spanner_client(
+        let db_client = create_spanner_client(
             &config.spanner_project,
             &config.spanner_instance,
             &config.database,
@@ -250,7 +266,7 @@ impl SpannerExternalTableReader {
             config.credentials_path.as_deref(),
         )
         .await?;
-        let external_table = SpannerExternalTable::connect(config).await?;
+        let external_table = SpannerExternalTable::connect(&db_client, config).await?;
 
         let pk_names = external_table.pk_names().clone();
         let pk_types: Vec<DataType> = pk_names
@@ -280,7 +296,7 @@ impl SpannerExternalTableReader {
             table_name: external_table.table_name().to_string(),
             enable_databoost,
             snapshot_ts,
-            client,
+            db_client,
         })
     }
 }
@@ -289,8 +305,9 @@ impl ExternalTableReader for SpannerExternalTableReader {
     async fn current_cdc_offset(&self) -> ConnectorResult<CdcOffset> {
         // Return the snapshot timestamp from config (set by frontend at table creation).
         // This serves as the CDC offset for filtering changes (commit_ts > snapshot_ts).
-        let timestamp = self.snapshot_ts
-            .ok_or_else(|| anyhow!("spanner.snapshot_ts not found in connect_properties - table must be recreated"))?;
+        let timestamp = self.snapshot_ts.ok_or_else(|| {
+            anyhow!("spanner.snapshot_ts not found in connect_properties - table must be recreated")
+        })?;
         Ok(CdcOffset::Spanner(SpannerOffset::new(timestamp)))
     }
 
@@ -309,8 +326,7 @@ impl ExternalTableReader for SpannerExternalTableReader {
         let backfill_num_rows_per_split = options.backfill_num_rows_per_split;
         if backfill_num_rows_per_split == 0 {
             return Err(
-                anyhow!("invalid backfill_num_rows_per_split, must be greater than 0")
-                    .into(),
+                anyhow!("invalid backfill_num_rows_per_split, must be greater than 0").into(),
             );
         }
         if options.backfill_split_pk_column_index as usize >= self.pk_names.len() {
@@ -371,24 +387,28 @@ impl SpannerExternalTableReader {
     /// Queries MIN and MAX values of the split column.
     async fn min_and_max(
         &self,
-        txn: &mut Transaction,
+        txn: &mut MultiUseReadOnlyTransaction,
         split_column: &Field,
     ) -> ConnectorResult<Option<(ScalarImpl, ScalarImpl)>> {
         let col = Self::quote_column(&split_column.name);
         let tbl = Self::quote_column(&self.table_name);
-        let minmax_query = format!(
-            "SELECT MIN({col}) as min_val, MAX({col}) as max_val FROM {tbl}",
-        );
+        let minmax_query =
+            format!("SELECT MIN({col}) as min_val, MAX({col}) as max_val FROM {tbl}",);
 
-        let stmt = Statement::new(&minmax_query);
+        let stmt = Statement::builder(&minmax_query).build();
         let mut rows = txn
-            .query(stmt)
+            .execute_query(stmt)
             .await
-            .context("PK range query failed")?;
+            .context("min/max query failed")?;
 
-        if let Some(row) = rows.next().await.context("PK range row failed")? {
-            let min_val = spanner_cell_to_scalar_impl(&row, &split_column.data_type, "min_val");
-            let max_val = spanner_cell_to_scalar_impl(&row, &split_column.data_type, "max_val");
+        if let Some(row) = rows
+            .next()
+            .await
+            .transpose()
+            .context("PK range row failed")?
+        {
+            let min_val = spanner_cell_to_scalar_impl(&row, &split_column.data_type, 0);
+            let max_val = spanner_cell_to_scalar_impl(&row, &split_column.data_type, 1);
             match (min_val, max_val) {
                 (Some(min), Some(max)) => Ok(Some((min, max))),
                 _ => Ok(None),
@@ -405,7 +425,7 @@ impl SpannerExternalTableReader {
     /// Follows Postgres CDC's CTE pattern exactly.
     async fn next_split_right_bound_exclusive(
         &self,
-        txn: &mut Transaction,
+        txn: &mut MultiUseReadOnlyTransaction,
         left_value: &ScalarImpl,
         max_value: &ScalarImpl,
         max_split_size: u64,
@@ -418,17 +438,23 @@ impl SpannerExternalTableReader {
              SELECT CASE WHEN MAX({col}) < @max THEN MAX({col}) ELSE NULL END AS val FROM t",
         );
 
-        let mut stmt = Statement::new(&sql);
-        add_scalar_param(&mut stmt, "left", left_value);
-        add_scalar_param(&mut stmt, "max", max_value);
+        let stmt = Statement::builder(&sql);
+        let stmt = add_scalar_param(stmt, "left", left_value);
+        let stmt = add_scalar_param(stmt, "max", max_value);
+        let stmt = stmt.build();
 
         let mut rows = txn
-            .query(stmt)
+            .execute_query(stmt)
             .await
             .context("boundary query failed")?;
 
-        if let Some(row) = rows.next().await.context("boundary row fetch failed")? {
-            let datum = spanner_cell_to_scalar_impl(&row, &split_column.data_type, "val");
+        if let Some(row) = rows
+            .next()
+            .await
+            .transpose()
+            .context("boundary row fetch failed")?
+        {
+            let datum = spanner_cell_to_scalar_impl(&row, &split_column.data_type, 0);
             Ok(Some(datum))
         } else {
             Ok(None)
@@ -438,29 +464,33 @@ impl SpannerExternalTableReader {
     /// Finds the next greater distinct value when all rows have the same PK value.
     async fn next_greater_bound(
         &self,
-        txn: &mut Transaction,
+        txn: &mut MultiUseReadOnlyTransaction,
         start_offset: &ScalarImpl,
         max_value: &ScalarImpl,
         split_column: &Field,
     ) -> ConnectorResult<Option<Datum>> {
         let col = Self::quote_column(&split_column.name);
         let tbl = Self::quote_column(&self.table_name);
-        let sql = format!(
-            "SELECT MIN({col}) AS val FROM {tbl} WHERE {col} > @start AND {col} < @max",
-        );
+        let sql =
+            format!("SELECT MIN({col}) AS val FROM {tbl} WHERE {col} > @start AND {col} < @max",);
 
-        let mut stmt = Statement::new(&sql);
-        add_scalar_param(&mut stmt, "start", start_offset);
-        add_scalar_param(&mut stmt, "max", max_value);
+        let stmt = Statement::builder(&sql);
+        let stmt = add_scalar_param(stmt, "start", start_offset);
+        let stmt = add_scalar_param(stmt, "max", max_value);
+        let stmt = stmt.build();
 
         let mut rows = txn
-            .query(stmt)
+            .execute_query(stmt)
             .await
             .context("next_greater_bound query failed")?;
 
-        if let Some(row) = rows.next().await.context("next_greater_bound row fetch failed")?
+        if let Some(row) = rows
+            .next()
+            .await
+            .transpose()
+            .context("next_greater_bound row fetch failed")?
         {
-            let datum = spanner_cell_to_scalar_impl(&row, &split_column.data_type, "val");
+            let datum = spanner_cell_to_scalar_impl(&row, &split_column.data_type, 0);
             Ok(Some(datum))
         } else {
             Ok(None)
@@ -475,8 +505,9 @@ impl SpannerExternalTableReader {
         let split_column = self.split_column(&options);
 
         // Create a read-only transaction at the snapshot timestamp for consistency.
-        let snapshot_timestamp = self.snapshot_ts
-            .ok_or_else(|| anyhow!("spanner.snapshot_ts not found in connect_properties - table must be recreated"))?;
+        let snapshot_timestamp = self.snapshot_ts.ok_or_else(|| {
+            anyhow!("spanner.snapshot_ts not found in connect_properties - table must be recreated")
+        })?;
 
         tracing::info!(
             snapshot_timestamp_us = snapshot_timestamp,
@@ -485,12 +516,11 @@ impl SpannerExternalTableReader {
 
         let timestamp = micros_to_spanner_ts(snapshot_timestamp);
         let tb = TimestampBound::read_timestamp(timestamp);
-        let txn_options = ReadOnlyTransactionOption {
-            timestamp_bound: tb,
-            call_options: Default::default(),
-        };
-        let mut txn = self.client
-            .read_only_transaction_with_option(txn_options)
+        let mut txn = self
+            .db_client
+            .read_only_transaction()
+            .set_timestamp_bound(tb)
+            .build()
             .await
             .context("failed to create read-only transaction at snapshot timestamp")?;
 
@@ -509,7 +539,9 @@ impl SpannerExternalTableReader {
 
         tracing::info!(
             "PK range: min={}, max={}, type={:?}",
-            min_value, max_value, split_column.data_type
+            min_value,
+            max_value,
+            split_column.data_type
         );
 
         let saturated_split_max_size = options
@@ -557,8 +589,9 @@ impl SpannerExternalTableReader {
         let split_column = self.split_column(&options);
 
         // Create a read-only transaction at the snapshot timestamp for consistency.
-        let snapshot_timestamp = self.snapshot_ts
-            .ok_or_else(|| anyhow!("spanner.snapshot_ts not found in connect_properties - table must be recreated"))?;
+        let snapshot_timestamp = self.snapshot_ts.ok_or_else(|| {
+            anyhow!("spanner.snapshot_ts not found in connect_properties - table must be recreated")
+        })?;
 
         tracing::info!(
             snapshot_timestamp_us = snapshot_timestamp,
@@ -567,17 +600,15 @@ impl SpannerExternalTableReader {
 
         let timestamp = micros_to_spanner_ts(snapshot_timestamp);
         let tb = TimestampBound::read_timestamp(timestamp);
-        let txn_options = ReadOnlyTransactionOption {
-            timestamp_bound: tb,
-            call_options: Default::default(),
-        };
-        let mut txn = self.client
-            .read_only_transaction_with_option(txn_options)
+        let mut txn = self
+            .db_client
+            .read_only_transaction()
+            .set_timestamp_bound(tb)
+            .build()
             .await
             .context("failed to create read-only transaction at snapshot timestamp")?;
 
-        let Some((min_value, max_value)) = self.min_and_max(&mut txn, &split_column).await?
-        else {
+        let Some((min_value, max_value)) = self.min_and_max(&mut txn, &split_column).await? else {
             // Table is empty, return a single empty split
             yield CdcTableSnapshotSplit {
                 split_id: CDC_TABLE_SPLIT_ID_START,
@@ -587,22 +618,18 @@ impl SpannerExternalTableReader {
             return Ok(());
         };
 
-        tracing::info!(
-            "PK range: min={:?}, max={:?}",
-            min_value, max_value
-        );
+        tracing::info!("PK range: min={:?}, max={:?}", min_value, max_value);
 
         // left bound will never be NULL value.
         let mut next_left_bound_inclusive = min_value.clone();
         let mut split_id = CDC_TABLE_SPLIT_ID_START;
 
         loop {
-            let left_bound_inclusive: Datum =
-                if next_left_bound_inclusive == min_value {
-                    None
-                } else {
-                    Some(next_left_bound_inclusive.clone())
-                };
+            let left_bound_inclusive: Datum = if next_left_bound_inclusive == min_value {
+                None
+            } else {
+                Some(next_left_bound_inclusive.clone())
+            };
 
             let right_bound_exclusive;
             let mut next_right = self
@@ -709,43 +736,49 @@ impl SpannerExternalTableReader {
             let filter = build_pk_filter_sql(&primary_keys);
             let sql = format!(
                 "SELECT {} FROM {} WHERE {} ORDER BY {} LIMIT {}",
-                self.field_names, Self::quote_column(&self.table_name), filter, order_key, scan_limit
+                self.field_names,
+                Self::quote_column(&self.table_name),
+                filter,
+                order_key,
+                scan_limit
             );
-            let mut stmt = Statement::new(&sql);
-            add_pk_params(&mut stmt, pk_row);
-            stmt
+            let stmt = Statement::builder(&sql);
+            add_pk_params(stmt, pk_row).build()
         } else {
             let sql = format!(
                 "SELECT {} FROM {} ORDER BY {} LIMIT {}",
-                self.field_names, Self::quote_column(&self.table_name), order_key, scan_limit
+                self.field_names,
+                Self::quote_column(&self.table_name),
+                order_key,
+                scan_limit
             );
-            Statement::new(&sql)
+            Statement::builder(&sql).build()
         };
 
         // Create a read-only transaction at the snapshot timestamp for consistency.
         // Note: We use regular read_only_transaction (not batch) because the query
         // has LIMIT clause which cannot be partitioned.
-        let snapshot_timestamp = self.snapshot_ts
-            .ok_or_else(|| anyhow!("spanner.snapshot_ts not found in connect_properties - table must be recreated"))?;
+        let snapshot_timestamp = self.snapshot_ts.ok_or_else(|| {
+            anyhow!("spanner.snapshot_ts not found in connect_properties - table must be recreated")
+        })?;
 
         let timestamp = micros_to_spanner_ts(snapshot_timestamp);
         let tb = TimestampBound::read_timestamp(timestamp);
-        let options = ReadOnlyTransactionOption {
-            timestamp_bound: tb,
-            call_options: Default::default(),
-        };
-        let mut txn = self.client
-            .read_only_transaction_with_option(options)
+        let txn = self
+            .db_client
+            .read_only_transaction()
+            .set_timestamp_bound(tb)
+            .build()
             .await
             .context("failed to create read-only transaction at snapshot timestamp")?;
 
         // Execute the query directly (no partition, since LIMIT queries can't be partitioned)
         let mut rows = txn
-            .query(stmt)
+            .execute_query(stmt)
             .await
             .context("snapshot query failed")?;
 
-        while let Some(row) = rows.next().await.context("row read failed")? {
+        while let Some(row) = rows.next().await.transpose().context("row read failed")? {
             yield spanner_row_to_owned_row(&row, &fields)?;
         }
     }
@@ -778,49 +811,39 @@ impl SpannerExternalTableReader {
             "multiple split columns is not supported yet"
         );
         assert_eq!(left.len(), 1, "multiple split columns is not supported yet");
-        assert_eq!(right.len(), 1, "multiple split columns is not supported yet");
+        assert_eq!(
+            right.len(),
+            1,
+            "multiple split columns is not supported yet"
+        );
         let split_column_name = &split_columns[0].name;
 
         let is_first_split = left[0].is_none();
         let is_last_split = right[0].is_none();
 
         // Snapshot timestamp is guaranteed to exist by the frontend.
-        let split_snapshot_ts = self.snapshot_ts
-            .ok_or_else(|| anyhow!("spanner.snapshot_ts not found in connect_properties - table must be recreated"))?;
+        let split_snapshot_ts = self.snapshot_ts.ok_or_else(|| {
+            anyhow!("spanner.snapshot_ts not found in connect_properties - table must be recreated")
+        })?;
 
         tracing::info!(
             "split_snapshot_read: PK range=[{:?}, {:?}), snapshot_ts={}",
-            left[0], right[0], split_snapshot_ts
+            left[0],
+            right[0],
+            split_snapshot_ts
         );
 
         // Create a NEW BatchReadOnlyTransaction at the exact same snapshot timestamp
         // This is the key to snapshot consistency across all actors
         let timestamp = micros_to_spanner_ts(split_snapshot_ts);
         let tb = TimestampBound::read_timestamp(timestamp);
-        let options = ReadOnlyTransactionOption {
-            timestamp_bound: tb,
-            call_options: Default::default(),
-        };
-
-        let mut txn = self.client
-            .batch_read_only_transaction_with_option(options)
+        let txn = self
+            .db_client
+            .batch_read_only_transaction()
+            .set_timestamp_bound(tb)
+            .build()
             .await
             .context("failed to create batch read-only transaction at snapshot timestamp")?;
-
-        // Verify the transaction's read timestamp matches
-        let actual_ts = (txn
-            .rts
-            .context("read timestamp not available")?
-            .unix_timestamp_nanos()
-            / 1000) as i64;
-
-        if actual_ts != split_snapshot_ts {
-            bail!(
-                "snapshot timestamp mismatch: expected {}, got {}",
-                split_snapshot_ts,
-                actual_ts
-            );
-        }
 
         // Build query with PK range WHERE clause using parameter binding
         // Follows Postgres CDC pattern: split on single column specified by backfill_split_pk_column_index
@@ -830,73 +853,94 @@ impl SpannerExternalTableReader {
         let (where_clause, stmt) = if is_first_split && is_last_split {
             // No bounds - full table scan
             let sql = format!("SELECT {} FROM {}", self.field_names, tbl);
-            (String::new(), Statement::new(&sql))
+            (String::new(), Statement::builder(&sql).build())
         } else if is_first_split {
             // Unbounded left side: WHERE pk < @pk_end
-            let sql = format!("SELECT {} FROM {} WHERE {} < @pk_end", self.field_names, tbl, col);
-            let mut stmt = Statement::new(&sql);
+            let sql = format!(
+                "SELECT {} FROM {} WHERE {} < @pk_end",
+                self.field_names, tbl, col
+            );
+            let mut b = Statement::builder(&sql);
             if let Some(ref scalar) = right[0] {
-                add_scalar_param(&mut stmt, "pk_end", scalar);
+                b = add_scalar_param(b, "pk_end", scalar);
             }
-            (format!("WHERE {} < @pk_end", col), stmt)
+            (format!("WHERE {} < @pk_end", col), b.build())
         } else if is_last_split {
             // Unbounded right side: WHERE pk >= @pk_start
-            let sql = format!("SELECT {} FROM {} WHERE {} >= @pk_start", self.field_names, tbl, col);
-            let mut stmt = Statement::new(&sql);
+            let sql = format!(
+                "SELECT {} FROM {} WHERE {} >= @pk_start",
+                self.field_names, tbl, col
+            );
+            let mut b = Statement::builder(&sql);
             if let Some(ref scalar) = left[0] {
-                add_scalar_param(&mut stmt, "pk_start", scalar);
+                b = add_scalar_param(b, "pk_start", scalar);
             }
-            (format!("WHERE {} >= @pk_start", col), stmt)
+            (format!("WHERE {} >= @pk_start", col), b.build())
         } else {
             // Bounded range: WHERE pk >= @pk_start AND pk < @pk_end
             let sql = format!(
                 "SELECT {} FROM {} WHERE {} >= @pk_start AND {} < @pk_end",
                 self.field_names, tbl, col, col
             );
-            let mut stmt = Statement::new(&sql);
+            let mut b = Statement::builder(&sql);
             if let Some(ref scalar) = left[0] {
-                add_scalar_param(&mut stmt, "pk_start", scalar);
+                b = add_scalar_param(b, "pk_start", scalar);
             }
             if let Some(ref scalar) = right[0] {
-                add_scalar_param(&mut stmt, "pk_end", scalar);
+                b = add_scalar_param(b, "pk_end", scalar);
             }
-            (format!("WHERE {} >= @pk_start AND {} < @pk_end", col, col), stmt)
+            (
+                format!("WHERE {} >= @pk_start AND {} < @pk_end", col, col),
+                b.build(),
+            )
         };
 
         tracing::info!(
             "split_snapshot_read: executing partition_query with databoost={}, where={}",
-            self.enable_databoost, where_clause
+            self.enable_databoost,
+            where_clause
         );
 
-        // Use partition_query for intra-actor parallelism
-        // Spanner will create multiple partitions within this PK range
+        // partition_query returns Partition handles that can be cloned and executed
+        // concurrently against the same DatabaseClient.
         let partitions = txn
-            .partition_query_with_option(
-                stmt,
-                None,
-                google_cloud_spanner::transaction::QueryOptions::default(),
-                self.enable_databoost,
-                None,
-            )
+            .partition_query(stmt, PartitionOptions::default())
             .await
             .context("failed to get partitions for PK range")?;
 
-        tracing::info!(
-            "split_snapshot_read: got {} intra-partitions, streaming rows sequentially",
-            partitions.len(),
-        );
+        let data_boost = self.enable_databoost;
+        let db_client = self.db_client.clone();
+        let partition_count = partitions.len();
+        tracing::info!(partition_count, "split_snapshot_read: fanning out");
 
-        // Stream each intra-partition directly instead of collecting all rows in memory.
-        // The current upstream library requires mutable access to the batch transaction for
-        // partition execution, so partitions are still consumed sequentially here.
-        for partition in partitions {
-            let mut rows = txn
-                .execute(partition, None)
-                .await
-                .context("failed to execute partition")?;
+        // Fan out all partitions and stream completed partition batches.
+        //
+        // Each partition future materializes its full result set into a
+        // `Vec<OwnedRow>` before yielding. `buffer_unordered` therefore
+        // holds completed partition batches, not row-yielding streams.
+        // Peak memory scales with the number of in-flight partitions
+        // multiplied by the average partition size; both are bounded by
+        // Spanner's `PartitionOptions` (default partition sizing) and
+        // the gRPC channel pool (default 4, env: `SPANNER_NUM_CHANNELS`),
+        // which caps in-flight RPC concurrency at the network layer.
+        let mut stream = futures::stream::iter(partitions.into_iter().map(|p| {
+            let p = p.set_data_boost(data_boost);
+            let db = db_client.clone();
+            let fields = &fields;
+            async move {
+                let mut rs = p.execute(&db).await?;
+                let mut out: Vec<OwnedRow> = Vec::new();
+                while let Some(row) = rs.next().await.transpose()? {
+                    out.push(spanner_row_to_owned_row(&row, fields)?);
+                }
+                Ok::<_, anyhow::Error>(out)
+            }
+        }))
+        .buffer_unordered(partition_count.max(1));
 
-            while let Some(row) = rows.next().await.context("row read failed")? {
-                yield spanner_row_to_owned_row(&row, &fields)?;
+        while let Some(batch) = stream.next().await {
+            for row in batch? {
+                yield row;
             }
         }
     }
@@ -908,7 +952,10 @@ impl SpannerExternalTableReader {
 /// numeric boundaries. All other types (Varchar, text, UUID, etc.) require
 /// data-driven sampling to find split points.
 fn is_supported_even_split_data_type(data_type: &DataType) -> bool {
-    matches!(data_type, DataType::Int16 | DataType::Int32 | DataType::Int64)
+    matches!(
+        data_type,
+        DataType::Int16 | DataType::Int32 | DataType::Int64
+    )
 }
 
 /// Convert i64 to ScalarImpl based on data type (follows Postgres CDC's to_int_scalar)
@@ -936,10 +983,14 @@ fn try_increase_split_id(split_id: &mut i64) -> ConnectorResult<()> {
     }
 }
 
-/// Adds a `ScalarImpl` value as a named parameter to a Spanner `Statement`.
+/// Adds a `ScalarImpl` value as a named parameter to a Spanner `StatementBuilder`.
 ///
 /// Converts RisingWave scalar types to the corresponding Spanner parameter types.
-fn add_scalar_param(stmt: &mut Statement, name: &str, scalar: &ScalarImpl) {
+fn add_scalar_param(
+    stmt: google_cloud_spanner::statement::StatementBuilder,
+    name: &str,
+    scalar: &ScalarImpl,
+) -> google_cloud_spanner::statement::StatementBuilder {
     match scalar {
         ScalarImpl::Int16(v) => stmt.add_param(name, &(*v as i64)),
         ScalarImpl::Int32(v) => stmt.add_param(name, &(*v as i64)),
@@ -949,7 +1000,10 @@ fn add_scalar_param(stmt: &mut Statement, name: &str, scalar: &ScalarImpl) {
         ScalarImpl::Utf8(v) => stmt.add_param(name, &v.as_ref().to_string()),
         ScalarImpl::Bool(v) => stmt.add_param(name, v),
         ScalarImpl::Decimal(v) => stmt.add_param(name, &v.to_string()),
-        _ => panic!("unsupported ScalarImpl type for Spanner param binding: {:?}", scalar),
+        _ => panic!(
+            "unsupported ScalarImpl type for Spanner param binding: {:?}",
+            scalar
+        ),
     }
 }
 
@@ -979,21 +1033,25 @@ fn build_pk_filter_sql(pk_names: &[String]) -> String {
     clauses.join(" OR ")
 }
 
-/// Adds PK row values as named parameters (@pk0, @pk1, ...) to a Spanner `Statement`.
-fn add_pk_params(stmt: &mut Statement, pk_row: &OwnedRow) {
+/// Adds PK row values as named parameters (@pk0, @pk1, ...) to a Spanner `StatementBuilder`.
+fn add_pk_params(
+    mut stmt: google_cloud_spanner::statement::StatementBuilder,
+    pk_row: &OwnedRow,
+) -> google_cloud_spanner::statement::StatementBuilder {
     for (i, datum_ref) in pk_row.iter().enumerate() {
         if let Some(scalar_ref) = datum_ref {
             let scalar = scalar_ref.into_scalar_impl();
-            add_scalar_param(stmt, &format!("pk{}", i), &scalar);
+            stmt = add_scalar_param(stmt, &format!("pk{}", i), &scalar);
         }
     }
+    stmt
 }
 
 // ---------------------------------------------------------------------------
 // Spanner client factory
 // ---------------------------------------------------------------------------
 
-/// Create a Spanner client from connection parameters.
+/// Create a Spanner `DatabaseClient` from connection parameters.
 ///
 /// Shared by both `SpannerExternalTable` (backfill) and `SpannerCdcProperties` (CDC reader).
 pub(crate) async fn create_spanner_client(
@@ -1003,9 +1061,7 @@ pub(crate) async fn create_spanner_client(
     emulator_host: Option<&str>,
     credentials: Option<&str>,
     credentials_path: Option<&str>,
-) -> ConnectorResult<Client> {
-    use google_cloud_spanner::client::ClientConfig;
-
+) -> ConnectorResult<DatabaseClient> {
     if project.is_empty() || instance.is_empty() || database.is_empty() {
         bail!("spanner.project, spanner.instance, and database.name are required");
     }
@@ -1013,24 +1069,42 @@ pub(crate) async fn create_spanner_client(
     if let Some(host) = emulator_host {
         unsafe { std::env::set_var("SPANNER_EMULATOR_HOST", host) };
     }
-    if let Some(path) = credentials_path {
+
+    let dsn = format!(
+        "projects/{}/instances/{}/databases/{}",
+        project, instance, database
+    );
+
+    let mut builder = Spanner::builder();
+    if let Some(json) = credentials {
+        let creds = build_service_account_credentials(json)?;
+        builder = builder.with_credentials(creds);
+    } else if let Some(path) = credentials_path {
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("failed to read credentials file: {}", path))?;
-        unsafe { std::env::set_var("GOOGLE_APPLICATION_CREDENTIALS_JSON", content) };
-    } else if let Some(json) = credentials {
-        unsafe { std::env::set_var("GOOGLE_APPLICATION_CREDENTIALS_JSON", json) };
+        let creds = build_service_account_credentials(&content)?;
+        builder = builder.with_credentials(creds);
     }
 
-    let client_config = ClientConfig::default()
-        .with_auth()
+    let spanner = builder
+        .build()
         .await
-        .context("Spanner auth failed")?;
-
-    let dsn = format!("projects/{}/instances/{}/databases/{}", project, instance, database);
-
-    Ok(Client::new(&dsn, client_config)
+        .context("failed to create Spanner client")?;
+    let db_client = spanner
+        .database_client(&dsn)
+        .build()
         .await
-        .context("failed to create Spanner client")?)
+        .context("failed to create Spanner database client")?;
+    Ok(db_client)
+}
+
+fn build_service_account_credentials(json: &str) -> ConnectorResult<Credentials> {
+    let key: serde_json::Value =
+        serde_json::from_str(json).with_context(|| "credentials JSON is not valid JSON")?;
+    let creds = service_account::Builder::new(key)
+        .build()
+        .map_err(|e| anyhow::anyhow!("failed to build service account credentials: {:?}", e))?;
+    Ok(creds)
 }
 
 /// Current time as microseconds since epoch.
@@ -1050,21 +1124,26 @@ pub fn rfc3339_to_micros(s: &str) -> ConnectorResult<i64> {
         .map_err(|e| anyhow!("invalid RFC3339 timestamp '{}': {}", s, e))?;
     let nanos = offset.unix_timestamp_nanos();
     let micros = nanos.div_euclid(1000);
-    Ok(i64::try_from(micros).map_err(|_| anyhow!("timestamp out of i64 range: {} nanos", nanos))?)
+    Ok(
+        i64::try_from(micros)
+            .map_err(|_| anyhow!("timestamp out of i64 range: {} nanos", nanos))?,
+    )
 }
 
 /// Convert microseconds since epoch to OffsetDateTime.
 pub fn micros_to_offset_datetime(micros: i64) -> ConnectorResult<OffsetDateTime> {
-    Ok(OffsetDateTime::from_unix_timestamp_nanos((micros as i128) * 1000)
-        .map_err(|e| anyhow!("invalid microseconds timestamp {}: {}", micros, e))?)
+    Ok(
+        OffsetDateTime::from_unix_timestamp_nanos((micros as i128) * 1000)
+            .map_err(|e| anyhow!("invalid microseconds timestamp {}: {}", micros, e))?,
+    )
 }
 
-/// Convert microseconds since epoch to a Spanner `Timestamp`.
-fn micros_to_spanner_ts(micros: i64) -> google_cloud_spanner::value::Timestamp {
-    google_cloud_spanner::value::Timestamp {
-        seconds: micros.div_euclid(1_000_000),
-        nanos: (micros.rem_euclid(1_000_000) * 1000) as i32,
-    }
+/// Convert microseconds since epoch to a `google_cloud_wkt::Timestamp`.
+fn micros_to_spanner_ts(micros: i64) -> google_cloud_wkt::Timestamp {
+    google_cloud_wkt::Timestamp::clamp(
+        micros.div_euclid(1_000_000),
+        (micros.rem_euclid(1_000_000) * 1000) as i32,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1088,7 +1167,9 @@ pub(crate) fn spanner_type_to_rw_type(spanner_type: &str) -> ConnectorResult<Dat
         let inner = rest
             .strip_suffix('>')
             .ok_or_else(|| anyhow!("invalid ARRAY type: {}", spanner_type))?;
-        return Ok(DataType::List(ListType::new(spanner_type_to_rw_type(inner)?)));
+        return Ok(DataType::List(ListType::new(spanner_type_to_rw_type(
+            inner,
+        )?)));
     }
 
     // Handle STRUCT type - map to JSONB for serialization
@@ -1110,12 +1191,18 @@ pub(crate) fn spanner_type_to_rw_type(spanner_type: &str) -> ConnectorResult<Dat
         "JSON" => Ok(DataType::Jsonb),
         // PROTO types - store as raw bytes (data preserved, can be deserialized later)
         t if t.starts_with("PROTO") => {
-            tracing::info!("mapping PROTO type '{}' to BYTEA (raw bytes preserved)", spanner_type);
+            tracing::info!(
+                "mapping PROTO type '{}' to BYTEA (raw bytes preserved)",
+                spanner_type
+            );
             Ok(DataType::Bytea)
         }
         // ENUM types - store as VARCHAR (enum name preserved)
         t if t.starts_with("ENUM") => {
-            tracing::info!("mapping ENUM type '{}' to VARCHAR (enum name preserved)", spanner_type);
+            tracing::info!(
+                "mapping ENUM type '{}' to VARCHAR (enum name preserved)",
+                spanner_type
+            );
             Ok(DataType::Varchar)
         }
         // INTERVAL - store as VARCHAR (text representation)
@@ -1130,7 +1217,10 @@ pub(crate) fn spanner_type_to_rw_type(spanner_type: &str) -> ConnectorResult<Dat
         }
         // Unknown types - log and map to VARCHAR as safe fallback
         _ => {
-            tracing::warn!("unknown Spanner type '{}' mapped to VARCHAR as fallback", spanner_type);
+            tracing::warn!(
+                "unknown Spanner type '{}' mapped to VARCHAR as fallback",
+                spanner_type
+            );
             Ok(DataType::Varchar)
         }
     }
@@ -1143,157 +1233,132 @@ pub(crate) fn spanner_type_to_rw_type(spanner_type: &str) -> ConnectorResult<Dat
 /// Extracts a single typed cell from a Spanner row as a `ScalarImpl`.
 ///
 /// Follows the same pattern as `postgres_cell_to_scalar_impl` in the Postgres CDC parser.
-fn spanner_cell_to_scalar_impl(
-    row: &google_cloud_spanner::row::Row,
-    data_type: &DataType,
-    col_name: &str,
-) -> Option<ScalarImpl> {
+fn spanner_cell_to_scalar_impl(row: &SpannerRow, data_type: &DataType, idx: usize) -> Option<ScalarImpl> {
     match data_type {
-        DataType::Boolean => row
-            .column_by_name::<bool>(col_name)
-            .ok()
-            .map(ScalarImpl::Bool),
+        DataType::Boolean => { let v: Option<bool> = row.try_get(idx).ok(); v.map(ScalarImpl::Bool) },
 
-        DataType::Int64 => row
-            .column_by_name::<i64>(col_name)
-            .ok()
-            .map(ScalarImpl::Int64),
+        DataType::Int64 => { let v: Option<i64> = row.try_get(idx).ok(); v.map(ScalarImpl::Int64) },
 
-        DataType::Int32 => row
-            .column_by_name::<i64>(col_name)
-            .ok()
-            .map(|v| ScalarImpl::Int32(v as i32)),
+        DataType::Int32 => {
+            let v: Option<i64> = row.try_get(idx).ok();
+            v.map(|v| ScalarImpl::Int32(v as i32))
+        }
 
-        DataType::Int16 => row
-            .column_by_name::<i64>(col_name)
-            .ok()
-            .map(|v| ScalarImpl::Int16(v as i16)),
+        DataType::Int16 => {
+            let v: Option<i64> = row.try_get(idx).ok();
+            v.map(|v| ScalarImpl::Int16(v as i16))
+        }
 
-        DataType::Float64 => row
-            .column_by_name::<f64>(col_name)
-            .ok()
-            .map(|v| ScalarImpl::Float64(F64::from(v))),
+        DataType::Float64 => {
+            let v: Option<f64> = row.try_get(idx).ok();
+            v.map(|v| ScalarImpl::Float64(F64::from(v)))
+        }
 
-        DataType::Float32 => row
-            .column_by_name::<f64>(col_name)
-            .ok()
-            .map(|v| ScalarImpl::Float32(F32::from(v as f32))),
+        DataType::Float32 => {
+            let v: Option<f64> = row.try_get(idx).ok();
+            v.map(|v| ScalarImpl::Float32(F32::from(v as f32)))
+        }
 
         DataType::Varchar => {
             // Handle VARCHAR, ENUM (stored as string), TIME, INTERVAL
-            row.column_by_name::<String>(col_name)
-                .ok()
-                .map(|s| ScalarImpl::Utf8(s.into()))
+            let s: Option<String> = row.try_get(idx).ok();
+            s.map(|s| ScalarImpl::Utf8(s.into()))
         }
 
         DataType::Bytea => {
             // Handle BYTEA and PROTO types (stored as bytes)
             // Try reading as Vec<u8> first (for PROTO)
-            if let Ok(v) = row.column_by_name::<Vec<u8>>(col_name) {
+            if let Ok(v) = row.try_get::<Vec<u8>, _>(idx) {
                 Some(ScalarImpl::Bytea(v.into()))
             } else {
                 // Fallback: read as string (for BYTES stored as base64 string)
-                row.column_by_name::<String>(col_name)
-                    .ok()
-                    .map(|s| ScalarImpl::Bytea(s.into_bytes().into()))
+                let s: Option<String> = row.try_get(idx).ok();
+                s.map(|s| ScalarImpl::Bytea(s.into_bytes().into()))
             }
         }
 
         DataType::Timestamptz => {
             use risingwave_common::types::Timestamptz;
-            row.column_by_name::<time::OffsetDateTime>(col_name)
-                .ok()
-                .map(|v| {
-                    let micros = (v.unix_timestamp_nanos() / 1000) as i64;
-                    ScalarImpl::Timestamptz(Timestamptz::from_micros(micros))
-                })
+            let v: Option<time::OffsetDateTime> = row.try_get(idx).ok();
+            v.map(|v| {
+                let micros = (v.unix_timestamp_nanos() / 1000) as i64;
+                ScalarImpl::Timestamptz(Timestamptz::from_micros(micros))
+            })
         }
 
         DataType::Timestamp => {
             use risingwave_common::types::Timestamp;
-            row.column_by_name::<time::OffsetDateTime>(col_name)
-                .ok()
-                .map(|v| {
-                    let micros = (v.unix_timestamp_nanos() / 1000) as i64;
-                    ScalarImpl::Timestamp(Timestamp::with_micros(micros).unwrap())
-                })
+            let v: Option<time::OffsetDateTime> = row.try_get(idx).ok();
+            v.map(|v| {
+                let micros = (v.unix_timestamp_nanos() / 1000) as i64;
+                ScalarImpl::Timestamp(Timestamp::with_micros(micros).unwrap())
+            })
         }
 
         DataType::Date => {
             use risingwave_common::types::Date;
-            row.column_by_name::<time::Date>(col_name)
-                .ok()
-                .and_then(|v| {
-                    let s = format!("{:04}-{:02}-{:02}", v.year(), v.month(), v.day());
-                    Date::from_str(&s).ok()
-                })
-                .map(ScalarImpl::Date)
+            let v: Option<time::Date> = row.try_get(idx).ok();
+            v.and_then(|v| {
+                let s = format!("{:04}-{:02}-{:02}", v.year(), v.month(), v.day());
+                Date::from_str(&s).ok()
+            })
+            .map(ScalarImpl::Date)
         }
 
         DataType::Decimal => {
             use risingwave_common::types::Decimal;
-            // Numeric is returned as BigDecimal by the spanner library
-            // Read as string first (Spanner stores NUMERIC as string)
-            row.column_by_name::<String>(col_name)
-                .ok()
-                .and_then(|s| Decimal::from_str(&s).ok())
-                .map(ScalarImpl::Decimal)
+            // Spanner stores NUMERIC as string on the wire; read as String and parse.
+            let s: Option<String> = row.try_get(idx).ok();
+            s.and_then(|s| Decimal::from_str(&s).ok()).map(ScalarImpl::Decimal)
         }
 
         DataType::Jsonb => {
             // Handle JSON and STRUCT types (stored as JSON string)
-            row.column_by_name::<String>(col_name)
-                .ok()
-                .and_then(|s| {
-                    // Try to parse as JSON first
-                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&s) {
-                        Some(ScalarImpl::Jsonb(json.into()))
-                    } else {
-                        // If not valid JSON, wrap as string
-                        Some(ScalarImpl::Jsonb(
-                            serde_json::json!(s).into()
-                        ))
-                    }
-                })
+            let s: Option<String> = row.try_get(idx).ok();
+            s.and_then(|s| {
+                // Try to parse as JSON first
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&s) {
+                    Some(ScalarImpl::Jsonb(json.into()))
+                } else {
+                    // If not valid JSON, wrap as string
+                    Some(ScalarImpl::Jsonb(serde_json::json!(s).into()))
+                }
+            })
         }
 
         DataType::List(_) => {
             // Handle ARRAY types - read as JSON array and convert
             // The spanner library returns arrays as JSON strings
-            row.column_by_name::<String>(col_name)
-                .ok()
-                .and_then(|s| {
-                    // Parse the JSON array string
-                    if let Ok(json_arr) = serde_json::from_str::<serde_json::Value>(&s) {
-                        // Return as JSONB for now (preserves all data)
-                        Some(ScalarImpl::Jsonb(json_arr.into()))
-                    } else {
-                        None
-                    }
-                })
+            let s: Option<String> = row.try_get(idx).ok();
+            s.and_then(|s| {
+                // Parse the JSON array string
+                if let Ok(json_arr) = serde_json::from_str::<serde_json::Value>(&s) {
+                    // Return as JSONB for now (preserves all data)
+                    Some(ScalarImpl::Jsonb(json_arr.into()))
+                } else {
+                    None
+                }
+            })
         }
 
         // Unknown or unsupported types - try to read as string as fallback
         _ => {
             tracing::warn!(
-                "column '{}' has unsupported type {:?} - reading as string fallback",
-                col_name,
+                "column at index {} has unsupported type {:?} - reading as string fallback",
+                idx,
                 data_type
             );
-            row.column_by_name::<String>(col_name)
-                .ok()
-                .map(|s| ScalarImpl::Utf8(s.into()))
+            let s: Option<String> = row.try_get(idx).ok();
+            s.map(|s| ScalarImpl::Utf8(s.into()))
         }
     }
 }
 
-fn spanner_row_to_owned_row(
-    row: &google_cloud_spanner::row::Row,
-    fields: &[Field],
-) -> ConnectorResult<OwnedRow> {
+fn spanner_row_to_owned_row(row: &SpannerRow, fields: &[Field]) -> ConnectorResult<OwnedRow> {
     let values = fields
         .iter()
-        .map(|f| spanner_cell_to_scalar_impl(row, &f.data_type, &f.name))
+        .enumerate()
+        .map(|(idx, f)| spanner_cell_to_scalar_impl(row, &f.data_type, idx))
         .collect();
     Ok(OwnedRow::new(values))
 }
@@ -1310,10 +1375,22 @@ mod tests {
 
     #[test]
     fn test_spanner_type_to_rw_type() {
-        assert!(matches!(spanner_type_to_rw_type("BOOL").unwrap(), DataType::Boolean));
-        assert!(matches!(spanner_type_to_rw_type("INT64").unwrap(), DataType::Int64));
-        assert!(matches!(spanner_type_to_rw_type("STRING").unwrap(), DataType::Varchar));
-        assert!(matches!(spanner_type_to_rw_type("ARRAY<INT64>").unwrap(), DataType::List(_)));
+        assert!(matches!(
+            spanner_type_to_rw_type("BOOL").unwrap(),
+            DataType::Boolean
+        ));
+        assert!(matches!(
+            spanner_type_to_rw_type("INT64").unwrap(),
+            DataType::Int64
+        ));
+        assert!(matches!(
+            spanner_type_to_rw_type("STRING").unwrap(),
+            DataType::Varchar
+        ));
+        assert!(matches!(
+            spanner_type_to_rw_type("ARRAY<INT64>").unwrap(),
+            DataType::List(_)
+        ));
     }
 
     #[test]
@@ -1332,52 +1409,5 @@ mod tests {
             expr,
             "(`v1` > @pk0) OR (`v1` = @pk0 AND `v2` > @pk1) OR (`v1` = @pk0 AND `v2` = @pk1 AND `v3` > @pk2)"
         );
-    }
-
-    #[test]
-    fn test_micros_to_spanner_ts_positive() {
-        let ts = micros_to_spanner_ts(1_500_000); // 1.5 seconds
-        assert_eq!(ts.seconds, 1);
-        assert_eq!(ts.nanos, 500_000_000); // 500ms in nanos
-    }
-
-    #[test]
-    fn test_micros_to_spanner_ts_zero() {
-        let ts = micros_to_spanner_ts(0);
-        assert_eq!(ts.seconds, 0);
-        assert_eq!(ts.nanos, 0);
-    }
-
-    #[test]
-    fn test_micros_to_spanner_ts_negative() {
-        // -1.5 seconds: div_euclid gives -2, rem_euclid gives 500000
-        let ts = micros_to_spanner_ts(-1_500_000);
-        assert_eq!(ts.seconds, -2);
-        assert_eq!(ts.nanos, 500_000_000);
-    }
-
-    #[test]
-    fn test_micros_to_spanner_ts_exact_second() {
-        let ts = micros_to_spanner_ts(1_000_000);
-        assert_eq!(ts.seconds, 1);
-        assert_eq!(ts.nanos, 0);
-
-        let ts = micros_to_spanner_ts(-1_000_000);
-        assert_eq!(ts.seconds, -1);
-        assert_eq!(ts.nanos, 0);
-    }
-
-    #[test]
-    fn test_micros_to_spanner_ts_sub_second() {
-        let ts = micros_to_spanner_ts(999_999);
-        assert_eq!(ts.seconds, 0);
-        assert_eq!(ts.nanos, 999_999_000);
-    }
-
-    #[test]
-    fn test_micros_to_spanner_ts_negative_one() {
-        let ts = micros_to_spanner_ts(-1);
-        assert_eq!(ts.seconds, -1);
-        assert_eq!(ts.nanos, 999_999_000);
     }
 }

@@ -85,18 +85,34 @@ mod tests {
     }
 
     #[test]
-    fn test_heartbeat_interval_parsing() {
+    fn test_heartbeat_milliseconds_default() {
         let props: SpannerCdcProperties = serde_json::from_value(serde_json::json!({
             "connector": "spanner-cdc",
             "spanner.project": "test-project",
             "spanner.instance": "test-instance",
             "database.name": "test-db",
             "spanner.change_stream.name": "test-stream",
-            "spanner.heartbeat_interval": "5s",
         }))
         .unwrap();
 
-        assert_eq!(props.heartbeat_interval_ms().unwrap(), 5000);
+        assert_eq!(props.heartbeat_milliseconds, 2000);
+    }
+
+    #[test]
+    fn test_heartbeat_milliseconds_override() {
+        // The DDL parser always serializes source properties as JSON strings;
+        // `DisplayFromStr` handles the string-to-i64 conversion.
+        let props: SpannerCdcProperties = serde_json::from_value(serde_json::json!({
+            "connector": "spanner-cdc",
+            "spanner.project": "test-project",
+            "spanner.instance": "test-instance",
+            "database.name": "test-db",
+            "spanner.change_stream.name": "test-stream",
+            "spanner.heartbeat_milliseconds": "5000",
+        }))
+        .unwrap();
+
+        assert_eq!(props.heartbeat_milliseconds, 5000);
     }
 
     #[test]
