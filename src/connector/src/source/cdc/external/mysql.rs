@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use anyhow::{Context, anyhow};
 use chrono::{DateTime, NaiveDateTime};
 use futures::stream::BoxStream;
-use futures::{StreamExt, pin_mut, stream};
+use futures::{StreamExt, pin_mut};
 use futures_async_stream::try_stream;
 use itertools::Itertools;
 use mysql_async::prelude::*;
@@ -25,7 +25,7 @@ use mysql_common::params::Params;
 use mysql_common::value::Value;
 use risingwave_common::bail;
 use risingwave_common::catalog::{CDC_OFFSET_COLUMN_NAME, ColumnDesc, ColumnId, Field, Schema};
-use risingwave_common::row::OwnedRow;
+use risingwave_common::row::{OwnedRow, Row};
 use risingwave_common::types::{DataType, Datum, Decimal, F32, ScalarImpl};
 use risingwave_common::util::iter_util::ZipEqFast;
 use sea_schema::mysql::def::{ColumnDefault, ColumnKey, ColumnType, NumericAttr};
@@ -41,10 +41,12 @@ use crate::connector_common::SslMode;
 // Re-export SslMode for convenience
 pub use crate::connector_common::SslMode as MySqlSslMode;
 use crate::error::{ConnectorError, ConnectorResult};
+use crate::parser::mysql_datum_to_rw_datum;
 use crate::source::CdcTableSnapshotSplit;
 use crate::source::cdc::external::{
-    CdcOffset, CdcOffsetParseFunc, CdcTableSnapshotSplitOption, DebeziumOffset,
-    ExternalTableConfig, ExternalTableReader, SchemaTableName, mysql_row_to_owned_row,
+    CDC_TABLE_SPLIT_ID_START, CdcOffset, CdcOffsetParseFunc, CdcTableSnapshotSplitOption,
+    DebeziumOffset, ExternalTableConfig, ExternalTableReader, SchemaTableName,
+    mysql_row_to_owned_row,
 };
 
 /// Build MySQL connection pool with proper SSL configuration.
@@ -434,6 +436,12 @@ pub struct MySqlExternalTableReader {
     pool: mysql_async::Pool,
     upstream_mysql_pk_infos: Vec<(String, String)>, // (column_name, column_type)
     mysql_version: (u8, u8),
+    /// Primary key column indices into `rw_schema`, following the table's PK definition order.
+    /// Used by parallelized backfill (v2) to select the split column.
+    pk_indices: Vec<usize>,
+    /// The schema (database) and table name of the upstream table. Used by parallelized
+    /// backfill (v2) where the table name is not passed in as a method argument.
+    schema_table_name: SchemaTableName,
 }
 
 impl ExternalTableReader for MySqlExternalTableReader {
@@ -480,22 +488,64 @@ impl ExternalTableReader for MySqlExternalTableReader {
         self.pool.disconnect().await.map_err(|e| e.into())
     }
 
-    fn get_parallel_cdc_splits(
-        &self,
-        _options: CdcTableSnapshotSplitOption,
-    ) -> BoxStream<'_, ConnectorResult<CdcTableSnapshotSplit>> {
-        // TODO(zw): feat: impl
-        stream::empty::<ConnectorResult<CdcTableSnapshotSplit>>().boxed()
+    #[try_stream(boxed, ok = CdcTableSnapshotSplit, error = ConnectorError)]
+    async fn get_parallel_cdc_splits(&self, options: CdcTableSnapshotSplitOption) {
+        let backfill_num_rows_per_split = options.backfill_num_rows_per_split;
+        if backfill_num_rows_per_split == 0 {
+            return Err(anyhow!("invalid backfill_num_rows_per_split, must be greater than 0").into());
+        }
+        if options.backfill_split_pk_column_index as usize >= self.pk_indices.len() {
+            return Err(anyhow!(
+                "invalid backfill_split_pk_column_index {}, out of bound",
+                options.backfill_split_pk_column_index
+            )
+            .into());
+        }
+        let split_column = self.split_column(&options);
+        let row_stream = if options.backfill_as_even_splits
+            && is_supported_even_split_data_type(&split_column.data_type)
+        {
+            tracing::info!(?self.schema_table_name, ?self.rw_schema, ?self.pk_indices, ?split_column, "Get parallel cdc table snapshot even splits.");
+            self.as_even_splits(options)
+        } else {
+            if options.backfill_as_even_splits
+                && !is_supported_even_split_data_type(&split_column.data_type)
+            {
+                // The user requested even (arithmetic) splits, but the split column's data
+                // type is not supported (e.g. BIGINT UNSIGNED, which maps to Decimal). Fall
+                // back to uneven (data-driven) splits, which produce correct results for any
+                // comparable type.
+                tracing::warn!(
+                    ?self.schema_table_name,
+                    ?split_column,
+                    split_data_type = %split_column.data_type,
+                    "as_even_splits was requested but the split column data type \
+                     ({}) does not support arithmetic splitting; only integer types \
+                     (Int16/Int32/Int64) do. Falling back to uneven (data-driven) splits, \
+                     which remain correct and parallel but require one probing query per \
+                     split instead of pure arithmetic.",
+                    split_column.data_type,
+                );
+            }
+            tracing::info!(?self.schema_table_name, ?self.rw_schema, ?self.pk_indices, ?split_column, "Get parallel cdc table snapshot uneven splits.");
+            self.as_uneven_splits(options)
+        };
+        pin_mut!(row_stream);
+        #[for_await]
+        for row in row_stream {
+            let row = row?;
+            yield row;
+        }
     }
 
     fn split_snapshot_read(
         &self,
-        _table_name: SchemaTableName,
-        _left: OwnedRow,
-        _right: OwnedRow,
-        _split_columns: Vec<Field>,
+        table_name: SchemaTableName,
+        left: OwnedRow,
+        right: OwnedRow,
+        split_columns: Vec<Field>,
     ) -> BoxStream<'_, ConnectorResult<OwnedRow>> {
-        todo!("implement MySQL CDC parallelized backfill")
+        self.split_snapshot_read_inner(table_name, left, right, split_columns)
     }
 }
 
@@ -526,7 +576,12 @@ impl MySqlExternalTableReader {
         major > 8 || (major == 8 && minor >= 4)
     }
 
-    pub async fn new(config: ExternalTableConfig, rw_schema: Schema) -> ConnectorResult<Self> {
+    pub async fn new(
+        config: ExternalTableConfig,
+        rw_schema: Schema,
+        pk_indices: Vec<usize>,
+        schema_table_name: SchemaTableName,
+    ) -> ConnectorResult<Self> {
         let database = config.database.clone();
         let table = config.table.clone();
         let pool = build_mysql_connection_pool(
@@ -562,6 +617,8 @@ impl MySqlExternalTableReader {
             pool,
             upstream_mysql_pk_infos,
             mysql_version,
+            pk_indices,
+            schema_table_name,
         })
     }
 
@@ -620,9 +677,371 @@ impl MySqlExternalTableReader {
             .unwrap_or(false)
     }
 
-    /// Convert negative i64 to unsigned u64 based on column type
-    fn convert_negative_to_unsigned(&self, negative_val: i64) -> u64 {
-        negative_val as u64
+    /// The split column used by parallelized backfill (v2), selected from the primary keys
+    /// via `backfill_split_pk_column_index`.
+    fn split_column(&self, options: &CdcTableSnapshotSplitOption) -> Field {
+        self.rw_schema.fields[self.pk_indices[options.backfill_split_pk_column_index as usize]]
+            .clone()
+    }
+
+    /// Convert a RisingWave scalar into a MySQL bind parameter, handling unsigned integer
+    /// columns whose values wrap around `i64`. Shared by snapshot read (v1) and split read (v2).
+    fn scalar_to_mysql_value(
+        value: ScalarImpl,
+        data_type: &DataType,
+        is_unsigned: bool,
+    ) -> ConnectorResult<Value> {
+        let val = match data_type {
+            DataType::Boolean => Value::from(value.into_bool()),
+            DataType::Int16 => Value::from(value.into_int16()),
+            DataType::Int32 => Value::from(value.into_int32()),
+            DataType::Int64 => {
+                let int64_val = value.into_int64();
+                if int64_val < 0 && is_unsigned {
+                    Value::from(int64_val as u64)
+                } else {
+                    Value::from(int64_val)
+                }
+            }
+            DataType::Float32 => Value::from(value.into_float32().into_inner()),
+            DataType::Float64 => Value::from(value.into_float64().into_inner()),
+            DataType::Varchar => Value::from(String::from(value.into_utf8())),
+            DataType::Date => Value::from(value.into_date().0),
+            DataType::Time => Value::from(value.into_time().0),
+            DataType::Timestamp => Value::from(value.into_timestamp().0),
+            DataType::Decimal => Value::from(value.into_decimal().to_string()),
+            // MySQL expects NaiveDateTime for TIMESTAMP parameters.
+            DataType::Timestamptz => {
+                Value::from(value.into_timestamptz().to_datetime_utc().naive_utc())
+            }
+            _ => bail!("unsupported data type for MySQL bind parameter: {}", data_type),
+        };
+        Ok(val)
+    }
+
+    /// Query the minimum and maximum values of the split column. Returns `None` when the
+    /// table is empty (or the min/max are NULL).
+    async fn min_and_max(
+        &self,
+        split_column: &Field,
+    ) -> ConnectorResult<Option<(ScalarImpl, ScalarImpl)>> {
+        let col = Self::quote_column(&split_column.name);
+        let sql = format!(
+            "SELECT MIN({}) AS min_val, MAX({}) AS max_val FROM {}",
+            col,
+            col,
+            Self::get_normalized_table_name(&self.schema_table_name),
+        );
+        let mut conn = self.pool.get_conn().await?;
+        conn.exec_drop("SET time_zone = \"+00:00\"", ()).await?;
+        let rows = conn.query::<mysql_async::Row, _>(sql).await?;
+        drop(conn);
+        let Some(mut row) = rows.into_iter().next() else {
+            return Ok(None);
+        };
+        let min = mysql_datum_to_rw_datum(&mut row, 0, "min_val", &split_column.data_type)?;
+        let max = mysql_datum_to_rw_datum(&mut row, 1, "max_val", &split_column.data_type)?;
+        match (min, max) {
+            (Some(min), Some(max)) => Ok(Some((min, max))),
+            _ => Ok(None),
+        }
+    }
+
+    /// Find the right (exclusive) bound of the next split that contains at most
+    /// `max_split_size` rows starting from `left_value`. Returns the wrapped datum, which is
+    /// `Some(None)` (SQL NULL) when the remaining rows fit within the last split.
+    async fn next_split_right_bound_exclusive(
+        &self,
+        left_value: &ScalarImpl,
+        max_value: &ScalarImpl,
+        max_split_size: u64,
+        split_column: &Field,
+    ) -> ConnectorResult<Option<Datum>> {
+        let col = Self::quote_column(&split_column.name);
+        let is_unsigned = self.is_unsigned_type(&split_column.name);
+        let sql = format!(
+            "SELECT CASE WHEN MAX(t.{col}) < :max_val THEN MAX(t.{col}) ELSE NULL END AS bound \
+             FROM (SELECT {col} FROM {tbl} WHERE {col} >= :left_val ORDER BY {col} ASC LIMIT {limit}) AS t",
+            col = col,
+            tbl = Self::get_normalized_table_name(&self.schema_table_name),
+            limit = max_split_size,
+        );
+        let params = vec![
+            (
+                "max_val".to_owned(),
+                Self::scalar_to_mysql_value(max_value.clone(), &split_column.data_type, is_unsigned)?,
+            ),
+            (
+                "left_val".to_owned(),
+                Self::scalar_to_mysql_value(left_value.clone(), &split_column.data_type, is_unsigned)?,
+            ),
+        ];
+        let mut conn = self.pool.get_conn().await?;
+        conn.exec_drop("SET time_zone = \"+00:00\"", ()).await?;
+        let rows: Vec<mysql_async::Row> = conn.exec(sql, params).await?;
+        drop(conn);
+        let Some(mut row) = rows.into_iter().next() else {
+            return Ok(None);
+        };
+        let bound = mysql_datum_to_rw_datum(&mut row, 0, "bound", &split_column.data_type)?;
+        Ok(Some(bound))
+    }
+
+    /// Find the smallest value strictly greater than `start_offset` (and below `max_value`).
+    /// Used to advance past a value that spans more than `max_split_size` rows.
+    async fn next_greater_bound(
+        &self,
+        start_offset: &ScalarImpl,
+        max_value: &ScalarImpl,
+        split_column: &Field,
+    ) -> ConnectorResult<Option<Datum>> {
+        let col = Self::quote_column(&split_column.name);
+        let is_unsigned = self.is_unsigned_type(&split_column.name);
+        let sql = format!(
+            "SELECT MIN({col}) AS bound FROM {tbl} WHERE {col} > :start_val AND {col} < :max_val",
+            col = col,
+            tbl = Self::get_normalized_table_name(&self.schema_table_name),
+        );
+        let params = vec![
+            (
+                "start_val".to_owned(),
+                Self::scalar_to_mysql_value(
+                    start_offset.clone(),
+                    &split_column.data_type,
+                    is_unsigned,
+                )?,
+            ),
+            (
+                "max_val".to_owned(),
+                Self::scalar_to_mysql_value(max_value.clone(), &split_column.data_type, is_unsigned)?,
+            ),
+        ];
+        let mut conn = self.pool.get_conn().await?;
+        conn.exec_drop("SET time_zone = \"+00:00\"", ()).await?;
+        let rows: Vec<mysql_async::Row> = conn.exec(sql, params).await?;
+        drop(conn);
+        let Some(mut row) = rows.into_iter().next() else {
+            return Ok(None);
+        };
+        let bound = mysql_datum_to_rw_datum(&mut row, 0, "bound", &split_column.data_type)?;
+        Ok(Some(bound))
+    }
+
+    #[try_stream(boxed, ok = CdcTableSnapshotSplit, error = ConnectorError)]
+    async fn as_uneven_splits(&self, options: CdcTableSnapshotSplitOption) {
+        let split_column = self.split_column(&options);
+        let mut split_id = CDC_TABLE_SPLIT_ID_START;
+        let Some((min_value, max_value)) = self.min_and_max(&split_column).await? else {
+            // Empty table: yield a single all-encompassing split.
+            let split = CdcTableSnapshotSplit {
+                split_id,
+                left_bound_inclusive: OwnedRow::new(vec![None]),
+                right_bound_exclusive: OwnedRow::new(vec![None]),
+            };
+            yield split;
+            return Ok(());
+        };
+        // left bound will never be NULL value.
+        let mut next_left_bound_inclusive = min_value.clone();
+        loop {
+            let left_bound_inclusive: Datum = if next_left_bound_inclusive == min_value {
+                None
+            } else {
+                Some(next_left_bound_inclusive.clone())
+            };
+            let right_bound_exclusive;
+            let mut next_right = self
+                .next_split_right_bound_exclusive(
+                    &next_left_bound_inclusive,
+                    &max_value,
+                    options.backfill_num_rows_per_split,
+                    &split_column,
+                )
+                .await?;
+            if let Some(Some(ref inner)) = next_right
+                && *inner == next_left_bound_inclusive
+            {
+                // The current value already spans a whole split; advance to the next value.
+                next_right = self
+                    .next_greater_bound(&next_left_bound_inclusive, &max_value, &split_column)
+                    .await?;
+            }
+            if let Some(next_right) = next_right {
+                match next_right {
+                    None => {
+                        // NULL found, i.e. reached the last split.
+                        right_bound_exclusive = None;
+                    }
+                    Some(next_right) => {
+                        next_left_bound_inclusive = next_right.clone();
+                        right_bound_exclusive = Some(next_right);
+                    }
+                }
+            } else {
+                // Not found.
+                right_bound_exclusive = None;
+            };
+            let is_completed = right_bound_exclusive.is_none();
+            if is_completed && left_bound_inclusive.is_none() {
+                assert_eq!(split_id, CDC_TABLE_SPLIT_ID_START);
+            }
+            tracing::info!(
+                split_id,
+                ?left_bound_inclusive,
+                ?right_bound_exclusive,
+                "New CDC table snapshot split."
+            );
+            let split = CdcTableSnapshotSplit {
+                split_id,
+                left_bound_inclusive: OwnedRow::new(vec![left_bound_inclusive]),
+                right_bound_exclusive: OwnedRow::new(vec![right_bound_exclusive]),
+            };
+            try_increase_split_id(&mut split_id)?;
+            yield split;
+            if is_completed {
+                break;
+            }
+        }
+    }
+
+    #[try_stream(boxed, ok = CdcTableSnapshotSplit, error = ConnectorError)]
+    async fn as_even_splits(&self, options: CdcTableSnapshotSplitOption) {
+        let split_column = self.split_column(&options);
+        let mut split_id = CDC_TABLE_SPLIT_ID_START;
+        let Some((min_value, max_value)) = self.min_and_max(&split_column).await? else {
+            // Empty table: yield a single all-encompassing split.
+            let split = CdcTableSnapshotSplit {
+                split_id,
+                left_bound_inclusive: OwnedRow::new(vec![None]),
+                right_bound_exclusive: OwnedRow::new(vec![None]),
+            };
+            yield split;
+            return Ok(());
+        };
+        let min_value = min_value.as_integral();
+        let max_value = max_value.as_integral();
+        let saturated_split_max_size = options
+            .backfill_num_rows_per_split
+            .try_into()
+            .unwrap_or(i64::MAX);
+        let mut left = None;
+        let mut right = Some(min_value.saturating_add(saturated_split_max_size));
+        loop {
+            let mut is_completed = false;
+            if right.as_ref().map(|r| *r >= max_value).unwrap_or(true) {
+                right = None;
+                is_completed = true;
+            }
+            let split = CdcTableSnapshotSplit {
+                split_id,
+                left_bound_inclusive: OwnedRow::new(vec![
+                    left.map(|l| to_int_scalar(l, &split_column.data_type)),
+                ]),
+                right_bound_exclusive: OwnedRow::new(vec![
+                    right.map(|r| to_int_scalar(r, &split_column.data_type)),
+                ]),
+            };
+            try_increase_split_id(&mut split_id)?;
+            yield split;
+            if is_completed {
+                break;
+            }
+            left = right;
+            right = left.map(|l| l.saturating_add(saturated_split_max_size));
+        }
+    }
+
+    #[try_stream(boxed, ok = OwnedRow, error = ConnectorError)]
+    async fn split_snapshot_read_inner(
+        &self,
+        table_name: SchemaTableName,
+        left: OwnedRow,
+        right: OwnedRow,
+        split_columns: Vec<Field>,
+    ) {
+        assert_eq!(
+            split_columns.len(),
+            1,
+            "multiple split columns is not supported yet"
+        );
+        assert_eq!(left.len(), 1, "multiple split columns is not supported yet");
+        assert_eq!(
+            right.len(),
+            1,
+            "multiple split columns is not supported yet"
+        );
+        let split_column = &split_columns[0];
+        let col = Self::quote_column(&split_column.name);
+        let is_unsigned = self.is_unsigned_type(&split_column.name);
+        let is_first_split = left[0].is_none();
+        let is_last_split = right[0].is_none();
+
+        let where_clause = if is_first_split && is_last_split {
+            "1 = 1".to_owned()
+        } else if is_first_split {
+            format!("{col} < :right_bound")
+        } else if is_last_split {
+            format!("{col} >= :left_bound")
+        } else {
+            format!("{col} >= :left_bound AND {col} < :right_bound")
+        };
+        let sql = format!(
+            "SELECT {} FROM {} WHERE {}",
+            self.field_names,
+            Self::get_normalized_table_name(&table_name),
+            where_clause,
+        );
+
+        let mut params: Vec<(String, Value)> = vec![];
+        if !is_first_split {
+            let v = Self::scalar_to_mysql_value(
+                left[0].clone().unwrap(),
+                &split_column.data_type,
+                is_unsigned,
+            )?;
+            params.push(("left_bound".to_owned(), v));
+        }
+        if !is_last_split {
+            let v = Self::scalar_to_mysql_value(
+                right[0].clone().unwrap(),
+                &split_column.data_type,
+                is_unsigned,
+            )?;
+            params.push(("right_bound".to_owned(), v));
+        }
+
+        let mut conn = self.pool.get_conn().await?;
+        conn.exec_drop("SET time_zone = \"+00:00\"", ()).await?;
+
+        if params.is_empty() {
+            let rs_stream = sql.stream::<mysql_async::Row, _>(&mut conn).await?;
+            let row_stream = rs_stream.map(|row| {
+                let mut row = row?;
+                Ok::<_, ConnectorError>(mysql_row_to_owned_row(&mut row, &self.rw_schema))
+            });
+            pin_mut!(row_stream);
+            #[for_await]
+            for row in row_stream {
+                let row = row?;
+                yield row;
+            }
+        } else {
+            let rs_stream = sql
+                .with(Params::from(params))
+                .stream::<mysql_async::Row, _>(&mut conn)
+                .await?;
+            let row_stream = rs_stream.map(|row| {
+                let mut row = row?;
+                Ok::<_, ConnectorError>(mysql_row_to_owned_row(&mut row, &self.rw_schema))
+            });
+            pin_mut!(row_stream);
+            #[for_await]
+            for row in row_stream {
+                let row = row?;
+                yield row;
+            }
+        }
+        drop(conn);
     }
 
     #[try_stream(boxed, ok = OwnedRow, error = ConnectorError)]
@@ -671,41 +1090,13 @@ impl MySqlExternalTableReader {
                 .iter()
                 .zip_eq_fast(start_pk_row.into_iter())
                 .map(|(pk, datum)| {
-                    if let Some(value) = datum {
-                        let ty = field_map.get(pk.as_str()).unwrap();
-                        let val = match ty {
-                            DataType::Boolean => Value::from(value.into_bool()),
-                            DataType::Int16 => Value::from(value.into_int16()),
-                            DataType::Int32 => Value::from(value.into_int32()),
-                            DataType::Int64 => {
-                                let int64_val = value.into_int64();
-                                if int64_val < 0 && self.is_unsigned_type(pk.as_str()) {
-                                    Value::from(self.convert_negative_to_unsigned(int64_val))
-                                } else {
-                                    Value::from(int64_val)
-                                }
-                            }
-                            DataType::Float32 => Value::from(value.into_float32().into_inner()),
-                            DataType::Float64 => Value::from(value.into_float64().into_inner()),
-                            DataType::Varchar => Value::from(String::from(value.into_utf8())),
-                            DataType::Date => Value::from(value.into_date().0),
-                            DataType::Time => Value::from(value.into_time().0),
-                            DataType::Timestamp => Value::from(value.into_timestamp().0),
-                            DataType::Decimal => Value::from(value.into_decimal().to_string()),
-                            DataType::Timestamptz => {
-                                // Convert timestamptz to NaiveDateTime for MySQL TIMESTAMP comparison
-                                // MySQL expects NaiveDateTime for TIMESTAMP parameters
-                                let ts = value.into_timestamptz();
-                                let datetime_utc = ts.to_datetime_utc();
-                                let naive_datetime = datetime_utc.naive_utc();
-                                Value::from(naive_datetime)
-                            }
-                            _ => bail!("unsupported primary key data type: {}", ty),
-                        };
-                        ConnectorResult::Ok((pk.to_lowercase(), val))
-                    } else {
+                    let Some(value) = datum else {
                         bail!("primary key {} cannot be null", pk);
-                    }
+                    };
+                    let ty = field_map.get(pk.as_str()).unwrap();
+                    let val =
+                        Self::scalar_to_mysql_value(value, ty, self.is_unsigned_type(pk.as_str()))?;
+                    ConnectorResult::Ok((pk.to_lowercase(), val))
                 })
                 .try_collect::<_, _, ConnectorError>()?;
 
@@ -790,6 +1181,37 @@ impl MySqlExternalTableReader {
     fn quote_column(column: &str) -> String {
         format!("`{}`", column)
     }
+}
+
+fn to_int_scalar(i: i64, data_type: &DataType) -> ScalarImpl {
+    match data_type {
+        DataType::Int16 => ScalarImpl::Int16(i.try_into().unwrap()),
+        DataType::Int32 => ScalarImpl::Int32(i.try_into().unwrap()),
+        DataType::Int64 => ScalarImpl::Int64(i),
+        _ => {
+            panic!("Can't convert int {} to ScalarImpl::{}", i, data_type)
+        }
+    }
+}
+
+fn try_increase_split_id(split_id: &mut i64) -> ConnectorResult<()> {
+    match split_id.checked_add(1) {
+        Some(s) => {
+            *split_id = s;
+            Ok(())
+        }
+        None => Err(anyhow!("too many CDC snapshot splits").into()),
+    }
+}
+
+/// Only integer types can use evenly-sized (arithmetic) split boundaries. All other types
+/// require data-driven sampling. Mirrors the Postgres CDC behavior. Splits use the first
+/// (configurable) primary key column.
+fn is_supported_even_split_data_type(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Int16 | DataType::Int32 | DataType::Int64
+    )
 }
 
 #[cfg(test)]
@@ -889,9 +1311,17 @@ mod tests {
         let config =
             serde_json::from_value::<ExternalTableConfig>(serde_json::to_value(props).unwrap())
                 .unwrap();
-        let reader = MySqlExternalTableReader::new(config, rw_schema)
-            .await
-            .unwrap();
+        let reader = MySqlExternalTableReader::new(
+            config,
+            rw_schema,
+            vec![0],
+            SchemaTableName {
+                schema_name: "mytest".to_owned(),
+                table_name: "t1".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
         let offset = reader.current_cdc_offset().await.unwrap();
         println!("BinlogOffset: {:?}", offset);
 
