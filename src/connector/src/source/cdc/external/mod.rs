@@ -588,8 +588,17 @@ impl ExternalTableImpl {
     pub async fn connect(config: ExternalTableConfig) -> ConnectorResult<Self> {
         // Spanner CDC is not a Debezium-based connector, check it first.
         if config.connector == "spanner-cdc" {
+            let db_client = crate::source::cdc::external::spanner::create_spanner_client(
+                &config.spanner_project,
+                &config.spanner_instance,
+                &config.database,
+                config.emulator_host.as_deref(),
+                config.credentials.as_deref(),
+                config.credentials_path.as_deref(),
+            )
+            .await?;
             return Ok(ExternalTableImpl::Spanner(
-                SpannerExternalTable::connect(config).await?,
+                SpannerExternalTable::connect(&db_client, config).await?,
             ));
         }
 

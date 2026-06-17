@@ -8,7 +8,7 @@ This connector reads data from Google Cloud Spanner change streams and delivers 
 
 ### Key Features
 
-- **Native Rust Implementation**: Uses `gcloud-spanner` crate (v1.x), not Debezium
+- **Native Rust Implementation**: Uses the official `google-cloud-spanner` crate (googleapis/google-cloud-rust), not Debezium
 - **Debezium-Pattern Reader**: Same architecture as Postgres CDC — background task, mpsc channel, simple rx.recv()
 - **Full Type Support**: All Spanner types supported with data-preserving fallbacks
 - **Automatic Partition Management**: Handles parent-child partition splits and merges
@@ -231,7 +231,7 @@ PartitionOffsets (shared via Arc<Mutex<HashMap>>):
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `spanner.heartbeat_interval` | `3s` | Heartbeat interval for partition health monitoring |
+| `spanner.heartbeat_milliseconds` | `2000` | Heartbeat interval in milliseconds for partition health monitoring. Maps to the `heartbeat_milliseconds` TVF argument. Valid range: 1,000–300,000. |
 | `spanner.start_timestamp` | current time | Start timestamp for the change stream query (RFC3339 format) |
 | `table.name` | - | Filter by upstream table (set via `TABLE 'name'` in CREATE TABLE) |
 
@@ -267,7 +267,7 @@ CREATE SOURCE spanner_cdc_source WITH (
     database.name = 'my-database',
     spanner.change_stream.name = 'my_stream',
     spanner.credentials_path = '/secrets/spanner-sa.json',
-    spanner.heartbeat_interval = '5s'
+    spanner.heartbeat_milliseconds = 5000
 ) FORMAT PLAIN ENCODE JSON;
 
 CREATE TABLE users FROM spanner_cdc_source TABLE 'users';
@@ -744,4 +744,4 @@ PROTO types are mapped to `BYTEA` and ENUM types map to `VARCHAR`. If you see NU
 - [Spanner Change Streams Documentation](https://cloud.google.com/spanner/docs/change-streams/details)
 - [Spanner Type System](https://cloud.google.com/spanner/docs/reference/rest/v1/Type)
 - [Spanner Standard SQL Data Types](https://cloud.google.com/spanner/docs/reference/standard-sql/data-types)
-- [gcloud-spanner](https://github.com/yoshidan/google-cloud-rust) - Rust SDK for Google Cloud Spanner
+- [google-cloud-spanner](https://github.com/googleapis/google-cloud-rust) - Official Rust SDK for Google Cloud Spanner

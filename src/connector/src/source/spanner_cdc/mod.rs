@@ -14,7 +14,7 @@
 
 use std::collections::HashMap;
 
-use google_cloud_spanner::client::Client;
+use google_cloud_spanner::client::DatabaseClient;
 use phf::{Set, phf_set};
 use serde::Deserialize;
 use serde_with::{DisplayFromStr, serde_as};
@@ -32,7 +32,6 @@ pub mod types;
 
 #[cfg(test)]
 mod tests;
-
 
 pub use enumerator::*;
 pub use source::*;
@@ -70,10 +69,13 @@ pub struct SpannerCdcProperties {
     #[serde(rename = "table.name")]
     pub table_name: Option<String>,
 
-    /// Heartbeat interval for partition health monitoring (default: 3s)
-    #[serde(rename = "spanner.heartbeat_interval")]
-    #[serde(default = "default_heartbeat_interval")]
-    pub heartbeat_interval: String,
+    /// Heartbeat interval for partition health monitoring, in milliseconds (default: 2000).
+    /// Maps directly to the `heartbeat_milliseconds` argument of the
+    /// `READ_<change_stream_name>` TVF. Valid range per Spanner: 1,000–300,000.
+    #[serde_as(as = "DisplayFromStr")]
+    #[serde(rename = "spanner.heartbeat_milliseconds")]
+    #[serde(default = "default_heartbeat_milliseconds")]
+    pub heartbeat_milliseconds: i64,
 
     /// GCP credentials JSON string
     /// See: https://developers.google.com/workspace/guides/create-credentials#create_credentials_for_a_service_account
@@ -131,7 +133,6 @@ pub struct SpannerCdcProperties {
     // DO NOT REMOVE — removing any of these will break CREATE SOURCE or
     // CREATE TABLE for Spanner CDC.
     // ---------------------------------------------------------------------------
-
     /// Auto schema change flag
     #[serde(rename = "auto.schema.change", default)]
     #[serde(skip_serializing)]
@@ -153,8 +154,8 @@ pub struct SpannerCdcProperties {
     pub unknown_fields: HashMap<String, String>,
 }
 
-fn default_heartbeat_interval() -> String {
-    "3s".to_string()
+fn default_heartbeat_milliseconds() -> i64 {
+    2000
 }
 
 impl EnforceSecret for SpannerCdcProperties {
@@ -200,15 +201,8 @@ impl SpannerCdcProperties {
         self.retry_backoff_factor.unwrap_or(2)
     }
 
-    /// Parse heartbeat interval as duration in milliseconds
-    pub fn heartbeat_interval_ms(&self) -> ConnectorResult<i64> {
-        let duration = duration_str::parse(&self.heartbeat_interval)
-            .map_err(|e| anyhow::anyhow!("failed to parse heartbeat_interval: {}", e))?;
-        Ok(duration.as_millis() as i64)
-    }
-
-    /// Create a Spanner client using the shared factory.
-    pub(crate) async fn create_client(&self) -> ConnectorResult<Client> {
+    /// Create a Spanner `DatabaseClient` using the shared factory.
+    pub(crate) async fn create_client(&self) -> ConnectorResult<DatabaseClient> {
         crate::source::cdc::external::spanner::create_spanner_client(
             &self.project,
             &self.instance,
