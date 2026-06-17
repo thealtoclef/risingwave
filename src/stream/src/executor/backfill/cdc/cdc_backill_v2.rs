@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
 use either::Either;
@@ -19,10 +20,11 @@ use futures::stream;
 use futures::stream::select_with_strategy;
 use itertools::Itertools;
 use risingwave_common::bitmap::BitmapBuilder;
-use risingwave_common::catalog::{ColumnDesc, Field};
+use risingwave_common::catalog::{CdcKeyComparison, ColumnDesc, Field};
 use risingwave_common::row::RowDeserializer;
+use risingwave_common::types::DatumRef;
 use risingwave_common::util::iter_util::ZipEqFast;
-use risingwave_common::util::sort_util::{OrderType, cmp_datum};
+use risingwave_common::util::sort_util::OrderType;
 use risingwave_connector::source::cdc::CdcScanOptions;
 use risingwave_connector::source::cdc::external::{
     CdcOffset, ExternalCdcTableType, ExternalTableReaderImpl,
@@ -41,7 +43,9 @@ use crate::executor::backfill::cdc::upstream_table::external::ExternalStorageTab
 use crate::executor::backfill::cdc::upstream_table::snapshot::{
     SplitSnapshotReadArgs, UpstreamTableRead, UpstreamTableReader,
 };
-use crate::executor::backfill::utils::{get_cdc_chunk_last_offset, mapping_chunk, mapping_message};
+use crate::executor::backfill::utils::{
+    cmp_pk_unsigned_aware, get_cdc_chunk_last_offset, mapping_chunk, mapping_message,
+};
 use crate::executor::prelude::*;
 use crate::executor::source::get_infinite_backoff_strategy;
 use crate::task::cdc_progress::CdcProgressReporter;
@@ -125,6 +129,16 @@ impl<S: StateStore> ParallelizedCdcBackfillExecutor<S> {
             pk_indices[self.options.backfill_split_pk_column_index as usize];
         let cdc_table_snapshot_split_column =
             vec![self.external_table.schema().fields[snapshot_split_column_index].clone()];
+        // A MySQL `BIGINT UNSIGNED` split key is stored as `i64`, but split bounds follow the
+        // upstream unsigned order, so it must be compared as `u64`. Graphs created before PK
+        // comparison metadata existed resolve it from the table reader instead.
+        let mut split_key_needs_unsigned_i64_compare = self
+            .external_table
+            .pk_comparisons()
+            .and_then(|comparisons| {
+                comparisons.get(self.options.backfill_split_pk_column_index as usize)
+            })
+            .map(|comparison| *comparison == CdcKeyComparison::UnsignedInt64);
 
         let mut upstream = self.upstream.execute();
         // Poll the upstream to get the first barrier.
@@ -195,7 +209,7 @@ impl<S: StateStore> ParallelizedCdcBackfillExecutor<S> {
                 generation = Some(*snapshot_generation);
             }
             tracing::debug!(?actor_snapshot_splits, ?generation, "actor splits");
-            assert_consecutive_splits(&actor_snapshot_splits);
+            assert_consecutive_splits(&actor_snapshot_splits, split_key_needs_unsigned_i64_compare);
 
             let mut is_snapshot_paused = reset_barrier.is_pause_on_startup();
             let barrier_epoch = reset_barrier.epoch;
@@ -275,6 +289,12 @@ impl<S: StateStore> ParallelizedCdcBackfillExecutor<S> {
                     .await
                     .expect("Retry create cdc table reader until success.")
             });
+            if split_key_needs_unsigned_i64_compare.is_none() && current_actor_bounds.is_some() {
+                // Upstream events must be filtered against the finished splits, which needs the
+                // split key comparison that legacy graphs only get from the reader. Create the
+                // reader before polling upstream; unconsumed events stay buffered upstream.
+                table_reader = Some(future.as_mut().await);
+            }
             loop {
                 if let Some(msg) =
                     build_reader_and_poll_upstream(&mut upstream, &mut table_reader, &mut future)
@@ -298,6 +318,7 @@ impl<S: StateStore> ParallelizedCdcBackfillExecutor<S> {
                                     chunk,
                                     &current_actor_bounds,
                                     snapshot_split_column_index,
+                                    split_key_needs_unsigned_i64_compare.unwrap_or_default(),
                                 ) && filtered_chunk.cardinality() > 0
                                 {
                                     yield Message::Chunk(filtered_chunk);
@@ -318,10 +339,20 @@ impl<S: StateStore> ParallelizedCdcBackfillExecutor<S> {
                     break;
                 }
             }
-            let upstream_table_reader = UpstreamTableReader::new(
-                self.external_table.clone(),
-                table_reader.expect("table reader must created"),
-            );
+            let table_reader = table_reader.expect("table reader must created");
+            let split_key_unsigned = match split_key_needs_unsigned_i64_compare {
+                Some(needs_unsigned) => needs_unsigned,
+                None => {
+                    let split_column_name = cdc_table_snapshot_split_column[0].name.clone();
+                    let comparisons = table_reader.pk_column_comparisons(&[split_column_name])?;
+                    assert_eq!(comparisons.len(), 1);
+                    let needs_unsigned = comparisons[0] == CdcKeyComparison::UnsignedInt64;
+                    split_key_needs_unsigned_i64_compare = Some(needs_unsigned);
+                    needs_unsigned
+                }
+            };
+            let upstream_table_reader =
+                UpstreamTableReader::new(self.external_table.clone(), table_reader);
             // let mut upstream = upstream.peekable();
             let offset_parse_func = upstream_table_reader.reader.get_cdc_offset_parser();
 
@@ -480,6 +511,7 @@ impl<S: StateStore> ParallelizedCdcBackfillExecutor<S> {
                                             &finished_split_bounds,
                                             &current_split_bounds,
                                             snapshot_split_column_index,
+                                            split_key_unsigned,
                                         );
                                     if let Some(finished_chunk) = finished_chunk
                                         && finished_chunk.cardinality() > 0
@@ -660,6 +692,7 @@ impl<S: StateStore> ParallelizedCdcBackfillExecutor<S> {
                             chunk,
                             &current_actor_bounds,
                             snapshot_split_column_index,
+                            split_key_unsigned,
                         ) && filtered_chunk.cardinality() > 0
                         {
                             yield Message::Chunk(filtered_chunk);
@@ -681,23 +714,45 @@ fn split_finished_and_current_chunk(
     finished_split_bounds: &Option<(OwnedRow, OwnedRow)>,
     current_split_bounds: &Option<(OwnedRow, OwnedRow)>,
     snapshot_split_column_index: usize,
+    split_key_unsigned: bool,
 ) -> (Option<StreamChunk>, Option<StreamChunk>) {
     let finished_chunk = filter_stream_chunk(
         chunk.clone(),
         finished_split_bounds,
         snapshot_split_column_index,
+        split_key_unsigned,
     )
     .map(StreamChunk::compact_vis);
-    let current_chunk =
-        filter_stream_chunk(chunk, current_split_bounds, snapshot_split_column_index)
-            .map(StreamChunk::compact_vis);
+    let current_chunk = filter_stream_chunk(
+        chunk,
+        current_split_bounds,
+        snapshot_split_column_index,
+        split_key_unsigned,
+    )
+    .map(StreamChunk::compact_vis);
     (finished_chunk, current_chunk)
+}
+
+/// Compare two split keys, reinterpreting `i64` as `u64` for MySQL `BIGINT UNSIGNED`.
+fn cmp_split_key(
+    lhs: DatumRef<'_>,
+    rhs: DatumRef<'_>,
+    order: OrderType,
+    split_key_unsigned: bool,
+) -> Ordering {
+    cmp_pk_unsigned_aware(
+        std::iter::once(lhs),
+        std::iter::once(rhs),
+        &[order],
+        &[split_key_unsigned],
+    )
 }
 
 fn filter_stream_chunk(
     chunk: StreamChunk,
     bound: &Option<(OwnedRow, OwnedRow)>,
     snapshot_split_column_index: usize,
+    split_key_unsigned: bool,
 ) -> Option<StreamChunk> {
     let Some((left, right)) = bound else {
         return None;
@@ -727,18 +782,20 @@ fn filter_stream_chunk(
         }
         let mut is_in_range = true;
         if !is_leftmost_bound {
-            is_in_range = cmp_datum(
+            is_in_range = cmp_split_key(
                 row_split_key,
                 left_split_key,
                 OrderType::ascending_nulls_first(),
+                split_key_unsigned,
             )
             .is_ge();
         }
         if is_in_range && !is_rightmost_bound {
-            is_in_range = cmp_datum(
+            is_in_range = cmp_split_key(
                 row_split_key,
                 right_split_key,
                 OrderType::ascending_nulls_first(),
+                split_key_unsigned,
             )
             .is_lt();
         }
@@ -792,7 +849,12 @@ fn is_reset_barrier(barrier: &Barrier, actor_id: ActorId) -> bool {
     }
 }
 
-fn assert_consecutive_splits(actor_snapshot_splits: &[CdcTableSnapshotSplit]) {
+/// `split_key_unsigned` is `None` when the split key comparison is not resolved yet; the bound
+/// order is then not checked, since a `BIGINT UNSIGNED` key would look unordered as `i64`.
+fn assert_consecutive_splits(
+    actor_snapshot_splits: &[CdcTableSnapshotSplit],
+    split_key_unsigned: Option<bool>,
+) {
     for i in 1..actor_snapshot_splits.len() {
         assert_eq!(
             actor_snapshot_splits[i].split_id,
@@ -800,28 +862,95 @@ fn assert_consecutive_splits(actor_snapshot_splits: &[CdcTableSnapshotSplit]) {
             "{:?}",
             actor_snapshot_splits
         );
-        assert!(
-            cmp_datum(
-                actor_snapshot_splits[i - 1]
-                    .right_bound_exclusive
-                    .datum_at(0),
-                actor_snapshot_splits[i].right_bound_exclusive.datum_at(0),
-                OrderType::ascending_nulls_last(),
-            )
-            .is_lt()
-        );
+        if let Some(split_key_unsigned) = split_key_unsigned {
+            assert!(
+                cmp_split_key(
+                    actor_snapshot_splits[i - 1]
+                        .right_bound_exclusive
+                        .datum_at(0),
+                    actor_snapshot_splits[i].right_bound_exclusive.datum_at(0),
+                    OrderType::ascending_nulls_last(),
+                    split_key_unsigned,
+                )
+                .is_lt()
+            );
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use risingwave_common::array::StreamChunk;
+    use risingwave_common::array::{Op, StreamChunk};
     use risingwave_common::row::OwnedRow;
-    use risingwave_common::types::ScalarImpl;
+    use risingwave_common::types::{DataType, ScalarImpl};
+    use risingwave_connector::source::CdcTableSnapshotSplit;
 
     use crate::executor::backfill::cdc::cdc_backill_v2::{
-        filter_stream_chunk, split_finished_and_current_chunk,
+        assert_consecutive_splits, filter_stream_chunk, split_finished_and_current_chunk,
     };
+
+    /// A MySQL `BIGINT UNSIGNED` value as RisingWave stores it in an `Int64` column.
+    fn unsigned_i64(v: u64) -> ScalarImpl {
+        ScalarImpl::Int64(v as i64)
+    }
+
+    #[test]
+    fn test_filter_stream_chunk_unsigned_bigint_split_key() {
+        let keys = [50, 200, (1 << 63) + 5, u64::MAX];
+        let rows = keys
+            .iter()
+            .map(|&k| (Op::Insert, OwnedRow::new(vec![Some(unsigned_i64(k))])))
+            .collect::<Vec<_>>();
+        let chunk = StreamChunk::from_rows(&rows, &[DataType::Int64]);
+        // The split crosses 2^63, so its right bound is negative as `i64`.
+        let bound = Some((
+            OwnedRow::new(vec![Some(unsigned_i64(100))]),
+            OwnedRow::new(vec![Some(unsigned_i64((1 << 63) + 10))]),
+        ));
+
+        let c = filter_stream_chunk(chunk.clone(), &bound, 0, true).unwrap();
+        let expected = StreamChunk::from_rows(&rows[1..3], &[DataType::Int64]);
+        assert_eq!(c.compact_vis(), expected);
+
+        // Signed comparison sees an empty range and would drop every event of the split.
+        let c = filter_stream_chunk(chunk, &bound, 0, false).unwrap();
+        assert_eq!(c.cardinality(), 0);
+    }
+
+    #[test]
+    fn test_assert_consecutive_splits_unsigned_bigint_split_key() {
+        let split = |split_id, left: Option<u64>, right: Option<u64>| CdcTableSnapshotSplit {
+            split_id,
+            left_bound_inclusive: OwnedRow::new(vec![left.map(unsigned_i64)]),
+            right_bound_exclusive: OwnedRow::new(vec![right.map(unsigned_i64)]),
+        };
+        let splits = vec![
+            split(1, None, Some(100)),
+            split(2, Some(100), Some((1 << 63) + 10)),
+            split(3, Some((1 << 63) + 10), None),
+        ];
+        assert_consecutive_splits(&splits, Some(true));
+        // Unresolved comparison skips the bound order check.
+        assert_consecutive_splits(&splits, None);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_assert_consecutive_splits_signed_rejects_unsigned_order() {
+        let splits = vec![
+            CdcTableSnapshotSplit {
+                split_id: 1,
+                left_bound_inclusive: OwnedRow::new(vec![None]),
+                right_bound_exclusive: OwnedRow::new(vec![Some(unsigned_i64(100))]),
+            },
+            CdcTableSnapshotSplit {
+                split_id: 2,
+                left_bound_inclusive: OwnedRow::new(vec![Some(unsigned_i64(100))]),
+                right_bound_exclusive: OwnedRow::new(vec![Some(unsigned_i64((1 << 63) + 10))]),
+            },
+        ];
+        assert_consecutive_splits(&splits, Some(false));
+    }
 
     #[test]
     fn test_filter_stream_chunk() {
@@ -834,18 +963,18 @@ mod tests {
             U+ 4 .",
         );
         let bound = None;
-        let c = filter_stream_chunk(chunk.clone(), &bound, 0);
+        let c = filter_stream_chunk(chunk.clone(), &bound, 0, false);
         assert!(c.is_none());
 
         let bound = Some((OwnedRow::new(vec![None]), OwnedRow::new(vec![None])));
-        let c = filter_stream_chunk(chunk.clone(), &bound, 0);
+        let c = filter_stream_chunk(chunk.clone(), &bound, 0, false);
         assert_eq!(c.unwrap().compact_vis(), chunk);
 
         let bound = Some((
             OwnedRow::new(vec![None]),
             OwnedRow::new(vec![Some(ScalarImpl::Int64(3))]),
         ));
-        let c = filter_stream_chunk(chunk.clone(), &bound, 0);
+        let c = filter_stream_chunk(chunk.clone(), &bound, 0, false);
         assert_eq!(
             c.unwrap().compact_vis(),
             StreamChunk::from_pretty(
@@ -859,7 +988,7 @@ mod tests {
             OwnedRow::new(vec![Some(ScalarImpl::Int64(3))]),
             OwnedRow::new(vec![None]),
         ));
-        let c = filter_stream_chunk(chunk.clone(), &bound, 0);
+        let c = filter_stream_chunk(chunk.clone(), &bound, 0, false);
         assert_eq!(
             c.unwrap().compact_vis(),
             StreamChunk::from_pretty(
@@ -873,7 +1002,7 @@ mod tests {
             OwnedRow::new(vec![Some(ScalarImpl::Int64(2))]),
             OwnedRow::new(vec![Some(ScalarImpl::Int64(4))]),
         ));
-        let c = filter_stream_chunk(chunk.clone(), &bound, 0);
+        let c = filter_stream_chunk(chunk.clone(), &bound, 0, false);
         assert_eq!(
             c.unwrap().compact_vis(),
             StreamChunk::from_pretty(
@@ -885,18 +1014,18 @@ mod tests {
 
         // Test NULL value.
         let bound = None;
-        let c = filter_stream_chunk(chunk.clone(), &bound, 1);
+        let c = filter_stream_chunk(chunk.clone(), &bound, 1, false);
         assert!(c.is_none());
 
         let bound = Some((OwnedRow::new(vec![None]), OwnedRow::new(vec![None])));
-        let c = filter_stream_chunk(chunk.clone(), &bound, 1);
+        let c = filter_stream_chunk(chunk.clone(), &bound, 1, false);
         assert_eq!(c.unwrap().compact_vis(), chunk);
 
         let bound = Some((
             OwnedRow::new(vec![None]),
             OwnedRow::new(vec![Some(ScalarImpl::Int64(7))]),
         ));
-        let c = filter_stream_chunk(chunk.clone(), &bound, 1);
+        let c = filter_stream_chunk(chunk.clone(), &bound, 1, false);
         assert_eq!(
             c.unwrap().compact_vis(),
             StreamChunk::from_pretty(
@@ -911,7 +1040,7 @@ mod tests {
             OwnedRow::new(vec![Some(ScalarImpl::Int64(7))]),
             OwnedRow::new(vec![None]),
         ));
-        let c = filter_stream_chunk(chunk, &bound, 1);
+        let c = filter_stream_chunk(chunk, &bound, 1, false);
         assert_eq!(
             c.unwrap().compact_vis(),
             StreamChunk::from_pretty(
@@ -945,6 +1074,7 @@ mod tests {
             &finished_split_bounds,
             &current_split_bounds,
             0,
+            false,
         );
 
         assert_eq!(
