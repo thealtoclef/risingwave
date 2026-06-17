@@ -110,7 +110,6 @@ CREATE TABLE t_products (*) WITH (
     backfill.parallelism = 3,
     backfill.num_rows_per_split = 2,
     spanner.databoost.enabled = 'false',
-    spanner.partition_query.parallelism = 2,
 )
 FROM spanner_source
 TABLE 'products';
@@ -150,7 +149,6 @@ CREATE TABLE t_inventory (*) WITH (
     backfill.parallelism = 3,
     backfill.num_rows_per_split = 2,
     spanner.databoost.enabled = 'true',
-    spanner.partition_query.parallelism = 4,
 )
 FROM spanner_source
 TABLE 'inventory';
@@ -341,7 +339,6 @@ statement ok
 CREATE TABLE t_orders (*) WITH (
     backfill.parallelism = 3,
     spanner.databoost.enabled = 'true',
-    spanner.partition_query.parallelism = 4,
 )
 FROM spanner_source
 TABLE 'orders';

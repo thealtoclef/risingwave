@@ -144,11 +144,6 @@ pub struct SpannerCdcProperties {
     #[serde(skip_serializing)]
     _snapshot_ts: Option<i64>,
 
-    /// Partition query parallelism for Spanner CDC backfill
-    #[serde(rename = "spanner.partition_query.parallelism", default)]
-    #[serde(skip_serializing)]
-    _partition_query_parallelism: Option<String>,
-
     /// Enable databoost for Spanner CDC backfill
     #[serde(rename = "spanner.databoost.enabled", default)]
     #[serde(skip_serializing)]
