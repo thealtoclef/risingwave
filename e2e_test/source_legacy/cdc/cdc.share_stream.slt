@@ -436,6 +436,63 @@ SELECT COUNT(*) FROM pg_parallelized_cdc_backfill_test_table_2
 ----
 23
 
+# mysql parallelized (backfill v2) cdc backfill test
+system ok
+mysql --protocol=tcp -u root -e "
+DROP TABLE IF EXISTS mytest.parallelized_cdc_backfill_test;
+CREATE TABLE mytest.parallelized_cdc_backfill_test (id INT PRIMARY KEY, name VARCHAR(64));
+INSERT INTO mytest.parallelized_cdc_backfill_test VALUES (1,'11'),(2,'22'),(3,'33'),(4,'44'),(5,'55'),(6,'66'),(7,'77'),(8,'88'),(9,'99'),(10,'1010'),(11,'1111'),(15,'1515');
+"
+
+statement ok
+CREATE TABLE mysql_parallelized_cdc_backfill_test_table_1 (
+    id INT PRIMARY KEY,
+    name VARCHAR
+)
+WITH (
+    backfill.num_rows_per_split='2',
+    backfill.parallelism='3',
+    backfill.as_even_splits='true'
+)
+FROM mysql_source TABLE 'mytest.parallelized_cdc_backfill_test';
+
+statement ok
+CREATE TABLE mysql_parallelized_cdc_backfill_test_table_2 (
+    id INT PRIMARY KEY,
+    name VARCHAR
+)
+WITH (
+    backfill.num_rows_per_split='2',
+    backfill.parallelism='3',
+    backfill.as_even_splits='false'
+)
+FROM mysql_source TABLE 'mytest.parallelized_cdc_backfill_test';
+
+query I retry 6 backoff 1s
+SELECT COUNT(*) FROM mysql_parallelized_cdc_backfill_test_table_1
+----
+12
+
+query I retry 15 backoff 1s
+SELECT COUNT(*) FROM mysql_parallelized_cdc_backfill_test_table_2
+----
+12
+
+system ok
+mysql --protocol=tcp -u root -e "
+INSERT INTO mytest.parallelized_cdc_backfill_test VALUES (20,'2020'),(30,'3030'),(40,'4040'),(50,'5050'),(60,'6060'),(70,'7070'),(80,'8080'),(90,'9090'),(100,'100100'),(110,'110110'),(120,'120120');
+"
+
+query I retry 6 backoff 1s
+SELECT COUNT(*) FROM mysql_parallelized_cdc_backfill_test_table_1
+----
+23
+
+query I retry 15 backoff 1s
+SELECT COUNT(*) FROM mysql_parallelized_cdc_backfill_test_table_2
+----
+23
+
 # test postgres backfill data types
 statement ok
 CREATE TABLE IF NOT EXISTS postgres_all_types(
