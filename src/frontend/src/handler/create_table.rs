@@ -1116,7 +1116,7 @@ fn derive_with_options_for_cdc_table(
 
                 // For Spanner CDC, auto-generate spanner.snapshot_ts from current time.
                 use risingwave_connector::source::cdc::external::{
-                    SPANNER_DATABOOST_ENABLED_KEY, SPANNER_PARTITION_QUERY_PARALLELISM_KEY,
+                    SPANNER_DATABOOST_ENABLED_KEY,
                     SPANNER_SNAPSHOT_TS_KEY,
                     spanner::now_micros,
                 };
@@ -1125,9 +1125,6 @@ fn derive_with_options_for_cdc_table(
                 with_options.insert(SPANNER_SNAPSHOT_TS_KEY.to_string(), snapshot_ts.to_string());
 
                 // Inject table-level Spanner CDC properties
-                if let Some(parallelism) = table_with_options.get(SPANNER_PARTITION_QUERY_PARALLELISM_KEY) {
-                    with_options.insert(SPANNER_PARTITION_QUERY_PARALLELISM_KEY.to_string(), parallelism.clone());
-                }
                 if let Some(databoost) = table_with_options.get(SPANNER_DATABOOST_ENABLED_KEY) {
                     with_options.insert(SPANNER_DATABOOST_ENABLED_KEY.to_string(), databoost.clone());
                 }

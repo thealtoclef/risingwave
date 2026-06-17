@@ -1490,11 +1490,6 @@ SpannerCdcProperties:
     comments: Auto schema change flag
     required: false
     default: Default::default
-  - name: spanner.partition_query.parallelism
-    field_type: String
-    comments: Partition query parallelism for Spanner CDC backfill
-    required: false
-    default: Default::default
   - name: spanner.databoost.enabled
     field_type: String
     comments: Enable databoost for Spanner CDC backfill

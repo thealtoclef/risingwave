@@ -221,8 +221,6 @@ pub struct SpannerExternalTableReader {
     pk_types: Vec<DataType>,
     table_name: String,
     enable_databoost: bool,
-    /// Parallelism for partition query execution within a PK range split
-    partition_query_parallelism: u32,
     /// Snapshot timestamp from config (set by frontend at table creation).
     /// Used for consistent snapshot reads and CDC filtering.
     snapshot_ts: Option<i64>,
@@ -242,7 +240,6 @@ impl SpannerExternalTableReader {
         schema: Schema,
     ) -> ConnectorResult<Self> {
         let enable_databoost = config.spanner_databoost_enabled;
-        let partition_query_parallelism = config.spanner_partition_query_parallelism;
         let snapshot_ts = config.spanner_snapshot_ts;
         let client = create_spanner_client(
             &config.spanner_project,
@@ -282,7 +279,6 @@ impl SpannerExternalTableReader {
             pk_types,
             table_name: external_table.table_name().to_string(),
             enable_databoost,
-            partition_query_parallelism,
             snapshot_ts,
             client,
         })
@@ -886,8 +882,8 @@ impl SpannerExternalTableReader {
             .context("failed to get partitions for PK range")?;
 
         tracing::info!(
-            "split_snapshot_read: got {} intra-partitions, streaming rows sequentially with configured parallelism={}",
-            partitions.len(), self.partition_query_parallelism
+            "split_snapshot_read: got {} intra-partitions, streaming rows sequentially",
+            partitions.len(),
         );
 
         // Stream each intra-partition directly instead of collecting all rows in memory.

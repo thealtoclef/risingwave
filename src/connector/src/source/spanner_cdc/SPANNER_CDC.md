@@ -249,10 +249,9 @@ PartitionOffsets (shared via Arc<Mutex<HashMap>>):
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `spanner.databoost.enabled` | `false` | Enable DataBoost for partitioned snapshot backfill (requires `spanner.databases.useDataBoost` IAM permission) |
-| `spanner.partition_query.parallelism` | `1` | Number of concurrent partition queries during snapshot backfill |
 | `auto.schema.change` | `false` | Enable automatic schema change propagation |
 
-**Note**: `spanner.databoost.enabled` and `spanner.partition_query.parallelism` are table-level properties set automatically by the frontend during `CREATE TABLE FROM source`. They are passed internally and should not be set manually in `CREATE SOURCE`.
+**Note**: `spanner.databoost.enabled` is a table-level property set automatically by the frontend during `CREATE TABLE FROM source`. It is passed internally and should not be set manually in `CREATE SOURCE`.
 
 ---
 
@@ -306,15 +305,14 @@ CREATE SOURCE spanner_cdc_source WITH (
     spanner.credentials_path = '/secrets/spanner-sa.json'
 ) FORMAT PLAIN ENCODE JSON;
 
--- Enable databoost and set partition parallelism at table level
+-- Enable databoost at table level
 CREATE TABLE large_table FROM spanner_cdc_source TABLE 'large_table' WITH (
-    spanner.databoost.enabled = 'true',        -- Enable DataBoost for backfill
-    spanner.partition_query.parallelism = '10' -- 10 concurrent partition queries
+    spanner.databoost.enabled = 'true'         -- Enable DataBoost for backfill
 );
 ```
 
 **Important**:
-- `spanner.databoost.enabled` and `spanner.partition_query.parallelism` are table-level properties, not source-level
+- `spanner.databoost.enabled` is a table-level property, not source-level
 - DataBoost requires IAM permission `spanner.databases.useDataBoost` on the service account
 - If DataBoost permission is not available, set `spanner.databoost.enabled = 'false'` to use regular Spanner resources
 
@@ -515,7 +513,6 @@ When you create a table FROM a Spanner CDC source, RisingWave performs:
 **Backfill Implementation**:
 - Uses `BatchReadOnlyTransaction.partition_query_with_option()` API
 - Automatically discovers table schema via INFORMATION_SCHEMA
-- Supports parallel execution via `spanner.partition_query.parallelism`
 - DataBoost can be enabled via `spanner.databoost.enabled` for large tables
 
 **Timestamp Coordination**:
