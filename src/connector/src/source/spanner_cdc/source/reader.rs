@@ -44,11 +44,13 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use futures_async_stream::try_stream;
-use google_cloud_spanner::client::Client;
+use google_cloud_spanner::client::DatabaseClient;
 use google_cloud_spanner::statement::Statement;
-use risingwave_common::bail;
-use risingwave_common::ensure;
+use google_cloud_spanner::types;
+
+#[allow(unused_imports)]
 use risingwave_common::metrics::GLOBAL_ERROR_METRICS;
+use risingwave_common::{bail, ensure};
 use risingwave_pb::connector_service::{SourceType, cdc_message};
 use time::OffsetDateTime;
 use tokio::sync::mpsc;
@@ -59,11 +61,10 @@ use crate::error::{ConnectorError, ConnectorResult as Result};
 use crate::parser::ParserConfig;
 use crate::source::cdc::DebeziumCdcMeta;
 use crate::source::spanner_cdc::schema_track::SchemaTracker;
-use crate::source::spanner_cdc::types::ChangeStreamRecord;
 use crate::source::spanner_cdc::{SpannerCdcProperties, SpannerCdcSplit};
 use crate::source::{
-    BoxSourceChunkStream, Column, SourceContextRef, SourceMessage, SourceMeta, SplitId, SplitReader,
-    into_chunk_stream,
+    BoxSourceChunkStream, Column, SourceContextRef, SourceMessage, SourceMeta, SplitId,
+    SplitReader, into_chunk_stream,
 };
 
 const DEFAULT_CHANNEL_SIZE: usize = 16;
@@ -103,7 +104,7 @@ impl SplitReader for SpannerCdcSplitReader {
             .and_then(|s| s.offset);
 
         let client = properties.create_client().await?;
-        let heartbeat_interval_ms = properties.heartbeat_interval_ms()?;
+        let heartbeat_interval_ms = properties.heartbeat_milliseconds;
 
         let ctx = ReaderContext {
             client,
@@ -170,7 +171,7 @@ impl SpannerCdcSplitReader {
 // ---------------------------------------------------------------------------
 
 struct ReaderContext {
-    client: Client,
+    client: DatabaseClient,
     database: String,
     change_stream_name: String,
     heartbeat_interval_ms: i64,
@@ -620,7 +621,7 @@ fn spawn_partition_task(
 // ---------------------------------------------------------------------------
 
 async fn read_partition(
-    client: Client,
+    client: DatabaseClient,
     database: String,
     mut split: SpannerCdcSplit,
     change_stream_name: String,
@@ -643,25 +644,27 @@ async fn read_partition(
         ))
     })?;
 
-    let mut stmt = Statement::new(format!(
-        "SELECT ChangeRecord FROM READ_{} (@start_timestamp, @end_timestamp, @partition_token, @heartbeat_milliseconds)",
+    // Workaround: the googleapis SDK's `OffsetDateTime::to_value()` formats
+    // timestamps with 9-digit subsecond precision (nanoseconds, padded with
+    // zeros for microsecond-precision values). Spanner's TIMESTAMP literal
+    // parser rejects that, so we format the timestamp ourselves with
+    // microsecond precision and bind it as a string.
+    let sql = format!(
+        "SELECT ChangeRecord FROM READ_{}(start_timestamp => @start_timestamp, end_timestamp => @end_timestamp, partition_token => @partition_token, heartbeat_milliseconds => @heartbeat_milliseconds)",
         change_stream_name
-    ));
-    stmt.add_param("end_timestamp", &Option::<OffsetDateTime>::None);
-    if let Some(ref token) = split.partition_token {
-        stmt.add_param("partition_token", token);
-    } else {
-        stmt.add_param("partition_token", &Option::<String>::None);
-    }
-    stmt.add_param("heartbeat_milliseconds", &heartbeat_interval_ms);
+    );
 
     tracing::info!(%split_id, %start_ts, partition_token = ?split.partition_token, "change stream query starting");
 
     if retry_attempts == 0 {
-        stmt.add_param("start_timestamp", &start_ts);
+        let stmt = Statement::builder(&sql)
+            .add_typed_param("start_timestamp", &start_ts, types::timestamp())
+            .add_typed_param("end_timestamp", &Option::<OffsetDateTime>::None, types::timestamp())
+            .add_typed_param("partition_token", &split.partition_token, types::string())
+            .add_typed_param("heartbeat_milliseconds", &heartbeat_interval_ms, types::int64())
+            .build();
         return execute_query(
             &client,
-            &database_name,
             &stmt,
             &mut split,
             &split_id,
@@ -676,7 +679,9 @@ async fn read_partition(
     }
 
     let retry_strategy = ExponentialBackoff::from_millis(retry_backoff.as_millis() as u64)
-        .max_delay(tokio::time::Duration::from_millis(retry_backoff_max_delay_ms))
+        .max_delay(tokio::time::Duration::from_millis(
+            retry_backoff_max_delay_ms,
+        ))
         .factor(retry_backoff_factor)
         .take(retry_attempts as usize)
         .map(jitter);
@@ -687,7 +692,12 @@ async fn read_partition(
         let resume_ts = split
             .offset
             .expect("offset validated at entry and only advanced by advance_offset");
-        stmt.add_param("start_timestamp", &resume_ts);
+        let stmt = Statement::builder(&sql)
+            .add_typed_param("start_timestamp", &resume_ts, types::timestamp())
+            .add_typed_param("end_timestamp", &Option::<OffsetDateTime>::None, types::timestamp())
+            .add_typed_param("partition_token", &split.partition_token, types::string())
+            .add_typed_param("heartbeat_milliseconds", &heartbeat_interval_ms, types::int64())
+            .build();
         match execute_query(
             &client,
             &stmt,
@@ -727,7 +737,7 @@ async fn read_partition(
 }
 
 async fn execute_query(
-    client: &Client,
+    client: &DatabaseClient,
     stmt: &Statement,
     split: &mut SpannerCdcSplit,
     split_id: &SplitId,
@@ -738,27 +748,24 @@ async fn execute_query(
     child_discovery_tx: &tokio::sync::mpsc::UnboundedSender<SpannerCdcSplit>,
     change_stream_name: &str,
 ) -> Result<()> {
-    let mut txn = client
-        .single()
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to create transaction: {}", e))?;
+    let txn = client.single_use().build();
     let mut result_set = txn
-        .query(stmt.clone())
+        .execute_query(stmt.clone())
         .await
         .map_err(|e| anyhow::anyhow!("failed to execute query: {}", e))?;
 
     while let Some(row) = result_set
         .next()
         .await
+        .transpose()
         .map_err(|e| anyhow::anyhow!("failed to get next row: {}", e))?
     {
         if tx.is_closed() {
             return Ok(());
         }
 
-        let change_records: Vec<ChangeStreamRecord> = row
-            .column(0)
-            .map_err(|e| anyhow::anyhow!("failed to get ChangeRecord column: {}", e))?;
+        let change_records =
+            crate::source::spanner_cdc::types::parse_change_record_column(&row, 0)?;
 
         for record in change_records {
             let mut messages = Vec::new();
@@ -798,7 +805,6 @@ async fn execute_query(
                         split_id,
                         schema_payload.json,
                         data_change,
-                        database_name,
                         &offset_str,
                     );
                     if tx.send(vec![schema_msg]).await.is_err() {
@@ -883,8 +889,7 @@ async fn execute_query(
 // ---------------------------------------------------------------------------
 
 fn make_offset_string(offset_micros: i64) -> String {
-    let spanner_offset =
-        crate::source::cdc::external::spanner::SpannerOffset::new(offset_micros);
+    let spanner_offset = crate::source::cdc::external::spanner::SpannerOffset::new(offset_micros);
     let cdc_offset = crate::source::cdc::external::CdcOffset::Spanner(spanner_offset);
     serde_json::to_string(&cdc_offset).unwrap_or_else(|_| offset_micros.to_string())
 }
@@ -893,7 +898,6 @@ fn make_schema_change_msg(
     split_id: &SplitId,
     payload: Vec<u8>,
     data_change: &crate::source::spanner_cdc::types::DataChangeRecord,
-    database_name: &str,
     offset_str: &str,
 ) -> SourceMessage {
     SourceMessage {
@@ -916,8 +920,9 @@ fn make_schema_change_msg(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use time::macros::datetime;
+
+    use super::*;
 
     fn make_child(token: &str, parents: Vec<&str>, offset: OffsetDateTime) -> SpannerCdcSplit {
         SpannerCdcSplit::new_child(
@@ -1024,10 +1029,7 @@ mod tests {
         let discovered = HashMap::new();
 
         // Parent "PX" was never discovered — should return false (child waits forever).
-        assert!(!parents_all_finished(
-            &["PX".to_string()],
-            &discovered
-        ));
+        assert!(!parents_all_finished(&["PX".to_string()], &discovered));
     }
 
     // -----------------------------------------------------------------------
@@ -1178,7 +1180,14 @@ mod tests {
         tx.send(make_child("C2", vec!["P1"], ts)).unwrap();
         tx.send(make_child("C3", vec!["P1"], ts)).unwrap();
 
-        ingest_children(&mut rx, &mut discovered, &mut deferred, &mut ready_pool, &offsets, &split_id);
+        ingest_children(
+            &mut rx,
+            &mut discovered,
+            &mut deferred,
+            &mut ready_pool,
+            &offsets,
+            &split_id,
+        );
 
         assert_eq!(deferred.len(), 3, "all 3 children should be in deferred");
     }
@@ -1200,7 +1209,14 @@ mod tests {
         tx.send(make_child("C2", vec!["P1"], ts)).unwrap();
         tx.send(make_child("C1", vec!["P1"], ts)).unwrap(); // duplicate
 
-        ingest_children(&mut rx, &mut discovered, &mut deferred, &mut ready_pool, &offsets, &split_id);
+        ingest_children(
+            &mut rx,
+            &mut discovered,
+            &mut deferred,
+            &mut ready_pool,
+            &offsets,
+            &split_id,
+        );
 
         assert_eq!(deferred.len(), 2, "duplicate C1 should be deduped");
     }
@@ -1225,7 +1241,14 @@ mod tests {
         tx.send(make_child("C1", vec!["P1"], ts)).unwrap();
         tx.send(make_child("C2", vec!["P2"], ts)).unwrap();
 
-        ingest_children(&mut rx, &mut discovered, &mut deferred, &mut ready_pool, &offsets, &split_id);
+        ingest_children(
+            &mut rx,
+            &mut discovered,
+            &mut deferred,
+            &mut ready_pool,
+            &offsets,
+            &split_id,
+        );
 
         assert_eq!(ready_pool.len(), 1, "C1 should be in ready_pool");
         assert_eq!(ready_pool[0].partition_token, Some("C1".to_string()));
@@ -1249,7 +1272,14 @@ mod tests {
         tx.send(make_child("C1", vec!["P1"], ts)).unwrap();
 
         assert_eq!(offsets.watermark(), None);
-        ingest_children(&mut rx, &mut discovered, &mut deferred, &mut ready_pool, &offsets, &split_id);
+        ingest_children(
+            &mut rx,
+            &mut discovered,
+            &mut deferred,
+            &mut ready_pool,
+            &offsets,
+            &split_id,
+        );
         assert_eq!(offsets.watermark(), Some(ts), "offset should be registered");
     }
 
@@ -1333,12 +1363,26 @@ mod tests {
 
         // First call: C1 ingested.
         tx.send(make_child("C1", vec!["P1"], ts)).unwrap();
-        ingest_children(&mut rx, &mut discovered, &mut deferred, &mut ready_pool, &offsets, &split_id);
+        ingest_children(
+            &mut rx,
+            &mut discovered,
+            &mut deferred,
+            &mut ready_pool,
+            &offsets,
+            &split_id,
+        );
         assert_eq!(deferred.len(), 1);
 
         // Second call: same C1 again — should be deduped.
         tx.send(make_child("C1", vec!["P1"], ts)).unwrap();
-        ingest_children(&mut rx, &mut discovered, &mut deferred, &mut ready_pool, &offsets, &split_id);
+        ingest_children(
+            &mut rx,
+            &mut discovered,
+            &mut deferred,
+            &mut ready_pool,
+            &offsets,
+            &split_id,
+        );
         assert_eq!(deferred.len(), 1, "duplicate C1 should be deduped");
     }
 
@@ -1352,7 +1396,14 @@ mod tests {
         let offsets = PartitionOffsets::new();
         let split_id = SplitId::from("test".to_string());
 
-        ingest_children(&mut rx, &mut discovered, &mut deferred, &mut ready_pool, &offsets, &split_id);
+        ingest_children(
+            &mut rx,
+            &mut discovered,
+            &mut deferred,
+            &mut ready_pool,
+            &offsets,
+            &split_id,
+        );
 
         assert!(deferred.is_empty());
         assert!(ready_pool.is_empty());
@@ -1447,7 +1498,10 @@ mod tests {
             }
         })
         .await;
-        assert!(closed.is_ok(), "channel should close after sibling tasks are aborted");
+        assert!(
+            closed.is_ok(),
+            "channel should close after sibling tasks are aborted"
+        );
     }
 
     #[tokio::test]
@@ -1504,7 +1558,9 @@ mod tests {
         .await;
 
         assert!(test_result.is_ok(), "should complete within timeout");
-        let inner_error = test_result.unwrap().expect("should have captured the panic error");
+        let inner_error = test_result
+            .unwrap()
+            .expect("should have captured the panic error");
         assert!(
             inner_error.to_string().contains("task panicked"),
             "error should indicate a panic, got: {}",
@@ -1519,6 +1575,9 @@ mod tests {
             }
         })
         .await;
-        assert!(closed.is_ok(), "channel should close after sibling tasks are aborted");
+        assert!(
+            closed.is_ok(),
+            "channel should close after sibling tasks are aborted"
+        );
     }
 }

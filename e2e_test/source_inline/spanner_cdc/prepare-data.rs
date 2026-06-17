@@ -1,46 +1,51 @@
 #!/usr/bin/env -S cargo -Zscript
 ---cargo
+edition = "2021"
+
 [dependencies]
 anyhow = "1"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time"] }
-google-cloud-spanner = { package = "gcloud-spanner", version = "1", features = ["auth"] }
-google-cloud-gax = { package = "gcloud-gax", version = "1.3" }
-google-cloud-googleapis = { package = "gcloud-googleapis", version = "1", features = ["spanner"] }
-google-cloud-longrunning = { package = "gcloud-longrunning", version = "1.3" }
-google-cloud-auth = { package = "gcloud-auth", version = "1.2", default-features = false }
-rustls = { version = "0.23", features = ["ring"] }
+google-cloud-spanner = { git = "https://github.com/googleapis/google-cloud-rust", rev = "d0d2f50f099248d4795e4f4efa32fbac67e28024" }
+google-cloud-spanner-admin-database-v1 = { git = "https://github.com/googleapis/google-cloud-rust", rev = "d0d2f50f099248d4795e4f4efa32fbac67e28024" }
+google-cloud-auth = { git = "https://github.com/googleapis/google-cloud-rust", rev = "d0d2f50f099248d4795e4f4efa32fbac67e28024" }
+google-cloud-lro = { git = "https://github.com/googleapis/google-cloud-rust", rev = "d0d2f50f099248d4795e4f4efa32fbac67e28024" }
 ---
 use std::env;
 use std::io::{self, Read};
 
-use google_cloud_gax::conn::{ConnectionManager, ConnectionOptions, Environment};
-use google_cloud_googleapis::spanner::admin::database::v1::UpdateDatabaseDdlRequest;
-use google_cloud_googleapis::spanner::v1::{ExecuteSqlRequest, CreateSessionRequest, DeleteSessionRequest, BeginTransactionRequest, CommitRequest, TransactionSelector};
-use google_cloud_googleapis::spanner::v1::{transaction_options, TransactionOptions};
-use google_cloud_googleapis::spanner::v1::commit_request;
-
-use google_cloud_spanner::admin::database::database_admin_client::DatabaseAdminClient;
-use google_cloud_googleapis::spanner::v1::spanner_client::SpannerClient;
-use google_cloud_longrunning::autogen::operations_client::OperationsClient;
-
-// Type alias for the authenticated channel type returned by ConnectionManager
-type Channel = google_cloud_gax::conn::Channel;
-
-const AUDIENCE: &str = "https://spanner.googleapis.com/";
-const SPANNER_DOMAIN: &str = "spanner.googleapis.com";
+use anyhow::Context;
+use google_cloud_lro::Poller;
+use google_cloud_spanner::client::Spanner;
+use google_cloud_spanner::statement::Statement;
+use google_cloud_spanner_admin_database_v1::client::DatabaseAdmin;
 
 fn get_env_or_default(key: &str, default: &str) -> String {
     env::var(key).unwrap_or_else(|_| default.to_string())
 }
 
-fn get_project() -> String { get_env_or_default("SPANNER_PROJECT", "test-project") }
-fn get_instance() -> String { get_env_or_default("SPANNER_INSTANCE", "test-instance") }
-fn get_database() -> String { get_env_or_default("SPANNER_DATABASE", "test-database") }
+fn get_project() -> String {
+    get_env_or_default("SPANNER_PROJECT", "test-project")
+}
+fn get_instance() -> String {
+    get_env_or_default("SPANNER_INSTANCE", "test-instance")
+}
+fn get_database() -> String {
+    get_env_or_default("SPANNER_DATABASE", "test-database")
+}
 const STREAM: &str = "test_stream";
 
 /// Check if we're using emulator (SPANNER_EMULATOR_HOST is set)
 fn is_using_emulator() -> bool {
     env::var("SPANNER_EMULATOR_HOST").is_ok()
+}
+
+fn database_name() -> String {
+    format!(
+        "projects/{}/instances/{}/databases/{}",
+        get_project(),
+        get_instance(),
+        get_database()
+    )
 }
 
 /// Build a `gcloud` command pre-configured for the emulator.
@@ -49,190 +54,84 @@ fn is_using_emulator() -> bool {
 fn emulator_gcloud_command() -> std::process::Command {
     let emulator_host = env::var("SPANNER_EMULATOR_HOST")
         .expect("SPANNER_EMULATOR_HOST must be set for emulator mode");
-    let (host, grpc_port_str) = emulator_host.rsplit_once(':').expect("invalid SPANNER_EMULATOR_HOST format");
-    let grpc_port: u16 = grpc_port_str.parse().expect("invalid port in SPANNER_EMULATOR_HOST");
+    let (host, grpc_port_str) = emulator_host
+        .rsplit_once(':')
+        .expect("invalid SPANNER_EMULATOR_HOST format");
+    let grpc_port: u16 = grpc_port_str
+        .parse()
+        .expect("invalid port in SPANNER_EMULATOR_HOST");
     let rest_port = grpc_port + 10;
 
     let mut cmd = std::process::Command::new("gcloud");
     cmd.env("CLOUDSDK_AUTH_DISABLE_CREDENTIALS", "true")
-       .env("CLOUDSDK_API_ENDPOINT_OVERRIDES_SPANNER", format!("http://{}:{}/", host, rest_port))
-       .env("CLOUDSDK_CORE_PROJECT", get_project());
+        .env(
+            "CLOUDSDK_API_ENDPOINT_OVERRIDES_SPANNER",
+            format!("http://{}:{}/", host, rest_port),
+        )
+        .env("CLOUDSDK_CORE_PROJECT", get_project());
     cmd
 }
 
-/// Create environment for Spanner connection (emulator or real)
-async fn create_environment() -> anyhow::Result<Environment> {
-    if let Ok(host) = env::var("SPANNER_EMULATOR_HOST") {
-        // Emulator mode
-        Ok(Environment::Emulator(host))
-    } else {
-        // Real Spanner mode - use default authentication
-        // This will read GOOGLE_APPLICATION_CREDENTIALS_JSON or GOOGLE_APPLICATION_CREDENTIALS
-        use google_cloud_auth::token::DefaultTokenSourceProvider;
-        use google_cloud_auth::project::Config;
-
-        // Scopes required for Spanner
-        const SCOPES: &[&str] = &[
-            "https://www.googleapis.com/auth/cloud-platform",
-            "https://www.googleapis.com/auth/spanner.data",
-        ];
-
-        let config = Config::default().with_scopes(SCOPES);
-        let token_source_provider = DefaultTokenSourceProvider::new(config).await?;
-
-        // Debug: Print the SA email to confirm auth is working
-        if let Some(ref sa) = token_source_provider.source_credentials {
-            eprintln!("  Using Spanner SA: {}", sa.client_email.as_ref().unwrap_or(&"(unknown)".to_string()));
-        }
-
-        Ok(Environment::GoogleCloud(Box::new(token_source_provider)))
-    }
+/// Create a Spanner client, auto-detecting emulator via SPANNER_EMULATOR_HOST.
+async fn create_spanner() -> anyhow::Result<Spanner> {
+    Spanner::builder()
+        .build()
+        .await
+        .context("failed to build Spanner client")
 }
 
-/// Create Spanner admin client for DDL operations
-async fn create_admin_client() -> anyhow::Result<DatabaseAdminClient> {
-    let environment = create_environment().await?;
-
-    let conn_pool = ConnectionManager::new(
-        1,
-        SPANNER_DOMAIN,
-        AUDIENCE,
-        &environment,
-        &ConnectionOptions::default(),
-    ).await?;
-
-    let lro_client = OperationsClient::new(conn_pool.conn()).await?;
-    Ok(DatabaseAdminClient::new(conn_pool.conn(), lro_client))
+/// Create a DatabaseAdmin client for DDL operations.
+async fn create_admin_client() -> anyhow::Result<DatabaseAdmin> {
+    let spanner = create_spanner().await?;
+    let admin = spanner
+        .database_admin_builder()
+        .build()
+        .await
+        .context("failed to build DatabaseAdmin client")?;
+    Ok(admin)
 }
 
-/// Create Spanner client for DML operations
-async fn create_spanner_client() -> anyhow::Result<SpannerClient<Channel>> {
-    let environment = create_environment().await?;
-
-    let conn_pool = ConnectionManager::new(
-        1,
-        SPANNER_DOMAIN,
-        AUDIENCE,
-        &environment,
-        &ConnectionOptions::default(),
-    ).await?;
-
-    Ok(SpannerClient::new(conn_pool.conn()))
-}
-
-/// Execute DDL statement using DatabaseAdminClient
+/// Execute a DDL statement using DatabaseAdminClient.
 async fn execute_ddl(ddl: &str) -> anyhow::Result<()> {
-    let db_client = create_admin_client().await?;
+    let admin = create_admin_client().await?;
 
-    let database_name = format!(
-        "projects/{}/instances/{}/databases/{}",
-        get_project(),
-        get_instance(),
-        get_database()
-    );
+    let poller = admin
+        .update_database_ddl()
+        .set_database(database_name())
+        .set_statements([ddl.to_string()])
+        .poller();
 
-    // operation_id should be empty string for most cases
-    // (only needed for retrying operations)
-    let request = UpdateDatabaseDdlRequest {
-        database: database_name,
-        operation_id: "".to_string(),
-        statements: vec![ddl.to_string()],
-        proto_descriptors: vec![],
-        throughput_mode: false,
-    };
-
-    let mut operation = db_client.update_database_ddl(request, None).await?;
-
-    // Wait for the DDL operation to complete
-    let _ = operation.wait(None).await;
+    poller
+        .until_done()
+        .await
+        .context("DDL operation failed")?;
 
     println!("  DDL operation completed");
     Ok(())
 }
 
-/// Execute SQL using SpannerClient
-/// For DML statements, this uses a read-write transaction.
-/// For DDL statements, use execute_ddl() instead.
+/// Execute DML (INSERT, UPDATE, DELETE) inside a read-write transaction.
 async fn execute_sql(sql: &str) -> anyhow::Result<()> {
-    let mut spanner_client = create_spanner_client().await?;
+    let spanner = create_spanner().await?;
+    let db_client = spanner
+        .database_client(database_name())
+        .build()
+        .await
+        .context("failed to build DatabaseClient")?;
 
-    let database_name = format!(
-        "projects/{}/instances/{}/databases/{}",
-        get_project(),
-        get_instance(),
-        get_database()
-    );
+    let runner = db_client
+        .read_write_transaction()
+        .build()
+        .await
+        .context("failed to build read-write transaction")?;
 
-    let session = spanner_client
-        .create_session(CreateSessionRequest {
-            database: database_name,
-            session: None,
+    runner
+        .run(async |tx| {
+            tx.execute_update(Statement::builder(sql).build()).await?;
+            Ok(())
         })
-        .await?
-        .into_inner();
-
-    let session_name = session.name.clone();
-
-    // Begin a read-write transaction for DML
-    let begin_txn_response = spanner_client
-        .begin_transaction(BeginTransactionRequest {
-            session: session_name.clone(),
-            options: Some(TransactionOptions {
-                mode: Some(transaction_options::Mode::ReadWrite(transaction_options::ReadWrite::default())),
-                exclude_txn_from_change_streams: false,
-                isolation_level: 0,
-            }),
-            mutation_key: None,
-            request_options: None,
-        })
-        .await?;
-
-    let transaction_id = begin_txn_response.into_inner().id;
-    let transaction_selector = Some(TransactionSelector {
-        selector: Some(google_cloud_googleapis::spanner::v1::transaction_selector::Selector::Id(
-            transaction_id.clone(),
-        )),
-    });
-
-    // Execute the SQL with the transaction
-    let request = ExecuteSqlRequest {
-        session: session_name.clone(),
-        sql: sql.to_string(),
-        transaction: transaction_selector,
-        params: None,
-        param_types: Default::default(),
-        resume_token: vec![],
-        query_mode: 0,
-        partition_token: vec![],
-        seqno: 0,
-        query_options: None,
-        request_options: None,
-        directed_read_options: None,
-        data_boost_enabled: false,
-        last_statement: false,
-    };
-
-    let _ = spanner_client.execute_sql(request).await?;
-
-    // Commit the transaction
-    spanner_client
-        .commit(CommitRequest {
-            session: session_name.clone(),
-            transaction: Some(commit_request::Transaction::TransactionId(transaction_id)),
-            mutations: vec![],
-            max_commit_delay: None,
-            precommit_token: None,
-            return_commit_stats: false,
-            request_options: None,
-        })
-        .await?;
-
-    // Delete the session
-    let _ = spanner_client
-        .delete_session(DeleteSessionRequest {
-            name: session_name,
-        })
-        .await;
+        .await
+        .context("read-write transaction failed")?;
 
     Ok(())
 }
@@ -248,7 +147,9 @@ fn read_sql() -> String {
 
     // Otherwise, read from stdin
     let mut buffer = String::new();
-    io::stdin().read_to_string(&mut buffer).expect("Failed to read SQL from stdin");
+    io::stdin()
+        .read_to_string(&mut buffer)
+        .expect("Failed to read SQL from stdin");
     buffer.trim().to_string()
 }
 
@@ -258,9 +159,6 @@ fn read_sql() -> String {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Install default CryptoProvider for rustls TLS
-    rustls::crypto::ring::default_provider().install_default().unwrap();
-
     let args: Vec<String> = env::args().collect();
     let command = args.get(1).map(|s| s.as_str()).unwrap_or("help");
 
@@ -286,7 +184,10 @@ async fn main() -> anyhow::Result<()> {
                 println!("  Creating instance...");
                 let output = emulator_gcloud_command()
                     .args([
-                        "spanner", "instances", "create", &instance,
+                        "spanner",
+                        "instances",
+                        "create",
+                        &instance,
                         "--config=emulator-config",
                         "--description=Test Instance",
                         "--nodes=1",
@@ -302,7 +203,10 @@ async fn main() -> anyhow::Result<()> {
                 println!("  Creating database...");
                 let output = emulator_gcloud_command()
                     .args([
-                        "spanner", "databases", "create", &database,
+                        "spanner",
+                        "databases",
+                        "create",
+                        &database,
                         &format!("--instance={}", instance),
                     ])
                     .output()?;
@@ -342,6 +246,10 @@ async fn main() -> anyhow::Result<()> {
         }
         "insert-data" => {
             println!("Inserting test data...");
+            // Idempotent: delete existing rows first, then re-insert. Re-runs
+            // of the SLT refresh the seed data without duplicate-key errors.
+            let delete_sql = "DELETE FROM users WHERE true";
+            execute_sql(delete_sql).await?;
             let sql = "INSERT INTO users (id, name, email, age) VALUES ('1', 'Alice', 'alice@example.com', 30), ('2', 'Bob', 'bob@example.com', 25)";
             execute_sql(sql).await?;
             println!("Test data inserted (Alice, Bob)");
@@ -349,7 +257,9 @@ async fn main() -> anyhow::Result<()> {
         "dml" => {
             let sql = read_sql();
             if sql.is_empty() {
-                eprintln!("Error: No SQL provided. Use: prepare-data.rs dml \"<SQL>\" or echo \"<SQL>\" | prepare-data.rs dml");
+                eprintln!(
+                    "Error: No SQL provided. Use: prepare-data.rs dml \"<SQL>\" or echo \"<SQL>\" | prepare-data.rs dml"
+                );
                 std::process::exit(1);
             }
             execute_sql(&sql).await?;
@@ -358,7 +268,9 @@ async fn main() -> anyhow::Result<()> {
         "ddl" => {
             let ddl = read_sql();
             if ddl.is_empty() {
-                eprintln!("Error: No DDL provided. Use: prepare-data.rs ddl \"<DDL>\" or echo \"<DDL>\" | prepare-data.rs ddl");
+                eprintln!(
+                    "Error: No DDL provided. Use: prepare-data.rs ddl \"<DDL>\" or echo \"<DDL>\" | prepare-data.rs ddl"
+                );
                 std::process::exit(1);
             }
             execute_ddl(&ddl).await?;
@@ -381,7 +293,9 @@ async fn main() -> anyhow::Result<()> {
             eprintln!("  ddl \"<DDL>\"          Execute DDL (CREATE, ALTER, DROP)");
             eprintln!();
             eprintln!("Examples:");
-            eprintln!("  prepare-data.rs dml \"INSERT INTO users (id, name) VALUES ('1', 'Alice')\"");
+            eprintln!(
+                "  prepare-data.rs dml \"INSERT INTO users (id, name) VALUES ('1', 'Alice')\""
+            );
             eprintln!("  prepare-data.rs ddl \"ALTER TABLE users ADD COLUMN city STRING(MAX)\"");
             eprintln!("  echo \"UPDATE users SET age = 30 WHERE id = '1'\" | prepare-data.rs dml");
             eprintln!();
