@@ -1114,15 +1114,10 @@ fn derive_with_options_for_cdc_table(
                 // Insert table name into connect properties
                 with_options.insert(TABLE_NAME_KEY.into(), table_name.into());
 
-                // For Spanner CDC, auto-generate spanner.snapshot_ts from current time.
-                use risingwave_connector::source::cdc::external::{
-                    SPANNER_DATABOOST_ENABLED_KEY,
-                    SPANNER_SNAPSHOT_TS_KEY,
-                    spanner::now_micros,
-                };
-
-                let snapshot_ts = now_micros()?;
-                with_options.insert(SPANNER_SNAPSHOT_TS_KEY.to_string(), snapshot_ts.to_string());
+                // Spanner CDC uses strong (latest) reads for the backfill snapshot and
+                // derives the CDC offset from each read's resolved timestamp, so there is
+                // no pinned snapshot timestamp to inject here.
+                use risingwave_connector::source::cdc::external::SPANNER_DATABOOST_ENABLED_KEY;
 
                 // Inject table-level Spanner CDC properties
                 if let Some(databoost) = table_with_options.get(SPANNER_DATABOOST_ENABLED_KEY) {
