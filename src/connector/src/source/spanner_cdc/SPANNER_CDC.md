@@ -516,9 +516,13 @@ When you create a table FROM a Spanner CDC source, RisingWave performs:
 - DataBoost can be enabled via `spanner.databoost.enabled` for large tables
 
 **Timestamp Coordination**:
-- Backfill uses `spanner.snapshot_ts` (auto-generated at table creation time)
+- Backfill uses **strong (latest) reads**, so each snapshot reflects the current
+  committed state at read time — there is no pinned snapshot timestamp.
+- The CDC offset is the read timestamp resolved by a strong read-only transaction
+  (`current_cdc_offset()`), the Spanner analogue of Postgres's current WAL LSN.
 - CDC streaming starts from `spanner.start_timestamp` (user-provided or auto-generated at source creation time)
-- `CdcBackfillExecutor` coordinates the two phases automatically
+- `CdcBackfillExecutor` coordinates the two phases automatically, bracketing the
+  change-log against each snapshot read via the CDC offset (matches Postgres/MySQL).
 
 ### Rate Limiting
 
