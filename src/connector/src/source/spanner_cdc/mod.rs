@@ -138,13 +138,6 @@ pub struct SpannerCdcProperties {
     #[serde(skip_serializing)]
     _auto_schema_change: Option<String>,
 
-    /// Snapshot timestamp for Spanner CDC (microseconds since epoch).
-    /// i64 type provides a free validity check on the stored value.
-    #[serde(rename = "spanner.snapshot_ts", default)]
-    #[serde(deserialize_with = "crate::deserialize_i64_from_string_opt")]
-    #[serde(skip_serializing)]
-    _snapshot_ts: Option<i64>,
-
     /// Enable databoost for Spanner CDC backfill
     #[serde(rename = "spanner.databoost.enabled", default)]
     #[serde(skip_serializing)]
