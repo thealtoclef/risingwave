@@ -14,10 +14,23 @@
 
 //! Spanner external table reader for CDC backfill.
 //!
-//! Provides snapshot reads using Spanner's [`BatchReadOnlyTransaction`] to ensure
-//! all reads observe the same consistent snapshot. The snapshot timestamp is
-//! set at CREATE TABLE time (not at CREATE SOURCE time), following the same
-//! pattern as Postgres CDC (`pg_current_wal_lsn()`) and MySQL CDC (`SHOW MASTER STATUS`).
+//! Snapshot reads use **strong** (latest) reads, so every read observes the
+//! current committed state at read time — exactly like Postgres/MySQL CDC. This
+//! is what lets the CDC backfill executor safely drop change-log events ahead of
+//! the backfill cursor: the snapshot that eventually covers that key is
+//! guaranteed to contain its latest state.
+//!
+//! `current_cdc_offset()` returns the read timestamp resolved by a strong
+//! read-only transaction — the latest commit position visible "now". This is the
+//! Spanner analogue of Postgres CDC's `pg_current_wal_lsn()` / MySQL's
+//! `SHOW MASTER STATUS`, and is used to bracket the change-log against each
+//! snapshot read.
+//!
+//! NOTE: we deliberately do *not* pin reads to a fixed snapshot timestamp. A
+//! fixed past timestamp would (1) hide rows written after it that sort ahead of
+//! the cursor — those change-log events get dropped and never re-supplied,
+//! losing data — and (2) risk exceeding Spanner's `version_retention_period` on
+//! long backfills.
 
 use std::str::FromStr;
 
@@ -32,7 +45,9 @@ use google_cloud_spanner::client::{DatabaseClient, Spanner};
 use google_cloud_spanner::model::PartitionOptions;
 use google_cloud_spanner::result::Row as SpannerRow;
 use google_cloud_spanner::statement::Statement;
-use google_cloud_spanner::transaction::{MultiUseReadOnlyTransaction, TimestampBound};
+use google_cloud_spanner::transaction::{
+    BeginTransactionOption, MultiUseReadOnlyTransaction, TimestampBound,
+};
 use time::OffsetDateTime;
 
 use risingwave_common::bail;
@@ -47,13 +62,12 @@ use crate::source::cdc::external::{
     ExternalTableReader, SchemaTableName,
 };
 
-/// Upper bound on intra-actor partition concurrency for snapshot reads.
+/// A position in the Spanner change stream, used as the CDC offset.
 ///
-/// Each partition executes against a dedicated gRPC stream and buffers its
-/// Spanner offset representing a position in the change stream.
-///
-/// Uses the commit timestamp (microseconds since epoch) as the ordering key.
-/// Includes partition metadata for checkpoint / restoration.
+/// Ordered by the commit timestamp (microseconds since epoch), which is what the
+/// backfill merge compares change-log events against. Also carries per-partition
+/// change-stream metadata (partition token, stream name, progress) for checkpoint
+/// and restoration.
 #[derive(Debug, Clone, Default, PartialEq, PartialOrd, serde::Serialize, serde::Deserialize)]
 pub struct SpannerOffset {
     /// Commit timestamp of the change stream position (microseconds since epoch).
@@ -226,13 +240,10 @@ impl SpannerExternalTable {
 /// 2. **Intra-actor**: Within each PK range, uses Spanner's partition_query to
 ///    further parallelize reads using BatchReadOnlyTransaction
 ///
-/// The snapshot timestamp is generated at table creation time (in the frontend)
-/// and stored in `connect_properties` as `spanner.snapshot_ts`. This ensures
-/// the same timestamp is used across all splits and all recoveries.
-///
-/// The snapshot timestamp serves as the CDC offset for filtering changes:
-/// - Backfill reads at snapshot timestamp
-/// - CDC streaming phase filters: commit_ts > snapshot_ts
+/// All snapshot reads use **strong** (latest) reads. The CDC offset is the read
+/// timestamp resolved by a strong read-only transaction, obtained on demand in
+/// [`ExternalTableReader::current_cdc_offset`]. There is no pinned snapshot
+/// timestamp.
 pub struct SpannerExternalTableReader {
     rw_schema: Schema,
     field_names: String,
@@ -240,9 +251,6 @@ pub struct SpannerExternalTableReader {
     pk_types: Vec<DataType>,
     table_name: String,
     enable_databoost: bool,
-    /// Snapshot timestamp from config (set by frontend at table creation).
-    /// Used for consistent snapshot reads and CDC filtering.
-    snapshot_ts: Option<i64>,
     /// Database client. Shared across transactions and partition executions.
     db_client: DatabaseClient,
 }
@@ -256,7 +264,6 @@ impl SpannerExternalTableReader {
 
     pub async fn new(config: ExternalTableConfig, schema: Schema) -> ConnectorResult<Self> {
         let enable_databoost = config.spanner_databoost_enabled;
-        let snapshot_ts = config.spanner_snapshot_ts;
         let db_client = create_spanner_client(
             &config.spanner_project,
             &config.spanner_instance,
@@ -295,7 +302,6 @@ impl SpannerExternalTableReader {
             pk_types,
             table_name: external_table.table_name().to_string(),
             enable_databoost,
-            snapshot_ts,
             db_client,
         })
     }
@@ -303,12 +309,27 @@ impl SpannerExternalTableReader {
 
 impl ExternalTableReader for SpannerExternalTableReader {
     async fn current_cdc_offset(&self) -> ConnectorResult<CdcOffset> {
-        // Return the snapshot timestamp from config (set by frontend at table creation).
-        // This serves as the CDC offset for filtering changes (commit_ts > snapshot_ts).
-        let timestamp = self.snapshot_ts.ok_or_else(|| {
-            anyhow!("spanner.snapshot_ts not found in connect_properties - table must be recreated")
+        // The current CDC offset is the latest commit position visible "now" — the
+        // Spanner analogue of Postgres's `pg_current_wal_lsn()`.
+        //
+        // We obtain it from the read timestamp that Spanner resolves for a strong
+        // read-only transaction. Using `ExplicitBegin` forces a `BeginTransaction`
+        // RPC at build time, so the read timestamp is available immediately without
+        // executing any query (no `SELECT CURRENT_TIMESTAMP` round-trip needed).
+        let txn = self
+            .db_client
+            .read_only_transaction()
+            .with_begin_transaction_option(BeginTransactionOption::ExplicitBegin)
+            // No `set_timestamp_bound`: the transaction defaults to a strong (latest) read.
+            .build()
+            .await
+            .context("failed to begin strong read-only transaction for current CDC offset")?;
+        let read_ts = txn.read_timestamp().ok_or_else(|| {
+            anyhow!("Spanner did not return a read timestamp for the strong read-only transaction")
         })?;
-        Ok(CdcOffset::Spanner(SpannerOffset::new(timestamp)))
+        Ok(CdcOffset::Spanner(SpannerOffset::new(spanner_ts_to_micros(
+            &read_ts,
+        ))))
     }
 
     fn snapshot_read(
@@ -504,25 +525,18 @@ impl SpannerExternalTableReader {
     async fn as_even_splits(&self, options: CdcTableSnapshotSplitOption) {
         let split_column = self.split_column(&options);
 
-        // Create a read-only transaction at the snapshot timestamp for consistency.
-        let snapshot_timestamp = self.snapshot_ts.ok_or_else(|| {
-            anyhow!("spanner.snapshot_ts not found in connect_properties - table must be recreated")
-        })?;
+        tracing::info!("PK range enumeration started (even splits)");
 
-        tracing::info!(
-            snapshot_timestamp_us = snapshot_timestamp,
-            "PK range enumeration started (even splits)"
-        );
-
-        let timestamp = micros_to_spanner_ts(snapshot_timestamp);
-        let tb = TimestampBound::read_timestamp(timestamp);
+        // Use a strong (latest) read. Splits always cover (-inf, +inf) via the
+        // unbounded first/last splits, so generating boundaries from the current
+        // data distribution is safe even as the table changes.
         let mut txn = self
             .db_client
             .read_only_transaction()
-            .set_timestamp_bound(tb)
+            .set_timestamp_bound(TimestampBound::strong())
             .build()
             .await
-            .context("failed to create read-only transaction at snapshot timestamp")?;
+            .context("failed to create strong read-only transaction")?;
 
         let Some((min_value, max_value)) = self.min_and_max(&mut txn, &split_column).await? else {
             // Table is empty, return a single empty split
@@ -588,25 +602,18 @@ impl SpannerExternalTableReader {
     async fn as_uneven_splits(&self, options: CdcTableSnapshotSplitOption) {
         let split_column = self.split_column(&options);
 
-        // Create a read-only transaction at the snapshot timestamp for consistency.
-        let snapshot_timestamp = self.snapshot_ts.ok_or_else(|| {
-            anyhow!("spanner.snapshot_ts not found in connect_properties - table must be recreated")
-        })?;
+        tracing::info!("PK range enumeration started (uneven splits)");
 
-        tracing::info!(
-            snapshot_timestamp_us = snapshot_timestamp,
-            "PK range enumeration started (uneven splits)"
-        );
-
-        let timestamp = micros_to_spanner_ts(snapshot_timestamp);
-        let tb = TimestampBound::read_timestamp(timestamp);
+        // Use a strong (latest) read. Splits always cover (-inf, +inf) via the
+        // unbounded first/last splits, so generating boundaries from the current
+        // data distribution is safe even as the table changes.
         let mut txn = self
             .db_client
             .read_only_transaction()
-            .set_timestamp_bound(tb)
+            .set_timestamp_bound(TimestampBound::strong())
             .build()
             .await
-            .context("failed to create read-only transaction at snapshot timestamp")?;
+            .context("failed to create strong read-only transaction")?;
 
         let Some((min_value, max_value)) = self.min_and_max(&mut txn, &split_column).await? else {
             // Table is empty, return a single empty split
@@ -755,22 +762,16 @@ impl SpannerExternalTableReader {
             Statement::builder(&sql).build()
         };
 
-        // Create a read-only transaction at the snapshot timestamp for consistency.
-        // Note: We use regular read_only_transaction (not batch) because the query
-        // has LIMIT clause which cannot be partitioned.
-        let snapshot_timestamp = self.snapshot_ts.ok_or_else(|| {
-            anyhow!("spanner.snapshot_ts not found in connect_properties - table must be recreated")
-        })?;
-
-        let timestamp = micros_to_spanner_ts(snapshot_timestamp);
-        let tb = TimestampBound::read_timestamp(timestamp);
+        // Use a strong (latest) read so the snapshot reflects the current committed
+        // state at read time. Note: we use a regular read_only_transaction (not batch)
+        // because the query has a LIMIT clause, which cannot be partitioned.
         let txn = self
             .db_client
             .read_only_transaction()
-            .set_timestamp_bound(tb)
+            .set_timestamp_bound(TimestampBound::strong())
             .build()
             .await
-            .context("failed to create read-only transaction at snapshot timestamp")?;
+            .context("failed to create strong read-only transaction")?;
 
         // Execute the query directly (no partition, since LIMIT queries can't be partitioned)
         let mut rows = txn
@@ -790,9 +791,10 @@ impl SpannerExternalTableReader {
     /// 2. **Intra-actor**: Within this PK range, uses Spanner's partition_query
     ///    to further parallelize reads
     ///
-    /// Creates a NEW BatchReadOnlyTransaction at the snapshot timestamp from config
-    /// (set by frontend at table creation), then uses partition_query with WHERE
-    /// clause filtering for intra-actor parallelism.
+    /// Creates a strong (latest) BatchReadOnlyTransaction, then uses partition_query
+    /// with WHERE clause filtering for intra-actor parallelism. The change-log is
+    /// reconciled against this read via the offsets captured by
+    /// [`ExternalTableReader::current_cdc_offset`] before and after the read.
     #[try_stream(boxed, ok = OwnedRow, error = ConnectorError)]
     async fn split_snapshot_read_inner(
         &self,
@@ -821,29 +823,23 @@ impl SpannerExternalTableReader {
         let is_first_split = left[0].is_none();
         let is_last_split = right[0].is_none();
 
-        // Snapshot timestamp is guaranteed to exist by the frontend.
-        let split_snapshot_ts = self.snapshot_ts.ok_or_else(|| {
-            anyhow!("spanner.snapshot_ts not found in connect_properties - table must be recreated")
-        })?;
-
         tracing::info!(
-            "split_snapshot_read: PK range=[{:?}, {:?}), snapshot_ts={}",
+            "split_snapshot_read: PK range=[{:?}, {:?}), strong read",
             left[0],
             right[0],
-            split_snapshot_ts
         );
 
-        // Create a NEW BatchReadOnlyTransaction at the exact same snapshot timestamp
-        // This is the key to snapshot consistency across all actors
-        let timestamp = micros_to_spanner_ts(split_snapshot_ts);
-        let tb = TimestampBound::read_timestamp(timestamp);
+        // Create a strong (latest) BatchReadOnlyTransaction so the read reflects the
+        // current committed state. Each split/actor reads at its own resolved
+        // timestamp; cross-split consistency is provided by change-log reconciliation,
+        // not by a shared pinned timestamp (matches Postgres/MySQL CDC).
         let txn = self
             .db_client
             .batch_read_only_transaction()
-            .set_timestamp_bound(tb)
+            .set_timestamp_bound(TimestampBound::strong())
             .build()
             .await
-            .context("failed to create batch read-only transaction at snapshot timestamp")?;
+            .context("failed to create strong batch read-only transaction")?;
 
         // Build query with PK range WHERE clause using parameter binding
         // Follows Postgres CDC pattern: split on single column specified by backfill_split_pk_column_index
@@ -1138,12 +1134,14 @@ pub fn micros_to_offset_datetime(micros: i64) -> ConnectorResult<OffsetDateTime>
     )
 }
 
-/// Convert microseconds since epoch to a `google_cloud_wkt::Timestamp`.
-fn micros_to_spanner_ts(micros: i64) -> google_cloud_wkt::Timestamp {
-    google_cloud_wkt::Timestamp::clamp(
-        micros.div_euclid(1_000_000),
-        (micros.rem_euclid(1_000_000) * 1000) as i32,
-    )
+/// Convert a `google_cloud_wkt::Timestamp` to microseconds since epoch.
+///
+/// Sub-microsecond nanos are truncated; `SpannerOffset` tracks microsecond
+/// precision, matching how change-stream commit timestamps are stored.
+fn spanner_ts_to_micros(ts: &google_cloud_wkt::Timestamp) -> i64 {
+    ts.seconds()
+        .saturating_mul(1_000_000)
+        .saturating_add((ts.nanos() as i64) / 1000)
 }
 
 // ---------------------------------------------------------------------------
@@ -1371,6 +1369,19 @@ mod tests {
     fn test_spanner_offset() {
         let offset = SpannerOffset::new(1234567890);
         assert_eq!(offset.timestamp, 1234567890);
+    }
+
+    #[test]
+    fn test_spanner_ts_to_micros() {
+        // Whole seconds.
+        let ts = google_cloud_wkt::Timestamp::clamp(1_700_000_000, 0);
+        assert_eq!(spanner_ts_to_micros(&ts), 1_700_000_000_000_000);
+        // Sub-microsecond nanos are truncated.
+        let ts = google_cloud_wkt::Timestamp::clamp(5, 123_456);
+        assert_eq!(spanner_ts_to_micros(&ts), 5_000_123);
+        // Epoch.
+        let ts = google_cloud_wkt::Timestamp::clamp(0, 0);
+        assert_eq!(spanner_ts_to_micros(&ts), 0);
     }
 
     #[test]
