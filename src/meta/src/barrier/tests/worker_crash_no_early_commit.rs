@@ -571,12 +571,14 @@ async fn test_bootstrap_recovery_partial_graph_reset_after_failure() {
         timezone: None,
         config_override: None,
         adaptive_parallelism_strategy: None,
+        backfill_adaptive_parallelism_strategy: None,
         parallelism: StreamingParallelism::Fixed(1),
         backfill_parallelism: None,
         backfill_orders: None,
         max_parallelism: 1,
         specific_resource_group: Some(resource_group.to_owned()),
         is_serverless_backfill: false,
+        refresh_interval_sec: None,
     };
     let job_model1 = build_job_model(job_id1, worker1_group);
     let job_model2 = build_job_model(job_id2, worker2_group);
@@ -635,7 +637,7 @@ async fn test_bootstrap_recovery_partial_graph_reset_after_failure() {
                 StreamingJobExtraInfo {
                     timezone: None,
                     config_override: Arc::<str>::from(""),
-                    adaptive_parallelism_strategy: None,
+                    refresh_interval_sec: None,
                     job_definition: "".to_owned(),
                     backfill_orders: None,
                 },
@@ -645,7 +647,7 @@ async fn test_bootstrap_recovery_partial_graph_reset_after_failure() {
                 StreamingJobExtraInfo {
                     timezone: None,
                     config_override: Arc::<str>::from(""),
-                    adaptive_parallelism_strategy: None,
+                    refresh_interval_sec: None,
                     job_definition: "".to_owned(),
                     backfill_orders: None,
                 },
@@ -655,7 +657,7 @@ async fn test_bootstrap_recovery_partial_graph_reset_after_failure() {
                 StreamingJobExtraInfo {
                     timezone: None,
                     config_override: Arc::<str>::from(""),
-                    adaptive_parallelism_strategy: None,
+                    refresh_interval_sec: None,
                     job_definition: "".to_owned(),
                     backfill_orders: None,
                 },
@@ -665,7 +667,7 @@ async fn test_bootstrap_recovery_partial_graph_reset_after_failure() {
                 StreamingJobExtraInfo {
                     timezone: None,
                     config_override: Arc::<str>::from(""),
-                    adaptive_parallelism_strategy: None,
+                    refresh_interval_sec: None,
                     job_definition: "".to_owned(),
                     backfill_orders: None,
                 },
