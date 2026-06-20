@@ -122,7 +122,7 @@ impl<S: StateStore, const UPSERT: bool> WatermarkFilterExecutorInner<S, UPSERT> 
         table.init_epoch(first_epoch).await?;
 
         // Initiate and yield the first watermark.
-        let (mut current_watermark, has_watermark_row) = Self::get_global_max_watermark(
+        let (mut current_watermark, has_any_watermark) = Self::get_global_max_watermark(
             &table,
             &global_watermark_table,
             HummockReadEpoch::Committed(prev_epoch),
@@ -134,8 +134,8 @@ impl<S: StateStore, const UPSERT: bool> WatermarkFilterExecutorInner<S, UPSERT> 
         // Watermark state is persisted only after backfill (a value or a NULL
         // marker row), so any persisted row proves backfill is done. The mutation
         // and its recovery re-send cover the window before the first checkpoint.
-        let mut backfill_done = !emit_only || has_watermark_row;
-        let mut has_marker_row = has_watermark_row;
+        let mut backfill_done = !emit_only || has_any_watermark;
+        let mut has_persisted_watermark = has_any_watermark;
 
         if let Some(watermark) = current_watermark.clone()
             && !is_paused
@@ -271,7 +271,7 @@ impl<S: StateStore, const UPSERT: bool> WatermarkFilterExecutorInner<S, UPSERT> 
                             &mut backfill_done,
                             &mut current_watermark,
                             &mut last_checkpoint_watermark,
-                            &mut has_marker_row,
+                            &mut has_persisted_watermark,
                         )
                         .await?;
                     }
@@ -282,14 +282,14 @@ impl<S: StateStore, const UPSERT: bool> WatermarkFilterExecutorInner<S, UPSERT> 
                             last_checkpoint_watermark.clone_from(&current_watermark);
                             if let Some(watermark) = current_watermark.clone() {
                                 Self::persist_watermark(&mut table, Some(watermark));
-                                has_marker_row = true;
+                                has_persisted_watermark = true;
                             }
                         }
                         // Emit-only: write a NULL marker row when no event-time data has
                         // arrived yet, so a restarted/scaled-out actor can re-arm.
-                        if emit_only && !has_marker_row {
+                        if emit_only && !has_persisted_watermark {
                             Self::persist_watermark(&mut table, None);
-                            has_marker_row = true;
+                            has_persisted_watermark = true;
                         }
                     }
                     let post_commit = table.commit(barrier.epoch).await?;
@@ -324,7 +324,7 @@ impl<S: StateStore, const UPSERT: bool> WatermarkFilterExecutorInner<S, UPSERT> 
                     }
 
                     if need_update_global_max_watermark {
-                        let (watermark, has_watermark_row) = Self::get_global_max_watermark(
+                        let (watermark, has_any_watermark) = Self::get_global_max_watermark(
                             &table,
                             &global_watermark_table,
                             HummockReadEpoch::Committed(prev_epoch),
@@ -332,8 +332,8 @@ impl<S: StateStore, const UPSERT: bool> WatermarkFilterExecutorInner<S, UPSERT> 
                         .await?;
                         current_watermark = watermark;
                         // Scaled-out actors miss BackfillFinished; re-arm from state.
-                        backfill_done = backfill_done || has_watermark_row;
-                        has_marker_row = has_marker_row || has_watermark_row;
+                        backfill_done = backfill_done || has_any_watermark;
+                        has_persisted_watermark = has_persisted_watermark || has_any_watermark;
                     }
 
                     if is_checkpoint && !is_paused {
@@ -393,7 +393,7 @@ impl<S: StateStore, const UPSERT: bool> WatermarkFilterExecutorInner<S, UPSERT> 
         backfill_done: &mut bool,
         current_watermark: &mut Option<ScalarImpl>,
         last_checkpoint_watermark: &mut Option<ScalarImpl>,
-        has_marker_row: &mut bool,
+        has_persisted_watermark: &mut bool,
     ) -> StreamExecutorResult<()> {
         match mutation {
             Mutation::BackfillFinished(m) if m.table_ids.contains(&table_id.as_raw_id()) => {
@@ -403,7 +403,7 @@ impl<S: StateStore, const UPSERT: bool> WatermarkFilterExecutorInner<S, UPSERT> 
                 *backfill_done = false;
                 *current_watermark = None;
                 *last_checkpoint_watermark = None;
-                *has_marker_row = false;
+                *has_persisted_watermark = false;
                 Self::clear_persisted_watermark(table).await?;
             }
             _ => {}
