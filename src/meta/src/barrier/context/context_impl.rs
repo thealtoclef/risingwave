@@ -99,12 +99,43 @@ impl GlobalBarrierWorkerContext for GlobalBarrierWorkerContextImpl {
         self.env
             .notification_manager()
             .notify_local_subscribers(LocalNotification::StreamingJobBackfillFinished(job_id));
+        self.try_schedule_backfill_finished(job_id).await?;
         Ok(())
     }
 
     #[await_tree::instrument("finish_cdc_table_backfill({job})")]
     async fn finish_cdc_table_backfill(&self, job: JobId) -> MetaResult<()> {
-        CdcTableBackfillTracker::mark_complete_job(&self.env.meta_store().conn, job).await
+        CdcTableBackfillTracker::mark_complete_job(&self.env.meta_store().conn, job).await?;
+        self.try_schedule_backfill_finished(job).await?;
+        Ok(())
+    }
+
+    async fn resend_backfill_finished_on_recovery(
+        &self,
+        database_id: DatabaseId,
+    ) -> MetaResult<()> {
+        let catalog = &self.metadata_manager.catalog_controller;
+        let tables_with_created_status: HashSet<TableId> =
+            catalog.get_created_table_ids().await?.into_iter().collect();
+        // Only re-arm tables whose backfill is finished (job is `Created`).
+        // Batch all emit-only tables into a single barrier per database.
+        let table_ids: Vec<TableId> = catalog
+            .list_all_state_tables()
+            .await?
+            .into_iter()
+            .filter(|table| {
+                table.database_id == database_id
+                    && tables_with_created_status.contains(&table.id)
+                    && Self::is_emit_only_watermark_table(table)
+            })
+            .map(|table| table.id)
+            .collect();
+        if !table_ids.is_empty() {
+            self.barrier_scheduler
+                .run_command_no_wait(database_id, Command::BackfillFinished { table_ids })
+                .context("Failed to re-send BackfillFinished command on recovery")?;
+        }
+        Ok(())
     }
 
     #[await_tree::instrument("new_control_stream({})", node.id)]
@@ -290,6 +321,51 @@ impl GlobalBarrierWorkerContextImpl {
 
     fn set_status(&self, new_status: BarrierManagerStatus) {
         self.status.store(Arc::new(new_status));
+    }
+
+    /// A CDC table with a non-TTL watermark (emit-only). TTL watermarks populate
+    /// `clean_watermark_indices`; its absence together with a non-empty
+    /// `watermark_indices` is the discriminator.
+    fn is_emit_only_watermark_table(table: &risingwave_pb::catalog::Table) -> bool {
+        table.cdc_table_id.is_some()
+            && !table.watermark_indices.is_empty()
+            && table.clean_watermark_indices.is_empty()
+    }
+
+    /// Arm the emit-only watermark filter now that backfill is done. No-op for
+    /// non-CDC jobs, TTL watermarks, and tables without a watermark. Invoked from
+    /// both job-finish seams (V1 `finish_creating_job` + V2 `finish_cdc_table_backfill`);
+    /// idempotent and harmless to call from both.
+    async fn try_schedule_backfill_finished(&self, job_id: JobId) -> MetaResult<()> {
+        let table_id = job_id.as_mv_table_id();
+        let table = match self
+            .metadata_manager
+            .catalog_controller
+            .get_table_by_id(table_id)
+            .await
+        {
+            Ok(table) => table,
+            // The finished job is not a table (e.g. a sink or index): nothing to do.
+            Err(err) if err.is_catalog_id_not_found("table") => return Ok(()),
+            Err(err) => return Err(err),
+        };
+        if !Self::is_emit_only_watermark_table(&table) {
+            return Ok(());
+        }
+        let database_id = self
+            .metadata_manager
+            .catalog_controller
+            .get_object_database_id(table_id)
+            .await?;
+        self.barrier_scheduler
+            .run_command_no_wait(
+                database_id,
+                Command::BackfillFinished {
+                    table_ids: vec![table_id],
+                },
+            )
+            .context("Failed to schedule BackfillFinished command")?;
+        Ok(())
     }
 
     /// Load the context metadata and resolve upstream log epochs for a batch refresh trigger.

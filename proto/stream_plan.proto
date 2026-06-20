@@ -210,11 +210,23 @@ message BarrierMutation {
     // Reset CDC backfill state so the executor re-runs the full initial snapshot.
     // Triggered after a schema change adds a column with an expression default.
     ResetBackfillMutation reset_backfill = 20;
+    // Notify emit-only watermark filters that a CDC table's backfill has finished,
+    // so they may start emitting and persisting watermarks. Best-effort re-sent on
+    // recovery. After the first post-backfill checkpoint the filter self-arms from
+    // its persisted backfill-done marker.
+    BackfillFinishedMutation backfill_finished = 21;
   }
 }
 
 message ResetBackfillMutation {
   // IDs of the RisingWave tables whose backfill state should be reset.
+  repeated uint32 table_ids = 1;
+}
+
+message BackfillFinishedMutation {
+  // IDs of the RisingWave tables whose CDC backfill has finished. An emit-only
+  // watermark filter whose own table id is contained here starts emitting and
+  // persisting its watermark.
   repeated uint32 table_ids = 1;
 }
 
@@ -955,6 +967,14 @@ message WatermarkFilterNode {
   repeated catalog.WatermarkDesc watermark_descs = 1;
   // The tables used to persist watermarks, the key is vnode.
   repeated catalog.Table tables = 2;
+  // Emit-only mode: produce and propagate the watermark downstream but never drop
+  // any input row. Set by the planner for non-append-only (e.g. CDC) tables that
+  // declare a non-TTL watermark, so downstream operators can bound their state
+  // while this table retains all historical rows.
+  bool emit_only = 3;
+  // The owning job/table id, filled by meta's `fill_job`. Used by an emit-only
+  // filter to self-target the `BackfillFinished` mutation.
+  uint32 table_id = 4;
 }
 
 // Acts like a merger, but on different inputs.

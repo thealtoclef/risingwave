@@ -616,8 +616,12 @@ impl<C: GlobalBarrierWorkerContext> GlobalBarrierWorker<C> {
                                 }
                             }
                             CheckpointControlEvent::EnteringRunning(entering_running) => {
-                                self.context.mark_ready(MarkReadyOptions::Database(entering_running.database_id()));
+                                let database_id = entering_running.database_id();
+                                self.context.mark_ready(MarkReadyOptions::Database(database_id));
                                 entering_running.enter();
+                                if let Err(err) = self.context.resend_backfill_finished_on_recovery(database_id).await {
+                                    error!(%database_id, err = %err.as_report(), "failed to re-send BackfillFinished after database recovery");
+                                }
                             }
                             CheckpointControlEvent::BatchRefreshTrigger { database_id, job_id } => {
                                 self.handle_batch_refresh_trigger(database_id, job_id).await?;
@@ -1006,6 +1010,20 @@ impl<C: GlobalBarrierWorkerContext> GlobalBarrierWorker<C> {
         self.context.mark_ready(MarkReadyOptions::Global {
             blocked_databases: self.checkpoint_control.recovering_databases().collect(),
         });
+
+        // Re-arm emit-only filters of recovered databases. Complements the per-database
+        // `EnteringRunning` hook; calling from both is harmless — the mutation is
+        // idempotent and batched. Best-effort.
+        let running_databases: Vec<_> = self.checkpoint_control.running_databases().collect();
+        for database_id in running_databases {
+            if let Err(err) = self
+                .context
+                .resend_backfill_finished_on_recovery(database_id)
+                .await
+            {
+                error!(%database_id, err = %err.as_report(), "failed to re-send BackfillFinished after global recovery");
+            }
+        }
     }
 
     #[await_tree::instrument("recovery({recovery_reason})")]

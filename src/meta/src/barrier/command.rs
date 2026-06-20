@@ -560,6 +560,12 @@ pub enum Command {
         table_id: TableId,
     },
 
+    /// `BackfillFinished` arms emit-only watermark filters when a CDC table's backfill
+    /// finishes. Scheduled once on completion; re-sent batched per database on recovery.
+    BackfillFinished {
+        table_ids: Vec<TableId>,
+    },
+
     /// `ResumeBackfill` command generates a `StartFragmentBackfill` barrier to force backfill
     /// to resume for troubleshooting.
     ResumeBackfill {
@@ -656,6 +662,9 @@ impl std::fmt::Display for Command {
             ),
             Command::ResetSource { source_id } => write!(f, "ResetSource: {source_id}"),
             Command::ResetBackfill { table_id } => write!(f, "ResetBackfill: {table_id}"),
+            Command::BackfillFinished { table_ids } => {
+                write!(f, "BackfillFinished: {}", table_ids.iter().join(", "))
+            }
             Command::ResumeBackfill { target } => match target {
                 ResumeBackfillTarget::Job(job_id) => {
                     write!(f, "ResumeBackfill: job={job_id}")
@@ -1461,6 +1470,13 @@ impl Command {
     pub(super) fn reset_backfill_to_mutation(table_id: TableId) -> Mutation {
         Mutation::ResetBackfill(risingwave_pb::stream_plan::ResetBackfillMutation {
             table_ids: vec![table_id.as_raw_id()],
+        })
+    }
+
+    /// Build the `BackfillFinished` mutation.
+    pub(super) fn backfill_finished_to_mutation(table_ids: &[TableId]) -> Mutation {
+        Mutation::BackfillFinished(risingwave_pb::stream_plan::BackfillFinishedMutation {
+            table_ids: table_ids.iter().map(|id| id.as_raw_id()).collect(),
         })
     }
 

@@ -393,6 +393,7 @@ pub enum Mutation {
         source_id: SourceId,
     },
     ResetBackfill(risingwave_pb::stream_plan::ResetBackfillMutation),
+    BackfillFinished(risingwave_pb::stream_plan::BackfillFinishedMutation),
     InjectSourceOffsets {
         source_id: SourceId,
         /// Split ID -> offset (JSON-encoded based on connector type)
@@ -579,6 +580,7 @@ impl Barrier {
             | Mutation::LoadFinish { .. }
             | Mutation::ResetSource { .. }
             | Mutation::ResetBackfill(_)
+            | Mutation::BackfillFinished(_)
             | Mutation::InjectSourceOffsets { .. } => false,
         }
     }
@@ -950,6 +952,7 @@ impl Mutation {
                 })
             }
             Mutation::ResetBackfill(m) => PbMutation::ResetBackfill(m.clone()),
+            Mutation::BackfillFinished(m) => PbMutation::BackfillFinished(m.clone()),
             Mutation::InjectSourceOffsets {
                 source_id,
                 split_offsets,
@@ -1132,6 +1135,7 @@ impl Mutation {
                 source_id: SourceId::from(reset_source.source_id),
             },
             PbMutation::ResetBackfill(m) => Mutation::ResetBackfill(m.clone()),
+            PbMutation::BackfillFinished(m) => Mutation::BackfillFinished(m.clone()),
             PbMutation::InjectSourceOffsets(inject) => Mutation::InjectSourceOffsets {
                 source_id: SourceId::from(inject.source_id),
                 split_offsets: inject.split_offsets.clone(),

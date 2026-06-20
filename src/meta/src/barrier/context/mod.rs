@@ -105,6 +105,11 @@ pub(super) trait GlobalBarrierWorkerContext: Send + Sync + 'static {
         job_id: JobId,
     ) -> impl Future<Output = MetaResult<()>> + Send + '_;
 
+    async fn resend_backfill_finished_on_recovery(
+        &self,
+        database_id: DatabaseId,
+    ) -> MetaResult<()>;
+
     fn new_control_stream<'a>(
         &'a self,
         node: &'a WorkerNode,

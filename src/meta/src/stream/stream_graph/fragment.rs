@@ -221,6 +221,9 @@ impl BuildingFragment {
                     table_desc.table_id = job_id.as_mv_table_id();
                 }
             }
+            NodeBody::WatermarkFilter(node) => {
+                node.table_id = job_id.as_mv_table_id().as_raw_id();
+            }
             NodeBody::VectorIndexWrite(node) => {
                 let table = node.table.as_mut().unwrap();
                 table.id = job_id.as_mv_table_id();

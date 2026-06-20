@@ -33,17 +33,12 @@ pub struct StreamWatermarkFilter {
     pub base: PlanBase<Stream>,
     input: PlanRef,
     watermark_descs: Vec<WatermarkDesc>,
+    emit_only: bool,
 }
 
 impl StreamWatermarkFilter {
     pub fn new(input: PlanRef, watermark_descs: Vec<WatermarkDesc>) -> Self {
-        if watermark_descs.iter().any(|d| !d.with_ttl) {
-            assert!(
-                input.append_only(),
-                "StreamWatermarkFilter on non-TTL watermark only supports append-only input, got {}",
-                input.stream_kind()
-            );
-        }
+        let emit_only = !input.append_only() && watermark_descs.iter().any(|d| !d.with_ttl);
 
         let ctx = input.ctx();
         let mut watermark_columns = input.watermark_columns().clone();
@@ -65,18 +60,20 @@ impl StreamWatermarkFilter {
             // watermark filter preserves input order and hence monotonicity
             input.columns_monotonicity().clone(),
         );
-        Self::with_base(base, input, watermark_descs)
+        Self::with_base(base, input, watermark_descs, emit_only)
     }
 
     fn with_base(
         base: PlanBase<Stream>,
         input: PlanRef,
         watermark_descs: Vec<WatermarkDesc>,
+        emit_only: bool,
     ) -> Self {
         Self {
             base,
             input,
             watermark_descs,
+            emit_only,
         }
     }
 }
@@ -111,7 +108,8 @@ impl Distill for StreamWatermarkFilter {
         ];
         childless_record(
             plan_node_name!("StreamWatermarkFilter",
-               { "upsert", self.input().stream_kind().is_upsert() }
+               { "upsert", self.input().stream_kind().is_upsert() },
+               { "emit_only", self.emit_only }
             ),
             fields,
         )
@@ -171,6 +169,9 @@ impl StreamNode for StreamWatermarkFilter {
                     .with_id(state.gen_table_id_wrapped())
                     .to_internal_table_prost(),
             ],
+            emit_only: self.emit_only,
+            // Left as 0 here; meta's `fill_job` fills the owning table id.
+            table_id: 0,
         }))
     }
 }

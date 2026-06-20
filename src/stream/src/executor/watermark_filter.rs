@@ -15,6 +15,7 @@
 use std::cmp;
 
 use futures::future::{try_join, try_join_all};
+use risingwave_common::catalog::TableId;
 use risingwave_common::hash::VnodeBitmapExt;
 use risingwave_common::types::DefaultOrd;
 use risingwave_common::{bail, row};
@@ -46,6 +47,12 @@ pub struct WatermarkFilterExecutorInner<S: StateStore, const UPSERT: bool> {
     global_watermark_table: BatchTable<S>,
 
     eval_error_report: ActorEvalErrorReport,
+
+    /// Emit-only: propagate the watermark downstream but never drop rows. Emission
+    /// held back until CDC backfill finishes (snapshot order ≠ event-time order).
+    emit_only: bool,
+    /// Owning table id for self-targeting `BackfillFinished` (emit-only only).
+    table_id: TableId,
 }
 
 pub type WatermarkFilterExecutor<S> = WatermarkFilterExecutorInner<S, false>;
@@ -60,6 +67,8 @@ impl<S: StateStore, const UPSERT: bool> WatermarkFilterExecutorInner<S, UPSERT> 
         table: StateTable<S>,
         global_watermark_table: BatchTable<S>,
         eval_error_report: ActorEvalErrorReport,
+        emit_only: bool,
+        table_id: TableId,
     ) -> Self {
         Self {
             ctx,
@@ -69,6 +78,8 @@ impl<S: StateStore, const UPSERT: bool> WatermarkFilterExecutorInner<S, UPSERT> 
             table,
             global_watermark_table,
             eval_error_report,
+            emit_only,
+            table_id,
         }
     }
 }
@@ -91,6 +102,8 @@ impl<S: StateStore, const UPSERT: bool> WatermarkFilterExecutorInner<S, UPSERT> 
             mut table,
             mut global_watermark_table,
             eval_error_report,
+            emit_only,
+            table_id,
         } = *self;
 
         let watermark_type = watermark_expr.return_type();
@@ -109,7 +122,7 @@ impl<S: StateStore, const UPSERT: bool> WatermarkFilterExecutorInner<S, UPSERT> 
         table.init_epoch(first_epoch).await?;
 
         // Initiate and yield the first watermark.
-        let mut current_watermark = Self::get_global_max_watermark(
+        let (mut current_watermark, has_watermark_row) = Self::get_global_max_watermark(
             &table,
             &global_watermark_table,
             HummockReadEpoch::Committed(prev_epoch),
@@ -118,8 +131,15 @@ impl<S: StateStore, const UPSERT: bool> WatermarkFilterExecutorInner<S, UPSERT> 
 
         let mut last_checkpoint_watermark = None;
 
+        // Watermark state is persisted only after backfill (a value or a NULL
+        // marker row), so any persisted row proves backfill is done. The mutation
+        // and its recovery re-send cover the window before the first checkpoint.
+        let mut backfill_done = !emit_only || has_watermark_row;
+        let mut has_marker_row = has_watermark_row;
+
         if let Some(watermark) = current_watermark.clone()
             && !is_paused
+            && backfill_done
         {
             yield Message::Watermark(Watermark::new(
                 event_time_col_idx,
@@ -145,18 +165,25 @@ impl<S: StateStore, const UPSERT: bool> WatermarkFilterExecutorInner<S, UPSERT> 
 
                     let watermark_array = watermark_expr.eval_infallible(chunk.data_chunk()).await;
 
-                    // Build the expression to calculate watermark filter.
-                    let watermark_filter_expr = current_watermark
-                        .clone()
-                        .map(|watermark| {
-                            Self::build_watermark_filter_expr(
-                                watermark_type.clone(),
-                                event_time_col_idx,
-                                watermark,
-                                eval_error_report.clone(),
-                            )
-                        })
-                        .transpose()?;
+                    // Build the filter expr only when needed. Non-emit needs it on
+                    // every chunk; emit-only never filters, so skip entirely.
+                    let need_filter_expr =
+                        current_watermark.is_some() && !emit_only;
+                    let watermark_filter_expr = if need_filter_expr {
+                        current_watermark
+                            .clone()
+                            .map(|watermark| {
+                                Self::build_watermark_filter_expr(
+                                    watermark_type.clone(),
+                                    event_time_col_idx,
+                                    watermark,
+                                    eval_error_report.clone(),
+                                )
+                            })
+                            .transpose()?
+                    } else {
+                        None
+                    };
 
                     // NULL watermark should not be considered.
                     let max_watermark = watermark_array
@@ -178,7 +205,9 @@ impl<S: StateStore, const UPSERT: bool> WatermarkFilterExecutorInner<S, UPSERT> 
                         ));
                     }
 
-                    if let Some(expr) = watermark_filter_expr {
+                    if emit_only {
+                        yield Message::Chunk(chunk);
+                    } else if let Some(expr) = watermark_filter_expr {
                         let pred_output = expr.eval_infallible(chunk.data_chunk()).await;
 
                         if let Some(output_chunk) =
@@ -191,7 +220,10 @@ impl<S: StateStore, const UPSERT: bool> WatermarkFilterExecutorInner<S, UPSERT> 
                         yield Message::Chunk(chunk);
                     }
 
-                    if let Some(watermark) = current_watermark.clone() {
+                    // Hold watermark emission until backfill is done (emit-only).
+                    if let Some(watermark) = current_watermark.clone()
+                        && backfill_done
+                    {
                         idle_input = false;
                         yield Message::Watermark(Watermark::new(
                             event_time_col_idx,
@@ -209,6 +241,7 @@ impl<S: StateStore, const UPSERT: bool> WatermarkFilterExecutorInner<S, UPSERT> 
                         let watermark = watermark.val;
                         if let Some(cur_watermark) = current_watermark.clone()
                             && cur_watermark.default_cmp(&watermark).is_lt()
+                            && backfill_done
                         {
                             current_watermark = Some(watermark.clone());
                             idle_input = false;
@@ -226,16 +259,37 @@ impl<S: StateStore, const UPSERT: bool> WatermarkFilterExecutorInner<S, UPSERT> 
                     let prev_epoch = barrier.epoch.prev;
                     let is_checkpoint = barrier.kind.is_checkpoint();
 
-                    if is_checkpoint && last_checkpoint_watermark != current_watermark {
-                        last_checkpoint_watermark.clone_from(&current_watermark);
-                        // Persist the watermark when checkpoint arrives.
-                        if let Some(watermark) = current_watermark.clone() {
-                            for vnode in table.vnodes().clone().iter_vnodes() {
-                                let pk = vnode.to_datum();
-                                let row = [pk, Some(watermark.clone())];
-                                // This is an upsert.
-                                table.insert(row);
+                    // Apply backfill gate mutations before persisting, so any state
+                    // change is reflected in this barrier's commit.
+                    if emit_only
+                        && let Some(mutation) = barrier.mutation.as_deref()
+                    {
+                        Self::apply_backfill_mutation(
+                            mutation,
+                            table_id,
+                            &mut table,
+                            &mut backfill_done,
+                            &mut current_watermark,
+                            &mut last_checkpoint_watermark,
+                            &mut has_marker_row,
+                        )
+                        .await?;
+                    }
+
+                    // Persist watermark at checkpoints once backfill is done.
+                    if is_checkpoint && backfill_done {
+                        if last_checkpoint_watermark != current_watermark {
+                            last_checkpoint_watermark.clone_from(&current_watermark);
+                            if let Some(watermark) = current_watermark.clone() {
+                                Self::persist_watermark(&mut table, Some(watermark));
+                                has_marker_row = true;
                             }
+                        }
+                        // Emit-only: write a NULL marker row when no event-time data has
+                        // arrived yet, so a restarted/scaled-out actor can re-arm.
+                        if emit_only && !has_marker_row {
+                            Self::persist_watermark(&mut table, None);
+                            has_marker_row = true;
                         }
                     }
                     let post_commit = table.commit(barrier.epoch).await?;
@@ -270,12 +324,16 @@ impl<S: StateStore, const UPSERT: bool> WatermarkFilterExecutorInner<S, UPSERT> 
                     }
 
                     if need_update_global_max_watermark {
-                        current_watermark = Self::get_global_max_watermark(
+                        let (watermark, has_watermark_row) = Self::get_global_max_watermark(
                             &table,
                             &global_watermark_table,
                             HummockReadEpoch::Committed(prev_epoch),
                         )
                         .await?;
+                        current_watermark = watermark;
+                        // Scaled-out actors miss BackfillFinished; re-arm from state.
+                        backfill_done = backfill_done || has_watermark_row;
+                        has_marker_row = has_marker_row || has_watermark_row;
                     }
 
                     if is_checkpoint && !is_paused {
@@ -288,7 +346,7 @@ impl<S: StateStore, const UPSERT: bool> WatermarkFilterExecutorInner<S, UPSERT> 
                                 barrier_num_during_idle = 0;
                                 // Align watermark
                                 // NOTE(st1page): Should be `NoWait` because it could lead to a degradation of concurrent checkpoint situations, as it would require waiting for the previous epoch
-                                let global_max_watermark = Self::get_global_max_watermark(
+                                let (global_max_watermark, _) = Self::get_global_max_watermark(
                                     &table,
                                     &global_watermark_table,
                                     HummockReadEpoch::NoWait(prev_epoch),
@@ -307,7 +365,9 @@ impl<S: StateStore, const UPSERT: bool> WatermarkFilterExecutorInner<S, UPSERT> 
                                 } else {
                                     current_watermark.or(global_max_watermark)
                                 };
-                                if let Some(watermark) = current_watermark.clone() {
+                                if let Some(watermark) = current_watermark.clone()
+                                    && backfill_done
+                                {
                                     yield Message::Watermark(Watermark::new(
                                         event_time_col_idx,
                                         watermark_type.clone(),
@@ -323,6 +383,58 @@ impl<S: StateStore, const UPSERT: bool> WatermarkFilterExecutorInner<S, UPSERT> 
                 }
             }
         }
+    }
+
+    /// Handle `BackfillFinished` / `ResetBackfill` mutations for this emit-only filter.
+    async fn apply_backfill_mutation(
+        mutation: &Mutation,
+        table_id: TableId,
+        table: &mut StateTable<S>,
+        backfill_done: &mut bool,
+        current_watermark: &mut Option<ScalarImpl>,
+        last_checkpoint_watermark: &mut Option<ScalarImpl>,
+        has_marker_row: &mut bool,
+    ) -> StreamExecutorResult<()> {
+        match mutation {
+            Mutation::BackfillFinished(m) if m.table_ids.contains(&table_id.as_raw_id()) => {
+                *backfill_done = true;
+            }
+            Mutation::ResetBackfill(m) if m.table_ids.contains(&table_id.as_raw_id()) => {
+                *backfill_done = false;
+                *current_watermark = None;
+                *last_checkpoint_watermark = None;
+                *has_marker_row = false;
+                Self::clear_persisted_watermark(table).await?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Upsert the watermark value (or a NULL marker when `None`) into every owned vnode.
+    fn persist_watermark(table: &mut StateTable<S>, watermark: Option<ScalarImpl>) {
+        for vnode in table.vnodes().clone().iter_vnodes() {
+            // This is an upsert keyed by vnode.
+            table.insert([vnode.to_datum(), watermark.clone()]);
+        }
+    }
+
+    /// Delete every persisted watermark/marker row of this actor. Reads are issued
+    /// concurrently, deletes applied after all reads complete.
+    async fn clear_persisted_watermark(table: &mut StateTable<S>) -> StreamExecutorResult<()> {
+        let vnodes = table.vnodes().clone();
+        let table_ref = &*table;
+        let reads = vnodes.iter_vnodes().map(|vnode| async move {
+            let pk = row::once(vnode.to_datum());
+            table_ref.get_row(pk).await.map(|row| (vnode, row))
+        });
+        let rows = try_join_all(reads).await?;
+        for (vnode, row) in rows {
+            if let Some(row) = row {
+                table.delete([vnode.to_datum(), row[0].clone()]);
+            }
+        }
+        Ok(())
     }
 
     fn build_watermark_filter_expr(
@@ -342,21 +454,24 @@ impl<S: StateStore, const UPSERT: bool> WatermarkFilterExecutorInner<S, UPSERT> 
         )
     }
 
-    /// If the returned if `Ok(None)`, it means there is no global max watermark.
+    /// Returns `(max_watermark, any_row_present)`. A NULL marker row counts as present
+    /// (proves backfill done) but contributes no watermark value.
     async fn get_global_max_watermark(
         table: &StateTable<S>,
         global_watermark_table: &BatchTable<S>,
         wait_epoch: HummockReadEpoch,
-    ) -> StreamExecutorResult<Option<ScalarImpl>> {
+    ) -> StreamExecutorResult<(Option<ScalarImpl>, bool)> {
+        // Returns `(watermark_value, row_present)`. A marker row (NULL value) counts as
+        // present but contributes no watermark value.
         let handle_watermark_row = |watermark_row: Option<OwnedRow>| match watermark_row {
             Some(row) => {
                 if row.len() == 1 {
-                    Ok::<_, StreamExecutorError>(row[0].clone())
+                    Ok::<_, StreamExecutorError>((row[0].clone(), true))
                 } else {
                     bail!("The watermark row should only contain 1 datum");
                 }
             }
-            _ => Ok(None),
+            _ => Ok((None, false)),
         };
         let global_watermark_iter_futures =
             global_watermark_table
@@ -379,14 +494,19 @@ impl<S: StateStore, const UPSERT: bool> WatermarkFilterExecutorInner<S, UPSERT> 
         )
         .await?;
 
-        // Return the minimal value if the remote max watermark is Null.
+        let any_present = global_watermarks
+            .iter()
+            .chain(local_watermarks.iter())
+            .any(|(_, present)| *present);
+
+        // Return the max non-NULL watermark value across all vnodes.
         let watermark = global_watermarks
             .into_iter()
             .chain(local_watermarks.into_iter())
-            .flatten()
+            .filter_map(|(value, _)| value)
             .max_by(DefaultOrd::default_cmp);
 
-        Ok(watermark)
+        Ok((watermark, any_present))
     }
 }
 
@@ -470,6 +590,8 @@ mod tests {
 
     async fn create_watermark_filter_executor(
         mem_state: MemoryStateStore,
+        emit_only: bool,
+        table_id: u32,
     ) -> (Box<dyn Execute>, MessageSender) {
         let schema = Schema {
             fields: vec![
@@ -514,6 +636,8 @@ mod tests {
                 table,
                 storage_table,
                 eval_error_report,
+                emit_only,
+                TableId::new(table_id),
             )
             .boxed(),
             tx,
@@ -543,7 +667,7 @@ mod tests {
 
         let mem_state = MemoryStateStore::new();
 
-        let (executor, mut tx) = create_watermark_filter_executor(mem_state.clone()).await;
+        let (executor, mut tx) = create_watermark_filter_executor(mem_state.clone(), false, 0).await;
         let mut executor = executor.execute();
 
         // push the init barrier
@@ -607,7 +731,7 @@ mod tests {
         drop(executor);
 
         // Build new executor
-        let (executor, mut tx) = create_watermark_filter_executor(mem_state.clone()).await;
+        let (executor, mut tx) = create_watermark_filter_executor(mem_state.clone(), false, 0).await;
         let mut executor = executor.execute();
 
         // push the 1st barrier after failover
@@ -641,5 +765,255 @@ mod tests {
                 Date::from_ymd_uncheck(2022, 11, 13).and_hms_uncheck(0, 0, 0)
             ))
         );
+    }
+
+    #[tokio::test]
+    async fn test_watermark_filter_emit_only() {
+        let mem_state = MemoryStateStore::new();
+        // emit_only = true, owning table id = 1.
+        let (executor, mut tx) =
+            create_watermark_filter_executor(mem_state.clone(), true, 1).await;
+        let mut executor = executor.execute();
+
+        tx.push_barrier(test_epoch(1), false);
+        executor.next().await.unwrap().unwrap();
+
+        // Before backfill finishes: all rows pass through unfiltered and no watermark
+        // is emitted, even though a lower-ts row is present.
+        tx.push_chunk(StreamChunk::from_pretty(
+            "  I TS
+             + 1 2022-11-10T00:00:00
+             + 2 2022-11-01T00:00:00",
+        ));
+        let chunk = executor.next().await.unwrap().unwrap();
+        assert_eq!(
+            chunk.into_chunk().unwrap().compact_vis(),
+            StreamChunk::from_pretty(
+                "  I TS
+                 + 1 2022-11-10T00:00:00
+                 + 2 2022-11-01T00:00:00",
+            )
+        );
+        // The next message is the barrier, proving no watermark was emitted.
+        tx.push_barrier(test_epoch(2), false);
+        assert!(matches!(
+            executor.next().await.unwrap().unwrap(),
+            Message::Barrier(_)
+        ));
+
+        // Deliver BackfillFinished targeting this table id.
+        tx.send_barrier(Barrier::new_test_barrier(test_epoch(3)).with_mutation(
+            Mutation::BackfillFinished(risingwave_pb::stream_plan::BackfillFinishedMutation {
+                table_ids: vec![1],
+            }),
+        ));
+        assert!(matches!(
+            executor.next().await.unwrap().unwrap(),
+            Message::Barrier(_)
+        ));
+
+        // After backfill finishes: rows still pass through and the watermark is emitted.
+        tx.push_chunk(StreamChunk::from_pretty(
+            "  I TS
+             + 3 2022-11-12T00:00:00",
+        ));
+        let chunk = executor.next().await.unwrap().unwrap();
+        assert_eq!(
+            chunk.into_chunk().unwrap().compact_vis(),
+            StreamChunk::from_pretty(
+                "  I TS
+                 + 3 2022-11-12T00:00:00",
+            )
+        );
+        let watermark = executor.next().await.unwrap().unwrap();
+        assert_eq!(
+            watermark.into_watermark().unwrap(),
+            Watermark::new(
+                1,
+                WATERMARK_TYPE.clone(),
+                ScalarImpl::Timestamp(
+                    Date::from_ymd_uncheck(2022, 11, 11).and_hms_uncheck(0, 0, 0)
+                ),
+            )
+        );
+    }
+
+    fn backfill_finished(epoch: u64) -> Barrier {
+        Barrier::new_test_barrier(epoch).with_mutation(Mutation::BackfillFinished(
+            risingwave_pb::stream_plan::BackfillFinishedMutation {
+                table_ids: vec![1],
+            },
+        ))
+    }
+
+    /// After backfill and a persisted watermark, a restarted actor must re-arm from the
+    /// persisted watermark and re-emit it without receiving a fresh `BackfillFinished`.
+    #[tokio::test]
+    async fn test_watermark_filter_emit_only_recovery_rearm() {
+        let mem_state = MemoryStateStore::new();
+        let (executor, mut tx) = create_watermark_filter_executor(mem_state.clone(), true, 1).await;
+        let mut executor = executor.execute();
+
+        tx.push_barrier(test_epoch(1), false);
+        executor.next().await.unwrap().unwrap();
+
+        // Arm via BackfillFinished.
+        tx.send_barrier(backfill_finished(test_epoch(2)));
+        assert!(matches!(
+            executor.next().await.unwrap().unwrap(),
+            Message::Barrier(_)
+        ));
+
+        // Produce a watermark, then persist it at the next checkpoint barrier.
+        tx.push_chunk(StreamChunk::from_pretty(
+            "  I TS
+             + 3 2022-11-12T00:00:00",
+        ));
+        assert!(matches!(
+            executor.next().await.unwrap().unwrap(),
+            Message::Chunk(_)
+        ));
+        assert!(matches!(
+            executor.next().await.unwrap().unwrap(),
+            Message::Watermark(_)
+        ));
+        tx.push_barrier(test_epoch(3), false);
+        assert!(matches!(
+            executor.next().await.unwrap().unwrap(),
+            Message::Barrier(_)
+        ));
+
+        // Restart over the same state store.
+        drop(executor);
+        let (executor, mut tx) = create_watermark_filter_executor(mem_state.clone(), true, 1).await;
+        let mut executor = executor.execute();
+
+        tx.push_barrier(test_epoch(3), false);
+        executor.next().await.unwrap().unwrap(); // barrier
+        // Re-armed from the persisted watermark, the filter re-emits it immediately.
+        let watermark = executor.next().await.unwrap().unwrap();
+        assert_eq!(
+            watermark.into_watermark().unwrap(),
+            Watermark::new(
+                1,
+                WATERMARK_TYPE.clone(),
+                ScalarImpl::Timestamp(
+                    Date::from_ymd_uncheck(2022, 11, 11).and_hms_uncheck(0, 0, 0)
+                ),
+            )
+        );
+    }
+
+    /// Backfill finishes with no event-time data yet (no watermark). A durable NULL
+    /// marker must still be persisted so a restarted actor re-arms and emits once the
+    /// first row arrives, without a fresh `BackfillFinished`.
+    #[tokio::test]
+    async fn test_watermark_filter_emit_only_empty_marker_rearm() {
+        let mem_state = MemoryStateStore::new();
+        let (executor, mut tx) = create_watermark_filter_executor(mem_state.clone(), true, 1).await;
+        let mut executor = executor.execute();
+
+        tx.push_barrier(test_epoch(1), false);
+        executor.next().await.unwrap().unwrap();
+
+        // Arm via BackfillFinished, then checkpoint with no data: persists a NULL marker.
+        tx.send_barrier(backfill_finished(test_epoch(2)));
+        assert!(matches!(
+            executor.next().await.unwrap().unwrap(),
+            Message::Barrier(_)
+        ));
+        tx.push_barrier(test_epoch(3), false);
+        assert!(matches!(
+            executor.next().await.unwrap().unwrap(),
+            Message::Barrier(_)
+        ));
+
+        // Restart; no watermark is persisted (only the marker), so no init watermark.
+        drop(executor);
+        let (executor, mut tx) = create_watermark_filter_executor(mem_state.clone(), true, 1).await;
+        let mut executor = executor.execute();
+
+        tx.push_barrier(test_epoch(3), false);
+        assert!(matches!(
+            executor.next().await.unwrap().unwrap(),
+            Message::Barrier(_)
+        ));
+
+        // The first row after restart must emit a watermark — proving the marker re-armed
+        // the gate without a fresh BackfillFinished.
+        tx.push_chunk(StreamChunk::from_pretty(
+            "  I TS
+             + 3 2022-11-12T00:00:00",
+        ));
+        assert!(matches!(
+            executor.next().await.unwrap().unwrap(),
+            Message::Chunk(_)
+        ));
+        assert!(matches!(
+            executor.next().await.unwrap().unwrap(),
+            Message::Watermark(_)
+        ));
+    }
+
+    /// `ResetBackfill` re-gates an emit-only filter and clears persisted state, so after a
+    /// reset (and a restart) it no longer emits until backfill finishes again.
+    #[tokio::test]
+    async fn test_watermark_filter_emit_only_reset_backfill() {
+        let mem_state = MemoryStateStore::new();
+        let (executor, mut tx) = create_watermark_filter_executor(mem_state.clone(), true, 1).await;
+        let mut executor = executor.execute();
+
+        tx.push_barrier(test_epoch(1), false);
+        executor.next().await.unwrap().unwrap();
+
+        // Arm and persist a watermark.
+        tx.send_barrier(backfill_finished(test_epoch(2)));
+        assert!(matches!(
+            executor.next().await.unwrap().unwrap(),
+            Message::Barrier(_)
+        ));
+        tx.push_chunk(StreamChunk::from_pretty(
+            "  I TS
+             + 3 2022-11-12T00:00:00",
+        ));
+        assert!(matches!(
+            executor.next().await.unwrap().unwrap(),
+            Message::Chunk(_)
+        ));
+        assert!(matches!(
+            executor.next().await.unwrap().unwrap(),
+            Message::Watermark(_)
+        ));
+        tx.push_barrier(test_epoch(3), false);
+        assert!(matches!(
+            executor.next().await.unwrap().unwrap(),
+            Message::Barrier(_)
+        ));
+
+        // Reset backfill: clears state and re-gates.
+        tx.send_barrier(Barrier::new_test_barrier(test_epoch(4)).with_mutation(
+            Mutation::ResetBackfill(risingwave_pb::stream_plan::ResetBackfillMutation {
+                table_ids: vec![1],
+            }),
+        ));
+        assert!(matches!(
+            executor.next().await.unwrap().unwrap(),
+            Message::Barrier(_)
+        ));
+
+        // A row now passes through but no watermark is emitted (re-gated).
+        tx.push_chunk(StreamChunk::from_pretty(
+            "  I TS
+             + 5 2022-11-20T00:00:00",
+        ));
+        assert!(matches!(
+            executor.next().await.unwrap().unwrap(),
+            Message::Chunk(_)
+        ));
+        tx.push_barrier(test_epoch(5), false);
+        assert!(matches!(
+            executor.next().await.unwrap().unwrap(),
+            Message::Barrier(_)
+        ));
     }
 }

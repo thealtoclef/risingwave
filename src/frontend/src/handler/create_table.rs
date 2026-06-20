@@ -1510,18 +1510,6 @@ fn sanity_check_for_table_on_cdc_source(
         .into());
     }
 
-    if !source_watermarks.is_empty()
-        && source_watermarks
-            .iter()
-            .any(|watermark| !watermark.with_ttl)
-    {
-        return Err(ErrorCode::NotSupported(
-            "non-TTL watermark defined on the table created from a CDC source".into(),
-            "Use `WATERMARK ... WITH TTL` instead.".into(),
-        )
-        .into());
-    }
-
     Ok(())
 }
 

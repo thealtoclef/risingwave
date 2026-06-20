@@ -14,7 +14,7 @@
 
 use std::sync::Arc;
 
-use risingwave_common::catalog::{ColumnId, TableDesc};
+use risingwave_common::catalog::{ColumnId, TableDesc, TableId};
 use risingwave_expr::expr::build_non_strict_from_prost;
 use risingwave_pb::stream_plan::WatermarkFilterNode;
 use risingwave_pb::stream_plan::stream_node::PbStreamKind;
@@ -78,6 +78,8 @@ impl ExecutorBuilder for WatermarkFilterBuilder {
                 table,
                 global_watermark_table,
                 params.eval_error_report,
+                node.emit_only,
+                TableId::new(node.table_id),
             )
             .boxed()
         } else {
@@ -89,6 +91,8 @@ impl ExecutorBuilder for WatermarkFilterBuilder {
                 table,
                 global_watermark_table,
                 params.eval_error_report,
+                node.emit_only,
+                TableId::new(node.table_id),
             )
             .boxed()
         };
