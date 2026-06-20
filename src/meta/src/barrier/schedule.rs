@@ -930,6 +930,13 @@ mod tests {
             unimplemented!()
         }
 
+        async fn resend_backfill_finished_on_recovery(
+            &self,
+            _database_id: DatabaseId,
+        ) -> MetaResult<()> {
+            unimplemented!()
+        }
+
         async fn handle_refresh_finished_table_ids(
             &self,
             _refresh_finished_table_ids: Vec<JobId>,
