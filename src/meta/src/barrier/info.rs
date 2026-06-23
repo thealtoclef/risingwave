@@ -789,8 +789,8 @@ impl InflightDatabaseInfo {
                     }
                 }
             }
-            if let Some(cdc_backfill_tracker) = &mut job.cdc_table_backfill_tracker
-                && cdc_backfill_tracker.take_pre_completed()
+            if let Some(tracker) = &mut job.cdc_table_backfill_tracker
+                && tracker.take_pre_completed()
             {
                 finished_cdc_table_backfill.push(*job_id);
             }
