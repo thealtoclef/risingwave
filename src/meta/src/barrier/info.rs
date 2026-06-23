@@ -720,37 +720,44 @@ impl InflightDatabaseInfo {
     }
 
     fn iter_creating_job_tracker(&self) -> impl Iterator<Item = &CreateMviewProgressTracker> {
-        self.jobs.values().filter_map(|job| match &job.status {
-            CreateStreamingJobStatus::Init => None,
-            CreateStreamingJobStatus::Creating { tracker, .. } => Some(tracker),
-            CreateStreamingJobStatus::Created => None,
+        self.jobs.values().filter_map(|job| {
+            let CreateStreamingJobStatus::Creating { tracker } = &job.status else {
+                return None;
+            };
+            if tracker.is_finished()
+                && job
+                    .cdc_table_backfill_tracker
+                    .as_ref()
+                    .is_some_and(|t| !t.is_pre_completed())
+            {
+                return None;
+            }
+            Some(tracker)
         })
     }
 
     fn iter_mut_creating_job_tracker(
         &mut self,
     ) -> impl Iterator<Item = &mut CreateMviewProgressTracker> {
-        self.jobs
-            .values_mut()
-            .filter_map(|job| match &mut job.status {
-                CreateStreamingJobStatus::Init => None,
-                CreateStreamingJobStatus::Creating { tracker, .. } => Some(tracker),
-                CreateStreamingJobStatus::Created => None,
-            })
+        self.jobs.values_mut().filter_map(|job| {
+            let cdc_backfill_pending = job
+                .cdc_table_backfill_tracker
+                .as_ref()
+                .is_some_and(|t| !t.is_pre_completed());
+            match &mut job.status {
+                CreateStreamingJobStatus::Creating { tracker }
+                    if !(tracker.is_finished() && cdc_backfill_pending) =>
+                {
+                    Some(tracker)
+                }
+                _ => None,
+            }
+        })
     }
 
     pub(super) fn has_pending_finished_jobs(&self) -> bool {
-        self.jobs.values().any(|job| {
-            let CreateStreamingJobStatus::Creating { tracker } = &job.status else {
-                return false;
-            };
-            if !tracker.is_finished() {
-                return false;
-            }
-            !job.cdc_table_backfill_tracker
-                .as_ref()
-                .is_some_and(|t| !t.is_pre_completed())
-        })
+        self.iter_creating_job_tracker()
+            .any(|tracker| tracker.is_finished())
     }
 
     pub(super) fn take_pending_backfill_nodes(&mut self) -> Vec<FragmentId> {
