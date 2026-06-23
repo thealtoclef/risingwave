@@ -48,7 +48,7 @@ use crate::barrier::command::{
 use crate::barrier::edge_builder::{
     EdgeBuilderFragmentInfo, FragmentEdgeBuildResult, FragmentEdgeBuilder,
 };
-use crate::barrier::progress::{CreateMviewProgressTracker, StagingCommitInfo, TrackingJob};
+use crate::barrier::progress::{CreateMviewProgressTracker, StagingCommitInfo};
 use crate::barrier::rpc::{ControlStreamManager, to_partial_graph_id};
 use crate::barrier::{
     BackfillProgress, BarrierKind, CreateStreamingJobType, FragmentBackfillProgress, TracedEpoch,
@@ -397,7 +397,6 @@ pub enum SubscriberType {
 pub(super) enum CreateStreamingJobStatus {
     Init,
     Creating { tracker: CreateMviewProgressTracker },
-    CdcBackfilling { tracking_job: TrackingJob },
     Created,
 }
 
@@ -537,7 +536,6 @@ impl InflightDatabaseInfo {
                         },
                     ))
                 }
-                CreateStreamingJobStatus::CdcBackfilling { .. } => None,
                 CreateStreamingJobStatus::Created => None,
             })
     }
@@ -670,7 +668,7 @@ impl InflightDatabaseInfo {
                     continue;
                 }
                 CreateStreamingJobStatus::Creating { tracker, .. } => tracker,
-                CreateStreamingJobStatus::CdcBackfilling { .. } | CreateStreamingJobStatus::Created => {
+                CreateStreamingJobStatus::Created => {
                     if !progress.done {
                         warn!("update the progress of an created streaming job: {progress:?}");
                     }
@@ -725,7 +723,6 @@ impl InflightDatabaseInfo {
         self.jobs.values().filter_map(|job| match &job.status {
             CreateStreamingJobStatus::Init => None,
             CreateStreamingJobStatus::Creating { tracker, .. } => Some(tracker),
-            CreateStreamingJobStatus::CdcBackfilling { .. } => None,
             CreateStreamingJobStatus::Created => None,
         })
     }
@@ -738,14 +735,22 @@ impl InflightDatabaseInfo {
             .filter_map(|job| match &mut job.status {
                 CreateStreamingJobStatus::Init => None,
                 CreateStreamingJobStatus::Creating { tracker, .. } => Some(tracker),
-                CreateStreamingJobStatus::CdcBackfilling { .. } => None,
                 CreateStreamingJobStatus::Created => None,
             })
     }
 
     pub(super) fn has_pending_finished_jobs(&self) -> bool {
-        self.iter_creating_job_tracker()
-            .any(|tracker| tracker.is_finished())
+        self.jobs.values().any(|job| {
+            let CreateStreamingJobStatus::Creating { tracker } = &job.status else {
+                return false;
+            };
+            if !tracker.is_finished() {
+                return false;
+            }
+            !job.cdc_table_backfill_tracker
+                .as_ref()
+                .is_some_and(|t| !t.is_pre_completed())
+        })
     }
 
     pub(super) fn take_pending_backfill_nodes(&mut self) -> Vec<FragmentId> {
@@ -766,30 +771,30 @@ impl InflightDatabaseInfo {
                     let cdc_not_done = job
                         .cdc_table_backfill_tracker
                         .as_ref()
-                        .map(|t| !t.is_pre_completed())
-                        .unwrap_or(false);
-                    let CreateStreamingJobStatus::Creating { tracker, .. } =
-                        replace(&mut job.status, CreateStreamingJobStatus::Created)
-                    else {
-                        unreachable!()
-                    };
-                    if cdc_not_done {
-                        job.status = CreateStreamingJobStatus::CdcBackfilling {
-                            tracking_job: tracker.into_tracking_job(),
+                        .is_some_and(|t| !t.is_pre_completed());
+                    if !cdc_not_done {
+                        let CreateStreamingJobStatus::Creating { tracker, .. } =
+                            replace(&mut job.status, CreateStreamingJobStatus::Created)
+                        else {
+                            unreachable!()
                         };
-                    } else {
                         finished_jobs.push(tracker.into_tracking_job());
                     }
                 }
             }
-            if let Some(tracker) = &mut job.cdc_table_backfill_tracker
-                && tracker.take_pre_completed()
+            if let Some(cdc_tracker) = &mut job.cdc_table_backfill_tracker
+                && cdc_tracker.take_pre_completed()
             {
                 finished_cdc_table_backfill.push(*job_id);
-                if let CreateStreamingJobStatus::CdcBackfilling { tracking_job } =
-                    replace(&mut job.status, CreateStreamingJobStatus::Created)
+                if let CreateStreamingJobStatus::Creating { tracker } = &job.status
+                    && tracker.is_finished()
                 {
-                    finished_jobs.push(tracking_job);
+                    let CreateStreamingJobStatus::Creating { tracker } =
+                        replace(&mut job.status, CreateStreamingJobStatus::Created)
+                    else {
+                        unreachable!()
+                    };
+                    finished_jobs.push(tracker.into_tracking_job());
                 }
             }
         }
