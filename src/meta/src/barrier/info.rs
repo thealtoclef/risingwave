@@ -793,16 +793,12 @@ impl InflightDatabaseInfo {
                 && cdc_backfill_tracker.take_pre_completed()
             {
                 finished_cdc_table_backfill.push(*job_id);
-                if let CreateStreamingJobStatus::Creating { tracker } = &job.status
-                    && tracker.is_finished()
-                {
-                    let CreateStreamingJobStatus::Creating { tracker } =
-                        replace(&mut job.status, CreateStreamingJobStatus::Created)
-                    else {
-                        unreachable!()
-                    };
-                    finished_jobs.push(tracker.into_tracking_job());
-                }
+                let CreateStreamingJobStatus::Creating { tracker } =
+                    replace(&mut job.status, CreateStreamingJobStatus::Created)
+                else {
+                    unreachable!()
+                };
+                finished_jobs.push(tracker.into_tracking_job());
             }
         }
         StagingCommitInfo {
