@@ -740,18 +740,18 @@ impl InflightDatabaseInfo {
         &mut self,
     ) -> impl Iterator<Item = &mut CreateMviewProgressTracker> {
         self.jobs.values_mut().filter_map(|job| {
-            let cdc_backfill_pending = job
-                .cdc_table_backfill_tracker
-                .as_ref()
-                .is_some_and(|t| !t.is_pre_completed());
-            match &mut job.status {
-                CreateStreamingJobStatus::Creating { tracker }
-                    if !(tracker.is_finished() && cdc_backfill_pending) =>
-                {
-                    Some(tracker)
-                }
-                _ => None,
+            let CreateStreamingJobStatus::Creating { tracker } = &mut job.status else {
+                return None;
+            };
+            if tracker.is_finished()
+                && job
+                    .cdc_table_backfill_tracker
+                    .as_ref()
+                    .is_some_and(|t| !t.is_pre_completed())
+            {
+                return None;
             }
+            Some(tracker)
         })
     }
 
@@ -775,11 +775,11 @@ impl InflightDatabaseInfo {
                 let (is_finished, truncate_table_ids) = tracker.collect_staging_commit_info();
                 table_ids_to_truncate.extend(truncate_table_ids);
                 if is_finished {
-                    let cdc_backfill_not_done = job
+                    let cdc_backfill_pending = job
                         .cdc_table_backfill_tracker
                         .as_ref()
                         .is_some_and(|t| !t.is_pre_completed());
-                    if !cdc_backfill_not_done {
+                    if !cdc_backfill_pending {
                         let CreateStreamingJobStatus::Creating { tracker, .. } =
                             replace(&mut job.status, CreateStreamingJobStatus::Created)
                         else {
