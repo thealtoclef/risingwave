@@ -739,12 +739,20 @@ impl InflightDatabaseInfo {
     fn iter_mut_creating_job_tracker(
         &mut self,
     ) -> impl Iterator<Item = &mut CreateMviewProgressTracker> {
-        self.jobs
-            .values_mut()
-            .filter_map(|job| match &mut job.status {
-                CreateStreamingJobStatus::Creating { tracker, .. } => Some(tracker),
-                _ => None,
-            })
+        self.jobs.values_mut().filter_map(|job| {
+            let CreateStreamingJobStatus::Creating { tracker } = &mut job.status else {
+                return None;
+            };
+            if tracker.is_finished()
+                && job
+                    .cdc_table_backfill_tracker
+                    .as_ref()
+                    .is_some_and(|t| !t.is_pre_completed())
+            {
+                return None;
+            }
+            Some(tracker)
+        })
     }
 
     pub(super) fn has_pending_finished_jobs(&self) -> bool {
