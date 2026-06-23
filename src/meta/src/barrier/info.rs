@@ -768,11 +768,11 @@ impl InflightDatabaseInfo {
                 let (is_finished, truncate_table_ids) = tracker.collect_staging_commit_info();
                 table_ids_to_truncate.extend(truncate_table_ids);
                 if is_finished {
-                    let cdc_not_done = job
+                    let cdc_backfill_not_done = job
                         .cdc_table_backfill_tracker
                         .as_ref()
                         .is_some_and(|t| !t.is_pre_completed());
-                    if !cdc_not_done {
+                    if !cdc_backfill_not_done {
                         let CreateStreamingJobStatus::Creating { tracker, .. } =
                             replace(&mut job.status, CreateStreamingJobStatus::Created)
                         else {
