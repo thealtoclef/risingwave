@@ -324,6 +324,56 @@ mod test {
         assert!(tracker.take_pre_completed());
     }
 
+    #[tokio::test]
+    async fn test_is_pre_completed() {
+        let split_count = 2u64;
+        let mut tracker = CdcTableBackfillTracker::new(
+            1.into(),
+            (0..split_count)
+                .map(|split_id| CdcTableSnapshotSplitRaw {
+                    split_id: split_id as _,
+                    left_bound_inclusive: vec![],
+                    right_bound_exclusive: vec![],
+                })
+                .collect(),
+        );
+        tracker
+            .reassign_splits([1.into()].into_iter().collect())
+            .unwrap();
+        let generation = tracker.progress().split_assignment_generation;
+
+        assert!(!tracker.is_pre_completed());
+        assert!(!tracker.take_pre_completed());
+
+        tracker.update_split_progress(&CdcTableBackfillProgress {
+            done: true,
+            split_id_start_inclusive: 0,
+            split_id_end_inclusive: 0,
+            generation,
+            fragment_id: 1.into(),
+            ..Default::default()
+        });
+        assert!(!tracker.is_pre_completed());
+
+        tracker.update_split_progress(&CdcTableBackfillProgress {
+            done: true,
+            split_id_start_inclusive: 1,
+            split_id_end_inclusive: 1,
+            generation,
+            fragment_id: 1.into(),
+            ..Default::default()
+        });
+        // All splits done: PreCompleted
+        assert!(tracker.is_pre_completed());
+        // Non-consuming: still PreCompleted
+        assert!(tracker.is_pre_completed());
+
+        // take_pre_completed transitions to Completed
+        assert!(tracker.take_pre_completed());
+        assert!(!tracker.is_pre_completed());
+        assert!(!tracker.take_pre_completed());
+    }
+
     fn assert_init_state(tracker: &CdcTableBackfillTracker, split_count: u64) {
         let CdcBackfillStatus::Backfilling(progress) = &tracker.status else {
             unreachable!()
