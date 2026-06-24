@@ -60,7 +60,7 @@ pub const CDC_SNAPSHOT_PORT_KEY: &str = "snapshot.port";
 pub const CDC_SNAPSHOT_USERNAME_KEY: &str = "snapshot.username";
 pub const CDC_SNAPSHOT_PASSWORD_KEY: &str = "snapshot.password";
 pub const CDC_SNAPSHOT_DEDICATED_KEY: &str = "snapshot.dedicated";
-pub const CDC_SNAPSHOT_CATCHUP_TIMEOUT_KEY: &str = "snapshot.catchup.timeout.seconds";
+pub const CDC_SNAPSHOT_CATCHUP_TIMEOUT_KEY: &str = "snapshot.catchup.timeout.ms";
 
 // User can set strong-schema='true' to enable strong schema for mongo cdc source
 pub const CDC_MONGODB_STRONG_SCHEMA_KEY: &str = "strong_schema";

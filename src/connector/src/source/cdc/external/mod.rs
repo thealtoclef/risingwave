@@ -400,14 +400,14 @@ pub struct ExternalTableConfig {
     #[serde(default)]
     pub snapshot_dedicated: bool,
 
-    /// Seconds to wait for snapshot endpoint WAL catch-up. 0 = skip check.
-    #[serde(rename = "snapshot.catchup.timeout.seconds")]
+    /// Milliseconds to wait for snapshot endpoint WAL catch-up. 0 = skip check.
+    #[serde(rename = "snapshot.catchup.timeout.ms")]
     #[serde(default = "default_snapshot_catchup_timeout")]
-    pub snapshot_catchup_timeout_secs: u64,
+    pub snapshot_catchup_timeout_ms: u64,
 }
 
 fn default_snapshot_catchup_timeout() -> u64 {
-    300
+    300_000
 }
 
 fn postgres_ssl_mode_default() -> SslMode {

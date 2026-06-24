@@ -337,7 +337,7 @@ impl PostgresExternalTableReader {
         let target_lsn: u64 = row.get::<_, PgLsn>(0).into();
         tracing::info!(target_lsn, "waiting for snapshot endpoint WAL catch-up");
         let snap_client = self.client.lock().await;
-        wait_for_snapshot_catchup(&*snap_client, target_lsn, config.snapshot_catchup_timeout_secs)
+        wait_for_snapshot_catchup(&*snap_client, target_lsn, config.snapshot_catchup_timeout_ms)
             .await
     }
 

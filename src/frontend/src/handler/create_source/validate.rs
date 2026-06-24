@@ -253,11 +253,11 @@ pub fn validate_compatibility(
                 "snapshot.dedicated is only supported for {POSTGRES_CDC_CONNECTOR}"
             ))));
         }
-        if let Some(timeout_value) = props.get("snapshot.catchup.timeout.seconds")
+        if let Some(timeout_value) = props.get("snapshot.catchup.timeout.ms")
             && timeout_value.parse::<u64>().is_err()
         {
             return Err(ErrorCode::InvalidConfigValue {
-                config_entry: "snapshot.catchup.timeout.seconds".to_owned(),
+                config_entry: "snapshot.catchup.timeout.ms".to_owned(),
                 config_value: timeout_value.to_owned(),
             }
             .into());

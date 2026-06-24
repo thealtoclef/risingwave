@@ -811,18 +811,18 @@ fn sea_type_to_pg_type(sea_type: &SeaType) -> ConnectorResult<tokio_postgres::ty
 }
 
 /// Polls `pg_last_wal_receive_lsn()` on `client` until WAL ≥ `target_lsn` or timeout.
-/// Returns an error if the endpoint is a primary (NULL receive LSN). `timeout_secs = 0` skips.
+/// Returns an error if the endpoint is a primary (NULL receive LSN). `timeout_ms = 0` skips.
 pub async fn wait_for_snapshot_catchup(
     client: &PgClient,
     target_lsn: u64,
-    timeout_secs: u64,
+    timeout_ms: u64,
 ) -> ConnectorResult<()> {
     use std::time::Duration;
-    if timeout_secs == 0 {
-        tracing::info!("snapshot.catchup.timeout.seconds=0, skipping WAL catch-up check");
+    if timeout_ms == 0 {
+        tracing::info!("snapshot.catchup.timeout.ms=0, skipping WAL catch-up check");
         return Ok(());
     }
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
     let poll_interval = Duration::from_millis(500);
     loop {
         let row = client
@@ -848,10 +848,10 @@ pub async fn wait_for_snapshot_catchup(
         }
         if tokio::time::Instant::now() > deadline {
             return Err(anyhow::anyhow!(
-                "Snapshot endpoint WAL at LSN {} has not caught up to CDC slot LSN {} after {}s. \
+                "Snapshot endpoint WAL at LSN {} has not caught up to CDC slot LSN {} after {}ms. \
                  Check pg_stat_replication on the CDC primary and pg_last_wal_receive_lsn() on \
-                 the snapshot endpoint. Increase snapshot.catchup.timeout.seconds or fix replication lag.",
-                snapshot_lsn_u64, target_lsn, timeout_secs
+                 the snapshot endpoint. Increase snapshot.catchup.timeout.ms or fix replication lag.",
+                snapshot_lsn_u64, target_lsn, timeout_ms
             )
             .into());
         }
