@@ -55,6 +55,10 @@ pub const CDC_TRANSACTIONAL_KEY: &str = "transactional";
 pub const CDC_WAIT_FOR_STREAMING_START_TIMEOUT: &str = "cdc.source.wait.streaming.start.timeout";
 pub const CDC_BACKFILL_MAX_PARALLELISM: u32 = 256;
 
+// Dedicated snapshot endpoint properties (Postgres CDC only).
+// When `snapshot.dedicated = true`, the Backfill Executor routes snapshot SELECTs
+// to the configured endpoint while Debezium CDC remains on the primary.
+// A WAL catch-up gate guarantees no data gap between the snapshot and CDC stream.
 pub const CDC_SNAPSHOT_HOSTNAME_KEY: &str = "snapshot.hostname";
 pub const CDC_SNAPSHOT_PORT_KEY: &str = "snapshot.port";
 pub const CDC_SNAPSHOT_USERNAME_KEY: &str = "snapshot.username";

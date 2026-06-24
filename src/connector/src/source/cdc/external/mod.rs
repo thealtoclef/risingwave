@@ -382,25 +382,58 @@ pub struct ExternalTableConfig {
     #[serde(default)]
     pub spanner_databoost_enabled: bool,
 
-    // Dedicated snapshot endpoint (Postgres CDC only). All optional; falls back to primary.
+    // ── Dedicated snapshot endpoint (Postgres CDC only) ──
+    //
+    // When `snapshot.dedicated` is enabled, the Backfill Executor opens its snapshot
+    // connection to a separate Postgres endpoint (typically a physical streaming replica),
+    // while Debezium CDC and schema discovery remain on the primary.
+    //
+    // Before the first snapshot row is read, a WAL catch-up gate queries
+    // `pg_current_wal_lsn()` on the primary and polls `pg_last_wal_receive_lsn()` on the
+    // replica until the replica has received all WAL up to that point. This guarantees
+    // the snapshot data covers everything the CDC slot will replay — no data gap.
+    //
+    // All snapshot.* properties are optional and fall back to the primary connection.
+
+    /// Host of the standby replica for snapshot reads.
+    /// Falls back to `hostname` (primary) when unset.
     #[serde(rename = "snapshot.hostname")]
     pub snapshot_host: Option<String>,
 
+    /// Port of the standby replica for snapshot reads.
+    /// Falls back to `port` (primary) when unset.
     #[serde(rename = "snapshot.port")]
     pub snapshot_port: Option<String>,
 
+    /// Username for the standby replica connection.
+    /// Falls back to `username` (primary) when unset.
     #[serde(rename = "snapshot.username")]
     pub snapshot_username: Option<String>,
 
+    /// Password for the standby replica connection.
+    /// Falls back to `password` (primary) when unset.
     #[serde(rename = "snapshot.password")]
     pub snapshot_password: Option<String>,
 
     /// Enable dedicated snapshot endpoint with WAL catch-up.
+    ///
+    /// When `true`, snapshot backfill SELECTs are routed to the endpoint specified
+    /// by `snapshot.hostname`/`snapshot.port` (or the primary if unset).
+    /// A post-handshake WAL catch-up gate queries `pg_current_wal_lsn()` on the
+    /// primary and blocks until the snapshot endpoint's `pg_last_wal_receive_lsn()`
+    /// reaches that LSN, guaranteeing no data gap between snapshot and CDC stream.
+    ///
+    /// Only supported for `postgres-cdc`. Rejected at validation for other connectors.
+    /// The snapshot endpoint must be a physical standby — a NULL `pg_last_wal_receive_lsn()`
+    /// (indicating a primary) is surfaced as a clear error.
     #[serde(rename = "snapshot.dedicated")]
     #[serde(default)]
     pub snapshot_dedicated: bool,
 
-    /// Milliseconds to wait for snapshot endpoint WAL catch-up. 0 = skip check.
+    /// Maximum time to wait for the snapshot endpoint WAL to catch up to the
+    /// primary's current LSN during `prepare_snapshot`. Polls every 500ms.
+    /// Set to `0` to skip the catch-up check entirely (e.g. when replication
+    /// lag is known to be negligible or the endpoint is the primary itself).
     #[serde(rename = "snapshot.catchup.timeout.ms")]
     #[serde(default = "default_snapshot_catchup_timeout")]
     pub snapshot_catchup_timeout_ms: u64,
