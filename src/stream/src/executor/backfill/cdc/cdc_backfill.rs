@@ -283,7 +283,7 @@ impl<S: StateStore> CdcBackfillExecutor<S> {
             }
         }
 
-        let upstream_table_reader = UpstreamTableReader::new(
+        let mut upstream_table_reader = UpstreamTableReader::new(
             self.external_table.clone(),
             table_reader.expect("table reader must created"),
         );
@@ -382,6 +382,12 @@ impl<S: StateStore> CdcBackfillExecutor<S> {
                     }
                 }
             }
+
+            upstream_table_reader
+                .reader
+                .prepare_snapshot(self.external_table.config())
+                .await
+                .map_err(StreamExecutorError::connector_error)?;
 
             tracing::info!(%table_id,
                 upstream_table_name,

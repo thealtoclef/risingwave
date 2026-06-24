@@ -28,7 +28,7 @@ use serde::Deserialize;
 use sqlx::postgres::{PgConnectOptions, PgSslMode};
 use sqlx::{PgPool, Row};
 use thiserror_ext::AsReport;
-use tokio_postgres::types::Kind as PgKind;
+use tokio_postgres::types::{Kind as PgKind, PgLsn};
 use tokio_postgres::{Client as PgClient, NoTls};
 
 #[cfg(not(madsim))]
@@ -807,6 +807,55 @@ fn sea_type_to_pg_type(sea_type: &SeaType) -> ConnectorResult<tokio_postgres::ty
             ))
         }
         _ => bail!("unsupported type: {:?}", sea_type),
+    }
+}
+
+/// Polls `pg_last_wal_receive_lsn()` on `client` until WAL ≥ `target_lsn` or timeout.
+/// Returns an error if the endpoint is a primary (NULL receive LSN). `timeout_ms = 0` skips.
+pub async fn wait_for_snapshot_catchup(
+    client: &PgClient,
+    target_lsn: u64,
+    timeout_ms: u64,
+) -> ConnectorResult<()> {
+    use std::time::Duration;
+    if timeout_ms == 0 {
+        tracing::info!("snapshot.catchup.timeout.ms=0, skipping WAL catch-up check");
+        return Ok(());
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
+    let poll_interval = Duration::from_millis(500);
+    loop {
+        let row = client
+            .query_one("SELECT pg_last_wal_receive_lsn()", &[])
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to query pg_last_wal_receive_lsn: {}", e))?;
+        let snapshot_lsn: Option<PgLsn> = row.get(0);
+        let snapshot_lsn = snapshot_lsn.ok_or_else(|| {
+            anyhow::anyhow!(
+                "snapshot.dedicated endpoint returned NULL for pg_last_wal_receive_lsn(). \
+                 This endpoint appears to be a primary, not a standby replica. \
+                 snapshot.dedicated requires a physical standby."
+            )
+        })?;
+        let snapshot_lsn_u64 = u64::from(snapshot_lsn);
+        if snapshot_lsn_u64 >= target_lsn {
+            tracing::info!(
+                snapshot_lsn = snapshot_lsn_u64,
+                target_lsn,
+                "Snapshot endpoint WAL caught up"
+            );
+            return Ok(());
+        }
+        if tokio::time::Instant::now() > deadline {
+            return Err(anyhow::anyhow!(
+                "Snapshot endpoint WAL at LSN {} has not caught up to CDC slot LSN {} after {}ms. \
+                 Check pg_stat_replication on the CDC primary and pg_last_wal_receive_lsn() on \
+                 the snapshot endpoint. Increase snapshot.catchup.timeout.ms or fix replication lag.",
+                snapshot_lsn_u64, target_lsn, timeout_ms
+            )
+            .into());
+        }
+        tokio::time::sleep(poll_interval).await;
     }
 }
 
