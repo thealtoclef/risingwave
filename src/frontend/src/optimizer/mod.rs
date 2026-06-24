@@ -58,7 +58,7 @@ use plan_expr_rewriter::ConstEvalRewriter;
 use property::Order;
 use risingwave_common::bail;
 use risingwave_common::catalog::{
-    ColumnCatalog, ColumnDesc, ConflictBehavior, Field, FieldDisplay, Schema,
+    ColumnCatalog, ColumnDesc, ConflictBehavior, CreateType, Field, FieldDisplay, Schema,
 };
 use risingwave_common::session_config::LocalityBackfillMode;
 use risingwave_common::types::DataType;
@@ -875,6 +875,7 @@ impl LogicalPlanRoot {
             webhook_info,
             engine,
         }: CreateTableProps,
+        create_type: CreateType,
     ) -> Result<StreamMaterialize> {
         let backfill_type = self.derive_backfill_type(false);
         // Snapshot backfill is not allowed for create table
@@ -1165,6 +1166,7 @@ impl LogicalPlanRoot {
             webhook_info,
             engine,
             refreshable,
+            create_type,
         )
     }
 

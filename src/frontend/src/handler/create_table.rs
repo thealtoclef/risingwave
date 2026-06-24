@@ -27,7 +27,7 @@ use percent_encoding::percent_decode_str;
 use pgwire::pg_response::{PgResponse, StatementType};
 use prost::Message as _;
 use risingwave_common::catalog::{
-    CdcKeyComparison, CdcTableDesc, ColumnCatalog, ColumnDesc, ConflictBehavior,
+    CdcKeyComparison, CdcTableDesc, ColumnCatalog, ColumnDesc, ConflictBehavior, CreateType,
     DEFAULT_SCHEMA_NAME, Engine, ICEBERG_SINK_PREFIX, ICEBERG_SOURCE_PREFIX,
     RISINGWAVE_ICEBERG_ROW_ID, ROW_ID_COLUMN_NAME, ObjectId, TableId,
 };
@@ -812,8 +812,15 @@ fn gen_table_plan_inner(
         }
     }
 
-    let materialize =
-        plan_root.gen_table_plan(context, table_name, database_id, schema_id, info, props)?;
+    let materialize = plan_root.gen_table_plan(
+        context,
+        table_name,
+        database_id,
+        schema_id,
+        info,
+        props,
+        CreateType::Foreground,
+    )?;
 
     let mut table = materialize.table().clone();
     table.owner = session.user_id();
@@ -951,6 +958,11 @@ pub(crate) fn gen_create_table_plan_for_cdc_table(
         external_table_name
     };
     let cdc_table_id = build_cdc_table_id(source.id, &cdc_table_id_external_table_name);
+    let create_type = if session.config().background_ddl() {
+        CreateType::Background
+    } else {
+        CreateType::Foreground
+    };
     let materialize = plan_root.gen_table_plan(
         context,
         resolved_table_name,
@@ -972,6 +984,7 @@ pub(crate) fn gen_create_table_plan_for_cdc_table(
             webhook_info: None,
             engine,
         },
+        create_type,
     )?;
 
     let mut table = materialize.table().clone();

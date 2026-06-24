@@ -199,6 +199,7 @@ impl StreamMaterialize {
         webhook_info: Option<PbWebhookSourceInfo>,
         engine: Engine,
         refreshable: bool,
+        create_type: CreateType,
     ) -> Result<Self> {
         let input = Self::rewrite_input(input, user_distributed_by.clone(), TableType::Table)?;
 
@@ -220,7 +221,7 @@ impl StreamMaterialize {
             Some(version),
             Cardinality::unknown(), // unknown cardinality for tables
             retention_seconds,
-            CreateType::Foreground,
+            create_type,
             webhook_info,
             engine,
             refreshable,

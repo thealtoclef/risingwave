@@ -195,6 +195,10 @@ impl CdcTableBackfillTracker {
         }
     }
 
+    pub fn is_pre_completed(&self) -> bool {
+        matches!(self.status, CdcBackfillStatus::PreCompleted)
+    }
+
     pub fn take_pre_completed(&mut self) -> bool {
         if let CdcBackfillStatus::PreCompleted = &self.status {
             self.status = CdcBackfillStatus::Completed;
