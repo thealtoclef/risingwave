@@ -56,7 +56,7 @@ pub use optimizer_context::*;
 use plan_expr_rewriter::ConstEvalRewriter;
 use property::Order;
 use risingwave_common::bail;
-use risingwave_common::catalog::{ColumnCatalog, ColumnDesc, ConflictBehavior, Field, Schema};
+use risingwave_common::catalog::{ColumnCatalog, ColumnDesc, ConflictBehavior, CreateType, Field, Schema};
 use risingwave_common::types::DataType;
 use risingwave_common::util::column_index_mapping::ColIndexMapping;
 use risingwave_common::util::iter_util::ZipEqDebug;
@@ -792,6 +792,7 @@ impl LogicalPlanRoot {
             webhook_info,
             engine,
         }: CreateTableProps,
+        create_type: CreateType,
     ) -> Result<StreamMaterialize> {
         let backfill_type = self.derive_backfill_type(false);
         // Snapshot backfill is not allowed for create table
@@ -1073,6 +1074,7 @@ impl LogicalPlanRoot {
             webhook_info,
             engine,
             refreshable,
+            create_type,
         )
     }
 

@@ -720,23 +720,39 @@ impl InflightDatabaseInfo {
     }
 
     fn iter_creating_job_tracker(&self) -> impl Iterator<Item = &CreateMviewProgressTracker> {
-        self.jobs.values().filter_map(|job| match &job.status {
-            CreateStreamingJobStatus::Init => None,
-            CreateStreamingJobStatus::Creating { tracker, .. } => Some(tracker),
-            CreateStreamingJobStatus::Created => None,
+        self.jobs.values().filter_map(|job| {
+            let CreateStreamingJobStatus::Creating { tracker } = &job.status else {
+                return None;
+            };
+            if tracker.is_finished()
+                && job
+                    .cdc_table_backfill_tracker
+                    .as_ref()
+                    .is_some_and(|t| !t.is_pre_completed())
+            {
+                return None;
+            }
+            Some(tracker)
         })
     }
 
     fn iter_mut_creating_job_tracker(
         &mut self,
     ) -> impl Iterator<Item = &mut CreateMviewProgressTracker> {
-        self.jobs
-            .values_mut()
-            .filter_map(|job| match &mut job.status {
-                CreateStreamingJobStatus::Init => None,
-                CreateStreamingJobStatus::Creating { tracker, .. } => Some(tracker),
-                CreateStreamingJobStatus::Created => None,
-            })
+        self.jobs.values_mut().filter_map(|job| {
+            let CreateStreamingJobStatus::Creating { tracker } = &mut job.status else {
+                return None;
+            };
+            if tracker.is_finished()
+                && job
+                    .cdc_table_backfill_tracker
+                    .as_ref()
+                    .is_some_and(|t| !t.is_pre_completed())
+            {
+                return None;
+            }
+            Some(tracker)
+        })
     }
 
     pub(super) fn has_pending_finished_jobs(&self) -> bool {
@@ -759,12 +775,18 @@ impl InflightDatabaseInfo {
                 let (is_finished, truncate_table_ids) = tracker.collect_staging_commit_info();
                 table_ids_to_truncate.extend(truncate_table_ids);
                 if is_finished {
-                    let CreateStreamingJobStatus::Creating { tracker, .. } =
-                        replace(&mut job.status, CreateStreamingJobStatus::Created)
-                    else {
-                        unreachable!()
-                    };
-                    finished_jobs.push(tracker.into_tracking_job());
+                    let cdc_backfill_pending = job
+                        .cdc_table_backfill_tracker
+                        .as_ref()
+                        .is_some_and(|t| !t.is_pre_completed());
+                    if !cdc_backfill_pending {
+                        let CreateStreamingJobStatus::Creating { tracker, .. } =
+                            replace(&mut job.status, CreateStreamingJobStatus::Created)
+                        else {
+                            unreachable!()
+                        };
+                        finished_jobs.push(tracker.into_tracking_job());
+                    }
                 }
             }
             if let Some(tracker) = &mut job.cdc_table_backfill_tracker
