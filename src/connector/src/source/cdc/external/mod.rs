@@ -90,6 +90,10 @@ impl ExternalCdcTableType {
         matches!(self, Self::Spanner)
     }
 
+    pub fn supports_dedicated_snapshot(&self) -> bool {
+        matches!(self, Self::Postgres)
+    }
+
     pub async fn create_table_reader(
         &self,
         config: ExternalTableConfig,
@@ -377,6 +381,33 @@ pub struct ExternalTableConfig {
     #[serde(deserialize_with = "crate::deserialize_bool_from_string")]
     #[serde(default)]
     pub spanner_databoost_enabled: bool,
+
+    // Dedicated snapshot endpoint (Postgres CDC only). All optional; falls back to primary.
+    #[serde(rename = "snapshot.hostname")]
+    pub snapshot_host: Option<String>,
+
+    #[serde(rename = "snapshot.port")]
+    pub snapshot_port: Option<String>,
+
+    #[serde(rename = "snapshot.username")]
+    pub snapshot_username: Option<String>,
+
+    #[serde(rename = "snapshot.password")]
+    pub snapshot_password: Option<String>,
+
+    /// Enable dedicated snapshot endpoint with WAL catch-up.
+    #[serde(rename = "snapshot.dedicated")]
+    #[serde(default)]
+    pub snapshot_dedicated: bool,
+
+    /// Seconds to wait for snapshot endpoint WAL catch-up. 0 = skip check.
+    #[serde(rename = "snapshot.catchup.timeout.seconds")]
+    #[serde(default = "default_snapshot_catchup_timeout")]
+    pub snapshot_catchup_timeout_secs: u64,
+}
+
+fn default_snapshot_catchup_timeout() -> u64 {
+    300
 }
 
 fn postgres_ssl_mode_default() -> SslMode {
@@ -445,6 +476,13 @@ impl ExternalTableReader for ExternalTableReaderImpl {
 }
 
 impl ExternalTableReaderImpl {
+    pub async fn prepare_snapshot(&mut self, config: &ExternalTableConfig) -> ConnectorResult<()> {
+        if let ExternalTableReaderImpl::Postgres(reader) = self {
+            reader.prepare_snapshot(config).await?;
+        }
+        Ok(())
+    }
+
     pub fn get_cdc_offset_parser(&self) -> CdcOffsetParseFunc {
         match self {
             ExternalTableReaderImpl::MySql(_) => MySqlExternalTableReader::get_cdc_offset_parser(),

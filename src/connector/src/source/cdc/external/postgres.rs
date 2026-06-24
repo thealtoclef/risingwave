@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 use thiserror_ext::AsReport;
 use tokio_postgres::types::{PgLsn, Type as PgType};
 
-use crate::connector_common::create_pg_client;
+use crate::connector_common::{create_pg_client, wait_for_snapshot_catchup};
 use crate::error::{ConnectorError, ConnectorResult};
 use crate::parser::scalar_adapter::ScalarAdapter;
 use crate::parser::{postgres_cell_to_scalar_impl, postgres_row_to_owned_row};
@@ -239,11 +239,16 @@ impl PostgresExternalTableReader {
             ?pk_indices,
             "create postgres external table reader"
         );
+
+        let snapshot_host = config.snapshot_host.as_deref().unwrap_or(&config.host);
+        let snapshot_port = config.snapshot_port.as_deref().unwrap_or(&config.port);
+        let snapshot_username = config.snapshot_username.as_deref().unwrap_or(&config.username);
+        let snapshot_password = config.snapshot_password.as_deref().unwrap_or(&config.password);
         let client = create_pg_client(
-            &config.username,
-            &config.password,
-            &config.host,
-            &config.port,
+            snapshot_username,
+            snapshot_password,
+            snapshot_host,
+            snapshot_port,
             &config.database,
             &config.ssl_mode,
             &config.ssl_root_cert,
@@ -309,6 +314,31 @@ impl PostgresExternalTableReader {
             client: tokio::sync::Mutex::new(client),
             schema_table_name,
         })
+    }
+
+    pub async fn prepare_snapshot(&mut self, config: &ExternalTableConfig) -> ConnectorResult<()> {
+        if !config.snapshot_dedicated {
+            return Ok(());
+        }
+        let primary_client = create_pg_client(
+            &config.username,
+            &config.password,
+            &config.host,
+            &config.port,
+            &config.database,
+            &config.ssl_mode,
+            &config.ssl_root_cert,
+            None,
+        )
+        .await?;
+        let row = primary_client
+            .query_one("SELECT pg_current_wal_lsn()", &[])
+            .await?;
+        let target_lsn: u64 = row.get::<_, PgLsn>(0).into();
+        tracing::info!(target_lsn, "waiting for snapshot endpoint WAL catch-up");
+        let snap_client = self.client.lock().await;
+        wait_for_snapshot_catchup(&*snap_client, target_lsn, config.snapshot_catchup_timeout_secs)
+            .await
     }
 
     pub fn get_normalized_table_name(table_name: &SchemaTableName) -> String {

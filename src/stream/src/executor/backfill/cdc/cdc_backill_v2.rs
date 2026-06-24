@@ -342,10 +342,15 @@ impl<S: StateStore> ParallelizedCdcBackfillExecutor<S> {
                     break;
                 }
             }
-            let upstream_table_reader = UpstreamTableReader::new(
+            let mut upstream_table_reader = UpstreamTableReader::new(
                 self.external_table.clone(),
                 table_reader.expect("table reader must created"),
             );
+            upstream_table_reader
+                .reader
+                .prepare_snapshot(self.external_table.config())
+                .await
+                .map_err(StreamExecutorError::connector_error)?;
             // let mut upstream = upstream.peekable();
             let offset_parse_func = upstream_table_reader.reader.get_cdc_offset_parser();
 

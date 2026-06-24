@@ -242,6 +242,28 @@ pub fn validate_compatibility(
         props.insert("schema.name".into(), "dbo".into());
     }
 
+    if props
+        .get("snapshot.dedicated")
+        .map(|v| v.to_ascii_lowercase())
+        .as_deref()
+        == Some("true")
+    {
+        if connector != POSTGRES_CDC_CONNECTOR {
+            return Err(RwError::from(ProtocolError(format!(
+                "snapshot.dedicated is only supported for {POSTGRES_CDC_CONNECTOR}"
+            ))));
+        }
+        if let Some(timeout_value) = props.get("snapshot.catchup.timeout.seconds")
+            && timeout_value.parse::<u64>().is_err()
+        {
+            return Err(ErrorCode::InvalidConfigValue {
+                config_entry: "snapshot.catchup.timeout.seconds".to_owned(),
+                config_value: timeout_value.to_owned(),
+            }
+            .into());
+        }
+    }
+
     // Validate cdc.source.wait.streaming.start.timeout for all CDC connectors
     if (connector == MYSQL_CDC_CONNECTOR
         || connector == POSTGRES_CDC_CONNECTOR
