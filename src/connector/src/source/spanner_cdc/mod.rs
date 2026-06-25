@@ -112,6 +112,13 @@ pub struct SpannerCdcProperties {
     #[serde(rename = "spanner.retry_backoff_factor")]
     pub retry_backoff_factor: Option<u64>,
 
+    /// Maximum consecutive missed heartbeats before a partition stream is
+    /// considered stalled and restarted (default: 10, matching the Spanner
+    /// Kafka connector's `connector.spanner.max.missed.heartbeats`).
+    #[serde_as(as = "Option<DisplayFromStr>")]
+    #[serde(rename = "spanner.max_missed_heartbeats")]
+    pub max_missed_heartbeats: Option<u32>,
+
     /// Start timestamp for the change stream query (RFC3339 format)
     #[serde(rename = "spanner.start_timestamp", default)]
     #[serde(deserialize_with = "crate::deserialize_i64_from_string_opt")]
@@ -192,6 +199,14 @@ impl SpannerCdcProperties {
     /// Get retry backoff factor (default: 2, meaning double each time)
     pub fn get_retry_backoff_factor(&self) -> u64 {
         self.retry_backoff_factor.unwrap_or(2)
+    }
+
+    /// Stall timeout = heartbeat_interval * max_missed_heartbeats.
+    /// Matches the Spanner Kafka connector's default (10 missed heartbeats).
+    pub fn get_stall_timeout(&self) -> std::time::Duration {
+        let heartbeat_ms = self.heartbeat_milliseconds.max(1000) as u64;
+        let max_missed = self.max_missed_heartbeats.unwrap_or(10).max(1) as u64;
+        std::time::Duration::from_millis(heartbeat_ms * max_missed)
     }
 
     /// Create a Spanner `DatabaseClient` using the shared factory.
