@@ -130,4 +130,42 @@ mod tests {
     }
 
     use crate::source::spanner_cdc::SpannerCdcProperties;
+
+    #[test]
+    fn test_max_missed_heartbeats_default() {
+        let props: SpannerCdcProperties = serde_json::from_value(serde_json::json!({
+            "connector": "spanner-cdc",
+            "spanner.project": "test-project",
+            "spanner.instance": "test-instance",
+            "database.name": "test-db",
+            "spanner.change_stream.name": "test-stream",
+        }))
+        .unwrap();
+
+        // Default: 10 missed heartbeats * 2000ms heartbeat = 20s stall timeout
+        assert_eq!(
+            props.get_stall_timeout(),
+            std::time::Duration::from_millis(20_000)
+        );
+    }
+
+    #[test]
+    fn test_max_missed_heartbeats_override() {
+        let props: SpannerCdcProperties = serde_json::from_value(serde_json::json!({
+            "connector": "spanner-cdc",
+            "spanner.project": "test-project",
+            "spanner.instance": "test-instance",
+            "database.name": "test-db",
+            "spanner.change_stream.name": "test-stream",
+            "spanner.heartbeat_milliseconds": "10000",
+            "spanner.max_missed_heartbeats": "5",
+        }))
+        .unwrap();
+
+        // 5 missed heartbeats * 10000ms = 50s
+        assert_eq!(
+            props.get_stall_timeout(),
+            std::time::Duration::from_millis(50_000)
+        );
+    }
 }
