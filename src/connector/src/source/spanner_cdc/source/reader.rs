@@ -115,6 +115,7 @@ impl SplitReader for SpannerCdcSplitReader {
             retry_backoff: properties.get_retry_backoff(),
             retry_backoff_max_delay_ms: properties.get_retry_backoff_max_delay_ms(),
             retry_backoff_factor: properties.get_retry_backoff_factor(),
+            stall_timeout: properties.get_stall_timeout(),
             source_id,
             checkpointed_offset,
         };
@@ -179,6 +180,7 @@ struct ReaderContext {
     retry_backoff: std::time::Duration,
     retry_backoff_max_delay_ms: u64,
     retry_backoff_factor: u64,
+    stall_timeout: std::time::Duration,
     source_id: u32,
     checkpointed_offset: Option<OffsetDateTime>,
 }
@@ -588,6 +590,7 @@ fn spawn_partition_task(
     let retry_backoff = ctx.retry_backoff;
     let retry_backoff_max_delay_ms = ctx.retry_backoff_max_delay_ms;
     let retry_backoff_factor = ctx.retry_backoff_factor;
+    let stall_timeout = ctx.stall_timeout;
     let offsets = offsets.clone();
     let shared_schema = shared_schema.clone();
     let tx = tx.clone();
@@ -606,6 +609,7 @@ fn spawn_partition_task(
             retry_backoff,
             retry_backoff_max_delay_ms,
             retry_backoff_factor,
+            stall_timeout,
             offsets,
             shared_schema,
             tx,
@@ -631,6 +635,7 @@ async fn read_partition(
     retry_backoff: std::time::Duration,
     retry_backoff_max_delay_ms: u64,
     retry_backoff_factor: u64,
+    stall_timeout: std::time::Duration,
     offsets: Arc<PartitionOffsets>,
     shared_schema: Arc<std::sync::Mutex<SchemaTracker>>,
     tx: mpsc::Sender<Vec<SourceMessage>>,
@@ -674,6 +679,7 @@ async fn read_partition(
             &tx,
             &child_discovery_tx,
             &change_stream_name,
+            stall_timeout,
         )
         .await;
     }
@@ -709,6 +715,7 @@ async fn read_partition(
             &tx,
             &child_discovery_tx,
             &change_stream_name,
+            stall_timeout,
         )
         .await
         {
@@ -747,19 +754,40 @@ async fn execute_query(
     tx: &mpsc::Sender<Vec<SourceMessage>>,
     child_discovery_tx: &tokio::sync::mpsc::UnboundedSender<SpannerCdcSplit>,
     change_stream_name: &str,
+    stall_timeout: std::time::Duration,
 ) -> Result<()> {
     let txn = client.single_use().build();
-    let mut result_set = txn
-        .execute_query(stmt.clone())
+    let mut result_set = match tokio::time::timeout(stall_timeout, txn.execute_query(stmt.clone()))
         .await
-        .map_err(|e| anyhow::anyhow!("failed to execute query: {}", e))?;
-
-    while let Some(row) = result_set
-        .next()
-        .await
-        .transpose()
-        .map_err(|e| anyhow::anyhow!("failed to get next row: {}", e))?
     {
+        Ok(Ok(rs)) => rs,
+        Ok(Err(e)) => return Err(anyhow::anyhow!("failed to execute query: {}", e).into()),
+        Err(_) => {
+            return Err(anyhow::anyhow!(
+                "query establishment timed out after {:?} for partition {:?}",
+                stall_timeout,
+                split.partition_token,
+            )
+            .into())
+        }
+    };
+
+    loop {
+        let row = match tokio::time::timeout(stall_timeout, result_set.next()).await {
+            Ok(Some(Ok(row))) => row,
+            Ok(Some(Err(e))) => {
+                return Err(anyhow::anyhow!("failed to get next row: {}", e).into())
+            }
+            Ok(None) => break, // result set exhausted
+            Err(_) => {
+                return Err(anyhow::anyhow!(
+                    "stream stalled: no data or heartbeat received within {:?} for partition {:?}",
+                    stall_timeout,
+                    split.partition_token,
+                )
+                .into())
+            }
+        };
         if tx.is_closed() {
             return Ok(());
         }
