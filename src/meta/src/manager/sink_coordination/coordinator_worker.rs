@@ -825,7 +825,8 @@ impl CoordinatorWorker {
                 .aligned()
             {
                 let (epoch, commit_requests) = pending_epochs.pop_first().expect("non-empty");
-                let mut metadatas = Vec::with_capacity(commit_requests.requests.len());
+                let vnode_count = commit_requests.requests.len();
+                let mut metadatas = Vec::with_capacity(vnode_count);
                 let mut requests = commit_requests.requests.into_iter();
                 let (first_metadata, first_schema_change) = requests.next().expect("non-empty");
                 metadatas.push(first_metadata);
@@ -899,7 +900,6 @@ impl CoordinatorWorker {
                     }
                 }
 
-                let vnode_count = commit_requests.requests.len();
                 tracing::info!(
                     %sink_id,
                     %epoch,
