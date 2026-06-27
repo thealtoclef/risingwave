@@ -179,11 +179,21 @@ impl TwoPhaseCommitHandler {
                         ));
                     };
                     self.curr_hummock_committed_epoch = recv_epoch;
+                    let mut moved_count = 0u64;
                     while let Some((epoch, metadata, schema_change)) = self.pending_epochs.pop_front_if(|(epoch, _, _)| *epoch <= recv_epoch) {
                         if let Some((last_epoch, _, _)) = self.prepared_epochs.back() {
                             assert!(epoch > *last_epoch, "prepared epochs must be in increasing order");
                         }
                         self.prepared_epochs.push_back((epoch, metadata, schema_change));
+                        moved_count += 1;
+                    }
+                    if moved_count > 0 {
+                        tracing::info!(
+                            %recv_epoch,
+                            %moved_count,
+                            remaining_pending = self.pending_epochs.len(),
+                            "Hummock confirmed — epochs moved from pending to prepared"
+                        );
                     }
                 }
             }
@@ -203,6 +213,11 @@ impl TwoPhaseCommitHandler {
                     "pending epochs must be in increasing order"
                 );
             }
+            tracing::info!(
+                %epoch,
+                curr_hummock_committed = %self.curr_hummock_committed_epoch,
+                "Epoch pushed to pending — waiting for Hummock confirmation"
+            );
             self.pending_epochs
                 .push_back((epoch, metadata, schema_change));
         } else {
@@ -714,7 +729,15 @@ impl CoordinatorWorker {
                         epoch,
                         metadata,
                         schema_change,
-                    } => (handle_id, epoch, (metadata, schema_change)),
+                    } => {
+                        tracing::info!(
+                            %sink_id,
+                            %epoch,
+                            %handle_id,
+                            "CommitRequest received from vnode"
+                        );
+                        (handle_id, epoch, (metadata, schema_change))
+                    },
                     CoordinationHandleManagerEvent::AlignInitialEpoch(_) => {
                         bail!("receive AlignInitialEpoch after initialization")
                     }
@@ -763,7 +786,7 @@ impl CoordinatorWorker {
                     };
                     let commit_res =
                         run_future_with_periodic_fn(commit_fut, Duration::from_secs(5), || {
-                            warn!(
+                            info!(
                                 elapsed = ?start_time.elapsed(),
                                 %sink_id,
                                 "committing"
@@ -827,7 +850,7 @@ impl CoordinatorWorker {
                                 ),
                                 Duration::from_secs(5),
                                 || {
-                                    warn!(
+                                    info!(
                                         elapsed = ?start_time.elapsed(),
                                         %sink_id,
                                         "committing"
@@ -876,6 +899,13 @@ impl CoordinatorWorker {
                     }
                 }
 
+                let vnode_count = commit_requests.requests.len();
+                tracing::info!(
+                    %sink_id,
+                    %epoch,
+                    %vnode_count,
+                    "CommitRequest alignment done, sending ack to vnodes"
+                );
                 self.handle_manager
                     .ack_commit(epoch, commit_requests.handle_ids)?;
                 self.last_writer_acked_epoch = Some(epoch);

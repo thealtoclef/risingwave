@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, anyhow};
 use async_trait::async_trait;
@@ -571,18 +571,24 @@ impl IcebergSinkCommitter {
         write_results: Vec<IcebergCommitResult>,
         snapshot_id: i64,
     ) -> Result<()> {
+        let commit_data_start = Instant::now();
+        tracing::info!(%epoch, data_files = write_results.iter().map(|r| r.data_files.len()).sum::<usize>(), "commit_data_impl started");
+
         // Empty write results should be handled before calling this function.
         assert!(
             !write_results.is_empty() && !write_results.iter().all(|r| r.data_files.is_empty())
         );
 
         // Check snapshot limit before proceeding with commit
+        let t = Instant::now();
         self.wait_for_snapshot_limit().await?;
+        tracing::info!(elapsed_ms = %t.elapsed().as_millis(), "commit_data_impl: wait_for_snapshot_limit");
 
         let expect_schema_id = write_results[0].schema_id;
         let expect_partition_spec_id = write_results[0].partition_spec_id;
 
         // Load the latest table to avoid concurrent modification with the best effort.
+        let t = Instant::now();
         self.table = Self::reload_table(
             self.catalog.as_ref(),
             self.table.identifier(),
@@ -590,6 +596,7 @@ impl IcebergSinkCommitter {
             expect_partition_spec_id,
         )
         .await?;
+        tracing::info!(elapsed_ms = %t.elapsed().as_millis(), "commit_data_impl: reload_table (pre-retry)");
 
         let Some(schema) = self.table.metadata().schema_by_id(expect_schema_id) else {
             return Err(SinkError::Iceberg(anyhow!(
@@ -678,7 +685,8 @@ impl IcebergSinkCommitter {
                     let err: IcebergError = err.into();
                     tracing::error!(error = %err.as_report(), "Failed to commit iceberg table");
                     CommitError::Commit(SinkError::Iceberg(anyhow!(err)))
-                })
+                })?;
+                tracing::info!("commit_data_impl: tx.commit (FastAppend) succeeded");
             },
             |err: &CommitError| {
                 // Only retry on commit errors, not on reload_table errors
@@ -712,6 +720,12 @@ impl IcebergSinkCommitter {
             .set(snapshot_num as i64);
 
         tracing::debug!("Succeeded to commit to iceberg table in epoch {epoch}.");
+
+        tracing::info!(
+            %epoch,
+            elapsed_ms = %commit_data_start.elapsed().as_millis(),
+            "commit_data_impl completed"
+        );
 
         self.notify_iceberg_compaction_scheduler(false);
 
