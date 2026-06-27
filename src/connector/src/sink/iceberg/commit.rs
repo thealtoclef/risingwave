@@ -681,12 +681,13 @@ impl IcebergSinkCommitter {
                     CommitError::Commit(SinkError::Iceberg(anyhow!(err)))
                 })?;
 
-                tx.commit(catalog.as_ref()).await.map_err(|err| {
-                    let err: IcebergError = err.into();
-                    tracing::error!(error = %err.as_report(), "Failed to commit iceberg table");
-                    CommitError::Commit(SinkError::Iceberg(anyhow!(err)))
-                })?;
-                tracing::info!("commit_data_impl: tx.commit (FastAppend) succeeded");
+                tx.commit(catalog.as_ref()).await
+                    .inspect(|_| tracing::info!("commit_data_impl: tx.commit (FastAppend) succeeded"))
+                    .map_err(|err| {
+                        let err: IcebergError = err.into();
+                        tracing::error!(error = %err.as_report(), "Failed to commit iceberg table");
+                        CommitError::Commit(SinkError::Iceberg(anyhow!(err)))
+                    })
             },
             |err: &CommitError| {
                 // Only retry on commit errors, not on reload_table errors
