@@ -590,6 +590,8 @@ impl<S: StateStore> ParallelizedCdcBackfillExecutor<S> {
             );
 
             let mut should_report_actor_backfill_done = false;
+            // One-shot latch ensuring completion is reported exactly once.
+            let mut backfill_completion_reported = false;
             // After backfill progress finished
             // we can forward messages directly to the downstream,
             // as backfill is finished.
@@ -616,8 +618,17 @@ impl<S: StateStore> ParallelizedCdcBackfillExecutor<S> {
                                 split_range,
                             );
                         }
+                        // Report completion on the first forwarding barrier: all splits are
+                        // snapshotted and forwarded by now, so the cut is established. The
+                        // `Message::Chunk` offset check alone hangs idle tables, whose only
+                        // events are heartbeats (zero-cardinality chunks dropped upstream).
+                        if !backfill_completion_reported && !actor_snapshot_splits.is_empty() {
+                            should_report_actor_backfill_done = true;
+                        }
                         if should_report_actor_backfill_done {
                             should_report_actor_backfill_done = false;
+                            backfill_completion_reported = true;
+                            actor_cdc_offset_high = None;
                             assert!(!actor_snapshot_splits.is_empty());
                             if let Some(ref progress) = self.progress {
                                 progress.finish(
