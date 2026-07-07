@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use iceberg::actions::RemoveOrphanFilesAction;
+use iceberg::actions::{RemoveDanglingDeleteFilesAction, RemoveOrphanFilesAction};
 use iceberg::spec::{DataFile, FormatVersion, ManifestContentType, ManifestFile, MAIN_BRANCH};
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use itertools::Itertools;
@@ -88,6 +88,9 @@ impl IcebergCompactionManager {
             }
             if let Err(e) = self.check_and_remove_orphan_files(sink_id).await {
                 tracing::error!(error = ?e.as_report(), "Failed to remove orphan files for sink {}", sink_id);
+            }
+            if let Err(e) = self.check_and_remove_dangling_delete_files(sink_id).await {
+                tracing::error!(error = ?e.as_report(), "Failed to remove dangling delete files for sink {}", sink_id);
             }
         }
 
@@ -380,6 +383,42 @@ impl IcebergCompactionManager {
             file_count = paths.len(),
             dry_run = iceberg_config.orphan_file_dry_run,
             "Removed orphan files for iceberg table",
+        );
+
+        Ok(())
+    }
+
+    /// Removes dangling delete files (position deletes, deletion vectors, and
+    /// equality deletes that no longer apply to any live data file) from the
+    /// table's manifests. Runs only when `enable_dangling_delete_file_removal`
+    /// is set on the sink (default enabled).
+    pub async fn check_and_remove_dangling_delete_files(&self, sink_id: SinkId) -> MetaResult<()> {
+        let iceberg_config = self.load_iceberg_config(sink_id).await?;
+        if !iceberg_config.enable_dangling_delete_file_removal {
+            return Ok(());
+        }
+
+        let catalog = iceberg_config.create_catalog().await?;
+        let table_ident = iceberg_config.full_table_name()?;
+
+        tracing::info!(
+            catalog_name = iceberg_config.catalog_name(),
+            table_name = table_ident.to_string(),
+            %sink_id,
+            "try trigger dangling delete file removal",
+        );
+
+        let removed = RemoveDanglingDeleteFilesAction::new(catalog, table_ident.clone())
+            .execute()
+            .await
+            .map_err(|e| SinkError::Iceberg(e.into()))?;
+
+        tracing::info!(
+            catalog_name = iceberg_config.catalog_name(),
+            table_name = table_ident.to_string(),
+            %sink_id,
+            removed_count = removed,
+            "Removed dangling delete files for iceberg table",
         );
 
         Ok(())
