@@ -167,14 +167,14 @@ hashbrown0_16 = { package = "hashbrown", version = "0.16.1", features = [
     "nightly",
 ] }
 hytra = "0.1"
-iceberg = { git = "https://github.com/thealtoclef/rw-iceberg-rust.git", rev = "e8bb505d5935c0230c4d79473d454b2a67e5fd2e", features = [
+iceberg = { git = "https://github.com/thealtoclef/rw-iceberg-rust.git", rev = "8d23b9991c2293dac329574ef7eabda239416ee1", features = [
     "storage-s3",
     "storage-gcs",
     "storage-azblob",
     "storage-azdls",
 ] }
-iceberg-catalog-glue = { git = "https://github.com/thealtoclef/rw-iceberg-rust.git", rev = "e8bb505d5935c0230c4d79473d454b2a67e5fd2e" }
-iceberg-catalog-rest = { git = "https://github.com/thealtoclef/rw-iceberg-rust.git", rev = "e8bb505d5935c0230c4d79473d454b2a67e5fd2e" }
+iceberg-catalog-glue = { git = "https://github.com/thealtoclef/rw-iceberg-rust.git", rev = "8d23b9991c2293dac329574ef7eabda239416ee1" }
+iceberg-catalog-rest = { git = "https://github.com/thealtoclef/rw-iceberg-rust.git", rev = "8d23b9991c2293dac329574ef7eabda239416ee1" }
 
 indexmap = { version = "2.12.0", features = ["serde"] }
 itertools = "0.14.0"

@@ -582,6 +582,19 @@ pub struct IcebergConfig {
     #[serde_as(as = "Option<DisplayFromStr>")]
     #[with_option(allow_alter_on_fly)]
     pub orphan_file_delete_concurrency: Option<usize>,
+
+    /// Whether to enable periodic removal of dangling delete files for this
+    /// iceberg sink. Dangling deletes (position deletes, deletion vectors, and
+    /// equality deletes that no longer apply to any live data file) are pruned
+    /// from manifests to reduce metadata overhead and read amplification.
+    /// Enabled by default.
+    #[serde(
+        rename = "enable_dangling_delete_file_removal",
+        default = "default_true",
+        deserialize_with = "deserialize_bool_from_string"
+    )]
+    #[with_option(allow_alter_on_fly)]
+    pub enable_dangling_delete_file_removal: bool,
 }
 
 impl EnforceSecret for IcebergConfig {
