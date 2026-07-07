@@ -146,6 +146,8 @@ pub const ORPHAN_FILE_DELETE_CONCURRENCY: &str = "orphan_file_delete_concurrency
 /// Matches the upstream iceberg-rust `RemoveOrphanFilesAction` default.
 pub const DEFAULT_ORPHAN_FILE_MIN_AGE_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 
+pub const ENABLE_DANGLING_DELETE_FILE_REMOVAL: &str = "enable_dangling_delete_file_removal";
+
 pub(super) const PARQUET_CREATED_BY: &str =
     concat!("risingwave version ", env!("CARGO_PKG_VERSION"));
 
@@ -576,6 +578,19 @@ pub struct IcebergConfig {
     #[serde_as(as = "Option<DisplayFromStr>")]
     #[with_option(allow_alter_on_fly)]
     pub orphan_file_delete_concurrency: Option<usize>,
+
+    /// Whether to enable periodic removal of dangling delete files for this
+    /// iceberg sink. Dangling deletes (position deletes, deletion vectors, and
+    /// equality deletes that no longer apply to any live data file) are pruned
+    /// from manifests to reduce metadata overhead and read amplification.
+    /// Enabled by default.
+    #[serde(
+        rename = "enable_dangling_delete_file_removal",
+        default = "default_true",
+        deserialize_with = "deserialize_bool_from_string"
+    )]
+    #[with_option(allow_alter_on_fly)]
+    pub enable_dangling_delete_file_removal: bool,
 }
 
 impl EnforceSecret for IcebergConfig {

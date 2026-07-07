@@ -36,9 +36,9 @@ use crate::sink::iceberg::{
     SNAPSHOT_EXPIRATION_CLEAR_EXPIRED_META_DATA, SNAPSHOT_EXPIRATION_MAX_AGE_MILLIS,
     SNAPSHOT_EXPIRATION_RETAIN_LAST, WRITE_MODE, parse_order_key_exprs, validate_order_key_columns,
     DEFAULT_MANIFEST_REWRITE_MIN_COUNT_TO_MERGE, DEFAULT_MANIFEST_REWRITE_TARGET_SIZE_MB,
-    DEFAULT_ORPHAN_FILE_MIN_AGE_MS, ENABLE_ORPHAN_FILE_REMOVAL, ORPHAN_FILE_DELETE_CONCURRENCY,
-    ORPHAN_FILE_DRY_RUN, ORPHAN_FILE_LOAD_CONCURRENCY, ORPHAN_FILE_MIN_AGE_MILLIS,
-    SNAPSHOT_EXPIRATION_RETAIN_MAX
+    DEFAULT_ORPHAN_FILE_MIN_AGE_MS, ENABLE_DANGLING_DELETE_FILE_REMOVAL, ENABLE_ORPHAN_FILE_REMOVAL,
+    ORPHAN_FILE_DELETE_CONCURRENCY, ORPHAN_FILE_DRY_RUN, ORPHAN_FILE_LOAD_CONCURRENCY,
+    ORPHAN_FILE_MIN_AGE_MILLIS, SNAPSHOT_EXPIRATION_RETAIN_MAX
 };
 
 pub const DEFAULT_ICEBERG_COMPACTION_INTERVAL: u64 = 3600; // 1 hour
@@ -413,6 +413,7 @@ fn test_parse_iceberg_config() {
             orphan_file_dry_run: false,
             orphan_file_load_concurrency: None,
             orphan_file_delete_concurrency: None,
+            enable_dangling_delete_file_removal: true,
         };
 
     assert_eq!(iceberg_config, expected_iceberg_config);
@@ -781,6 +782,10 @@ fn test_config_constants_consistency() {
     assert_eq!(
         ORPHAN_FILE_DELETE_CONCURRENCY,
         "orphan_file_delete_concurrency"
+    );
+    assert_eq!(
+        ENABLE_DANGLING_DELETE_FILE_REMOVAL,
+        "enable_dangling_delete_file_removal"
     );
 }
 
@@ -1215,4 +1220,53 @@ fn test_orphan_file_removal_defaults() {
         config.orphan_file_older_than_ms(now),
         now - DEFAULT_ORPHAN_FILE_MIN_AGE_MS,
     );
+}
+
+#[test]
+fn test_dangling_delete_file_removal_default_enabled() {
+    let values: BTreeMap<String, String> = [
+        ("connector", "iceberg"),
+        ("type", "append-only"),
+        ("force_append_only", "true"),
+        ("warehouse.path", "s3://iceberg"),
+        ("s3.endpoint", "http://127.0.0.1:9301"),
+        ("s3.access.key", "test"),
+        ("s3.secret.key", "test"),
+        ("s3.region", "us-east-1"),
+        ("catalog.type", "storage"),
+        ("catalog.name", "demo"),
+        ("database.name", "test_db"),
+        ("table.name", "test_table"),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_owned(), v.to_owned()))
+    .collect();
+
+    let config = IcebergConfig::from_btreemap(values).unwrap();
+    assert!(config.enable_dangling_delete_file_removal);
+}
+
+#[test]
+fn test_dangling_delete_file_removal_can_be_disabled() {
+    let values: BTreeMap<String, String> = [
+        ("connector", "iceberg"),
+        ("type", "append-only"),
+        ("force_append_only", "true"),
+        ("warehouse.path", "s3://iceberg"),
+        ("s3.endpoint", "http://127.0.0.1:9301"),
+        ("s3.access.key", "test"),
+        ("s3.secret.key", "test"),
+        ("s3.region", "us-east-1"),
+        ("catalog.type", "storage"),
+        ("catalog.name", "demo"),
+        ("database.name", "test_db"),
+        ("table.name", "test_table"),
+        ("enable_dangling_delete_file_removal", "false"),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_owned(), v.to_owned()))
+    .collect();
+
+    let config = IcebergConfig::from_btreemap(values).unwrap();
+    assert!(!config.enable_dangling_delete_file_removal);
 }
