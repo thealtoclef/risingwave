@@ -81,7 +81,7 @@ futures = { version = "0.3", default-features = false, features = ["alloc"] }
 futures-async-stream = { workspace = true }
 gcp-bigquery-client = { version = "0.28.0", optional = true }
 glob = "0.3"
-google-cloud-auth = { git = "https://github.com/googleapis/google-cloud-rust", rev = "20b85b29b2b641099096e8a405ccedec3171d345" }
+google-cloud-auth = { git = "https://github.com/googleapis/google-cloud-rust", rev = "3774eba33c9c6cf017b3939eac18a41c3d7329bc" }
 google-cloud-bigquery = { package = "gcloud-bigquery", version = "1.6", features = [
     "auth",
 ], optional = true }
@@ -92,8 +92,8 @@ google-cloud-googleapis = { package = "gcloud-googleapis", version = "1", featur
     "spanner",
 ], optional = true }
 google-cloud-pubsub = { package = "gcloud-pubsub", version = "1.5" }
-google-cloud-spanner = { git = "https://github.com/googleapis/google-cloud-rust", rev = "20b85b29b2b641099096e8a405ccedec3171d345" }
-google-cloud-wkt = { git = "https://github.com/googleapis/google-cloud-rust", rev = "20b85b29b2b641099096e8a405ccedec3171d345" }
+google-cloud-spanner = { git = "https://github.com/googleapis/google-cloud-rust", rev = "3774eba33c9c6cf017b3939eac18a41c3d7329bc" }
+google-cloud-wkt = { git = "https://github.com/googleapis/google-cloud-rust", rev = "3774eba33c9c6cf017b3939eac18a41c3d7329bc" }
 iceberg = { workspace = true }
 iceberg-catalog-glue = { workspace = true }
 iceberg-catalog-rest = { workspace = true }
