@@ -1590,12 +1590,12 @@ dependencies = [
  "aws-smithy-runtime-api",
  "aws-smithy-types",
  "h2 0.3.26",
- "h2 0.4.12",
+ "h2 0.4.14",
  "http 0.2.12",
  "http 1.4.0",
  "http-body 0.4.6",
  "hyper 0.14.27",
- "hyper 1.9.0",
+ "hyper 1.10.0",
  "hyper-rustls 0.24.2",
  "hyper-rustls 0.27.5",
  "hyper-util",
@@ -1774,7 +1774,7 @@ dependencies = [
  "http 1.4.0",
  "http-body 1.0.1",
  "http-body-util",
- "hyper 1.9.0",
+ "hyper 1.10.0",
  "hyper-util",
  "itoa",
  "matchit",
@@ -1886,7 +1886,7 @@ dependencies = [
  "fs-err",
  "http 1.4.0",
  "http-body 1.0.1",
- "hyper 1.9.0",
+ "hyper 1.10.0",
  "hyper-util",
  "openssl",
  "openssl-sys",
@@ -2713,7 +2713,7 @@ dependencies = [
  "futures",
  "futures-channel",
  "http-body-util",
- "hyper 1.9.0",
+ "hyper 1.10.0",
  "hyper-rustls 0.27.5",
  "hyper-util",
  "lz4_flex 0.11.6",
@@ -6058,7 +6058,7 @@ dependencies = [
  "chrono",
  "http 1.4.0",
  "http-body-util",
- "hyper 1.9.0",
+ "hyper 1.10.0",
  "hyper-rustls 0.27.5",
  "hyper-util",
  "ring",
@@ -6238,7 +6238,7 @@ dependencies = [
 [[package]]
 name = "google-cloud-auth"
 version = "1.13.0"
-source = "git+https://github.com/googleapis/google-cloud-rust?rev=20b85b29b2b641099096e8a405ccedec3171d345#20b85b29b2b641099096e8a405ccedec3171d345"
+source = "git+https://github.com/googleapis/google-cloud-rust?rev=3774eba33c9c6cf017b3939eac18a41c3d7329bc#3774eba33c9c6cf017b3939eac18a41c3d7329bc"
 dependencies = [
  "async-trait",
  "aws-lc-rs",
@@ -6266,7 +6266,7 @@ dependencies = [
 [[package]]
 name = "google-cloud-gax"
 version = "1.11.0"
-source = "git+https://github.com/googleapis/google-cloud-rust?rev=20b85b29b2b641099096e8a405ccedec3171d345#20b85b29b2b641099096e8a405ccedec3171d345"
+source = "git+https://github.com/googleapis/google-cloud-rust?rev=3774eba33c9c6cf017b3939eac18a41c3d7329bc#3774eba33c9c6cf017b3939eac18a41c3d7329bc"
 dependencies = [
  "bytes",
  "futures",
@@ -6284,7 +6284,7 @@ dependencies = [
 [[package]]
 name = "google-cloud-gax-internal"
 version = "0.7.14"
-source = "git+https://github.com/googleapis/google-cloud-rust?rev=20b85b29b2b641099096e8a405ccedec3171d345#20b85b29b2b641099096e8a405ccedec3171d345"
+source = "git+https://github.com/googleapis/google-cloud-rust?rev=3774eba33c9c6cf017b3939eac18a41c3d7329bc#3774eba33c9c6cf017b3939eac18a41c3d7329bc"
 dependencies = [
  "bytes",
  "futures",
@@ -6322,7 +6322,7 @@ dependencies = [
 [[package]]
 name = "google-cloud-iam-v1"
 version = "1.10.0"
-source = "git+https://github.com/googleapis/google-cloud-rust?rev=20b85b29b2b641099096e8a405ccedec3171d345#20b85b29b2b641099096e8a405ccedec3171d345"
+source = "git+https://github.com/googleapis/google-cloud-rust?rev=3774eba33c9c6cf017b3939eac18a41c3d7329bc#3774eba33c9c6cf017b3939eac18a41c3d7329bc"
 dependencies = [
  "async-trait",
  "bytes",
@@ -6339,7 +6339,7 @@ dependencies = [
 [[package]]
 name = "google-cloud-longrunning"
 version = "1.11.0"
-source = "git+https://github.com/googleapis/google-cloud-rust?rev=20b85b29b2b641099096e8a405ccedec3171d345#20b85b29b2b641099096e8a405ccedec3171d345"
+source = "git+https://github.com/googleapis/google-cloud-rust?rev=3774eba33c9c6cf017b3939eac18a41c3d7329bc#3774eba33c9c6cf017b3939eac18a41c3d7329bc"
 dependencies = [
  "async-trait",
  "bytes",
@@ -6356,7 +6356,7 @@ dependencies = [
 [[package]]
 name = "google-cloud-lro"
 version = "1.8.0"
-source = "git+https://github.com/googleapis/google-cloud-rust?rev=20b85b29b2b641099096e8a405ccedec3171d345#20b85b29b2b641099096e8a405ccedec3171d345"
+source = "git+https://github.com/googleapis/google-cloud-rust?rev=3774eba33c9c6cf017b3939eac18a41c3d7329bc#3774eba33c9c6cf017b3939eac18a41c3d7329bc"
 dependencies = [
  "google-cloud-gax",
  "google-cloud-gax-internal",
@@ -6371,7 +6371,7 @@ dependencies = [
 [[package]]
 name = "google-cloud-rpc"
 version = "1.5.0"
-source = "git+https://github.com/googleapis/google-cloud-rust?rev=20b85b29b2b641099096e8a405ccedec3171d345#20b85b29b2b641099096e8a405ccedec3171d345"
+source = "git+https://github.com/googleapis/google-cloud-rust?rev=3774eba33c9c6cf017b3939eac18a41c3d7329bc#3774eba33c9c6cf017b3939eac18a41c3d7329bc"
 dependencies = [
  "bytes",
  "google-cloud-wkt",
@@ -6383,7 +6383,7 @@ dependencies = [
 [[package]]
 name = "google-cloud-spanner"
 version = "0.34.2-preview"
-source = "git+https://github.com/googleapis/google-cloud-rust?rev=20b85b29b2b641099096e8a405ccedec3171d345#20b85b29b2b641099096e8a405ccedec3171d345"
+source = "git+https://github.com/googleapis/google-cloud-rust?rev=3774eba33c9c6cf017b3939eac18a41c3d7329bc#3774eba33c9c6cf017b3939eac18a41c3d7329bc"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -6413,7 +6413,7 @@ dependencies = [
 [[package]]
 name = "google-cloud-spanner-admin-database-v1"
 version = "1.12.0"
-source = "git+https://github.com/googleapis/google-cloud-rust?rev=20b85b29b2b641099096e8a405ccedec3171d345#20b85b29b2b641099096e8a405ccedec3171d345"
+source = "git+https://github.com/googleapis/google-cloud-rust?rev=3774eba33c9c6cf017b3939eac18a41c3d7329bc#3774eba33c9c6cf017b3939eac18a41c3d7329bc"
 dependencies = [
  "async-trait",
  "bytes",
@@ -6433,7 +6433,7 @@ dependencies = [
 [[package]]
 name = "google-cloud-spanner-admin-instance-v1"
 version = "1.12.0"
-source = "git+https://github.com/googleapis/google-cloud-rust?rev=20b85b29b2b641099096e8a405ccedec3171d345#20b85b29b2b641099096e8a405ccedec3171d345"
+source = "git+https://github.com/googleapis/google-cloud-rust?rev=3774eba33c9c6cf017b3939eac18a41c3d7329bc#3774eba33c9c6cf017b3939eac18a41c3d7329bc"
 dependencies = [
  "async-trait",
  "bytes",
@@ -6452,7 +6452,7 @@ dependencies = [
 [[package]]
 name = "google-cloud-type"
 version = "1.5.0"
-source = "git+https://github.com/googleapis/google-cloud-rust?rev=20b85b29b2b641099096e8a405ccedec3171d345#20b85b29b2b641099096e8a405ccedec3171d345"
+source = "git+https://github.com/googleapis/google-cloud-rust?rev=3774eba33c9c6cf017b3939eac18a41c3d7329bc#3774eba33c9c6cf017b3939eac18a41c3d7329bc"
 dependencies = [
  "bytes",
  "google-cloud-wkt",
@@ -6464,7 +6464,7 @@ dependencies = [
 [[package]]
 name = "google-cloud-wkt"
 version = "1.5.0"
-source = "git+https://github.com/googleapis/google-cloud-rust?rev=20b85b29b2b641099096e8a405ccedec3171d345#20b85b29b2b641099096e8a405ccedec3171d345"
+source = "git+https://github.com/googleapis/google-cloud-rust?rev=3774eba33c9c6cf017b3939eac18a41c3d7329bc#3774eba33c9c6cf017b3939eac18a41c3d7329bc"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -6538,9 +6538,9 @@ dependencies = [
 
 [[package]]
 name = "h2"
-version = "0.4.12"
+version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f3c0b69cfcb4e1b9f1bf2f53f95f766e4661169728ec61cd3fe5a0166f2d1386"
+checksum = "171fefbc92fe4a4de27e0698d6a5b392d6a0e333506bc49133760b3bcf948733"
 dependencies = [
  "atomic-waker",
  "bytes",
@@ -6928,15 +6928,15 @@ dependencies = [
 
 [[package]]
 name = "hyper"
-version = "1.9.0"
+version = "1.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6299f016b246a94207e63da54dbe807655bf9e00044f73ded42c3ac5305fbcca"
+checksum = "eb92f162bf56536459fc83c79b974bb12837acfed43d6bc370a7916d0ae15ecc"
 dependencies = [
  "atomic-waker",
  "bytes",
  "futures-channel",
  "futures-core",
- "h2 0.4.12",
+ "h2 0.4.14",
  "http 1.4.0",
  "http-body 1.0.1",
  "httparse",
@@ -6971,7 +6971,7 @@ checksum = "2d191583f3da1305256f22463b9bb0471acad48a4e534a5218b9963e9c1f59b2"
 dependencies = [
  "futures-util",
  "http 1.4.0",
- "hyper 1.9.0",
+ "hyper 1.10.0",
  "hyper-util",
  "rustls 0.23.40",
  "rustls-native-certs 0.8.1",
@@ -6988,7 +6988,7 @@ version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3203a961e5c83b6f5498933e78b6b263e208c197b63e9c6c53cc82ffd3f63793"
 dependencies = [
- "hyper 1.9.0",
+ "hyper 1.10.0",
  "hyper-util",
  "pin-project-lite",
  "tokio",
@@ -7003,7 +7003,7 @@ checksum = "70206fc6890eaca9fde8a0bf71caa2ddfc9fe045ac9e5c70df101a7dbde866e0"
 dependencies = [
  "bytes",
  "http-body-util",
- "hyper 1.9.0",
+ "hyper 1.10.0",
  "hyper-util",
  "native-tls",
  "tokio",
@@ -7023,7 +7023,7 @@ dependencies = [
  "futures-util",
  "http 1.4.0",
  "http-body 1.0.1",
- "hyper 1.9.0",
+ "hyper 1.10.0",
  "ipnet",
  "libc",
  "percent-encoding",
@@ -9157,7 +9157,7 @@ dependencies = [
  "http-body-util",
  "httparse",
  "humantime",
- "hyper 1.9.0",
+ "hyper 1.10.0",
  "itertools 0.14.0",
  "md-5",
  "parking_lot 0.12.5",
@@ -11465,11 +11465,11 @@ dependencies = [
  "futures-channel",
  "futures-core",
  "futures-util",
- "h2 0.4.12",
+ "h2 0.4.14",
  "http 1.4.0",
  "http-body 1.0.1",
  "http-body-util",
- "hyper 1.9.0",
+ "hyper 1.10.0",
  "hyper-rustls 0.27.5",
  "hyper-tls",
  "hyper-util",
@@ -11513,11 +11513,11 @@ dependencies = [
  "encoding_rs",
  "futures-core",
  "futures-util",
- "h2 0.4.12",
+ "h2 0.4.14",
  "http 1.4.0",
  "http-body 1.0.1",
  "http-body-util",
- "hyper 1.9.0",
+ "hyper 1.10.0",
  "hyper-rustls 0.27.5",
  "hyper-util",
  "js-sys",
@@ -12032,7 +12032,7 @@ dependencies = [
  "futures",
  "http 1.4.0",
  "http-body 1.0.1",
- "hyper 1.9.0",
+ "hyper 1.10.0",
  "hyper-util",
  "hytra",
  "itertools 0.14.0",
@@ -16226,11 +16226,11 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "flate2",
- "h2 0.4.12",
+ "h2 0.4.14",
  "http 1.4.0",
  "http-body 1.0.1",
  "http-body-util",
- "hyper 1.9.0",
+ "hyper 1.10.0",
  "hyper-timeout",
  "hyper-util",
  "percent-encoding",
@@ -18438,7 +18438,7 @@ dependencies = [
  "base64 0.22.1",
  "http 1.4.0",
  "http-body-util",
- "hyper 1.9.0",
+ "hyper 1.10.0",
  "hyper-rustls 0.27.5",
  "hyper-util",
  "log",
