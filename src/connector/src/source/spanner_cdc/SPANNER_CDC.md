@@ -232,6 +232,7 @@ PartitionOffsets (shared via Arc<Mutex<HashMap>>):
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `spanner.heartbeat_milliseconds` | `2000` | Heartbeat interval in milliseconds for partition health monitoring. Maps to the `heartbeat_milliseconds` TVF argument. Valid range: 1,000–300,000. |
+| `spanner.max_missed_heartbeats` | `100` | Maximum consecutive missed heartbeats before a partition stream is considered stalled and restarted. Stall timeout = `spanner.heartbeat_milliseconds` × `spanner.max_missed_heartbeats`. |
 | `spanner.start_timestamp` | current time | Start timestamp for the change stream query (RFC3339 format) |
 | `table.name` | - | Filter by upstream table (set via `TABLE 'name'` in CREATE TABLE) |
 
@@ -252,6 +253,33 @@ PartitionOffsets (shared via Arc<Mutex<HashMap>>):
 | `auto.schema.change` | `false` | Enable automatic schema change propagation |
 
 **Note**: `spanner.databoost.enabled` is a table-level property set automatically by the frontend during `CREATE TABLE FROM source`. It is passed internally and should not be set manually in `CREATE SOURCE`.
+
+---
+
+## Live Configuration Updates (`ALTER SOURCE`)
+
+The following properties can be changed on a running source without dropping and recreating it:
+
+| Parameter | Alterable on the fly |
+|-----------|-----------------------|
+| `spanner.heartbeat_milliseconds` | Yes |
+| `spanner.retry_attempts` | Yes |
+| `spanner.retry_backoff_ms` | Yes |
+| `spanner.retry_backoff_max_delay_ms` | Yes |
+| `spanner.retry_backoff_factor` | Yes |
+| `spanner.max_missed_heartbeats` | Yes |
+| `spanner.databoost.enabled` | No — table-level, set once at `CREATE TABLE FROM ... TABLE '...'` time; consumed only by the one-shot snapshot backfill reader, which has no live-reload path |
+
+```sql
+ALTER SOURCE spanner_cdc_source SET (
+    spanner.heartbeat_milliseconds = 5000,
+    spanner.max_missed_heartbeats = 200
+);
+```
+
+Under the hood, `ALTER SOURCE ... SET (...)` updates the source catalog and issues a `ConnectorPropsChange` barrier mutation; the running source executor rebuilds its `SpannerCdcSplitReader` with the new properties in place — no restart or backfill re-run required. Only properties registered as `#[with_option(allow_alter_on_fly)]` on `SpannerCdcProperties` (see `mod.rs`) are accepted; anything else is rejected by `check_source_allow_alter_on_fly_fields`.
+
+`spanner.databoost.enabled` cannot be altered this way: it's injected into `CdcTableDesc.connect_properties` at `CREATE TABLE` time and read once by the backfill's external table reader, which doesn't subscribe to `ConnectorPropsChange`.
 
 ---
 

@@ -75,6 +75,7 @@ pub struct SpannerCdcProperties {
     #[serde_as(as = "DisplayFromStr")]
     #[serde(rename = "spanner.heartbeat_milliseconds")]
     #[serde(default = "default_heartbeat_milliseconds")]
+    #[with_option(allow_alter_on_fly)]
     pub heartbeat_milliseconds: i64,
 
     /// GCP credentials JSON string
@@ -95,21 +96,25 @@ pub struct SpannerCdcProperties {
     /// Retry attempts for transient failures (default: 5)
     #[serde_as(as = "Option<DisplayFromStr>")]
     #[serde(rename = "spanner.retry_attempts")]
+    #[with_option(allow_alter_on_fly)]
     pub retry_attempts: Option<u32>,
 
     /// Retry backoff in milliseconds (default: 1000)
     #[serde_as(as = "Option<DisplayFromStr>")]
     #[serde(rename = "spanner.retry_backoff_ms")]
+    #[with_option(allow_alter_on_fly)]
     pub retry_backoff_ms: Option<u64>,
 
     /// Retry backoff max delay in milliseconds (default: 10000)
     #[serde_as(as = "Option<DisplayFromStr>")]
     #[serde(rename = "spanner.retry_backoff_max_delay_ms")]
+    #[with_option(allow_alter_on_fly)]
     pub retry_backoff_max_delay_ms: Option<u64>,
 
     /// Retry backoff factor (default: 2, meaning double each time)
     #[serde_as(as = "Option<DisplayFromStr>")]
     #[serde(rename = "spanner.retry_backoff_factor")]
+    #[with_option(allow_alter_on_fly)]
     pub retry_backoff_factor: Option<u64>,
 
     /// Maximum consecutive missed heartbeats before a partition stream is
@@ -117,6 +122,7 @@ pub struct SpannerCdcProperties {
     /// Kafka connector's `connector.spanner.max.missed.heartbeats`).
     #[serde_as(as = "Option<DisplayFromStr>")]
     #[serde(rename = "spanner.max_missed_heartbeats")]
+    #[with_option(allow_alter_on_fly)]
     pub max_missed_heartbeats: Option<u32>,
 
     /// Start timestamp for the change stream query (RFC3339 format)
