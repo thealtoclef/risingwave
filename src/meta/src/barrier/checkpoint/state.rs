@@ -67,7 +67,7 @@ use crate::model::{
 use crate::stream::cdc::parallel_cdc_table_backfill_fragment;
 use crate::stream::{
     GlobalActorIdGen, ReplaceJobSplitPlan, SourceManager, SplitAssignment,
-    fill_snapshot_backfill_epoch,
+    fill_snapshot_backfill_epoch, sink_snapshot_backfill_append_only_eligible,
 };
 
 /// The latest state of `GlobalBarrierWorker` after injecting the latest barrier.
@@ -526,11 +526,19 @@ impl DatabaseCheckpointControl {
                             "must not set previously"
                         );
                     }
+                    let fill_sink_snapshot_epoch = sink_snapshot_backfill_append_only_eligible(
+                        info.stream_job_fragments
+                            .inner
+                            .fragments
+                            .values()
+                            .map(|fragment| &fragment.nodes),
+                    );
                     for fragment in info.stream_job_fragments.inner.fragments.values_mut() {
                         fill_snapshot_backfill_epoch(
                             &mut fragment.nodes,
                             Some(&snapshot_backfill_info),
                             &cross_db_snapshot_backfill_info,
+                            fill_sink_snapshot_epoch,
                         )?;
                     }
                     let job_id = info.stream_job_fragments.stream_job_id();
@@ -652,6 +660,8 @@ impl DatabaseCheckpointControl {
                             &mut fragment.nodes,
                             Some(snapshot_backfill_info),
                             &cross_db_snapshot_backfill_info,
+                            // batch refresh jobs have no sink
+                            false,
                         )?;
                     }
                     let snapshot_backfill_upstream_tables: HashSet<TableId> =
@@ -808,6 +818,8 @@ impl DatabaseCheckpointControl {
                         &mut fragment.nodes,
                         None,
                         &cross_db_snapshot_backfill_info,
+                        // cross-db snapshot backfill sinks are not eligible
+                        false,
                     )?;
                 }
 

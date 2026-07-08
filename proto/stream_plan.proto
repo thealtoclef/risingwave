@@ -385,6 +385,10 @@ message SinkNode {
   catalog.Table table = 2;
   SinkLogStoreType log_store_type = 3;
   optional uint32 rate_limit = 4;
+  // Snapshot epoch of the snapshot backfill job this sink belongs to, filled by meta at job
+  // creation only when the sink's input plan is insert-only during the snapshot phase. When
+  // set, an upsert iceberg sink writes append-only for epochs <= this epoch.
+  optional uint64 snapshot_backfill_epoch = 5;
 }
 
 message IcebergWithPkIndexWriterNode {

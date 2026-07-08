@@ -594,6 +594,11 @@ pub struct SinkWriterParam {
     pub connector: String,
     pub streaming_config: StreamingConfig,
     pub time_zone: Tz,
+    /// Snapshot epoch of the snapshot backfill job this sink belongs to. Epochs `<=` this
+    /// epoch carry only insert-only snapshot-phase data (each key exactly once), so the
+    /// iceberg sink writes them append-only and switches to upsert mode at the boundary
+    /// commit. `None` keeps the sink's behavior unchanged.
+    pub snapshot_backfill_epoch: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -691,6 +696,7 @@ impl SinkWriterParam {
             connector: "test_connector".to_owned(),
             streaming_config: StreamingConfig::default(),
             time_zone: UTC,
+            snapshot_backfill_epoch: None,
         }
     }
 }

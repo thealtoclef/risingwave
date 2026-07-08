@@ -1587,12 +1587,15 @@ impl StreamFragmentGraph {
     }
 }
 
-/// Fill snapshot epoch for `StreamScanNode` of `SnapshotBackfill`.
+/// Fill snapshot epoch for `StreamScanNode` of `SnapshotBackfill`, and, when
+/// `fill_sink_snapshot_epoch` is set, for `SinkNode` as well (see
+/// [`sink_snapshot_backfill_append_only_eligible`]).
 /// Return `true` when has change applied.
 pub fn fill_snapshot_backfill_epoch(
     node: &mut StreamNode,
     snapshot_backfill_info: Option<&SnapshotBackfillInfo>,
     cross_db_snapshot_backfill_info: &SnapshotBackfillInfo,
+    fill_sink_snapshot_epoch: bool,
 ) -> MetaResult<bool> {
     let mut result = Ok(());
     let mut applied = false;
@@ -1628,11 +1631,89 @@ pub fn fill_snapshot_backfill_epoch(
                 applied = true;
             };
             result.is_ok()
+        } else if fill_sink_snapshot_epoch
+            && let Some(NodeBody::Sink(sink)) = node.node_body.as_mut()
+        {
+            result = try {
+                let snapshot_backfill_info = snapshot_backfill_info.ok_or_else(|| {
+                    anyhow!("should have snapshot backfill info to fill sink snapshot epoch")
+                })?;
+                let mut epochs = snapshot_backfill_info
+                    .upstream_mv_table_id_to_backfill_epoch
+                    .values()
+                    .copied();
+                // All upstream tables of a snapshot backfill job share the same snapshot epoch.
+                let snapshot_epoch = epochs
+                    .next()
+                    .ok_or_else(|| anyhow!("snapshot backfill info has no upstream table"))?
+                    .ok_or_else(|| anyhow!("snapshot epoch not set for sink"))?;
+                for other_epoch in epochs {
+                    if other_epoch != Some(snapshot_epoch) {
+                        Err(anyhow!(
+                            "inconsistent snapshot epochs for sink: {:?} vs {}",
+                            other_epoch,
+                            snapshot_epoch
+                        ))?;
+                    }
+                }
+                if let Some(prev_snapshot_epoch) =
+                    sink.snapshot_backfill_epoch.replace(snapshot_epoch)
+                {
+                    Err(anyhow!(
+                        "sink snapshot backfill epoch set again: {} {}",
+                        prev_snapshot_epoch,
+                        snapshot_epoch
+                    ))?;
+                }
+                applied = true;
+            };
+            result.is_ok()
         } else {
             true
         }
     });
     result.map(|_| applied)
+}
+
+/// Whether a snapshot-backfill job may have `snapshot_backfill_epoch` filled on its
+/// `SinkNode`, letting an upsert iceberg sink write append-only during the snapshot phase.
+///
+/// Requires a sink, a same-db `SnapshotBackfill` stream scan, and only operators that keep
+/// insert-only input insert-only — joins, aggregations etc. can emit retractions even from
+/// insert-only inputs, and cross-db snapshot backfill does not run on the creating-job
+/// barrier track. Ineligible jobs keep today's sink behavior.
+pub fn sink_snapshot_backfill_append_only_eligible<'a>(
+    fragment_nodes: impl Iterator<Item = &'a StreamNode>,
+) -> bool {
+    let mut has_sink = false;
+    let mut has_snapshot_backfill_scan = false;
+    let mut eligible = true;
+    for node in fragment_nodes {
+        visit_stream_node_cont(node, |node| {
+            match node.node_body.as_ref().unwrap() {
+                NodeBody::Sink(_) => has_sink = true,
+                NodeBody::StreamScan(stream_scan) => {
+                    if stream_scan.stream_scan_type == StreamScanType::SnapshotBackfill as i32 {
+                        has_snapshot_backfill_scan = true;
+                    } else {
+                        eligible = false;
+                    }
+                }
+                NodeBody::Project(_)
+                | NodeBody::Filter(_)
+                | NodeBody::Merge(_)
+                | NodeBody::Exchange(_)
+                | NodeBody::BatchPlan(_)
+                | NodeBody::NoOp(_) => {}
+                _ => eligible = false,
+            }
+            eligible
+        });
+        if !eligible {
+            return false;
+        }
+    }
+    eligible && has_sink && has_snapshot_backfill_scan
 }
 
 static EMPTY_HASHMAP: LazyLock<HashMap<GlobalFragmentId, StreamFragmentEdge>> =
@@ -2630,6 +2711,482 @@ mod tests {
         assert_eq!(
             new_log_store_table.value_indices,
             (0..new_log_store_table.columns.len() as i32).collect::<Vec<_>>()
+        );
+    }
+
+    // ── Tests for sink_snapshot_backfill_append_only_eligible ──
+
+    /// Helper: build a `StreamNode` for a downstream chain from Sink down to StreamScan.
+    /// `stream_scan_type` controls whether it's SnapshotBackfill, CrossDbSnapshotBackfill, etc.
+    /// Intermediate nodes are inserted between the Sink root and the StreamScan.
+    fn make_sink_chain(
+        table_id: u32,
+        columns: &[ColumnCatalog],
+        stream_scan_type: StreamScanType,
+        intermediate_nodes: Vec<StreamNode>,
+    ) -> StreamNode {
+        let table_name = "t";
+        let scan = make_stream_scan_node_with_type(table_name, table_id, columns, stream_scan_type);
+        let mut child = scan;
+        for node in intermediate_nodes.into_iter().rev() {
+            let mut node = node;
+            if node.input.is_empty() {
+                node.input = vec![child];
+            }
+            child = node;
+        }
+        let sink = make_sink_node("t", columns, child);
+        sink
+    }
+
+    /// Like `make_stream_scan_node` but allows specifying `stream_scan_type`.
+    fn make_stream_scan_node_with_type(
+        table_name: &str,
+        table_id: u32,
+        columns: &[ColumnCatalog],
+        stream_scan_type: StreamScanType,
+    ) -> StreamNode {
+        let merge_node = StreamNode {
+            node_body: Some(NodeBody::Merge(Box::new(MergeNode {
+                upstream_fragment_id: 0.into(),
+                ..Default::default()
+            }))),
+            fields: columns
+                .iter()
+                .map(|col| make_field(table_name, col))
+                .collect(),
+            ..Default::default()
+        };
+        let batch_plan_node = StreamNode {
+            node_body: Some(NodeBody::BatchPlan(Box::new(BatchPlanNode {
+                ..Default::default()
+            }))),
+            ..Default::default()
+        };
+        let stream_scan_node = StreamScanNode {
+            table_id: table_id.into(),
+            upstream_column_ids: columns.iter().map(|c| c.column_id().get_id()).collect(),
+            output_indices: (0..columns.len()).map(|i| i as u32).collect(),
+            stream_scan_type: stream_scan_type as i32,
+            table_desc: Some(StorageTableDesc {
+                table_id: table_id.into(),
+                columns: columns
+                    .iter()
+                    .map(|col| col.column_desc.to_protobuf())
+                    .collect(),
+                value_indices: (0..columns.len()).map(|i| i as u32).collect(),
+                versioned: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        StreamNode {
+            node_body: Some(NodeBody::StreamScan(Box::new(stream_scan_node))),
+            fields: columns
+                .iter()
+                .map(|col| make_field(table_name, col))
+                .collect(),
+            input: vec![merge_node, batch_plan_node],
+            ..Default::default()
+        }
+    }
+
+    /// Build a Sink-node StreamNode wrapping an input chain.
+    fn make_sink_node(table_name: &str, columns: &[ColumnCatalog], input: StreamNode) -> StreamNode {
+        let sink_desc = SinkDesc {
+            columns: columns.iter().map(|col| col.to_protobuf()).collect(),
+            sink_type: PbSinkType::AppendOnly as i32,
+            column_catalogs: columns.iter().map(|col| col.to_protobuf()).collect(),
+            ..Default::default()
+        };
+        let log_store_table = PbTable {
+            columns: columns
+                .iter()
+                .map(|col| col.to_protobuf())
+                .collect(),
+            value_indices: (0..columns.len()).map(|i| i as i32).collect(),
+            ..Default::default()
+        };
+        StreamNode {
+            node_body: Some(NodeBody::Sink(Box::new(SinkNode {
+                sink_desc: Some(sink_desc),
+                table: Some(log_store_table),
+                log_store_type: SinkLogStoreType::KvLogStore as i32,
+                ..Default::default()
+            }))),
+            fields: columns
+                .iter()
+                .map(|col| make_field(table_name, col))
+                .collect(),
+            input: vec![input],
+            ..Default::default()
+        }
+    }
+
+    /// Build a `StreamNode` with a disallowed operator (used to verify ineligibility).
+    fn make_disallowed_node() -> StreamNode {
+        StreamNode {
+            node_body: Some(NodeBody::Materialize(Box::new(Default::default()))),
+            ..Default::default()
+        }
+    }
+
+    fn two_cols() -> Vec<ColumnCatalog> {
+        vec![
+            make_column("a", 1, DataType::Int64),
+            make_column("b", 2, DataType::Int64),
+        ]
+    }
+
+    fn make_filter_node(columns: &[ColumnCatalog]) -> StreamNode {
+        StreamNode {
+            node_body: Some(NodeBody::Filter(Box::new(Default::default()))),
+            fields: columns
+                .iter()
+                .map(|col| make_field("t", col))
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn make_exchange_node(columns: &[ColumnCatalog]) -> StreamNode {
+        StreamNode {
+            node_body: Some(NodeBody::Exchange(Box::new(Default::default()))),
+            fields: columns
+                .iter()
+                .map(|col| make_field("t", col))
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn make_noop_node(columns: &[ColumnCatalog]) -> StreamNode {
+        StreamNode {
+            node_body: Some(NodeBody::NoOp(Box::new(Default::default()))),
+            fields: columns
+                .iter()
+                .map(|col| make_field("t", col))
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn make_merge_node(columns: &[ColumnCatalog]) -> StreamNode {
+        StreamNode {
+            node_body: Some(NodeBody::Merge(Box::new(MergeNode {
+                upstream_fragment_id: 0.into(),
+                ..Default::default()
+            }))),
+            fields: columns
+                .iter()
+                .map(|col| make_field("t", col))
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_sink_eligible_happy_path() {
+        // Sink → SnapshotBackfill StreamScan
+        let cols = two_cols();
+        let node = make_sink_chain(1, &cols, StreamScanType::SnapshotBackfill, vec![]);
+        let fragments = vec![node];
+        assert!(sink_snapshot_backfill_append_only_eligible(fragments.iter()));
+    }
+
+    #[test]
+    fn test_sink_eligible_with_allowed_ops() {
+        // Sink → Project → Filter → Merge → Exchange → BatchPlan → StreamScan(SnapshotBackfill)
+        let cols = two_cols();
+        let node = make_sink_chain(
+            1,
+            &cols,
+            StreamScanType::SnapshotBackfill,
+            vec![
+                make_project_node("t", &cols, Default::default()),
+                make_filter_node(&cols),
+                make_merge_node(&cols),
+                make_exchange_node(&cols),
+                make_noop_node(&cols),
+            ],
+        );
+        let fragments = vec![node];
+        assert!(sink_snapshot_backfill_append_only_eligible(fragments.iter()));
+    }
+
+    #[test]
+    fn test_sink_ineligible_no_sink() {
+        // StreamScan only, no Sink
+        let cols = two_cols();
+        let scan = make_stream_scan_node_with_type("t", 1, &cols, StreamScanType::SnapshotBackfill);
+        let fragments = vec![scan];
+        assert!(!sink_snapshot_backfill_append_only_eligible(fragments.iter()));
+    }
+
+    #[test]
+    fn test_sink_ineligible_no_snapshot_backfill_scan() {
+        // Sink → ArrangementBackfill StreamScan (not SnapshotBackfill)
+        let cols = two_cols();
+        let node = make_sink_chain(1, &cols, StreamScanType::ArrangementBackfill, vec![]);
+        let fragments = vec![node];
+        assert!(!sink_snapshot_backfill_append_only_eligible(fragments.iter()));
+    }
+
+    #[test]
+    fn test_sink_ineligible_cross_db_scan() {
+        // Sink → CrossDbSnapshotBackfill StreamScan → NOT eligible (cross-db is separate)
+        let cols = two_cols();
+        let node =
+            make_sink_chain(1, &cols, StreamScanType::CrossDbSnapshotBackfill, vec![]);
+        let fragments = vec![node];
+        assert!(!sink_snapshot_backfill_append_only_eligible(fragments.iter()));
+    }
+
+    #[test]
+    fn test_sink_ineligible_disallowed_operator() {
+        // Sink → Materialize (disallowed) → StreamScan(SnapshotBackfill)
+        let cols = two_cols();
+        let node = make_sink_chain(
+            1,
+            &cols,
+            StreamScanType::SnapshotBackfill,
+            vec![make_disallowed_node()],
+        );
+        let fragments = vec![node];
+        assert!(!sink_snapshot_backfill_append_only_eligible(fragments.iter()));
+    }
+
+    #[test]
+    fn test_sink_ineligible_mixed_scan_types() {
+        // Sink → StreamScan(ArrangementBackfill)  -- makes it ineligible
+        // The function checks ALL StreamScan nodes; a non-SnapshotBackfill one disqualifies.
+        let cols = two_cols();
+        let snapshot_scan = make_stream_scan_node_with_type(
+            "t",
+            1,
+            &cols,
+            StreamScanType::SnapshotBackfill,
+        );
+        let arrangement_scan =
+            make_stream_scan_node_with_type("t", 2, &cols, StreamScanType::ArrangementBackfill);
+        // Wrap both in the same fragment's nodes list — the iterator sees both.
+        let fragments = vec![snapshot_scan, arrangement_scan];
+        assert!(!sink_snapshot_backfill_append_only_eligible(fragments.iter()));
+    }
+
+    #[test]
+    fn test_sink_ineligible_no_fragments() {
+        let empty: Vec<StreamNode> = vec![];
+        assert!(!sink_snapshot_backfill_append_only_eligible(empty.iter()));
+    }
+
+    // ── Tests for fill_snapshot_backfill_epoch (Sink handling) ──
+
+    fn make_snapshot_backfill_info(
+        entries: impl IntoIterator<Item = (u32, u64)>,
+    ) -> SnapshotBackfillInfo {
+        SnapshotBackfillInfo {
+            upstream_mv_table_id_to_backfill_epoch: entries
+                .into_iter()
+                .map(|(id, epoch)| (TableId::new(id), Some(epoch)))
+                .collect(),
+        }
+    }
+
+    fn empty_cross_db_info() -> SnapshotBackfillInfo {
+        SnapshotBackfillInfo {
+            upstream_mv_table_id_to_backfill_epoch: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn test_fill_sink_snapshot_backfill_epoch_sets_epoch() {
+        let cols = two_cols();
+        let mut node = make_sink_chain(1, &cols, StreamScanType::SnapshotBackfill, vec![]);
+        let info = make_snapshot_backfill_info([(1, 42)]);
+        let cross_db = empty_cross_db_info();
+
+        let applied = fill_snapshot_backfill_epoch(&mut node, Some(&info), &cross_db, true).unwrap();
+        assert!(applied, "should have applied the sink epoch");
+
+        // Verify the SinkNode has the epoch set.
+        let sink = match node.node_body.unwrap() {
+            NodeBody::Sink(s) => s,
+            other => panic!("expected Sink node, got {:?}", other),
+        };
+        assert_eq!(sink.snapshot_backfill_epoch, Some(42));
+    }
+
+    #[test]
+    fn test_fill_sink_snapshot_backfill_epoch_skips_when_flag_false() {
+        let cols = two_cols();
+        let mut node = make_sink_chain(1, &cols, StreamScanType::SnapshotBackfill, vec![]);
+        let info = make_snapshot_backfill_info([(1, 42)]);
+        let cross_db = empty_cross_db_info();
+
+        // fill_sink_snapshot_epoch = false → Sink node should NOT be filled
+        let applied = fill_snapshot_backfill_epoch(&mut node, Some(&info), &cross_db, false).unwrap();
+        assert!(!applied, "should not have applied anything when flag is false");
+
+        let sink = match node.node_body.unwrap() {
+            NodeBody::Sink(s) => s,
+            other => panic!("expected Sink node, got {:?}", other),
+        };
+        assert_eq!(sink.snapshot_backfill_epoch, None);
+    }
+
+    #[test]
+    fn test_fill_sink_snapshot_backfill_epoch_error_on_double_set() {
+        let cols = two_cols();
+        let mut node = make_sink_chain(1, &cols, StreamScanType::SnapshotBackfill, vec![]);
+        let info = make_snapshot_backfill_info([(1, 42)]);
+        let cross_db = empty_cross_db_info();
+
+        // First call succeeds
+        fill_snapshot_backfill_epoch(&mut node, Some(&info), &cross_db, true).unwrap();
+
+        // Second call with the same info should error (double-set guard)
+        let result = fill_snapshot_backfill_epoch(&mut node, Some(&info), &cross_db, true);
+        assert!(result.is_err(), "double-set should error");
+    }
+
+    #[test]
+    fn test_fill_sink_snapshot_backfill_epoch_error_on_inconsistent_epochs() {
+        // Two upstream tables with different epochs → error
+        let info = SnapshotBackfillInfo {
+            upstream_mv_table_id_to_backfill_epoch: HashMap::from_iter([
+                (TableId::new(1), Some(42)),
+                (TableId::new(2), Some(99)),
+            ]),
+        };
+        let cross_db = empty_cross_db_info();
+
+        let cols = two_cols();
+        let mut node = make_sink_chain(1, &cols, StreamScanType::SnapshotBackfill, vec![]);
+        let result = fill_snapshot_backfill_epoch(&mut node, Some(&info), &cross_db, true);
+        assert!(result.is_err(), "inconsistent epochs should error");
+    }
+
+    #[test]
+    fn test_fill_sink_snapshot_backfill_epoch_error_on_missing_info() {
+        let cols = two_cols();
+        let mut node = make_sink_chain(1, &cols, StreamScanType::SnapshotBackfill, vec![]);
+        let cross_db = empty_cross_db_info();
+
+        // No snapshot backfill info provided → error
+        let result = fill_snapshot_backfill_epoch(&mut node, None, &cross_db, true);
+        assert!(result.is_err(), "missing info should error");
+    }
+
+    #[test]
+    fn test_fill_sink_snapshot_backfill_epoch_error_on_empty_info() {
+        let cols = two_cols();
+        let mut node = make_sink_chain(1, &cols, StreamScanType::SnapshotBackfill, vec![]);
+        let info = SnapshotBackfillInfo {
+            upstream_mv_table_id_to_backfill_epoch: HashMap::new(),
+        };
+        let cross_db = empty_cross_db_info();
+
+        // Info has no entries → error (no upstream table)
+        let result = fill_snapshot_backfill_epoch(&mut node, Some(&info), &cross_db, true);
+        assert!(result.is_err(), "empty info should error");
+    }
+
+    #[test]
+    fn test_fill_sink_snapshot_backfill_epoch_consistent_epochs_ok() {
+        // Multiple upstream tables with the SAME epoch → OK
+        let info = SnapshotBackfillInfo {
+            upstream_mv_table_id_to_backfill_epoch: HashMap::from_iter([
+                (TableId::new(1), Some(42)),
+                (TableId::new(2), Some(42)),
+            ]),
+        };
+        let cross_db = empty_cross_db_info();
+
+        let cols = two_cols();
+        let mut node = make_sink_chain(1, &cols, StreamScanType::SnapshotBackfill, vec![]);
+        let result = fill_snapshot_backfill_epoch(&mut node, Some(&info), &cross_db, true);
+        assert!(result.is_ok(), "consistent epochs should succeed");
+
+        let sink = match node.node_body.unwrap() {
+            NodeBody::Sink(s) => s,
+            other => panic!("expected Sink node, got {:?}", other),
+        };
+        assert_eq!(sink.snapshot_backfill_epoch, Some(42));
+    }
+
+    #[test]
+    fn test_fill_sink_snapshot_backfill_epoch_also_fills_stream_scan() {
+        // When fill_sink_snapshot_epoch is true, BOTH the StreamScan AND Sink should get filled.
+        let cols = two_cols();
+        let mut node = make_sink_chain(1, &cols, StreamScanType::SnapshotBackfill, vec![]);
+        let info = make_snapshot_backfill_info([(1, 42)]);
+        let cross_db = empty_cross_db_info();
+
+        fill_snapshot_backfill_epoch(&mut node, Some(&info), &cross_db, true).unwrap();
+
+        // Verify Sink got filled
+        let sink = match &node.node_body {
+            Some(NodeBody::Sink(s)) => s,
+            other => panic!("expected Sink, got {:?}", other),
+        };
+        assert_eq!(sink.snapshot_backfill_epoch, Some(42));
+
+        // Verify StreamScan got filled (it's in node.input[0])
+        let scan = node.input[0].node_body.as_ref().unwrap();
+        match scan {
+            NodeBody::StreamScan(s) => {
+                assert_eq!(
+                    s.snapshot_backfill_epoch, Some(42),
+                    "StreamScan should also have the epoch filled"
+                );
+            }
+            other => panic!("expected StreamScan in input, got {:?}", other),
+        };
+    }
+
+    /// When `fill_sink_snapshot_epoch` is false, StreamScan should still be filled.
+    #[test]
+    fn test_fill_stream_scan_filled_even_when_sink_skipped() {
+        let cols = two_cols();
+        let mut node = make_sink_chain(1, &cols, StreamScanType::SnapshotBackfill, vec![]);
+        let info = make_snapshot_backfill_info([(1, 42)]);
+        let cross_db = empty_cross_db_info();
+
+        fill_snapshot_backfill_epoch(&mut node, Some(&info), &cross_db, false).unwrap();
+
+        // Sink should NOT be filled
+        let sink = match &node.node_body {
+            Some(NodeBody::Sink(s)) => s,
+            other => panic!("expected Sink, got {:?}", other),
+        };
+        assert_eq!(sink.snapshot_backfill_epoch, None);
+
+        // StreamScan SHOULD be filled (independent of fill_sink_snapshot_epoch)
+        match node.input[0].node_body.as_ref().unwrap() {
+            NodeBody::StreamScan(s) => {
+                assert_eq!(s.snapshot_backfill_epoch, Some(42));
+            }
+            other => panic!("expected StreamScan, got {:?}", other),
+        };
+    }
+
+    /// A StreamScan with `None` epoch should be handled gracefully (skip it).
+    #[test]
+    fn test_fill_sink_snapshot_backfill_epoch_skips_none_epoch() {
+        let cols = two_cols();
+        let mut node = make_sink_chain(1, &cols, StreamScanType::SnapshotBackfill, vec![]);
+        let info = SnapshotBackfillInfo {
+            upstream_mv_table_id_to_backfill_epoch: HashMap::from_iter([(TableId::new(1), None)]),
+        };
+        let cross_db = empty_cross_db_info();
+
+        // The StreamScan gets None, the Sink lookup on the values iterator returns
+        // `None` (from `Some(None)` via `next().ok_or(...)?`), causing error.
+        let result = fill_snapshot_backfill_epoch(&mut node, Some(&info), &cross_db, true);
+        assert!(
+            result.is_err(),
+            "None epoch for sink should error (snapshot epoch not set)"
         );
     }
 }

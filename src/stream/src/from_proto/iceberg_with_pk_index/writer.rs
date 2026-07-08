@@ -98,6 +98,9 @@ impl ExecutorBuilder for IcebergWithPkIndexWriterExecutorBuilder {
             connector: ICEBERG_SINK.to_owned(),
             streaming_config: params.config.as_ref().clone(),
             time_zone: params.actor_context.time_zone,
+            // The pk-index writer keeps upsert state in a state table, not the in-memory
+            // delta writer, so it doesn't need the append-only backfill mode.
+            snapshot_backfill_epoch: None,
         };
         let writer = IcebergWriterImpl::build(&config, table, &writer_param)?;
         let pk_matched = params

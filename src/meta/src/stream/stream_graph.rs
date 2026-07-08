@@ -25,7 +25,7 @@ pub use fragment::{
     CompleteStreamFragmentGraph, ExtendedFragmentBackfillOrder, FragmentGraphDownstreamContext,
     FragmentGraphUpstreamContext, StreamFragmentGraph, UserDefinedFragmentBackfillOrder,
     check_sink_fragments_support_refresh_schema, fill_snapshot_backfill_epoch,
-    rewrite_refresh_schema_sink_fragment,
+    rewrite_refresh_schema_sink_fragment, sink_snapshot_backfill_append_only_eligible,
 };
 pub(crate) use id::GlobalActorIdGen;
 pub use schedule::Locations;

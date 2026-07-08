@@ -43,7 +43,9 @@ use crate::barrier::{
 use crate::hummock::CommitEpochInfo;
 use crate::manager::LocalNotification;
 use crate::model::FragmentDownstreamRelation;
-use crate::stream::{SourceChange, cleanup_dropped_streaming_jobs};
+use crate::stream::{
+    SourceChange, cleanup_dropped_streaming_jobs, sink_snapshot_backfill_append_only_eligible,
+};
 use crate::{MetaError, MetaResult};
 
 impl GlobalBarrierWorkerContext for GlobalBarrierWorkerContextImpl {
@@ -542,6 +544,7 @@ impl PostCollectCommand {
                                 ),
                                 None,
                                 &cross_db_snapshot_backfill_info,
+                                false,
                             )
                             .await?
                     }
@@ -550,6 +553,15 @@ impl PostCollectCommand {
                         snapshot_backfill_info,
                         ..
                     }) => {
+                        let fill_sink_snapshot_epoch = matches!(
+                            &job_type,
+                            CreateStreamingJobType::SnapshotBackfill(_)
+                        ) && sink_snapshot_backfill_append_only_eligible(
+                            info.stream_job_fragments
+                                .fragments
+                                .values()
+                                .map(|fragment| &fragment.nodes),
+                        );
                         barrier_manager_context
                             .metadata_manager
                             .catalog_controller
@@ -559,7 +571,11 @@ impl PostCollectCommand {
                                         if fragment.fragment_type_mask.contains_any([
                                             FragmentTypeFlag::SnapshotBackfillStreamScan,
                                             FragmentTypeFlag::CrossDbSnapshotBackfillStreamScan,
-                                        ]) {
+                                        ]) || (fill_sink_snapshot_epoch
+                                            && fragment
+                                                .fragment_type_mask
+                                                .contains(FragmentTypeFlag::Sink))
+                                        {
                                             Some(*fragment_id as _)
                                         } else {
                                             None
@@ -568,6 +584,7 @@ impl PostCollectCommand {
                                 ),
                                 Some(snapshot_backfill_info),
                                 &cross_db_snapshot_backfill_info,
+                                fill_sink_snapshot_epoch,
                             )
                             .await?
                     }

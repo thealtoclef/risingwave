@@ -1656,6 +1656,7 @@ impl CatalogController {
         fragment_ids: impl Iterator<Item = FragmentId>,
         snapshot_backfill_info: Option<&SnapshotBackfillInfo>,
         cross_db_snapshot_backfill_info: &SnapshotBackfillInfo,
+        fill_sink_snapshot_epoch: bool,
     ) -> MetaResult<()> {
         let inner = self.inner.write().await;
         let txn = inner.db.begin().await?;
@@ -1669,6 +1670,7 @@ impl CatalogController {
                 &mut node,
                 snapshot_backfill_info,
                 cross_db_snapshot_backfill_info,
+                fill_sink_snapshot_epoch,
             )? {
                 let node = StreamNode::from(&node);
                 FragmentModel::update(fragment::ActiveModel {

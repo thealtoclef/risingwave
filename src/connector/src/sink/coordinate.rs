@@ -37,6 +37,10 @@ pub struct CoordinatedLogSinker<W: SinkWriter<CommitMetadata = Option<SinkMetada
     vnode_bitmap: Bitmap,
     commit_checkpoint_interval: NonZeroU64,
     sink_writer_metrics: SinkWriterMetrics,
+    /// Snapshot epoch of the snapshot backfill job this sink belongs to, if any. A commit is
+    /// forced at the checkpoint barrier of exactly this epoch so the append-only snapshot
+    /// data gets a strictly lower iceberg sequence number than any upsert-phase data.
+    snapshot_backfill_epoch: Option<u64>,
 }
 
 impl<W: SinkWriter<CommitMetadata = Option<SinkMetadata>>> CoordinatedLogSinker<W> {
@@ -65,6 +69,7 @@ impl<W: SinkWriter<CommitMetadata = Option<SinkMetadata>>> CoordinatedLogSinker<
                 .clone(),
             commit_checkpoint_interval,
             sink_writer_metrics: SinkWriterMetrics::new(writer_param),
+            snapshot_backfill_epoch: writer_param.snapshot_backfill_epoch,
         })
     }
 }
@@ -75,11 +80,13 @@ fn should_commit_on_checkpoint_barrier(
     vnode_bitmap_updated: bool,
     is_stop: bool,
     has_schema_change: bool,
+    is_snapshot_backfill_boundary: bool,
 ) -> bool {
     current_checkpoint >= commit_checkpoint_interval.get()
         || vnode_bitmap_updated
         || is_stop
         || has_schema_change
+        || is_snapshot_backfill_boundary
 }
 
 #[async_trait]
@@ -160,6 +167,7 @@ impl<W: SinkWriter<CommitMetadata = Option<SinkMetadata>>> LogSinker for Coordin
         let mut current_checkpoint: u64 = 0;
         let commit_checkpoint_interval = self.commit_checkpoint_interval;
         let sink_writer_metrics = self.sink_writer_metrics;
+        let snapshot_backfill_epoch = self.snapshot_backfill_epoch;
 
         loop {
             let (epoch, item) = if let Some(item) = first_item.take() {
@@ -214,12 +222,17 @@ impl<W: SinkWriter<CommitMetadata = Option<SinkMetadata>>> LogSinker for Coordin
                     };
                     if is_checkpoint {
                         current_checkpoint += 1;
+                        // The barrier sealing the snapshot epoch is always a checkpoint, and
+                        // the log store replays it until the forced commit truncates it.
+                        let is_snapshot_backfill_boundary =
+                            snapshot_backfill_epoch == Some(epoch);
                         if should_commit_on_checkpoint_barrier(
                             current_checkpoint,
                             commit_checkpoint_interval,
                             new_vnode_bitmap.is_some(),
                             is_stop,
                             schema_change.is_some(),
+                            is_snapshot_backfill_boundary,
                         ) {
                             let start_time = Instant::now();
                             let metadata = sink_writer.barrier(true).await?;
@@ -303,10 +316,12 @@ mod tests {
             false,
             false,
             false,
+            false,
         ));
         assert!(!should_commit_on_checkpoint_barrier(
             2,
             NonZeroU64::new(3).unwrap(),
+            false,
             false,
             false,
             false,
@@ -321,6 +336,7 @@ mod tests {
             true,
             false,
             false,
+            false,
         ));
         assert!(should_commit_on_checkpoint_barrier(
             1,
@@ -328,6 +344,7 @@ mod tests {
             false,
             true,
             false,
+            false,
         ));
         assert!(should_commit_on_checkpoint_barrier(
             1,
@@ -335,6 +352,107 @@ mod tests {
             false,
             false,
             true,
+            false,
         ));
+        // the snapshot backfill boundary forces a commit regardless of the interval
+        assert!(should_commit_on_checkpoint_barrier(
+            1,
+            NonZeroU64::new(60).unwrap(),
+            false,
+            false,
+            false,
+            true,
+        ));
+    }
+
+    #[test]
+    fn test_should_commit_on_checkpoint_barrier_boundary_not_forced_when_false() {
+        // When is_snapshot_backfill_boundary is false, normal interval rules apply.
+        assert!(!should_commit_on_checkpoint_barrier(
+            1,
+            NonZeroU64::new(60).unwrap(),
+            false,
+            false,
+            false,
+            false,
+        ));
+    }
+
+    #[test]
+    fn test_should_commit_on_checkpoint_barrier_boundary_with_vnode_bitmap() {
+        // Both vnode bitmap update and boundary → still commits (one trigger is enough).
+        assert!(should_commit_on_checkpoint_barrier(
+            1,
+            NonZeroU64::new(60).unwrap(),
+            true,
+            false,
+            false,
+            true,
+        ));
+    }
+
+    #[test]
+    fn test_should_commit_on_checkpoint_barrier_boundary_with_stop() {
+        // Both stop signal and boundary → still commits.
+        assert!(should_commit_on_checkpoint_barrier(
+            1,
+            NonZeroU64::new(60).unwrap(),
+            false,
+            true,
+            false,
+            true,
+        ));
+    }
+
+    #[test]
+    fn test_should_commit_on_checkpoint_barrier_boundary_with_schema_change() {
+        // Both schema change and boundary → still commits.
+        assert!(should_commit_on_checkpoint_barrier(
+            1,
+            NonZeroU64::new(60).unwrap(),
+            false,
+            false,
+            true,
+            true,
+        ));
+    }
+
+    #[test]
+    fn test_should_commit_on_checkpoint_barrier_boundary_at_any_checkpoint() {
+        // The boundary commit triggers at the very first checkpoint, regardless of
+        // the current_checkpoint count.
+        for checkpoint_count in [1, 2, 60] {
+            assert!(
+                should_commit_on_checkpoint_barrier(
+                    checkpoint_count,
+                    NonZeroU64::new(60).unwrap(),
+                    false,
+                    false,
+                    false,
+                    true,
+                ),
+                "boundary should trigger commit at checkpoint {}",
+                checkpoint_count
+            );
+        }
+    }
+
+    #[test]
+    fn test_should_commit_on_checkpoint_barrier_all_triggers_false() {
+        // Nothing should trigger a commit when all flags are false.
+        for checkpoint_count in [1, 59] {
+            assert!(
+                !should_commit_on_checkpoint_barrier(
+                    checkpoint_count,
+                    NonZeroU64::new(60).unwrap(),
+                    false,
+                    false,
+                    false,
+                    false,
+                ),
+                "should not commit at checkpoint {} with no triggers",
+                checkpoint_count
+            );
+        }
     }
 }
