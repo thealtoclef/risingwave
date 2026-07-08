@@ -189,6 +189,18 @@ pub static SOURCE_ALLOW_ALTER_ON_FLY_FIELDS: LazyLock<HashMap<String, HashSet<St
             "pulsar.operation.retry.delay".to_owned(),
         ].into_iter().collect(),
     ).unwrap();
+    // SpannerCdcProperties
+    map.try_insert(
+        std::any::type_name::<SpannerCdcProperties>().to_owned(),
+        [
+            "spanner.heartbeat_milliseconds".to_owned(),
+            "spanner.retry_attempts".to_owned(),
+            "spanner.retry_backoff_ms".to_owned(),
+            "spanner.retry_backoff_max_delay_ms".to_owned(),
+            "spanner.retry_backoff_factor".to_owned(),
+            "spanner.max_missed_heartbeats".to_owned(),
+        ].into_iter().collect(),
+    ).unwrap();
     map
 });
 

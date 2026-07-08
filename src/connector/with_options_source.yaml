@@ -1450,6 +1450,7 @@ SpannerCdcProperties:
       Maps to the `heartbeat_milliseconds` argument of the `READ_<change_stream>` TVF.
       Valid range: 1,000–300,000. Defaults to 2000.
     required: false
+    allow_alter_on_fly: true
   - name: spanner.credentials
     field_type: String
     comments: |-
@@ -1471,18 +1472,29 @@ SpannerCdcProperties:
     field_type: u32
     comments: 'Retry attempts for transient failures (default: 3)'
     required: false
+    allow_alter_on_fly: true
   - name: spanner.retry_backoff_ms
     field_type: u64
     comments: 'Retry backoff in milliseconds (default: 1000)'
     required: false
+    allow_alter_on_fly: true
   - name: spanner.retry_backoff_max_delay_ms
     field_type: u64
     comments: 'Retry backoff max delay in milliseconds (default: 10000)'
     required: false
+    allow_alter_on_fly: true
   - name: spanner.retry_backoff_factor
     field_type: u64
     comments: 'Retry backoff factor (default: 2, meaning double each time)'
     required: false
+    allow_alter_on_fly: true
+  - name: spanner.max_missed_heartbeats
+    field_type: u32
+    comments: |-
+      Maximum consecutive missed heartbeats before a partition stream is
+      considered stalled and restarted (default: 100).
+    required: false
+    allow_alter_on_fly: true
   - name: spanner.start_timestamp
     field_type: String
     comments: Start timestamp for the change stream query (RFC3339 format; stored internally as microseconds since epoch)
