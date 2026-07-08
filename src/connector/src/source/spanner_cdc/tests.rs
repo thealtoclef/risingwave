@@ -142,10 +142,10 @@ mod tests {
         }))
         .unwrap();
 
-        // Default: 10 missed heartbeats * 2000ms heartbeat = 20s stall timeout
+        // Default: 100 missed heartbeats * 2000ms heartbeat = 200s stall timeout
         assert_eq!(
             props.get_stall_timeout(),
-            std::time::Duration::from_millis(20_000)
+            std::time::Duration::from_millis(200_000)
         );
     }
 

@@ -113,8 +113,7 @@ pub struct SpannerCdcProperties {
     pub retry_backoff_factor: Option<u64>,
 
     /// Maximum consecutive missed heartbeats before a partition stream is
-    /// considered stalled and restarted (default: 10, matching the Spanner
-    /// Kafka connector's `connector.spanner.max.missed.heartbeats`).
+    /// considered stalled and restarted (default: 100).
     #[serde_as(as = "Option<DisplayFromStr>")]
     #[serde(rename = "spanner.max_missed_heartbeats")]
     pub max_missed_heartbeats: Option<u32>,
@@ -202,10 +201,9 @@ impl SpannerCdcProperties {
     }
 
     /// Stall timeout = heartbeat_interval * max_missed_heartbeats.
-    /// Matches the Spanner Kafka connector's default (10 missed heartbeats).
     pub fn get_stall_timeout(&self) -> std::time::Duration {
         let heartbeat_ms = self.heartbeat_milliseconds.max(1000) as u64;
-        let max_missed = self.max_missed_heartbeats.unwrap_or(10).max(1) as u64;
+        let max_missed = self.max_missed_heartbeats.unwrap_or(100).max(1) as u64;
         std::time::Duration::from_millis(heartbeat_ms * max_missed)
     }
 
