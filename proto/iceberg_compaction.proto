@@ -58,6 +58,10 @@ message IcebergCompactionTask {
     SMALL_FILES = 2;
 
     FILES_WITH_DELETE = 3;
+
+    // Combined small-files and files-with-delete compaction task: selects a
+    // file if it matches EITHER predicate.
+    SMALL_FILES_WITH_DELETE = 4;
   }
 
   TaskType task_type = 3;

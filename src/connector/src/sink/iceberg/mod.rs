@@ -221,6 +221,28 @@ impl Sink for IcebergSink {
                     );
                 }
             }
+            CompactionType::SmallFilesWithDelete => {
+                // 1. check license
+                risingwave_common::license::Feature::IcebergCompaction
+                    .check_available()
+                    .map_err(|e| anyhow::anyhow!(e))?;
+
+                // 2. check write mode
+                if self.config.write_mode != IcebergWriteMode::MergeOnRead {
+                    bail!(
+                        "'small-files-with-delete' compaction type only supports 'merge-on-read' write mode, got: '{}'",
+                        self.config.write_mode
+                    );
+                }
+
+                // 3. unlike 'small-files' and 'files-with-delete', this combined type
+                // selects a file if it matches EITHER predicate, so
+                // `compaction.small-files-threshold-mb`,
+                // `compaction.delete-files-count-threshold`,
+                // `compaction.delete-position-records-count-threshold`, and
+                // `compaction.delete-equality-records-count-threshold` may all be
+                // set together.
+            }
             CompactionType::Full => {
                 // Full compaction has no special requirements
             }

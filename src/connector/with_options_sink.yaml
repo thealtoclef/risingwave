@@ -805,6 +805,30 @@ IcebergConfig:
     required: false
     default: Default::default
     allow_alter_on_fly: true
+  - name: compaction.delete_position_records_count_threshold
+    field_type: u64
+    comments: |-
+      Minimum approximate deleted row count (from file-scoped position
+      deletes only, clamped to the file's own row count) required to select
+      a data file for compaction. Combined with
+      `compaction.delete_files_count_threshold` and
+      `compaction.delete_equality_records_count_threshold` via logical OR.
+      Unset disables this check.
+    required: false
+    default: Default::default
+    allow_alter_on_fly: true
+  - name: compaction.delete_equality_records_count_threshold
+    field_type: u64
+    comments: |-
+      Minimum equality-delete record count applied to a data file required
+      to select it for compaction. Not clamped to the file's row count —
+      caps like BigLake's count applied records, not confirmed deleted rows.
+      Combined with `compaction.delete_files_count_threshold` and
+      `compaction.delete_position_records_count_threshold` via logical OR.
+      Unset disables this check.
+    required: false
+    default: Default::default
+    allow_alter_on_fly: true
   - name: compaction.trigger_snapshot_count
     field_type: usize
     required: false
@@ -818,7 +842,8 @@ IcebergConfig:
   - name: compaction.type
     field_type: CompactionType
     comments: |-
-      Compaction type: `full`, `small-files`, or `files-with-delete`
+      Compaction type: `full`, `small-files`, `files-with-delete`, or
+      `small-files-with-delete`
       If not set, will default to `full`
     required: false
     default: Default::default

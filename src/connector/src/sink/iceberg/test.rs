@@ -403,6 +403,8 @@ fn test_parse_iceberg_config() {
             max_snapshots_num_before_compaction: Some(DEFAULT_COMPACTION_MAX_SNAPSHOTS_NUM),
             small_files_threshold_mb: None,
             delete_files_count_threshold: None,
+            delete_position_records_count_threshold: None,
+            delete_equality_records_count_threshold: None,
             trigger_snapshot_count: None,
             target_file_size_mb: None,
             compaction_type: None,
@@ -815,6 +817,8 @@ fn test_parse_compaction_config() {
         ("compaction.max_snapshots_num", "100"),
         ("compaction.small_files_threshold_mb", "512"),
         ("compaction.delete_files_count_threshold", "50"),
+        ("compaction.delete_position_records_count_threshold", "1000"),
+        ("compaction.delete_equality_records_count_threshold", "90000"),
         ("compaction.trigger_snapshot_count", "10"),
         ("compaction.target_file_size_mb", "256"),
         ("compaction.type", "full"),
@@ -831,6 +835,8 @@ fn test_parse_compaction_config() {
     assert_eq!(config.max_snapshots_num_before_compaction, Some(100));
     assert_eq!(config.small_files_threshold_mb, Some(512));
     assert_eq!(config.delete_files_count_threshold, Some(50));
+    assert_eq!(config.delete_position_records_count_threshold, Some(1000));
+    assert_eq!(config.delete_equality_records_count_threshold, Some(90_000));
     assert_eq!(config.trigger_snapshot_count, Some(10));
     assert_eq!(config.target_file_size_mb, Some(256));
     assert_eq!(config.compaction_type, Some(CompactionType::Full));
