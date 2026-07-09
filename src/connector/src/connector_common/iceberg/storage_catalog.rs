@@ -52,6 +52,9 @@ pub struct StorageCatalogS3Config {
     region: Option<String>,
     path_style_access: Option<bool>,
     enable_config_load: Option<bool>,
+    /// `FileIO` timeout/retry properties (`IO_TIMEOUT_SECONDS`, `IO_MAX_RETRIES`, etc.).
+    #[builder(default)]
+    io_props: HashMap<String, String>,
 }
 
 #[derive(Clone, Debug, TypedBuilder)]
@@ -59,6 +62,9 @@ pub struct StorageCatalogGcsConfig {
     warehouse: String,
     credential: Option<String>,
     enable_config_load: Option<bool>,
+    /// `FileIO` timeout/retry properties (`IO_TIMEOUT_SECONDS`, `IO_MAX_RETRIES`, etc.).
+    #[builder(default)]
+    io_props: HashMap<String, String>,
 }
 
 #[derive(Clone, Debug, TypedBuilder)]
@@ -67,6 +73,9 @@ pub struct StorageCatalogAzblobConfig {
     account_name: Option<String>,
     account_key: Option<String>,
     endpoint: Option<String>,
+    /// `FileIO` timeout/retry properties (`IO_TIMEOUT_SECONDS`, `IO_MAX_RETRIES`, etc.).
+    #[builder(default)]
+    io_props: HashMap<String, String>,
 }
 
 /// File system catalog.
@@ -100,6 +109,7 @@ impl StorageCatalog {
                 let enable_config_load = config.enable_config_load.unwrap_or(false);
                 file_io_builder = file_io_builder
                     .with_prop(S3_DISABLE_CONFIG_LOAD, (!enable_config_load).to_string());
+                file_io_builder = file_io_builder.with_props(config.io_props);
                 (config.warehouse, file_io_builder.build()?)
             }
             StorageCatalogConfig::Gcs(config) => {
@@ -110,6 +120,7 @@ impl StorageCatalog {
                 let enable_config_load = config.enable_config_load.unwrap_or(false);
                 file_io_builder = file_io_builder
                     .with_prop(GCS_DISABLE_CONFIG_LOAD, (!enable_config_load).to_string());
+                file_io_builder = file_io_builder.with_props(config.io_props);
                 (config.warehouse, file_io_builder.build()?)
             }
             StorageCatalogConfig::Azblob(config) => {
@@ -123,6 +134,7 @@ impl StorageCatalog {
                 if let Some(endpoint) = &config.endpoint {
                     file_io_builder = file_io_builder.with_prop(AZBLOB_ENDPOINT, endpoint)
                 };
+                file_io_builder = file_io_builder.with_props(config.io_props);
                 (config.warehouse, file_io_builder.build()?)
             }
         };

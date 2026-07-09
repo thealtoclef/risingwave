@@ -365,6 +365,8 @@ fn test_parse_iceberg_config() {
                 catalog_io_impl: None,
                 namespace_properties: None,
                 table_properties: None,
+                io_timeout_sec: None,
+                io_max_retries: None,
             },
             table: IcebergTableIdentifier {
                 database_name: Some("demo_db".to_owned()),
