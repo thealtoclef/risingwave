@@ -30,7 +30,8 @@ use iceberg::io::object_cache::ObjectCache;
 use iceberg::io::{
     ADLS_ACCOUNT_KEY, ADLS_ACCOUNT_NAME, ADLS_AUTHORITY_HOST, ADLS_CLIENT_ID, ADLS_CLIENT_SECRET,
     ADLS_TENANT_ID, AZBLOB_ACCOUNT_KEY, AZBLOB_ACCOUNT_NAME, AZBLOB_ENDPOINT, GCS_CREDENTIALS_JSON,
-    GCS_DISABLE_CONFIG_LOAD, S3_DISABLE_CONFIG_LOAD, S3_PATH_STYLE_ACCESS,
+    GCS_DISABLE_CONFIG_LOAD, IO_MAX_RETRIES, IO_TIMEOUT_SECONDS, S3_DISABLE_CONFIG_LOAD,
+    S3_PATH_STYLE_ACCESS,
 };
 use iceberg_catalog_glue::{AWS_ACCESS_KEY_ID, AWS_REGION_NAME, AWS_SECRET_ACCESS_KEY};
 use moka::future::Cache as MokaCache;
@@ -40,7 +41,7 @@ use risingwave_common::error::IcebergError;
 use risingwave_common::util::deployment::Deployment;
 use risingwave_common::util::env_var::env_var_is_true;
 use serde::Deserialize;
-use serde_with::serde_as;
+use serde_with::{DisplayFromStr, serde_as};
 use url::Url;
 use uuid::Uuid;
 use with_options::WithOptions;
@@ -223,6 +224,24 @@ pub struct IcebergCommon {
     /// Example for BigQuery: "bq_connection=projects/my-project/locations/us/connections/my-connection"
     #[serde(rename = "table.properties")]
     pub table_properties: Option<String>,
+
+    /// Timeout (in seconds) applied to individual `FileIO` operations (read,
+    /// write, delete, stat, etc.) against the underlying object store (S3,
+    /// GCS, Azure Blob, etc.). If unset, falls back to OpenDAL's built-in
+    /// default (10 seconds). Increase this if you see `opendal::layers::retry`
+    /// warnings with `io operation timeout reached` under sustained write load.
+    #[serde(rename = "io.timeout_sec", default)]
+    #[serde_as(as = "Option<DisplayFromStr>")]
+    #[with_option(allow_alter_on_fly)]
+    pub io_timeout_sec: Option<u64>,
+
+    /// Maximum number of retries for a `FileIO` operation before the error is
+    /// surfaced to the caller. If unset, falls back to OpenDAL's built-in
+    /// default retry count.
+    #[serde(rename = "io.max_retries", default)]
+    #[serde_as(as = "Option<DisplayFromStr>")]
+    #[with_option(allow_alter_on_fly)]
+    pub io_max_retries: Option<usize>,
 }
 
 // Matches iceberg::io::object_cache default size (32MB).
@@ -540,6 +559,21 @@ impl IcebergCommon {
             kind: self.resolve_catalog_kind()?,
             java_catalog_props,
         })
+    }
+
+    /// `FileIO` properties controlling the timeout/retry behavior of individual
+    /// object-store operations (read, write, delete, stat, etc.). Only keys the
+    /// user explicitly configured are included, so unset knobs keep OpenDAL's
+    /// built-in defaults.
+    pub fn io_props(&self) -> HashMap<String, String> {
+        let mut props = HashMap::new();
+        if let Some(timeout) = self.io_timeout_sec {
+            props.insert(IO_TIMEOUT_SECONDS.to_owned(), timeout.to_string());
+        }
+        if let Some(max_retries) = self.io_max_retries {
+            props.insert(IO_MAX_RETRIES.to_owned(), max_retries.to_string());
+        }
+        props
     }
 
     fn glue_access_key(&self) -> Option<&str> {
@@ -975,6 +1009,8 @@ impl IcebergCommon {
                 );
             }
 
+            iceberg_configs.extend(self.io_props());
+
             iceberg_configs
         };
 
@@ -1295,6 +1331,8 @@ mod tests {
             catalog_io_impl: None,
             namespace_properties: None,
             table_properties: None,
+            io_timeout_sec: None,
+            io_max_retries: None,
         }
     }
 
