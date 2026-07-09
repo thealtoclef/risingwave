@@ -100,9 +100,11 @@ mod col_id_gen;
 pub use col_id_gen::*;
 use risingwave_connector::sink::SinkParam;
 use risingwave_connector::sink::iceberg::{
-    COMPACTION_DELETE_FILES_COUNT_THRESHOLD, COMPACTION_INTERVAL_SEC, COMPACTION_MAX_SNAPSHOTS_NUM,
-    COMPACTION_SMALL_FILES_THRESHOLD_MB, COMPACTION_TARGET_FILE_SIZE_MB,
-    COMPACTION_TRIGGER_SNAPSHOT_COUNT, COMPACTION_TYPE, COMPACTION_WRITE_PARQUET_COMPRESSION,
+    COMPACTION_DELETE_EQUALITY_RECORDS_COUNT_THRESHOLD, COMPACTION_DELETE_FILES_COUNT_THRESHOLD,
+    COMPACTION_DELETE_POSITION_RECORDS_COUNT_THRESHOLD, COMPACTION_INTERVAL_SEC,
+    COMPACTION_MAX_SNAPSHOTS_NUM, COMPACTION_SMALL_FILES_THRESHOLD_MB,
+    COMPACTION_TARGET_FILE_SIZE_MB, COMPACTION_TRIGGER_SNAPSHOT_COUNT, COMPACTION_TYPE,
+    COMPACTION_WRITE_PARQUET_COMPRESSION,
     COMPACTION_WRITE_PARQUET_MAX_ROW_GROUP_BYTES, COMPACTION_WRITE_PARQUET_MAX_ROW_GROUP_ROWS,
     CompactionType, ENABLE_COMPACTION, ENABLE_PK_INDEX, ENABLE_SNAPSHOT_EXPIRATION, FORMAT_VERSION,
     ICEBERG_WRITE_MODE_COPY_ON_WRITE, ICEBERG_WRITE_MODE_MERGE_ON_READ, IcebergSink,
@@ -2290,6 +2292,66 @@ pub async fn create_iceberg_engine_table(
         });
     }
 
+    if let Some(delete_position_records_count_threshold) = handler_args
+        .with_options
+        .get(COMPACTION_DELETE_POSITION_RECORDS_COUNT_THRESHOLD)
+    {
+        let delete_position_records_count_threshold =
+            delete_position_records_count_threshold.parse::<u64>().map_err(|_| {
+                ErrorCode::InvalidInputSyntax(format!(
+                    "{} must be greater than 0: {}",
+                    COMPACTION_DELETE_POSITION_RECORDS_COUNT_THRESHOLD, delete_position_records_count_threshold
+                ))
+            })?;
+        if delete_position_records_count_threshold == 0 {
+            bail!(format!(
+                "{} must be greater than 0",
+                COMPACTION_DELETE_POSITION_RECORDS_COUNT_THRESHOLD
+            ));
+        }
+        sink_with.insert(
+            COMPACTION_DELETE_POSITION_RECORDS_COUNT_THRESHOLD.to_owned(),
+            delete_position_records_count_threshold.to_string(),
+        );
+
+        // remove from source options, otherwise it will be considered as an unknown field.
+        source.as_mut().map(|x| {
+            x.with_properties
+                .remove(COMPACTION_DELETE_POSITION_RECORDS_COUNT_THRESHOLD)
+        });
+    }
+
+    if let Some(delete_equality_records_count_threshold) = handler_args
+        .with_options
+        .get(COMPACTION_DELETE_EQUALITY_RECORDS_COUNT_THRESHOLD)
+    {
+        let delete_equality_records_count_threshold = delete_equality_records_count_threshold
+            .parse::<u64>()
+            .map_err(|_| {
+                ErrorCode::InvalidInputSyntax(format!(
+                    "{} must be greater than 0: {}",
+                    COMPACTION_DELETE_EQUALITY_RECORDS_COUNT_THRESHOLD,
+                    delete_equality_records_count_threshold
+                ))
+            })?;
+        if delete_equality_records_count_threshold == 0 {
+            bail!(format!(
+                "{} must be greater than 0",
+                COMPACTION_DELETE_EQUALITY_RECORDS_COUNT_THRESHOLD
+            ));
+        }
+        sink_with.insert(
+            COMPACTION_DELETE_EQUALITY_RECORDS_COUNT_THRESHOLD.to_owned(),
+            delete_equality_records_count_threshold.to_string(),
+        );
+
+        // remove from source options, otherwise it will be considered as an unknown field.
+        source.as_mut().map(|x| {
+            x.with_properties
+                .remove(COMPACTION_DELETE_EQUALITY_RECORDS_COUNT_THRESHOLD)
+        });
+    }
+
     if let Some(trigger_snapshot_count) = handler_args
         .with_options
         .get(COMPACTION_TRIGGER_SNAPSHOT_COUNT)
@@ -2351,7 +2413,8 @@ pub async fn create_iceberg_engine_table(
                 &[
                     CompactionType::Full,
                     CompactionType::SmallFiles,
-                    CompactionType::FilesWithDelete
+                    CompactionType::FilesWithDelete,
+                    CompactionType::SmallFilesWithDelete
                 ]
             ))
         })?;

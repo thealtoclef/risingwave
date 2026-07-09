@@ -142,6 +142,7 @@ fn new_test_iceberg_config(
             CompactionType::Full => "full",
             CompactionType::SmallFiles => "small-files",
             CompactionType::FilesWithDelete => "files-with-delete",
+            CompactionType::SmallFilesWithDelete => "small-files-with-delete",
         }
         .to_owned(),
     );
