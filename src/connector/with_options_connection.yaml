@@ -212,6 +212,26 @@ IcebergConnection:
       Format: "key1=value1;key2=value2"
       Example for BigQuery: "bq_connection=projects/my-project/locations/us/connections/my-connection"
     required: false
+  - name: io.timeout_sec
+    field_type: u64
+    comments: |-
+      Timeout (in seconds) applied to individual `FileIO` operations (read,
+      write, delete, stat, etc.) against the underlying object store (S3,
+      GCS, Azure Blob, etc.). If unset, falls back to OpenDAL's built-in
+      default (10 seconds). Increase this if you see `opendal::layers::retry`
+      warnings with `io operation timeout reached` under sustained write load.
+    required: false
+    default: Default::default
+    allow_alter_on_fly: true
+  - name: io.max_retries
+    field_type: usize
+    comments: |-
+      Maximum number of retries for a `FileIO` operation before the error is
+      surfaced to the caller. If unset, falls back to OpenDAL's built-in
+      default retry count.
+    required: false
+    default: Default::default
+    allow_alter_on_fly: true
   - name: catalog.jdbc.user
     field_type: String
     required: false
