@@ -26,7 +26,7 @@ use iceberg_compaction_core::compaction::{
 use iceberg_compaction_core::config::{
     CompactionExecutionConfigBuilder, CompactionPlanningConfig, FileGroupScope,
     FilesWithDeletesConfigBuilder, FullCompactionConfigBuilder, GroupFilters,
-    SmallFilesConfigBuilder,
+    SmallFilesConfigBuilder, SmallFilesWithDeleteConfigBuilder,
 };
 use iceberg_compaction_core::executor::RewriteFilesStat;
 use mixtrics::registry::prometheus::PrometheusMetricsRegistry;
@@ -159,6 +159,7 @@ impl IcebergCompactionPlanRunner {
             TaskType::SmallFiles => "small-files",
             TaskType::Full => "full",
             TaskType::FilesWithDelete => "files-with-delete",
+            TaskType::SmallFilesWithDelete => "small-files-with-delete",
             _ => "unknown",
         };
         format!(
@@ -567,7 +568,8 @@ pub async fn create_task_execution(
         }
 
         TaskType::FilesWithDelete => {
-            let config = FilesWithDeletesConfigBuilder::default()
+            let mut builder = FilesWithDeletesConfigBuilder::default();
+            builder
                 .max_input_parallelism(config.max_parallelism as usize)
                 .max_output_parallelism(config.max_parallelism as usize)
                 .min_size_per_partition(config.min_size_per_partition)
@@ -575,18 +577,76 @@ pub async fn create_task_execution(
                 .target_file_size_bytes(iceberg_config.target_file_size_mb() * 1024 * 1024)
                 .enable_heuristic_output_parallelism(config.enable_heuristic_output_parallelism)
                 .grouping_strategy(grouping_strategy)
-                .min_delete_file_count_threshold(iceberg_config.delete_files_count_threshold())
+                .min_delete_file_count_threshold(iceberg_config.delete_files_count_threshold());
+
+            if let Some(min_position_delete_record_count_threshold) =
+                iceberg_config.delete_position_records_count_threshold()
+            {
+                builder.min_position_delete_record_count_threshold(
+                    min_position_delete_record_count_threshold,
+                );
+            }
+
+            if let Some(min_equality_delete_record_count_threshold) =
+                iceberg_config.delete_equality_records_count_threshold()
+            {
+                builder.min_equality_delete_record_count_threshold(
+                    min_equality_delete_record_count_threshold,
+                );
+            }
+
+            let config = builder
                 .build()
                 .map_err(|e| HummockError::compaction_executor(e.as_report()))?;
 
             CompactionPlanningConfig::FilesWithDeletes(config)
         }
 
+        TaskType::SmallFilesWithDelete => {
+            let mut builder = SmallFilesWithDeleteConfigBuilder::default();
+            builder
+                .max_input_parallelism(config.max_parallelism as usize)
+                .max_output_parallelism(config.max_parallelism as usize)
+                .min_size_per_partition(config.min_size_per_partition)
+                .max_file_count_per_partition(config.max_file_count_per_partition as usize)
+                .target_file_size_bytes(iceberg_config.target_file_size_mb() * 1024 * 1024)
+                .enable_heuristic_output_parallelism(config.enable_heuristic_output_parallelism)
+                .small_file_threshold_bytes(iceberg_config.small_files_threshold_mb() * 1024 * 1024)
+                .min_delete_file_count_threshold(iceberg_config.delete_files_count_threshold())
+                .grouping_strategy(grouping_strategy);
+
+            if let Some(min_position_delete_record_count_threshold) =
+                iceberg_config.delete_position_records_count_threshold()
+            {
+                builder.min_position_delete_record_count_threshold(
+                    min_position_delete_record_count_threshold,
+                );
+            }
+
+            if let Some(min_equality_delete_record_count_threshold) =
+                iceberg_config.delete_equality_records_count_threshold()
+            {
+                builder.min_equality_delete_record_count_threshold(
+                    min_equality_delete_record_count_threshold,
+                );
+            }
+
+            if let Some(group_filters) = group_filters.clone() {
+                builder.group_filters(group_filters);
+            }
+
+            let config = builder
+                .build()
+                .map_err(|e| HummockError::compaction_executor(e.as_report()))?;
+
+            CompactionPlanningConfig::SmallFilesWithDelete(config)
+        }
+
         _ => {
-            unreachable!(
+            return Err(HummockError::compaction_executor(format!(
                 "Unsupported task type in iceberg compaction task {}: {:?}",
                 task_id, parsed_task_type
-            )
+            )));
         }
     };
 

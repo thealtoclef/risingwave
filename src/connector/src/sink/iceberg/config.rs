@@ -43,6 +43,7 @@ pub const ICEBERG_WRITE_MODE_COPY_ON_WRITE: &str = "copy-on-write";
 pub const ICEBERG_COMPACTION_TYPE_FULL: &str = "full";
 pub const ICEBERG_COMPACTION_TYPE_SMALL_FILES: &str = "small-files";
 pub const ICEBERG_COMPACTION_TYPE_FILES_WITH_DELETE: &str = "files-with-delete";
+pub const ICEBERG_COMPACTION_TYPE_SMALL_FILES_WITH_DELETE: &str = "small-files-with-delete";
 
 pub const PARTITION_DATA_ID_START: i32 = 1000;
 
@@ -117,6 +118,12 @@ pub const COMPACTION_MAX_SNAPSHOTS_NUM: &str = "compaction.max_snapshots_num";
 pub const COMPACTION_SMALL_FILES_THRESHOLD_MB: &str = "compaction.small_files_threshold_mb";
 
 pub const COMPACTION_DELETE_FILES_COUNT_THRESHOLD: &str = "compaction.delete_files_count_threshold";
+
+pub const COMPACTION_DELETE_POSITION_RECORDS_COUNT_THRESHOLD: &str =
+    "compaction.delete_position_records_count_threshold";
+
+pub const COMPACTION_DELETE_EQUALITY_RECORDS_COUNT_THRESHOLD: &str =
+    "compaction.delete_equality_records_count_threshold";
 
 pub const COMPACTION_TRIGGER_SNAPSHOT_COUNT: &str = "compaction.trigger_snapshot_count";
 
@@ -257,6 +264,9 @@ pub enum CompactionType {
     SmallFiles,
     /// Files with delete compaction - only compact files that have associated delete files
     FilesWithDelete,
+    /// Combined small-files and files-with-delete compaction - compacts a file if it
+    /// matches EITHER predicate
+    SmallFilesWithDelete,
 }
 
 impl CompactionType {
@@ -265,6 +275,7 @@ impl CompactionType {
             CompactionType::Full => ICEBERG_COMPACTION_TYPE_FULL,
             CompactionType::SmallFiles => ICEBERG_COMPACTION_TYPE_SMALL_FILES,
             CompactionType::FilesWithDelete => ICEBERG_COMPACTION_TYPE_FILES_WITH_DELETE,
+            CompactionType::SmallFilesWithDelete => ICEBERG_COMPACTION_TYPE_SMALL_FILES_WITH_DELETE,
         }
     }
 }
@@ -277,12 +288,16 @@ impl std::str::FromStr for CompactionType {
             ICEBERG_COMPACTION_TYPE_FULL => Ok(CompactionType::Full),
             ICEBERG_COMPACTION_TYPE_SMALL_FILES => Ok(CompactionType::SmallFiles),
             ICEBERG_COMPACTION_TYPE_FILES_WITH_DELETE => Ok(CompactionType::FilesWithDelete),
+            ICEBERG_COMPACTION_TYPE_SMALL_FILES_WITH_DELETE => {
+                Ok(CompactionType::SmallFilesWithDelete)
+            }
             _ => Err(SinkError::Config(anyhow!(format!(
-                "invalid compaction_type: {}, must be one of: {}, {}, {}",
+                "invalid compaction_type: {}, must be one of: {}, {}, {}, {}",
                 s,
                 ICEBERG_COMPACTION_TYPE_FULL,
                 ICEBERG_COMPACTION_TYPE_SMALL_FILES,
-                ICEBERG_COMPACTION_TYPE_FILES_WITH_DELETE
+                ICEBERG_COMPACTION_TYPE_FILES_WITH_DELETE,
+                ICEBERG_COMPACTION_TYPE_SMALL_FILES_WITH_DELETE
             )))),
         }
     }
@@ -462,6 +477,34 @@ pub struct IcebergConfig {
     #[with_option(allow_alter_on_fly)]
     pub delete_files_count_threshold: Option<usize>,
 
+    /// Minimum approximate deleted row count (from file-scoped position
+    /// deletes only, clamped to the file's own row count) required to select
+    /// a data file for compaction. Combined with
+    /// `compaction.delete_files_count_threshold` and
+    /// `compaction.delete_equality_records_count_threshold` via logical OR.
+    /// Unset disables this check.
+    #[serde(
+        rename = "compaction.delete_position_records_count_threshold",
+        default
+    )]
+    #[serde_as(as = "Option<DisplayFromStr>")]
+    #[with_option(allow_alter_on_fly)]
+    pub delete_position_records_count_threshold: Option<u64>,
+
+    /// Minimum equality-delete record count applied to a data file required
+    /// to select it for compaction. Not clamped to the file's row count —
+    /// caps like BigLake's count applied records, not confirmed deleted rows.
+    /// Combined with `compaction.delete_files_count_threshold` and
+    /// `compaction.delete_position_records_count_threshold` via logical OR.
+    /// Unset disables this check.
+    #[serde(
+        rename = "compaction.delete_equality_records_count_threshold",
+        default
+    )]
+    #[serde_as(as = "Option<DisplayFromStr>")]
+    #[with_option(allow_alter_on_fly)]
+    pub delete_equality_records_count_threshold: Option<u64>,
+
     #[serde(rename = "compaction.trigger_snapshot_count", default)]
     #[serde_as(as = "Option<DisplayFromStr>")]
     #[with_option(allow_alter_on_fly)]
@@ -472,7 +515,8 @@ pub struct IcebergConfig {
     #[with_option(allow_alter_on_fly)]
     pub target_file_size_mb: Option<u64>,
 
-    /// Compaction type: `full`, `small-files`, or `files-with-delete`
+    /// Compaction type: `full`, `small-files`, `files-with-delete`, or
+    /// `small-files-with-delete`
     /// If not set, will default to `full`
     #[serde(rename = "compaction.type", default)]
     #[with_option(allow_alter_on_fly)]
@@ -862,6 +906,20 @@ impl IcebergConfig {
 
     pub fn delete_files_count_threshold(&self) -> usize {
         self.delete_files_count_threshold.unwrap_or(256)
+    }
+
+    /// Returns `None` when unset, which disables the approximate
+    /// delete-row-count check entirely (unlike `delete_files_count_threshold`,
+    /// which always has an effective default).
+    pub fn delete_position_records_count_threshold(&self) -> Option<u64> {
+        self.delete_position_records_count_threshold
+    }
+
+    /// Returns `None` when unset, which disables the equality-delete-record-count
+    /// check entirely (unlike `delete_files_count_threshold`, which always has
+    /// an effective default).
+    pub fn delete_equality_records_count_threshold(&self) -> Option<u64> {
+        self.delete_equality_records_count_threshold
     }
 
     pub fn target_file_size_mb(&self) -> u64 {
