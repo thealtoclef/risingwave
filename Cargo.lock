@@ -7172,7 +7172,7 @@ dependencies = [
 [[package]]
 name = "iceberg-compaction-core"
 version = "0.1.0"
-source = "git+https://github.com/thealtoclef/iceberg-compaction.git?rev=171dd6b2bcb3726f5bf6869ea687f14afda18c34#171dd6b2bcb3726f5bf6869ea687f14afda18c34"
+source = "git+https://github.com/thealtoclef/iceberg-compaction.git?rev=c3c3df4dc61e72020c868657ad2caa3a0af4ee43#c3c3df4dc61e72020c868657ad2caa3a0af4ee43"
 dependencies = [
  "async-stream",
  "async-trait",
