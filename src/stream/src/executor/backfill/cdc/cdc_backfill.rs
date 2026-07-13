@@ -383,6 +383,12 @@ impl<S: StateStore> CdcBackfillExecutor<S> {
                 }
             }
 
+            upstream_table_reader
+                .reader
+                .prepare_snapshot(self.external_table.config())
+                .await
+                .map_err(StreamExecutorError::connector_error)?;
+
             tracing::info!(%table_id,
                 upstream_table_name,
                 initial_binlog_offset = ?last_binlog_offset,
