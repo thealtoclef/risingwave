@@ -335,18 +335,9 @@ impl IcebergSinkCommitter {
         }
     }
 
-    // Reload table and guarantee current schema_id and partition_spec_id matches
-    // given `schema_id` and `partition_spec_id`
-    async fn reload_table(
-        catalog: &dyn Catalog,
-        table_ident: &TableIdent,
-        schema_id: i32,
-        partition_spec_id: i32,
-    ) -> Result<Table> {
-        let table = catalog
-            .load_table(table_ident)
-            .await
-            .map_err(|err| SinkError::Iceberg(anyhow!(err)))?;
+    // Guarantee the table's current schema_id and partition_spec_id match the
+    // given `schema_id` and `partition_spec_id`.
+    fn validate_table_ids(table: &Table, schema_id: i32, partition_spec_id: i32) -> Result<()> {
         if table.metadata().current_schema_id() != schema_id {
             return Err(SinkError::Iceberg(anyhow!(
                 "Schema evolution not supported, expect schema id {}, but got {}",
@@ -361,6 +352,22 @@ impl IcebergSinkCommitter {
                 table.metadata().default_partition_spec_id()
             )));
         }
+        Ok(())
+    }
+
+    // Reload table and guarantee current schema_id and partition_spec_id matches
+    // given `schema_id` and `partition_spec_id`
+    async fn reload_table(
+        catalog: &dyn Catalog,
+        table_ident: &TableIdent,
+        schema_id: i32,
+        partition_spec_id: i32,
+    ) -> Result<Table> {
+        let table = catalog
+            .load_table(table_ident)
+            .await
+            .map_err(|err| SinkError::Iceberg(anyhow!(err)))?;
+        Self::validate_table_ids(&table, schema_id, partition_spec_id)?;
         Ok(table)
     }
 }
@@ -386,7 +393,7 @@ impl SinglePhaseCommitCoordinator for IcebergSinkCommitter {
 
         // Commit data if present
         if let Some((write_results, snapshot_id)) = self.pre_commit_inner(epoch, metadata)? {
-            self.commit_data_impl(epoch, write_results, snapshot_id)
+            self.commit_data_impl(epoch, write_results, snapshot_id, None)
                 .await?;
         }
 
@@ -483,11 +490,18 @@ impl TwoPhaseCommitCoordinator for IcebergSinkCommitter {
             .map(IcebergCommitResult::try_from_serialized_bytes)
             .collect::<Result<Vec<_>>>()?;
 
-        let snapshot_committed = self
-            .is_snapshot_id_in_iceberg(&self.config, snapshot_id)
-            .await?;
+        // Load the table once, for both the snapshot dedup check and the commit base.
+        // Deliberately unvalidated: an already-committed snapshot must be skipped
+        // even if the schema has evolved since.
+        let table = self
+            .catalog
+            .load_table(self.table.identifier())
+            .await
+            .map_err(|err| SinkError::Iceberg(anyhow!(err)))?;
 
-        if snapshot_committed {
+        // Pre-commit recorded the `snapshot_id` for this batch of files, so the
+        // snapshot's presence means the batch is already committed.
+        if table.metadata().snapshot_by_id(snapshot_id).is_some() {
             tracing::info!(
                 "Snapshot id {} already committed in iceberg table, skip committing again.",
                 snapshot_id
@@ -495,7 +509,7 @@ impl TwoPhaseCommitCoordinator for IcebergSinkCommitter {
             return Ok(());
         }
 
-        self.commit_data_impl(epoch, write_results, snapshot_id)
+        self.commit_data_impl(epoch, write_results, snapshot_id, Some(table))
             .await
     }
 
@@ -570,6 +584,7 @@ impl IcebergSinkCommitter {
         epoch: u64,
         write_results: Vec<IcebergCommitResult>,
         snapshot_id: i64,
+        preloaded_table: Option<Table>,
     ) -> Result<()> {
         // Empty write results should be handled before calling this function.
         assert!(
@@ -583,13 +598,22 @@ impl IcebergSinkCommitter {
         let expect_partition_spec_id = write_results[0].partition_spec_id;
 
         // Load the latest table to avoid concurrent modification with the best effort.
-        self.table = Self::reload_table(
-            self.catalog.as_ref(),
-            self.table.identifier(),
-            expect_schema_id,
-            expect_partition_spec_id,
-        )
-        .await?;
+        // A caller-preloaded table skips the round-trip but gets the same validation.
+        self.table = match preloaded_table {
+            Some(table) => {
+                Self::validate_table_ids(&table, expect_schema_id, expect_partition_spec_id)?;
+                table
+            }
+            None => {
+                Self::reload_table(
+                    self.catalog.as_ref(),
+                    self.table.identifier(),
+                    expect_schema_id,
+                    expect_partition_spec_id,
+                )
+                .await?
+            }
+        };
 
         let Some(schema) = self.table.metadata().schema_by_id(expect_schema_id) else {
             return Err(SinkError::Iceberg(anyhow!(
@@ -632,9 +656,11 @@ impl IcebergSinkCommitter {
             .take(self.commit_retry_num as usize);
         let catalog = self.catalog.clone();
         let table_ident = self.table.identifier().clone();
+        // Seed the first commit attempt with the table loaded above.
+        let seeded_table = std::sync::Mutex::new(Some(self.table.clone()));
 
         // Custom retry logic that:
-        // 1. Calls reload_table before each commit attempt to get the latest metadata
+        // 1. First attempt uses the seeded table; later attempts reload the latest metadata
         // 2. If reload_table fails (table not exists/schema/partition mismatch), stops retrying immediately
         // 3. If commit fails, retries with backoff
         enum CommitError {
@@ -645,18 +671,21 @@ impl IcebergSinkCommitter {
         let table = RetryIf::spawn(
             retry_strategy,
             || async {
-                // Reload table before each commit attempt to get the latest metadata
-                let table = Self::reload_table(
-                    catalog.as_ref(),
-                    &table_ident,
-                    expect_schema_id,
-                    expect_partition_spec_id,
-                )
-                .await
-                .map_err(|e| {
-                    tracing::error!(error = %e.as_report(), "Failed to reload iceberg table");
-                    CommitError::ReloadTable(e)
-                })?;
+                let seeded = seeded_table.lock().unwrap().take();
+                let table = match seeded {
+                    Some(table) => table,
+                    None => Self::reload_table(
+                        catalog.as_ref(),
+                        &table_ident,
+                        expect_schema_id,
+                        expect_partition_spec_id,
+                    )
+                    .await
+                    .map_err(|e| {
+                        tracing::error!(error = %e.as_report(), "Failed to reload iceberg table");
+                        CommitError::ReloadTable(e)
+                    })?,
+                };
 
                 let txn = Transaction::new(&table);
                 let append_action = txn
@@ -716,22 +745,6 @@ impl IcebergSinkCommitter {
         self.notify_iceberg_compaction_scheduler(false);
 
         Ok(())
-    }
-
-    /// During pre-commit metadata, we record the `snapshot_id` corresponding to each batch of files.
-    /// Therefore, the logic for checking whether all files in this batch are present in Iceberg
-    /// has been changed to verifying if their corresponding `snapshot_id` exists in Iceberg.
-    async fn is_snapshot_id_in_iceberg(
-        &self,
-        iceberg_config: &IcebergConfig,
-        snapshot_id: i64,
-    ) -> Result<bool> {
-        let table = iceberg_config.load_table().await?;
-        if table.metadata().snapshot_by_id(snapshot_id).is_some() {
-            Ok(true)
-        } else {
-            Ok(false)
-        }
     }
 
     /// Check if the specified columns already exist in the iceberg table's current schema.
@@ -986,7 +999,11 @@ impl IcebergSinkCommitter {
                 tokio::time::sleep(Duration::from_secs(30)).await;
 
                 // Refresh table after the wait so the next check sees latest snapshots.
-                self.table = self.config.load_table().await?;
+                self.table = self
+                    .catalog
+                    .load_table(self.table.identifier())
+                    .await
+                    .map_err(|err| SinkError::Iceberg(anyhow!(err)))?;
             }
         }
         Ok(())
