@@ -264,6 +264,25 @@ pub fn execute_with_jni_env<T>(
     ret
 }
 
+/// Run a JNI call on the blocking thread pool instead of the current tokio worker
+/// thread. Calls into the JVM often perform network I/O or other blocking work and
+/// can take seconds; running them inline in an async context would pin a runtime
+/// worker for the whole call and starve other tasks on the same runtime, e.g. the
+/// barrier control plane when the JVM is used by sink coordinators on meta.
+///
+/// Dropping the returned future does NOT cancel the JNI call: it keeps running to
+/// completion on the blocking thread with its result discarded, so callers must
+/// tolerate an abandoned call (e.g. a timed-out catalog `updateTable`) still taking
+/// effect server-side, same as a crash mid-call.
+pub async fn execute_with_jni_env_blocking<T: Send + 'static>(
+    jvm: Jvm,
+    f: impl FnOnce(&mut JNIEnv<'_>) -> anyhow::Result<T> + Send + 'static,
+) -> anyhow::Result<T> {
+    tokio::task::spawn_blocking(move || execute_with_jni_env(jvm, f))
+        .await
+        .context("failed to join JNI blocking task")?
+}
+
 /// A helper method to convert an java object to rust string.
 pub fn jobj_to_str(env: &mut JNIEnv<'_>, obj: JObject<'_>) -> anyhow::Result<String> {
     if !env.is_instance_of(&obj, "java/lang/String")? {

@@ -36,7 +36,9 @@ use itertools::Itertools;
 use jni::objects::{GlobalRef, JObject};
 use risingwave_common::global_jvm::Jvm;
 use risingwave_jni_core::call_method;
-use risingwave_jni_core::jvm_runtime::{execute_with_jni_env, jobj_to_str};
+use risingwave_jni_core::jvm_runtime::{
+    execute_with_jni_env, execute_with_jni_env_blocking, jobj_to_str,
+};
 use serde::{Deserialize, Serialize};
 use thiserror_ext::AsReport;
 
@@ -126,9 +128,10 @@ impl Catalog for JniCatalog {
         &self,
         _parent: Option<&NamespaceIdent>,
     ) -> iceberg::Result<Vec<NamespaceIdent>> {
-        execute_with_jni_env(self.jvm, |env| {
+        let java_catalog = self.java_catalog.clone();
+        execute_with_jni_env_blocking(self.jvm, move |env| {
             let result_json =
-                call_method!(env, self.java_catalog.as_obj(), {String listNamespaces()})
+                call_method!(env, java_catalog.as_obj(), {String listNamespaces()})
                     .with_context(|| "Failed to list iceberg namespaces".to_owned())?;
 
             let rust_json_str = jobj_to_str(env, result_json)?;
@@ -137,6 +140,7 @@ impl Catalog for JniCatalog {
 
             Ok(resp.namespaces)
         })
+        .await
         .map_err(|e| {
             iceberg::Error::new(
                 iceberg::ErrorKind::Unexpected,
@@ -152,8 +156,10 @@ impl Catalog for JniCatalog {
         namespace: &iceberg::NamespaceIdent,
         properties: HashMap<String, String>,
     ) -> iceberg::Result<iceberg::Namespace> {
-        execute_with_jni_env(self.jvm, |env| {
-            let namespace_str = namespace_to_string(namespace);
+        let java_catalog = self.java_catalog.clone();
+        let namespace = namespace.clone();
+        execute_with_jni_env_blocking(self.jvm, move |env| {
+            let namespace_str = namespace_to_string(&namespace);
             let namespace_jstr = env.new_string(&namespace_str).unwrap();
 
             // Convert properties HashMap to Java String array
@@ -173,12 +179,13 @@ impl Catalog for JniCatalog {
                 env.set_object_array_element(&props_array, i as i32, jstr)?;
             }
 
-            call_method!(env, self.java_catalog.as_obj(), {void createNamespace(String, String[])},
+            call_method!(env, java_catalog.as_obj(), {void createNamespace(String, String[])},
                 &namespace_jstr, &props_array)
             .with_context(|| format!("Failed to create namespace: {namespace}"))?;
 
             Ok(Namespace::new(namespace.clone()))
         })
+        .await
         .map_err(|e| {
             iceberg::Error::new(
                 iceberg::ErrorKind::Unexpected,
@@ -195,17 +202,20 @@ impl Catalog for JniCatalog {
 
     /// Check if namespace exists in catalog.
     async fn namespace_exists(&self, namespace: &NamespaceIdent) -> iceberg::Result<bool> {
-        execute_with_jni_env(self.jvm, |env| {
-            let namespace_str = namespace_to_string(namespace);
+        let java_catalog = self.java_catalog.clone();
+        let namespace = namespace.clone();
+        execute_with_jni_env_blocking(self.jvm, move |env| {
+            let namespace_str = namespace_to_string(&namespace);
             let namespace_jstr = env.new_string(&namespace_str).unwrap();
 
             let exists =
-                call_method!(env, self.java_catalog.as_obj(), {boolean namespaceExists(String)},
+                call_method!(env, java_catalog.as_obj(), {boolean namespaceExists(String)},
                 &namespace_jstr)
                 .with_context(|| format!("Failed to check namespace exists: {namespace}"))?;
 
             Ok(exists)
         })
+        .await
         .map_err(|e| {
             iceberg::Error::new(
                 iceberg::ErrorKind::Unexpected,
@@ -222,12 +232,14 @@ impl Catalog for JniCatalog {
 
     /// List tables from namespace.
     async fn list_tables(&self, namespace: &NamespaceIdent) -> iceberg::Result<Vec<TableIdent>> {
-        execute_with_jni_env(self.jvm, |env| {
-            let namespace_str = namespace_to_string(namespace);
+        let java_catalog = self.java_catalog.clone();
+        let namespace = namespace.clone();
+        execute_with_jni_env_blocking(self.jvm, move |env| {
+            let namespace_str = namespace_to_string(&namespace);
             let namespace_jstr = env.new_string(&namespace_str).unwrap();
 
             let result_json =
-                call_method!(env, self.java_catalog.as_obj(), {String listTables(String)},
+                call_method!(env, java_catalog.as_obj(), {String listTables(String)},
                 &namespace_jstr)
                 .with_context(|| {
                     format!("Failed to list iceberg tables in namespace: {}", namespace)
@@ -239,6 +251,7 @@ impl Catalog for JniCatalog {
 
             Ok(resp.identifiers)
         })
+        .await
         .map_err(|e| {
             iceberg::Error::new(
                 iceberg::ErrorKind::Unexpected,
@@ -262,8 +275,11 @@ impl Catalog for JniCatalog {
         namespace: &NamespaceIdent,
         creation: TableCreation,
     ) -> iceberg::Result<Table> {
-        execute_with_jni_env(self.jvm, |env| {
-            let namespace_str = namespace_to_string(namespace);
+        let java_catalog = self.java_catalog.clone();
+        let file_io_props = self.file_io_props.clone();
+        let namespace = namespace.clone();
+        execute_with_jni_env_blocking(self.jvm, move |env| {
+            let namespace_str = namespace_to_string(&namespace);
             let namespace_jstr = env.new_string(&namespace_str).unwrap();
 
             let creation_str = serde_json::to_string(&CreateTableRequest::from(&creation))?;
@@ -271,7 +287,7 @@ impl Catalog for JniCatalog {
             let creation_jstr = env.new_string(&creation_str).unwrap();
 
             let result_json =
-                call_method!(env, self.java_catalog.as_obj(), {String createTable(String, String)},
+                call_method!(env, java_catalog.as_obj(), {String createTable(String, String)},
                 &namespace_jstr, &creation_jstr)
                 .with_context(|| format!("Failed to create iceberg table: {}", creation.name))?;
 
@@ -289,7 +305,7 @@ impl Catalog for JniCatalog {
             let table_metadata = resp.metadata;
 
             let file_io = FileIO::from_path(&metadata_location)?
-                .with_props(self.file_io_props.iter())
+                .with_props(file_io_props.iter())
                 .build()?;
 
             Ok(Table::builder()
@@ -298,6 +314,7 @@ impl Catalog for JniCatalog {
                 .metadata(table_metadata)
                 .build())
         })
+        .await
         .map_err(|e| {
             iceberg::Error::new(
                 iceberg::ErrorKind::Unexpected,
@@ -309,13 +326,16 @@ impl Catalog for JniCatalog {
 
     /// Load table from the catalog.
     async fn load_table(&self, table: &TableIdent) -> iceberg::Result<Table> {
-        execute_with_jni_env(self.jvm, |env| {
+        let java_catalog = self.java_catalog.clone();
+        let file_io_props = self.file_io_props.clone();
+        let table = table.clone();
+        execute_with_jni_env_blocking(self.jvm, move |env| {
             let table_name_str = table.to_string();
 
             let table_name_jstr = env.new_string(&table_name_str).unwrap();
 
             let result_json =
-                call_method!(env, self.java_catalog.as_obj(), {String loadTable(String)},
+                call_method!(env, java_catalog.as_obj(), {String loadTable(String)},
                 &table_name_jstr)
                 .with_context(|| format!("Failed to load iceberg table: {table_name_str}"))?;
 
@@ -335,7 +355,7 @@ impl Catalog for JniCatalog {
             let table_metadata = resp.metadata;
 
             let file_io = FileIO::from_path(&metadata_location)?
-                .with_props(self.file_io_props.iter())
+                .with_props(file_io_props.iter())
                 .build()?;
 
             Ok(Table::builder()
@@ -344,6 +364,7 @@ impl Catalog for JniCatalog {
                 .metadata(table_metadata)
                 .build())
         })
+        .await
         .map_err(|e| {
             iceberg::Error::new(
                 iceberg::ErrorKind::Unexpected,
@@ -355,29 +376,19 @@ impl Catalog for JniCatalog {
 
     /// Drop a table from the catalog.
     async fn drop_table(&self, table: &TableIdent) -> iceberg::Result<()> {
-        let jvm = self.jvm;
         let table = table.to_owned();
         let java_catalog = self.java_catalog.clone();
-        // spawn blocking the drop table task, since dropping a table by default would purge the data which may take a long time.
-        tokio::task::spawn_blocking(move || -> iceberg::Result<()> {
-            execute_with_jni_env(jvm, |env| {
-                let table_name_str = table.to_string();
+        // Dropping a table by default purges the data, which may take a long time.
+        execute_with_jni_env_blocking(self.jvm, move |env| {
+            let table_name_str = table.to_string();
 
-                let table_name_jstr = env.new_string(&table_name_str).unwrap();
+            let table_name_jstr = env.new_string(&table_name_str).unwrap();
 
-                call_method!(env, java_catalog.as_obj(), {boolean dropTable(String)},
-                &table_name_jstr)
-                .with_context(|| format!("Failed to drop iceberg table: {table_name_str}"))?;
+            call_method!(env, java_catalog.as_obj(), {boolean dropTable(String)},
+            &table_name_jstr)
+            .with_context(|| format!("Failed to drop iceberg table: {table_name_str}"))?;
 
-                Ok(())
-            })
-            .map_err(|e| {
-                iceberg::Error::new(
-                    iceberg::ErrorKind::Unexpected,
-                    "Failed to drop iceberg table.",
-                )
-                .with_source(e)
-            })
+            Ok(())
         })
         .await
         .map_err(|e| {
@@ -386,7 +397,7 @@ impl Catalog for JniCatalog {
                 "Failed to drop iceberg table.",
             )
             .with_source(e)
-        })?
+        })
     }
 
     async fn register_table(
@@ -402,13 +413,15 @@ impl Catalog for JniCatalog {
 
     /// Check if a table exists in the catalog.
     async fn table_exists(&self, table: &TableIdent) -> iceberg::Result<bool> {
-        execute_with_jni_env(self.jvm, |env| {
+        let java_catalog = self.java_catalog.clone();
+        let table = table.clone();
+        execute_with_jni_env_blocking(self.jvm, move |env| {
             let table_name_str = table.to_string();
 
             let table_name_jstr = env.new_string(&table_name_str).unwrap();
 
             let exists =
-                call_method!(env, self.java_catalog.as_obj(), {boolean tableExists(String)},
+                call_method!(env, java_catalog.as_obj(), {boolean tableExists(String)},
                 &table_name_jstr)
                 .with_context(|| {
                     format!("Failed to check iceberg table exists: {table_name_str}")
@@ -416,6 +429,7 @@ impl Catalog for JniCatalog {
 
             Ok(exists)
         })
+        .await
         .map_err(|e| {
             iceberg::Error::new(
                 iceberg::ErrorKind::Unexpected,
@@ -432,14 +446,15 @@ impl Catalog for JniCatalog {
 
     /// Update a table to the catalog.
     async fn update_table(&self, mut commit: TableCommit) -> iceberg::Result<Table> {
-        execute_with_jni_env(self.jvm, |env| {
-            let requirements = commit.take_requirements();
-            let updates = commit.take_updates();
-            let request = CommitTableRequest {
-                identifier: commit.identifier().clone(),
-                requirements,
-                updates,
-            };
+        let table_ident = commit.identifier().clone();
+        let request = CommitTableRequest {
+            identifier: table_ident.clone(),
+            requirements: commit.take_requirements(),
+            updates: commit.take_updates(),
+        };
+        let java_catalog = self.java_catalog.clone();
+        let file_io_props = self.file_io_props.clone();
+        execute_with_jni_env_blocking(self.jvm, move |env| {
             let request_str = serde_json::to_string(&request)?;
 
             let request_jni_str = env.new_string(&request_str).with_context(|| {
@@ -447,11 +462,9 @@ impl Catalog for JniCatalog {
             })?;
 
             let result_json =
-                call_method!(env, self.java_catalog.as_obj(), {String updateTable(String)},
+                call_method!(env, java_catalog.as_obj(), {String updateTable(String)},
                 &request_jni_str)
-                .with_context(|| {
-                    format!("Failed to update iceberg table: {}", commit.identifier())
-                })?;
+                .with_context(|| format!("Failed to update iceberg table: {table_ident}"))?;
 
             let rust_json_str = jobj_to_str(env, result_json)?;
 
@@ -459,22 +472,23 @@ impl Catalog for JniCatalog {
 
             tracing::info!(
                 "Table metadata location of {} is {}",
-                commit.identifier(),
+                table_ident,
                 response.metadata_location
             );
 
             let table_metadata = response.metadata;
 
             let file_io = FileIO::from_path(&response.metadata_location)?
-                .with_props(self.file_io_props.iter())
+                .with_props(file_io_props.iter())
                 .build()?;
 
             Ok(Table::builder()
                 .file_io(file_io)
-                .identifier(commit.identifier().clone())
+                .identifier(table_ident.clone())
                 .metadata(table_metadata)
                 .build()?)
         })
+        .await
         .map_err(|e| {
             iceberg::Error::new(
                 iceberg::ErrorKind::Unexpected,
@@ -499,58 +513,67 @@ impl Drop for JniCatalog {
 }
 
 impl JniCatalog {
-    fn build(
+    async fn build(
         file_io_props: HashMap<String, String>,
         name: impl ToString,
         catalog_impl: impl ToString,
         java_catalog_props: HashMap<String, String>,
     ) -> ConnectorResult<Self> {
-        let jvm = Jvm::get_or_init()?;
+        let name = name.to_string();
+        let catalog_impl = catalog_impl.to_string();
 
-        execute_with_jni_env(jvm, |env| {
-            // Convert props to string array
-            let props = env.new_object_array(
-                (java_catalog_props.len() * 2) as i32,
-                "java/lang/String",
-                JObject::null(),
-            )?;
-            for (i, (key, value)) in java_catalog_props.iter().enumerate() {
-                let key_j_str = env.new_string(key)?;
-                let value_j_str = env.new_string(value)?;
-                env.set_object_array_element(&props, i as i32 * 2, key_j_str)?;
-                env.set_object_array_element(&props, i as i32 * 2 + 1, value_j_str)?;
-            }
+        // Building the catalog lazily starts the JVM and constructs the Java catalog
+        // (class loading, auth initialization), which can take seconds.
+        tokio::task::spawn_blocking(move || -> ConnectorResult<Self> {
+            let jvm = Jvm::get_or_init()?;
 
-            let jni_catalog_wrapper = env
-                .call_static_method(
-                    "com/risingwave/connector/catalog/JniCatalogWrapper",
-                    "create",
-                    "(Ljava/lang/String;Ljava/lang/String;[Ljava/lang/String;)Lcom/risingwave/connector/catalog/JniCatalogWrapper;",
-                    &[
-                        (&env.new_string(name.to_string()).unwrap()).into(),
-                        (&env.new_string(catalog_impl.to_string()).unwrap()).into(),
-                        (&props).into(),
-                    ],
+            execute_with_jni_env(jvm, |env| {
+                // Convert props to string array
+                let props = env.new_object_array(
+                    (java_catalog_props.len() * 2) as i32,
+                    "java/lang/String",
+                    JObject::null(),
                 )?;
+                for (i, (key, value)) in java_catalog_props.iter().enumerate() {
+                    let key_j_str = env.new_string(key)?;
+                    let value_j_str = env.new_string(value)?;
+                    env.set_object_array_element(&props, i as i32 * 2, key_j_str)?;
+                    env.set_object_array_element(&props, i as i32 * 2 + 1, value_j_str)?;
+                }
 
-            let jni_catalog = env.new_global_ref(jni_catalog_wrapper.l().unwrap())?;
+                let jni_catalog_wrapper = env
+                    .call_static_method(
+                        "com/risingwave/connector/catalog/JniCatalogWrapper",
+                        "create",
+                        "(Ljava/lang/String;Ljava/lang/String;[Ljava/lang/String;)Lcom/risingwave/connector/catalog/JniCatalogWrapper;",
+                        &[
+                            (&env.new_string(&name).unwrap()).into(),
+                            (&env.new_string(&catalog_impl).unwrap()).into(),
+                            (&props).into(),
+                        ],
+                    )?;
 
-            Ok(Self {
-                java_catalog: jni_catalog,
-                jvm,
-                file_io_props,
+                let jni_catalog = env.new_global_ref(jni_catalog_wrapper.l().unwrap())?;
+
+                Ok(Self {
+                    java_catalog: jni_catalog,
+                    jvm,
+                    file_io_props,
+                })
             })
-        })
             .map_err(Into::into)
+        })
+        .await
+        .context("failed to join JNI blocking task")?
     }
 
-    pub fn build_catalog(
+    pub async fn build_catalog(
         file_io_props: HashMap<String, String>,
         name: impl ToString,
         catalog_impl: impl ToString,
         java_catalog_props: HashMap<String, String>,
     ) -> ConnectorResult<Arc<dyn Catalog>> {
-        let catalog = Self::build(file_io_props, name, catalog_impl, java_catalog_props)?;
+        let catalog = Self::build(file_io_props, name, catalog_impl, java_catalog_props).await?;
         Ok(Arc::new(catalog) as Arc<dyn Catalog>)
     }
 }
