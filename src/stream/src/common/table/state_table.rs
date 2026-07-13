@@ -2507,15 +2507,18 @@ fn fill_non_output_indices(
     data_types: &[DataType],
     chunk: StreamChunk,
 ) -> StreamChunk {
-    let cardinality = chunk.cardinality();
+    // Non-output columns are filled with nulls. Size the padding by the
+    // physical capacity so every column matches the retained visibility
+    // bitmap, as required by `DataChunk::new`.
+    let capacity = chunk.capacity();
     let (ops, columns, vis) = chunk.into_inner();
     let mut full_columns = Vec::with_capacity(data_types.len());
     for (i, data_type) in data_types.iter().enumerate() {
         if let Some(j) = i2o_mapping.try_map(i) {
             full_columns.push(columns[j].clone());
         } else {
-            let mut column_builder = ArrayImplBuilder::with_type(cardinality, data_type.clone());
-            column_builder.append_n_null(cardinality);
+            let mut column_builder = ArrayImplBuilder::with_type(capacity, data_type.clone());
+            column_builder.append_n_null(capacity);
             let column: ArrayRef = column_builder.finish().into();
             full_columns.push(column)
         }
@@ -2559,5 +2562,35 @@ mod tests {
             +---+---+---+-----+
              }"#]],
         );
+    }
+
+    /// A chunk written into a replicated state table may contain invisible
+    /// rows (`cardinality < capacity`), e.g. a lookup update pair that becomes
+    /// a no-op after column projection and is marked invisible. The null-filled
+    /// non-output columns must be sized by the physical capacity so they match
+    /// the retained visibility bitmap.
+    #[test]
+    fn test_fill_non_output_indices_all_invisible_chunk() {
+        let data_types = vec![DataType::Int32, DataType::Int32, DataType::Int32];
+        let rows = [
+            OwnedRow::new(vec![Some(1_i32.into()), Some(10_i32.into())]),
+            OwnedRow::new(vec![Some(2_i32.into()), Some(20_i32.into())]),
+        ];
+        // 2 physical rows, all invisible: cardinality 0, capacity 2.
+        let data_chunk = DataChunk::from_rows(&rows, &[DataType::Int32, DataType::Int32])
+            .with_visibility(Bitmap::zeros(2));
+        assert_eq!(data_chunk.cardinality(), 0);
+        assert_eq!(data_chunk.capacity(), 2);
+        let chunk = StreamChunk::from_parts(vec![Op::UpdateDelete, Op::UpdateInsert], data_chunk);
+
+        // Middle index (1) has no mapping, so it takes the null-fill branch.
+        let i2o_mapping = ColIndexMapping::new(vec![Some(1), None, Some(0)], 2);
+        let filled = fill_non_output_indices(&i2o_mapping, &data_types, chunk);
+
+        // Every column is padded to the physical capacity and visibility is
+        // preserved, so no rows are visible.
+        assert_eq!(filled.data_chunk().columns().len(), 3);
+        assert_eq!(filled.data_chunk().capacity(), 2);
+        assert_eq!(filled.cardinality(), 0);
     }
 }
