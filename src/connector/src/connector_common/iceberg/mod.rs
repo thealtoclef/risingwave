@@ -970,6 +970,7 @@ impl IcebergCommon {
                     catalog_impl,
                     java_catalog_props,
                 )
+                .await
             }
             "mock" => Ok(Arc::new(mock_catalog::MockCatalog {})),
             _ => {
