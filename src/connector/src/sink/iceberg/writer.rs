@@ -238,6 +238,7 @@ pub struct IcebergSinkWriterInner {
     // For chunk with extra partition column, we should remove this column before write.
     // This project index vec is used to avoid create project idx each time.
     project_idx_vec: ProjectIdxVec,
+    uncommitted_write_bytes: u64,
 }
 
 enum IcebergWriterDispatch {
@@ -414,6 +415,7 @@ impl IcebergSinkWriterInner {
                     ProjectIdxVec::None
                 }
             },
+            uncommitted_write_bytes: 0,
         })
     }
 
@@ -603,6 +605,7 @@ impl IcebergSinkWriterInner {
                     ProjectIdxVec::None
                 }
             },
+            uncommitted_write_bytes: 0,
         })
     }
 
@@ -707,6 +710,7 @@ impl IcebergSinkWriterInner {
             .write(batch)
             .instrument_await("iceberg_write")
             .await?;
+        self.uncommitted_write_bytes += write_batch_size as u64;
         self.metrics.write_bytes.inc_by(write_batch_size as _);
         Ok(())
     }
@@ -730,6 +734,7 @@ impl IcebergSinkWriterInner {
             .write_with_position(batch)
             .instrument_await("iceberg_write")
             .await?;
+        self.uncommitted_write_bytes += write_batch_size as u64;
         self.metrics.write_bytes.inc_by(write_batch_size as _);
         Ok(positions)
     }
@@ -782,6 +787,10 @@ impl IcebergSinkWriterInner {
                 close_result
             }
         };
+        // All buffered data has been flushed to data files, so reset the uncommitted byte
+        // counter. `close()` is the single flush point shared by both the coordinated-sink
+        // barrier path and the V3 writer-executor flush path.
+        self.uncommitted_write_bytes = 0;
         Ok(res)
     }
 
@@ -842,6 +851,13 @@ impl SinkWriter for IcebergSinkWriter {
             unreachable!("IcebergSinkWriter should be initialized before barrier");
         };
         inner.write_batch(chunk).await
+    }
+
+    fn buffered_bytes(&self) -> u64 {
+        match self {
+            Self::Initialized(inner) => inner.uncommitted_write_bytes,
+            Self::Created(_) => 0,
+        }
     }
 
     /// Receive a barrier and mark the end of current epoch. When `is_checkpoint` is true, the sink

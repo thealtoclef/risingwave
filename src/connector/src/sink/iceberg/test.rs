@@ -26,7 +26,10 @@ use risingwave_common::catalog::{Field, Schema};
 use risingwave_common::types::{DataType, MapType, StructType};
 
 use crate::connector_common::{IcebergCommon, IcebergTableIdentifier};
-use crate::sink::decouple_checkpoint_log_sink::ICEBERG_DEFAULT_COMMIT_CHECKPOINT_INTERVAL;
+use crate::sink::decouple_checkpoint_log_sink::{
+    ICEBERG_DEFAULT_COMMIT_CHECKPOINT_INTERVAL,
+    ICEBERG_DEFAULT_COMMIT_CHECKPOINT_SIZE_THRESHOLD_MB,
+};
 use crate::sink::iceberg::{
     COMPACTION_INTERVAL_SEC, COMPACTION_MAX_SNAPSHOTS_NUM,
     COMPACTION_WRITE_PARQUET_MAX_ROW_GROUP_BYTES, CompactionType,
@@ -383,6 +386,7 @@ fn test_parse_iceberg_config() {
                 .map(|(k, v)| (k.to_owned(), v.to_owned()))
                 .collect(),
             commit_checkpoint_interval: ICEBERG_DEFAULT_COMMIT_CHECKPOINT_INTERVAL,
+            commit_checkpoint_size_threshold_mb: ICEBERG_DEFAULT_COMMIT_CHECKPOINT_SIZE_THRESHOLD_MB,
             create_table_if_not_exists: false,
             drop_table_on_sink_drop: false,
             is_exactly_once: Some(true),

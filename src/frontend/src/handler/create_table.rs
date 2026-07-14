@@ -103,7 +103,8 @@ use risingwave_connector::sink::iceberg::{
     COMPACTION_DELETE_EQUALITY_RECORDS_COUNT_THRESHOLD, COMPACTION_DELETE_FILES_COUNT_THRESHOLD,
     COMPACTION_DELETE_POSITION_RECORDS_COUNT_THRESHOLD, COMPACTION_INTERVAL_SEC,
     COMPACTION_MAX_SNAPSHOTS_NUM, COMPACTION_SMALL_FILES_THRESHOLD_MB,
-    COMPACTION_TARGET_FILE_SIZE_MB, COMPACTION_TRIGGER_SNAPSHOT_COUNT, COMPACTION_TYPE,
+    COMPACTION_TARGET_FILE_SIZE_MB, COMPACTION_TRIGGER_SNAPSHOT_COUNT,     COMPACTION_TYPE,
+    COMMIT_CHECKPOINT_SIZE_THRESHOLD_MB,
     COMPACTION_WRITE_PARQUET_COMPRESSION,
     COMPACTION_WRITE_PARQUET_MAX_ROW_GROUP_BYTES, COMPACTION_WRITE_PARQUET_MAX_ROW_GROUP_ROWS,
     CompactionType, ENABLE_COMPACTION, ENABLE_PK_INDEX, ENABLE_SNAPSHOT_EXPIRATION, FORMAT_VERSION,
@@ -1975,6 +1976,26 @@ pub async fn create_iceberg_engine_table(
         COMMIT_CHECKPOINT_INTERVAL.to_owned(),
         commit_checkpoint_interval.to_string(),
     );
+
+    if let Some(commit_checkpoint_size_threshold_mb) =
+        handler_args.with_options.get(COMMIT_CHECKPOINT_SIZE_THRESHOLD_MB)
+    {
+        let threshold_mb: u64 = commit_checkpoint_size_threshold_mb.parse().map_err(|_| {
+            ErrorCode::InvalidInputSyntax(format!(
+                "{} must be a positive integer: {}",
+                COMMIT_CHECKPOINT_SIZE_THRESHOLD_MB, commit_checkpoint_size_threshold_mb
+            ))
+        })?;
+        // Setting to 0 disables size-based early commits.
+        if let Some(s) = source.as_mut() {
+            s.with_properties.remove(COMMIT_CHECKPOINT_SIZE_THRESHOLD_MB);
+        }
+        sink_with.insert(
+            COMMIT_CHECKPOINT_SIZE_THRESHOLD_MB.to_owned(),
+            threshold_mb.to_string(),
+        );
+    }
+
     sink_with.insert("create_table_if_not_exists".to_owned(), "true".to_owned());
 
     sink_with.insert("is_exactly_once".to_owned(), "true".to_owned());
