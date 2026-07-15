@@ -1648,7 +1648,7 @@ pub fn is_parquet_schema_match_source_schema(
         | (ArrowType::Date32, RwType::Date)
         | (ArrowType::Time32(_) | ArrowType::Time64(_), RwType::Time)
         | (ArrowType::Interval(arrow_schema::IntervalUnit::MonthDayNano), RwType::Interval)
-        | (ArrowType::Utf8 | ArrowType::LargeUtf8, RwType::Varchar)
+        | (ArrowType::Utf8 | ArrowType::LargeUtf8, RwType::Varchar | RwType::Jsonb)
         | (
             ArrowType::Binary | ArrowType::LargeBinary | ArrowType::FixedSizeBinary(_),
             RwType::Bytea,
@@ -1767,6 +1767,28 @@ mod tests {
         assert!(!is_parquet_schema_match_source_schema(
             &arrow_struct2,
             &rw_struct
+        ));
+    }
+
+    #[test]
+    fn test_utf8_to_jsonb_schema_match() {
+        // Regression for silent data loss when ingesting Parquet STRING columns
+        // (which become Arrow Utf8) into a RisingWave JSONB column. Previously
+        // rejected by the matcher, dropping the column from the projection mask
+        // and producing NULL for every row without error.
+        assert!(is_parquet_schema_match_source_schema(
+            &ArrowType::Utf8,
+            &RwType::Jsonb
+        ));
+        assert!(is_parquet_schema_match_source_schema(
+            &ArrowType::LargeUtf8,
+            &RwType::Jsonb
+        ));
+
+        // Sanity: the previously-working Varchar match still holds.
+        assert!(is_parquet_schema_match_source_schema(
+            &ArrowType::Utf8,
+            &RwType::Varchar
         ));
     }
 
