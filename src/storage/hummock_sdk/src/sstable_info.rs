@@ -106,14 +106,12 @@ fn filter_metadata_from_pb(
     let bloom_filter_kind = PbBloomFilterType::try_from(bloom_filter_kind)
         .expect("invalid legacy bloom_filter_kind in SST info");
 
-    // Exactly one metadata format is active for each SST: legacy SSTs use
-    // `bloom_filter_kind`, while new SSTs use `filter_type` plus optional `filter_layout`.
+    // New SSTs use `filter_type` plus optional `filter_layout`, while legacy SSTs use
+    // `bloom_filter_kind`. A transitional writer additionally set `bloom_filter_kind`
+    // alongside `filter_type` (encoding the layout via Sstable=plain / Blocked=blocked)
+    // without emitting `filter_layout`; tolerate that by recovering the layout from
+    // `bloom_filter_kind` instead of asserting the two formats are mutually exclusive.
     if let Some(filter_type) = filter_type {
-        assert_eq!(
-            bloom_filter_kind,
-            PbBloomFilterType::BloomFilterUnspecified,
-            "new SST filter metadata must not set legacy bloom_filter_kind"
-        );
         let filter_type =
             PbSstableFilterType::try_from(filter_type).expect("invalid filter_type in SST info");
         assert_ne!(
@@ -122,12 +120,17 @@ fn filter_metadata_from_pb(
             "new SST filter metadata must use a resolved filter_type"
         );
 
-        let filter_layout = filter_layout
-            .map(|filter_layout| {
-                PbSstableFilterLayout::try_from(filter_layout)
-                    .expect("invalid filter_layout in SST info")
-            })
-            .unwrap_or(PbSstableFilterLayout::Unspecified);
+        let filter_layout = match filter_layout {
+            Some(filter_layout) => PbSstableFilterLayout::try_from(filter_layout)
+                .expect("invalid filter_layout in SST info"),
+            // No explicit layout: recover it from the legacy `bloom_filter_kind` if the
+            // transitional writer set it, otherwise leave it unspecified.
+            None => match bloom_filter_kind {
+                PbBloomFilterType::Blocked => PbSstableFilterLayout::Blocked,
+                PbBloomFilterType::Sstable => PbSstableFilterLayout::Plain,
+                PbBloomFilterType::BloomFilterUnspecified => PbSstableFilterLayout::Unspecified,
+            },
+        };
         if filter_type == PbSstableFilterType::SstableFilterNone {
             assert_eq!(
                 filter_layout,
@@ -563,6 +566,24 @@ mod tests {
                 None,
                 PbSstableFilterType::SstableFilterNone,
                 PbSstableFilterLayout::Unspecified,
+            ),
+            // Transitional writer set both `filter_type` and legacy `bloom_filter_kind`
+            // without emitting `filter_layout`; layout must be recovered from the legacy kind.
+            (
+                "transitional plain filter",
+                Some(PbBloomFilterType::Sstable),
+                Some(PbSstableFilterType::SstableFilterXor16),
+                None,
+                PbSstableFilterType::SstableFilterXor16,
+                PbSstableFilterLayout::Plain,
+            ),
+            (
+                "transitional blocked filter",
+                Some(PbBloomFilterType::Blocked),
+                Some(PbSstableFilterType::SstableFilterXor16),
+                None,
+                PbSstableFilterType::SstableFilterXor16,
+                PbSstableFilterLayout::Blocked,
             ),
         ];
 
