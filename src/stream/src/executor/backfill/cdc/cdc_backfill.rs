@@ -510,6 +510,15 @@ impl<S: StateStore> CdcBackfillExecutor<S> {
             let mut upstream_chunk_buffer: Vec<StreamChunk> = vec![];
 
             'backfill_loop: loop {
+                // Gate each snapshot read on standby WAL catch-up: events dropped by
+                // `mark_cdc_chunk` assume the next snapshot SELECT sees a state at
+                // least as new as them, which a lagging standby doesn't guarantee.
+                upstream_table_reader
+                    .reader
+                    .prepare_snapshot(self.external_table.config())
+                    .await
+                    .map_err(StreamExecutorError::connector_error)?;
+
                 let mut should_bypass_snapshot_stream_patch =
                     self.rate_limit_rps.is_some_and(|val| val == 0);
                 let left_upstream = upstream.by_ref().map(Either::Left);

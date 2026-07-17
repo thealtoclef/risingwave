@@ -358,6 +358,15 @@ impl<S: StateStore> ParallelizedCdcBackfillExecutor<S> {
                 }
                 let mut split_cdc_offset_high = None;
 
+                // Gate each split read on standby WAL catch-up: events dropped for
+                // not-yet-backfilled splits assume this SELECT sees a state at least
+                // as new as them, which a lagging standby doesn't guarantee.
+                upstream_table_reader
+                    .reader
+                    .prepare_snapshot(self.external_table.config())
+                    .await
+                    .map_err(StreamExecutorError::connector_error)?;
+
                 let left_upstream = upstream.by_ref().map(Either::Left);
                 let read_args = SplitSnapshotReadArgs::new(
                     split.left_bound_inclusive.clone(),
