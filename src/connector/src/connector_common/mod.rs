@@ -43,7 +43,7 @@ pub use iceberg::{
 pub use postgres::{
     PgConnectionConfig, PostgresExternalTable, SslMode, TcpKeepaliveConfig, create_pg_client,
     create_pg_client_from_properties, discover_pgvector_dimensions,
-    pg_connection_config_from_properties,
+    pg_connection_config_from_properties, wait_for_snapshot_catchup,
 };
 
 #[cfg(test)]

@@ -510,6 +510,113 @@ impl<S: StateStore> CdcBackfillExecutor<S> {
             let mut upstream_chunk_buffer: Vec<StreamChunk> = vec![];
 
             'backfill_loop: loop {
+                // Gate each snapshot read on standby WAL catch-up: events dropped by
+                // `mark_cdc_chunk` assume the next snapshot SELECT sees a state at
+                // least as new as them, which a lagging standby doesn't guarantee.
+                // Keep polling upstream while waiting so barriers are not stalled.
+                {
+                    let gate_config = self.external_table.config().clone();
+                    let reader = &upstream_table_reader.reader;
+                    let mut gate_future = Box::pin(async move {
+                        reader
+                            .prepare_snapshot(&gate_config)
+                            .await
+                            .map_err(StreamExecutorError::connector_error)
+                    });
+                    let mut gate_passed = false;
+                    while !gate_passed {
+                        let Some(msg) = pass_snapshot_gate_and_poll_upstream(
+                            &mut upstream,
+                            &mut gate_passed,
+                            &mut gate_future,
+                        )
+                        .await?
+                        else {
+                            if !gate_passed {
+                                bail!("upstream ended during snapshot WAL catch-up gate");
+                            }
+                            continue;
+                        };
+                        match msg {
+                            Message::Barrier(barrier) => {
+                                if let Some(mutation) = barrier.mutation.as_deref() {
+                                    use crate::executor::Mutation;
+                                    match mutation {
+                                        Mutation::Pause => is_snapshot_paused = true,
+                                        Mutation::Resume => is_snapshot_paused = false,
+                                        Mutation::Throttle(some) => {
+                                            if let Some(entry) =
+                                                some.get(&self.actor_ctx.fragment_id)
+                                                && entry.throttle_type() == ThrottleType::Backfill
+                                            {
+                                                // Applied when the snapshot stream is built below.
+                                                self.rate_limit_rps = entry.rate_limit;
+                                            }
+                                        }
+                                        mutation if mutation.is_stop(self.actor_ctx.id) => {
+                                            yield Message::Barrier(barrier);
+                                            break 'backfill_loop;
+                                        }
+                                        _ => (),
+                                    }
+                                }
+                                let (
+                                    emitted_upstream_chunks,
+                                    consumed_upstream_row_count,
+                                    consumed_binlog_offset,
+                                ) = Self::consume_upstream_chunk_buffer(
+                                    &offset_parse_func,
+                                    &mut upstream_chunk_buffer,
+                                    current_pk_pos.as_ref(),
+                                    &pk_indices,
+                                    &pk_order,
+                                    &last_binlog_offset,
+                                    &self.output_indices,
+                                )?;
+                                if let Some(consumed_binlog_offset) = consumed_binlog_offset {
+                                    last_binlog_offset = Some(consumed_binlog_offset);
+                                }
+                                for chunk in emitted_upstream_chunks {
+                                    yield Message::Chunk(chunk);
+                                }
+                                Self::report_metrics(
+                                    &self.metrics,
+                                    0,
+                                    consumed_upstream_row_count,
+                                );
+                                state_impl
+                                    .mutate_state(
+                                        current_pk_pos.clone(),
+                                        last_binlog_offset.clone(),
+                                        total_snapshot_row_count,
+                                        false,
+                                    )
+                                    .await?;
+                                state_impl.commit_state(barrier.epoch).await?;
+                                yield Message::Barrier(barrier);
+                            }
+                            Message::Chunk(chunk) => {
+                                if chunk.cardinality() == 0 {
+                                    continue;
+                                }
+                                // Skip chunks that only contain events before the offset,
+                                // like the backfill loop below.
+                                if let Some(last_binlog_offset) = last_binlog_offset.as_ref()
+                                    && let Some(chunk_offset) =
+                                        get_cdc_chunk_last_offset(&offset_parse_func, &chunk)?
+                                    && chunk_offset < *last_binlog_offset
+                                {
+                                    continue;
+                                }
+                                upstream_chunk_buffer.push(chunk.compact_vis());
+                            }
+                            Message::Watermark(_) => {
+                                // Ignore watermark during backfill.
+                            }
+                        }
+                    }
+                }
+
                 let mut should_bypass_snapshot_stream_patch =
                     self.rate_limit_rps.is_some_and(|val| val == 0);
                 let left_upstream = upstream.by_ref().map(Either::Left);
@@ -975,6 +1082,33 @@ pub(crate) async fn build_reader_and_poll_upstream(
         biased;
         reader = &mut *future => {
             *table_reader = Some(reader);
+            Ok(None)
+        }
+        msg = upstream.next() => {
+            msg.transpose()
+        }
+    }
+}
+
+/// Drives the WAL catch-up gate (`prepare_snapshot`) while polling upstream, so
+/// barriers keep flowing during the wait. Returns the next upstream message, or
+/// `None` with `gate_passed` set once the gate completes.
+pub(crate) async fn pass_snapshot_gate_and_poll_upstream<S>(
+    upstream: &mut S,
+    gate_passed: &mut bool,
+    future: &mut Pin<Box<impl Future<Output = StreamExecutorResult<()>>>>,
+) -> StreamExecutorResult<Option<Message>>
+where
+    S: Stream<Item = StreamExecutorResult<Message>> + Unpin,
+{
+    if *gate_passed {
+        return Ok(None);
+    }
+    tokio::select! {
+        biased;
+        res = &mut *future => {
+            res?;
+            *gate_passed = true;
             Ok(None)
         }
         msg = upstream.next() => {

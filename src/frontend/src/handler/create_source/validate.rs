@@ -242,6 +242,52 @@ pub fn validate_compatibility(
         props.insert("schema.name".into(), "dbo".into());
     }
 
+    // Dedicated snapshot endpoint (postgres-cdc only).
+    let snapshot_dedicated = match props.get(CDC_SNAPSHOT_DEDICATED_KEY) {
+        Some(v) => match v.to_ascii_lowercase().as_str() {
+            "true" => true,
+            "false" => false,
+            _ => {
+                return Err(ErrorCode::InvalidConfigValue {
+                    config_entry: CDC_SNAPSHOT_DEDICATED_KEY.to_owned(),
+                    config_value: v.to_owned(),
+                }
+                .into());
+            }
+        },
+        None => false,
+    };
+    if snapshot_dedicated {
+        if connector != POSTGRES_CDC_CONNECTOR {
+            return Err(RwError::from(ProtocolError(format!(
+                "{CDC_SNAPSHOT_DEDICATED_KEY} is only supported for {POSTGRES_CDC_CONNECTOR}"
+            ))));
+        }
+        if let Some(timeout_value) = props.get(CDC_SNAPSHOT_CATCHUP_TIMEOUT_KEY)
+            && timeout_value.parse::<u64>().is_err()
+        {
+            return Err(ErrorCode::InvalidConfigValue {
+                config_entry: CDC_SNAPSHOT_CATCHUP_TIMEOUT_KEY.to_owned(),
+                config_value: timeout_value.to_owned(),
+            }
+            .into());
+        }
+    } else if let Some(key) = [
+        CDC_SNAPSHOT_HOSTNAME_KEY,
+        CDC_SNAPSHOT_PORT_KEY,
+        CDC_SNAPSHOT_USERNAME_KEY,
+        CDC_SNAPSHOT_PASSWORD_KEY,
+        CDC_SNAPSHOT_CATCHUP_TIMEOUT_KEY,
+    ]
+    .into_iter()
+    .find(|key| props.contains_key(*key))
+    {
+        // Reject snapshot.* overrides that would otherwise be silently ignored.
+        return Err(RwError::from(ProtocolError(format!(
+            "{key} requires {CDC_SNAPSHOT_DEDICATED_KEY}='true'"
+        ))));
+    }
+
     // Validate cdc.source.wait.streaming.start.timeout for all CDC connectors
     if (connector == MYSQL_CDC_CONNECTOR
         || connector == POSTGRES_CDC_CONNECTOR
