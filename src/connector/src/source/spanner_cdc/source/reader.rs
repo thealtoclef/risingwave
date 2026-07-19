@@ -459,11 +459,16 @@ async fn run_reader(ctx: ReaderContext, tx: mpsc::Sender<Vec<SourceMessage>>) ->
                             &mut partition_streams,
                             &child_discovery_tx,
                         );
-                        if ready_pool.is_empty() && deferred.is_empty() {
-                            tracing::info!(%split_id, "all partitions finished");
-                            break;
-                        }
+                        // `spawn_from_pool` drains `ready_pool`, so its emptiness
+                        // says nothing about in-flight work — tasks may have just
+                        // been spawned above. Exit only when nothing is running
+                        // and nothing is waiting; otherwise keep managing the
+                        // lifecycle of the tasks we just spawned.
                         if active_count == 0 {
+                            if deferred.is_empty() {
+                                tracing::info!(%split_id, "all partitions finished");
+                                break;
+                            }
                             return Err(ConnectorError::from(anyhow::anyhow!(
                                 "deadlock: no active tasks but {} children still waiting",
                                 deferred.len()
@@ -505,6 +510,15 @@ async fn run_reader(ctx: ReaderContext, tx: mpsc::Sender<Vec<SourceMessage>>) ->
                 );
             }
         }
+    }
+
+    // Abort any partition tasks still running when the lifecycle loop exits
+    // (e.g. the reader channel closed). Dropping a `JoinHandle` does NOT stop
+    // a tokio task — without the abort, orphaned tasks keep querying Spanner
+    // and holding `tx` clones, so the channel never closes and the source
+    // cannot detect the dead lifecycle loop and restart.
+    for handle in &partition_streams {
+        handle.abort();
     }
 
     Ok(())
