@@ -129,6 +129,16 @@ where
     }
 }
 
+pub(crate) fn deserialize_u64_from_string<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: de::Deserializer<'de>,
+{
+    let s: String = de::Deserialize::deserialize(deserializer)?;
+    s.parse::<u64>().map_err(|_| {
+        de::Error::invalid_value(de::Unexpected::Str(&s), &"a non-negative integer")
+    })
+}
+
 pub(crate) fn deserialize_bool_from_string<'de, D>(deserializer: D) -> Result<bool, D::Error>
 where
     D: de::Deserializer<'de>,
