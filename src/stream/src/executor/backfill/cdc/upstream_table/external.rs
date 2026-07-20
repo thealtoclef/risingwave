@@ -154,6 +154,10 @@ impl ExternalStorageTable {
         self.database_name.as_str()
     }
 
+    pub fn config(&self) -> &ExternalTableConfig {
+        &self.config
+    }
+
     pub fn table_type(&self) -> &ExternalCdcTableType {
         &self.table_type
     }

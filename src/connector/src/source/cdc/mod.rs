@@ -55,6 +55,13 @@ pub const CDC_TRANSACTIONAL_KEY: &str = "transactional";
 pub const CDC_WAIT_FOR_STREAMING_START_TIMEOUT: &str = "cdc.source.wait.streaming.start.timeout";
 pub const CDC_BACKFILL_MAX_PARALLELISM: u32 = 256;
 
+pub const CDC_SNAPSHOT_HOSTNAME_KEY: &str = "snapshot.hostname";
+pub const CDC_SNAPSHOT_PORT_KEY: &str = "snapshot.port";
+pub const CDC_SNAPSHOT_USERNAME_KEY: &str = "snapshot.username";
+pub const CDC_SNAPSHOT_PASSWORD_KEY: &str = "snapshot.password";
+pub const CDC_SNAPSHOT_DEDICATED_KEY: &str = "snapshot.dedicated";
+pub const CDC_SNAPSHOT_CATCHUP_TIMEOUT_KEY: &str = "snapshot.catchup.timeout.ms";
+
 // User can set strong-schema='true' to enable strong schema for mongo cdc source
 pub const CDC_MONGODB_STRONG_SCHEMA_KEY: &str = "strong_schema";
 
