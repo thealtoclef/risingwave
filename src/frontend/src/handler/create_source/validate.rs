@@ -263,6 +263,17 @@ pub fn validate_compatibility(
                 "{CDC_SNAPSHOT_DEDICATED_KEY} is only supported for {POSTGRES_CDC_CONNECTOR}"
             ))));
         }
+        // Hostname is required; without it the snapshot falls back to the primary and only
+        // fails at runtime. Port/username/password stay optional (may match the primary).
+        if props
+            .get(CDC_SNAPSHOT_HOSTNAME_KEY)
+            .map(|host| host.trim().is_empty())
+            .unwrap_or(true)
+        {
+            return Err(RwError::from(ProtocolError(format!(
+                "{CDC_SNAPSHOT_HOSTNAME_KEY} is required when {CDC_SNAPSHOT_DEDICATED_KEY}='true'"
+            ))));
+        }
         if let Some(timeout_value) = props.get(CDC_SNAPSHOT_CATCHUP_TIMEOUT_KEY)
             && timeout_value.parse::<u64>().is_err()
         {

@@ -18,7 +18,6 @@ use either::Either;
 use futures::stream;
 use futures::stream::select_with_strategy;
 use itertools::Itertools;
-use risingwave_common::bail;
 use risingwave_common::bitmap::BitmapBuilder;
 use risingwave_common::catalog::{ColumnDesc, Field};
 use risingwave_common::row::RowDeserializer;
@@ -26,7 +25,7 @@ use risingwave_common::util::iter_util::ZipEqFast;
 use risingwave_common::util::sort_util::{OrderType, cmp_datum};
 use risingwave_connector::source::cdc::CdcScanOptions;
 use risingwave_connector::source::cdc::external::{
-    CdcOffset, ExternalCdcTableType, ExternalTableReaderImpl,
+    CdcOffset, ExternalCdcTableType, ExternalTableConfig, ExternalTableReaderImpl,
 };
 use risingwave_connector::source::{CdcTableSnapshotSplit, CdcTableSnapshotSplitRaw};
 use risingwave_pb::common::ThrottleType;
@@ -35,8 +34,7 @@ use thiserror_ext::AsReport;
 use tracing::Instrument;
 
 use crate::executor::backfill::cdc::cdc_backfill::{
-    build_reader_and_poll_upstream, get_cdc_json_parse_handling_from_properties,
-    pass_snapshot_gate_and_poll_upstream, transform_upstream,
+    build_reader_and_poll_upstream, get_cdc_json_parse_handling_from_properties, transform_upstream,
 };
 use crate::executor::backfill::cdc::state_v2::ParallelizedCdcBackfillState;
 use crate::executor::backfill::cdc::upstream_table::external::ExternalStorageTable;
@@ -360,116 +358,6 @@ impl<S: StateStore> ParallelizedCdcBackfillExecutor<S> {
                 }
                 let mut split_cdc_offset_high = None;
 
-                // Gate each split read on standby WAL catch-up: events dropped for
-                // not-yet-backfilled splits assume this SELECT sees a state at least
-                // as new as them, which a lagging standby doesn't guarantee.
-                // Keep polling upstream while waiting so barriers are not stalled.
-                {
-                    let gate_config = self.external_table.config().clone();
-                    let reader = &upstream_table_reader.reader;
-                    let mut gate_future = Box::pin(async move {
-                        reader
-                            .prepare_snapshot(&gate_config)
-                            .await
-                            .map_err(StreamExecutorError::connector_error)
-                    });
-                    let mut gate_passed = false;
-                    while !gate_passed {
-                        let Some(msg) = pass_snapshot_gate_and_poll_upstream(
-                            &mut upstream,
-                            &mut gate_passed,
-                            &mut gate_future,
-                        )
-                        .await?
-                        else {
-                            if !gate_passed {
-                                bail!("upstream ended during snapshot WAL catch-up gate");
-                            }
-                            continue;
-                        };
-                        match msg {
-                            Message::Barrier(barrier) => {
-                                state_impl.commit_state(barrier.epoch).await?;
-                                if let Some(mutation) = barrier.mutation.as_deref() {
-                                    use crate::executor::Mutation;
-                                    match mutation {
-                                        Mutation::Pause => is_snapshot_paused = true,
-                                        Mutation::Resume => is_snapshot_paused = false,
-                                        Mutation::Throttle(some) => {
-                                            if let Some(entry) =
-                                                some.get(&self.actor_ctx.fragment_id)
-                                                && entry.throttle_type() == ThrottleType::Backfill
-                                            {
-                                                self.rate_limit_rps = entry.rate_limit;
-                                            }
-                                        }
-                                        mutation if mutation.is_stop(self.actor_ctx.id) => {
-                                            tracing::info!(
-                                                %table_id,
-                                                upstream_table_name,
-                                                "CdcBackfill has been dropped due to config change"
-                                            );
-                                            for chunk in upstream_chunk_buffer.drain(..) {
-                                                yield Message::Chunk(chunk);
-                                            }
-                                            yield Message::Barrier(barrier);
-                                            let () = futures::future::pending().await;
-                                            unreachable!();
-                                        }
-                                        _ => (),
-                                    }
-                                }
-                                if is_reset_barrier(&barrier, self.actor_ctx.id) {
-                                    next_reset_barrier = Some(barrier);
-                                    for chunk in upstream_chunk_buffer.drain(..) {
-                                        yield Message::Chunk(chunk);
-                                    }
-                                    continue 'with_cdc_table_snapshot_splits;
-                                }
-                                if let Some(split_range) =
-                                    should_report_actor_backfill_progress.take()
-                                    && let Some(ref progress) = self.progress
-                                {
-                                    progress.update(
-                                        self.actor_ctx.fragment_id,
-                                        self.actor_ctx.id,
-                                        barrier.epoch,
-                                        generation.expect("should have set generation when having progress to report"),
-                                        split_range,
-                                    );
-                                }
-                                yield Message::Barrier(barrier);
-                            }
-                            Message::Chunk(chunk) => {
-                                if chunk.cardinality() == 0 {
-                                    continue;
-                                }
-                                let chunk = mapping_chunk(chunk, &self.output_indices);
-                                let (finished_chunk, current_chunk) =
-                                    split_finished_and_current_chunk(
-                                        chunk,
-                                        &finished_split_bounds,
-                                        &current_split_bounds,
-                                        snapshot_split_column_index,
-                                    );
-                                if let Some(finished_chunk) = finished_chunk
-                                    && finished_chunk.cardinality() > 0
-                                {
-                                    yield Message::Chunk(finished_chunk);
-                                }
-                                if let Some(filtered_chunk) = current_chunk
-                                    && filtered_chunk.cardinality() > 0
-                                {
-                                    upstream_chunk_buffer.push(filtered_chunk);
-                                }
-                            }
-                            Message::Watermark(_) => {
-                                // Ignore watermark during backfill.
-                            }
-                        }
-                    }
-                }
-
                 let left_upstream = upstream.by_ref().map(Either::Left);
                 let read_args = SplitSnapshotReadArgs::new(
                     split.left_bound_inclusive.clone(),
@@ -480,10 +368,17 @@ impl<S: StateStore> ParallelizedCdcBackfillExecutor<S> {
                     schema_table_name.clone(),
                     external_database_name.clone(),
                 );
+                // Fold the WAL catch-up gate into the snapshot stream so `select_with_strategy`
+                // keeps servicing upstream barriers while it waits (it yields nothing until
+                // catch-up completes). No-op unless `snapshot.dedicated`.
+                let gate_config = self.external_table.config().clone();
                 let right_snapshot = pin!(
-                    upstream_table_reader
-                        .snapshot_read_table_split(read_args)
-                        .map(Either::Right)
+                    gated_snapshot_read_table_split(
+                        &upstream_table_reader,
+                        gate_config,
+                        read_args,
+                    )
+                    .map(Either::Right)
                 );
                 let (right_snapshot, snapshot_valve) = pausable(right_snapshot);
                 if is_snapshot_paused {
@@ -910,6 +805,27 @@ fn is_reset_barrier(barrier: &Barrier, actor_id: ActorId) -> bool {
             .splits
             .contains_key(&actor_id),
         _ => false,
+    }
+}
+
+/// Waits for standby WAL catch-up (`prepare_snapshot`, no-op unless `snapshot.dedicated`),
+/// then streams the split snapshot. Gating inside the stream keeps the caller's select loop
+/// free to service barriers while waiting. Safe here only because V2 has no "consume snapshot
+/// once" patch that would force a blocking poll outside the select loop.
+#[try_stream(ok = Option<StreamChunk>, error = StreamExecutorError)]
+async fn gated_snapshot_read_table_split(
+    upstream_table_reader: &UpstreamTableReader<ExternalStorageTable>,
+    config: ExternalTableConfig,
+    read_args: SplitSnapshotReadArgs,
+) {
+    upstream_table_reader
+        .reader
+        .prepare_snapshot(&config)
+        .await
+        .map_err(StreamExecutorError::connector_error)?;
+    #[for_await]
+    for msg in upstream_table_reader.snapshot_read_table_split(read_args) {
+        yield msg?;
     }
 }
 

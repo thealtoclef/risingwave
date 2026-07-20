@@ -768,13 +768,9 @@ fn sea_type_to_pg_type(sea_type: &SeaType) -> ConnectorResult<tokio_postgres::ty
     }
 }
 
-/// Polls `pg_last_wal_replay_lsn()` on `client` until it reaches `target_lsn` or the
-/// timeout expires (`timeout_ms = 0` skips the check).
-///
-/// Standby query visibility follows the *replayed* LSN, not the *received* one — WAL
-/// can sit received-but-unreplayed for a long time under replay conflicts, so gating
-/// on the receive LSN could reopen the data gap this check exists to close.
-///
+/// Polls `pg_last_wal_replay_lsn()` on `client` until it reaches `target_lsn`, or the
+/// timeout expires (`timeout_ms = 0` skips the check). Uses the *replayed* LSN, not the
+/// received one — WAL can sit received-but-unreplayed, which would reopen the data gap.
 /// Errors if the endpoint is a primary (NULL replay LSN).
 pub async fn wait_for_snapshot_catchup(
     client: &PgClient,

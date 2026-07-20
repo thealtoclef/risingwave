@@ -147,10 +147,8 @@ pub struct PostgresExternalTableReader {
     /// Serves snapshot SELECTs: the dedicated standby when `snapshot.dedicated=true`,
     /// otherwise the primary.
     client: tokio::sync::Mutex<tokio_postgres::Client>,
-    /// Extra primary connection, present only when `snapshot.dedicated=true`. The CDC
-    /// offset and the WAL catch-up gate must run on the primary:
-    /// `pg_current_wal_lsn()`/`txid_current()` fail on a standby, and the offset must
-    /// live in the primary's WAL/txid space used by the changelog.
+    /// Present only when `snapshot.dedicated=true`. The CDC offset and catch-up gate must
+    /// run on the primary: `pg_current_wal_lsn()`/`txid_current()` fail on a standby.
     primary_client: Option<tokio::sync::Mutex<tokio_postgres::Client>>,
     schema_table_name: SchemaTableName,
 }
