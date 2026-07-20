@@ -377,6 +377,35 @@ pub struct ExternalTableConfig {
     #[serde(deserialize_with = "crate::deserialize_bool_from_string")]
     #[serde(default)]
     pub spanner_databoost_enabled: bool,
+
+    // Dedicated snapshot endpoint (Postgres CDC only). All optional; falls back to primary.
+    #[serde(rename = "snapshot.hostname")]
+    pub snapshot_host: Option<String>,
+
+    #[serde(rename = "snapshot.port")]
+    pub snapshot_port: Option<String>,
+
+    #[serde(rename = "snapshot.username")]
+    pub snapshot_username: Option<String>,
+
+    #[serde(rename = "snapshot.password")]
+    pub snapshot_password: Option<String>,
+
+    /// Enable dedicated snapshot endpoint with WAL catch-up.
+    #[serde(rename = "snapshot.dedicated")]
+    #[serde(deserialize_with = "crate::deserialize_bool_from_string")]
+    #[serde(default)]
+    pub snapshot_dedicated: bool,
+
+    /// Milliseconds to wait for snapshot endpoint WAL catch-up. 0 = skip check.
+    #[serde(rename = "snapshot.catchup.timeout.ms")]
+    #[serde(deserialize_with = "crate::deserialize_u64_from_string")]
+    #[serde(default = "default_snapshot_catchup_timeout")]
+    pub snapshot_catchup_timeout_ms: u64,
+}
+
+fn default_snapshot_catchup_timeout() -> u64 {
+    300_000
 }
 
 fn postgres_ssl_mode_default() -> SslMode {
@@ -413,6 +442,30 @@ impl ExternalTableConfig {
             ssl_mode: self.ssl_mode.clone(),
             ssl_root_cert: self.ssl_root_cert.clone(),
         })
+    }
+
+    /// Connection config for snapshot reads: applies the `snapshot.*` overrides only
+    /// when `snapshot.dedicated=true`, otherwise same as [`Self::pg_connection_config`].
+    pub fn snapshot_pg_connection_config(&self) -> ConnectorResult<PgConnectionConfig> {
+        let mut config = self.pg_connection_config()?;
+        if !self.snapshot_dedicated {
+            return Ok(config);
+        }
+        if let Some(host) = &self.snapshot_host {
+            config.host = host.clone();
+        }
+        if let Some(port) = &self.snapshot_port {
+            config.port = port
+                .parse::<u16>()
+                .with_context(|| format!("invalid postgres snapshot.port `{}`", port))?;
+        }
+        if let Some(username) = &self.snapshot_username {
+            config.user = username.clone();
+        }
+        if let Some(password) = &self.snapshot_password {
+            config.password = password.clone();
+        }
+        Ok(config)
     }
 }
 
@@ -464,6 +517,15 @@ impl ExternalTableReader for ExternalTableReaderImpl {
 }
 
 impl ExternalTableReaderImpl {
+    /// Waits for the dedicated snapshot endpoint (if any) to catch up on WAL replay.
+    /// No-op for other connectors or when `snapshot.dedicated` is off.
+    pub async fn prepare_snapshot(&self, config: &ExternalTableConfig) -> ConnectorResult<()> {
+        if let ExternalTableReaderImpl::Postgres(reader) = self {
+            reader.prepare_snapshot(config).await?;
+        }
+        Ok(())
+    }
+
     pub fn get_cdc_offset_parser(&self) -> CdcOffsetParseFunc {
         match self {
             ExternalTableReaderImpl::MySql(_) => MySqlExternalTableReader::get_cdc_offset_parser(),

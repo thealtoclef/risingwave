@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 use thiserror_ext::AsReport;
 use tokio_postgres::types::{PgLsn, Type as PgType};
 
-use crate::connector_common::create_pg_client;
+use crate::connector_common::{create_pg_client, wait_for_snapshot_catchup};
 use crate::error::{ConnectorError, ConnectorResult};
 use crate::parser::scalar_adapter::ScalarAdapter;
 use crate::parser::{postgres_cell_to_scalar_impl, postgres_row_to_owned_row};
@@ -144,13 +144,22 @@ pub struct PostgresExternalTableReader {
     rw_schema: Schema,
     field_names: String,
     pk_indices: Vec<usize>,
+    /// Serves snapshot SELECTs: the dedicated standby when `snapshot.dedicated=true`,
+    /// otherwise the primary.
     client: tokio::sync::Mutex<tokio_postgres::Client>,
+    /// Present only when `snapshot.dedicated=true`. The CDC offset and catch-up gate must
+    /// run on the primary: `pg_current_wal_lsn()`/`txid_current()` fail on a standby.
+    primary_client: Option<tokio::sync::Mutex<tokio_postgres::Client>>,
     schema_table_name: SchemaTableName,
 }
 
 impl ExternalTableReader for PostgresExternalTableReader {
     async fn current_cdc_offset(&self) -> ConnectorResult<CdcOffset> {
-        let mut client = self.client.lock().await;
+        // The CDC offset must be sampled from the primary (see `primary_client`).
+        let mut client = match &self.primary_client {
+            Some(primary) => primary.lock().await,
+            None => self.client.lock().await,
+        };
         // start a transaction to read current lsn and txid
         let trxn = client.transaction().await?;
         let row = trxn.query_one("SELECT pg_current_wal_lsn()", &[]).await?;
@@ -240,7 +249,14 @@ impl PostgresExternalTableReader {
             "create postgres external table reader"
         );
         // No TCP keepalive for CDC source
-        let client = create_pg_client(&config.pg_connection_config()?, None).await?;
+        let client = create_pg_client(&config.snapshot_pg_connection_config()?, None).await?;
+
+        // Separate primary connection for the CDC offset and the WAL catch-up gate.
+        let primary_client = if config.snapshot_dedicated {
+            Some(create_pg_client(&config.pg_connection_config()?, None).await?)
+        } else {
+            None
+        };
 
         // Discover user-defined composite columns. tokio-postgres cannot decode
         // composite values natively, so for these columns we cast to text in the
@@ -298,8 +314,33 @@ impl PostgresExternalTableReader {
             field_names,
             pk_indices,
             client: tokio::sync::Mutex::new(client),
+            primary_client: primary_client.map(tokio::sync::Mutex::new),
             schema_table_name,
         })
+    }
+
+    /// Waits until the standby snapshot endpoint has replayed up to the primary's
+    /// current WAL position. No-op unless `snapshot.dedicated=true`.
+    pub async fn prepare_snapshot(&self, config: &ExternalTableConfig) -> ConnectorResult<()> {
+        if !config.snapshot_dedicated {
+            return Ok(());
+        }
+        let target_lsn: u64 = {
+            let primary_client = self
+                .primary_client
+                .as_ref()
+                .expect("primary_client must exist when snapshot.dedicated=true")
+                .lock()
+                .await;
+            let row = primary_client
+                .query_one("SELECT pg_current_wal_lsn()", &[])
+                .await?;
+            row.get::<_, PgLsn>(0).into()
+        };
+        tracing::debug!(target_lsn, "waiting for snapshot endpoint WAL catch-up");
+        let snap_client = self.client.lock().await;
+        wait_for_snapshot_catchup(&snap_client, target_lsn, config.snapshot_catchup_timeout_ms)
+            .await
     }
 
     pub fn get_normalized_table_name(table_name: &SchemaTableName) -> String {

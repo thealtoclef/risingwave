@@ -25,7 +25,7 @@ use risingwave_common::util::iter_util::ZipEqFast;
 use risingwave_common::util::sort_util::{OrderType, cmp_datum};
 use risingwave_connector::source::cdc::CdcScanOptions;
 use risingwave_connector::source::cdc::external::{
-    CdcOffset, ExternalCdcTableType, ExternalTableReaderImpl,
+    CdcOffset, ExternalCdcTableType, ExternalTableConfig, ExternalTableReaderImpl,
 };
 use risingwave_connector::source::{CdcTableSnapshotSplit, CdcTableSnapshotSplitRaw};
 use risingwave_pb::common::ThrottleType;
@@ -368,10 +368,17 @@ impl<S: StateStore> ParallelizedCdcBackfillExecutor<S> {
                     schema_table_name.clone(),
                     external_database_name.clone(),
                 );
+                // Fold the WAL catch-up gate into the snapshot stream so `select_with_strategy`
+                // keeps servicing upstream barriers while it waits (it yields nothing until
+                // catch-up completes). No-op unless `snapshot.dedicated`.
+                let gate_config = self.external_table.config().clone();
                 let right_snapshot = pin!(
-                    upstream_table_reader
-                        .snapshot_read_table_split(read_args)
-                        .map(Either::Right)
+                    gated_snapshot_read_table_split(
+                        &upstream_table_reader,
+                        gate_config,
+                        read_args,
+                    )
+                    .map(Either::Right)
                 );
                 let (right_snapshot, snapshot_valve) = pausable(right_snapshot);
                 if is_snapshot_paused {
@@ -798,6 +805,27 @@ fn is_reset_barrier(barrier: &Barrier, actor_id: ActorId) -> bool {
             .splits
             .contains_key(&actor_id),
         _ => false,
+    }
+}
+
+/// Waits for standby WAL catch-up (`prepare_snapshot`, no-op unless `snapshot.dedicated`),
+/// then streams the split snapshot. Gating inside the stream keeps the caller's select loop
+/// free to service barriers while waiting. Safe here only because V2 has no "consume snapshot
+/// once" patch that would force a blocking poll outside the select loop.
+#[try_stream(ok = Option<StreamChunk>, error = StreamExecutorError)]
+async fn gated_snapshot_read_table_split(
+    upstream_table_reader: &UpstreamTableReader<ExternalStorageTable>,
+    config: ExternalTableConfig,
+    read_args: SplitSnapshotReadArgs,
+) {
+    upstream_table_reader
+        .reader
+        .prepare_snapshot(&config)
+        .await
+        .map_err(StreamExecutorError::connector_error)?;
+    #[for_await]
+    for msg in upstream_table_reader.snapshot_read_table_split(read_args) {
+        yield msg?;
     }
 }
 
