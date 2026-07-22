@@ -28,8 +28,8 @@ use pgwire::pg_response::{PgResponse, StatementType};
 use prost::Message as _;
 use risingwave_common::catalog::{
     CdcKeyComparison, CdcTableDesc, ColumnCatalog, ColumnDesc, ConflictBehavior, CreateType,
-    DEFAULT_SCHEMA_NAME, Engine, ICEBERG_SINK_PREFIX, ICEBERG_SOURCE_PREFIX,
-    RISINGWAVE_ICEBERG_ROW_ID, ROW_ID_COLUMN_NAME, ObjectId, TableId,
+    DEFAULT_SCHEMA_NAME, Engine, ICEBERG_SINK_PREFIX, ICEBERG_SOURCE_PREFIX, ObjectId,
+    RISINGWAVE_ICEBERG_ROW_ID, ROW_ID_COLUMN_NAME, TableId,
 };
 use risingwave_common::config::MetaBackend;
 use risingwave_common::global_jvm::Jvm;
@@ -938,8 +938,10 @@ pub(crate) fn gen_create_table_plan_for_cdc_table(
     let options = build_cdc_scan_options_with_options(context.with_options(), &cdc_table_type)?;
 
     // Only parallelized backfill (V2) runs the WAL catch-up gate that makes the dedicated
-    // standby snapshot consistent; V1 would silently drop rows. Reject the combination.
-    if snapshot_dedicated && !options.is_parallelized_backfill() {
+    // standby snapshot consistent; V1 would silently drop rows. Reject that combination.
+    // When backfill is disabled entirely (`snapshot = 'false'`), no snapshot read happens at
+    // all, so the dedicated standby is never touched and there's nothing to reject.
+    if snapshot_dedicated && !options.disable_backfill && !options.is_parallelized_backfill() {
         return Err(ErrorCode::NotSupported(
             format!("`{CDC_SNAPSHOT_DEDICATED_KEY}` requires `backfill.parallelism > 0`"),
             "the dedicated snapshot endpoint is only supported with parallelized CDC backfill"
@@ -1025,8 +1027,8 @@ fn derive_with_options_for_cdc_table(
     external_table_name: String,
     table_with_options: &WithOptions,
 ) -> Result<(WithOptionsSecResolved, String)> {
-    use source::cdc::{MYSQL_CDC_CONNECTOR, POSTGRES_CDC_CONNECTOR, SQL_SERVER_CDC_CONNECTOR};
     use risingwave_connector::source::SPANNER_CDC_CONNECTOR;
+    use source::cdc::{MYSQL_CDC_CONNECTOR, POSTGRES_CDC_CONNECTOR, SQL_SERVER_CDC_CONNECTOR};
     // we should remove the prefix from `full_table_name`
     let source_database_name: &str = source_with_properties
         .get("database.name")
@@ -1136,7 +1138,7 @@ fn derive_with_options_for_cdc_table(
                 let table_name = external_table_name.clone();
 
                 // Insert table name into connect properties
-                with_options.insert(TABLE_NAME_KEY.into(), table_name.into());
+                with_options.insert(TABLE_NAME_KEY.into(), table_name);
 
                 // Spanner CDC uses strong (latest) reads for the backfill snapshot and
                 // derives the CDC offset from each read's resolved timestamp, so there is
@@ -1145,7 +1147,8 @@ fn derive_with_options_for_cdc_table(
 
                 // Inject table-level Spanner CDC properties
                 if let Some(databoost) = table_with_options.get(SPANNER_DATABOOST_ENABLED_KEY) {
-                    with_options.insert(SPANNER_DATABOOST_ENABLED_KEY.to_string(), databoost.clone());
+                    with_options
+                        .insert(SPANNER_DATABOOST_ENABLED_KEY.to_owned(), databoost.clone());
                 }
 
                 // Return original external_table_name unchanged for Spanner
@@ -1976,11 +1979,13 @@ pub async fn create_iceberg_engine_table(
     let iceberg_engine_connection: String = if let Some(conn_ref) =
         handler_args.with_options.connection_ref().get("connection")
     {
-        let (schema_name, connection_name) = Binder::resolve_schema_qualified_name(
-            &session.database(),
-            &conn_ref.connection_name,
-        )?;
-        format!("{}.{}", schema_name.unwrap_or_else(|| DEFAULT_SCHEMA_NAME.to_owned()), connection_name)
+        let (schema_name, connection_name) =
+            Binder::resolve_schema_qualified_name(&session.database(), &conn_ref.connection_name)?;
+        format!(
+            "{}.{}",
+            schema_name.unwrap_or_else(|| DEFAULT_SCHEMA_NAME.to_owned()),
+            connection_name
+        )
     } else {
         session.config().iceberg_engine_connection()
     };
@@ -1993,7 +1998,9 @@ pub async fn create_iceberg_engine_table(
 
     let mut connection_ref = BTreeMap::new();
     let with_common = if iceberg_engine_connection.is_empty() {
-        bail!("to use iceberg engine table, please either set the session variable `iceberg_engine_connection` or specify `connection` in the WITH clause.");
+        bail!(
+            "to use iceberg engine table, please either set the session variable `iceberg_engine_connection` or specify `connection` in the WITH clause."
+        );
     } else {
         let parts: Vec<&str> = iceberg_engine_connection.split('.').collect();
         assert_eq!(parts.len(), 2);
