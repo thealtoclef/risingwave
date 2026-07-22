@@ -946,8 +946,10 @@ pub(crate) fn gen_create_table_plan_for_cdc_table(
     let options = build_cdc_scan_options_with_options(context.with_options(), &cdc_table_type)?;
 
     // Only parallelized backfill (V2) runs the WAL catch-up gate that makes the dedicated
-    // standby snapshot consistent; V1 would silently drop rows. Reject the combination.
-    if snapshot_dedicated && !options.is_parallelized_backfill() {
+    // standby snapshot consistent; V1 would silently drop rows. Reject that combination.
+    // When backfill is disabled entirely (`snapshot = 'false'`), no snapshot read happens at
+    // all, so the dedicated standby is never touched and there's nothing to reject.
+    if snapshot_dedicated && !options.disable_backfill && !options.is_parallelized_backfill() {
         return Err(ErrorCode::NotSupported(
             format!("`{CDC_SNAPSHOT_DEDICATED_KEY}` requires `backfill.parallelism > 0`"),
             "the dedicated snapshot endpoint is only supported with parallelized CDC backfill"
