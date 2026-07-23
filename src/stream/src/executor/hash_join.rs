@@ -1046,8 +1046,10 @@ impl<K: HashKey, S: StateStore, const T: JoinTypePrimitive, E: JoinEncoding>
                         prefetched.push((key, entry));
                     }
                 }
-                // `ht`/`buffered` are no longer used past this point, so mutating
-                // `side_match.ht` here doesn't conflict with the shared borrows above.
+                // `buffered` is fully drained here, but still holds the (shared) `ht` borrow
+                // until dropped. Drop it now so that borrow ends before we mutate
+                // `side_match.ht` below.
+                drop(buffered);
                 for (key, entry) in prefetched {
                     side_match.ht.update_state(&key, entry);
                 }
