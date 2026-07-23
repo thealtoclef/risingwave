@@ -1026,8 +1026,8 @@ mod tests {
             <Key64 as HashKey>::Bitmap::from_bool_vec(vec![false]),
             false,
             Arc::new(StreamingMetrics::unused()),
-            1,
-            1,
+            1.into(),
+            1.into(),
             "test",
         );
         ht.init(EpochPair::new_test_epoch(test_epoch(1)))
