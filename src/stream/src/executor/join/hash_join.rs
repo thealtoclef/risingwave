@@ -549,6 +549,55 @@ impl<K: HashKey, S: StateStore, E: JoinEncoding> JoinHashMap<K, S, E> {
         }
     }
 
+    /// Whether `key` is currently present in the in-memory cache.
+    pub(crate) fn contains(&self, key: &K) -> bool {
+        self.inner.contains(key)
+    }
+
+    /// Fetches the matched rows (and degrees, if any) for `key`, without taking or mutating
+    /// any part of `JoinHashMap`. Takes `&self`, unlike
+    /// [`Self::fetch_matched_rows_and_get_degree_table_ref`] which needs `&mut self` to hand
+    /// back a degree-table write handle — so callers can run this for many keys concurrently
+    /// (e.g. via `buffer_unordered`), then apply the results with [`Self::update_state`]
+    /// sequentially afterwards.
+    ///
+    /// Returns `Ok(None)` if `key` has more than `entry_state_max_rows` matches, mirroring
+    /// `handle_match_rows`'s existing skip-cache behavior for high join amplification: the
+    /// caller should leave the key uncached and let the normal `CacheResult::Miss` path handle
+    /// it directly.
+    pub(crate) async fn prefetch_entry_state(
+        &self,
+        key: &K,
+        entry_state_max_rows: usize,
+    ) -> StreamExecutorResult<Option<HashValueType<E>>> {
+        let degrees = if let Some(degree_state) = &self.degree_state {
+            Some(fetch_degrees(key, &self.join_key_data_types, &degree_state.table).await?)
+        } else {
+            None
+        };
+        let stream = into_stream(
+            &self.join_key_data_types,
+            &self.state.pk_indices,
+            &self.pk_serializer,
+            &self.state.table,
+            key,
+            degrees,
+        );
+
+        let mut entry_state = JoinEntryState::default();
+        #[for_await]
+        for (i, matched_row) in stream.enumerate() {
+            if i >= entry_state_max_rows {
+                return Ok(None);
+            }
+            let (encoded_pk, matched_row) = matched_row?;
+            entry_state
+                .insert(encoded_pk, E::encode(&matched_row))
+                .with_context(|| format!("join key: {:?}", key))?;
+        }
+        Ok(Some(Box::new(entry_state)))
+    }
+
     pub async fn flush(
         &mut self,
         epoch: EpochPair,
@@ -836,12 +885,19 @@ impl<E: JoinEncoding> JoinEntryState<E> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicU64;
+
     use itertools::Itertools;
     use risingwave_common::array::*;
+    use risingwave_common::catalog::{ColumnDesc, ColumnId};
+    use risingwave_common::hash::{Key64, NullBitmap};
     use risingwave_common::types::ScalarRefImpl;
+    use risingwave_common::util::epoch::{EpochPair, test_epoch};
     use risingwave_common::util::iter_util::ZipEqDebug;
+    use risingwave_storage::memory::MemoryStateStore;
 
     use super::*;
+    use crate::common::table::test_utils::gen_pbtable;
     use crate::executor::MemoryEncoding;
 
     fn insert_chunk<E: JoinEncoding>(
@@ -915,5 +971,115 @@ mod tests {
         );
         insert_chunk(&mut managed_state, &pk_indices, &col_types, &data_chunk2);
         check(&mut managed_state, &col_types, &col1, &col2);
+    }
+
+    /// pk = [join_key, value], i.e. NOT a subset of the join key. This matches the common
+    /// production shape, and means `insert` alone does not warm the cache (see `insert`'s
+    /// `pk_contained_in_jk` check), so a key only becomes cached via `update_state`.
+    async fn create_test_join_hash_map(
+        mem_state: MemoryStateStore,
+    ) -> JoinHashMap<Key64, MemoryStateStore, MemoryEncoding> {
+        async fn create_table(
+            mem_state: MemoryStateStore,
+            data_types: &[DataType],
+            pk_indices: &[usize],
+            table_id: u32,
+        ) -> StateTable<MemoryStateStore> {
+            let column_descs = data_types
+                .iter()
+                .enumerate()
+                .map(|(id, data_type)| {
+                    ColumnDesc::unnamed(ColumnId::new(id as i32), data_type.clone())
+                })
+                .collect_vec();
+            let table_catalog = gen_pbtable(
+                TableId::new(table_id),
+                column_descs,
+                vec![OrderType::ascending(); pk_indices.len()],
+                pk_indices.to_vec(),
+                0,
+            );
+            StateTable::from_table_catalog(&table_catalog, mem_state, None).await
+        }
+
+        let data_types = vec![DataType::Int64, DataType::Int64];
+        let pk_indices = vec![0, 1];
+        let state_table = create_table(mem_state.clone(), &data_types, &pk_indices, 100).await;
+        // Degree table schema: [pk..., _degree]
+        let degree_table = create_table(
+            mem_state,
+            &[DataType::Int64, DataType::Int64, DataType::Int64],
+            &pk_indices,
+            102,
+        )
+        .await;
+        let degree_state = TableInner::new(pk_indices.clone(), vec![0], degree_table, None);
+
+        let mut ht: JoinHashMap<Key64, MemoryStateStore, MemoryEncoding> = JoinHashMap::new(
+            Arc::new(AtomicU64::new(0)),
+            vec![DataType::Int64],
+            vec![0],
+            data_types,
+            state_table,
+            pk_indices,
+            Some(degree_state),
+            <Key64 as HashKey>::Bitmap::from_bool_vec(vec![false]),
+            false,
+            Arc::new(StreamingMetrics::unused()),
+            1,
+            1,
+            "test",
+        );
+        ht.init(EpochPair::new_test_epoch(test_epoch(1)))
+            .await
+            .unwrap();
+        ht
+    }
+
+    fn test_key(k: i64) -> Key64 {
+        let chunk = DataChunk::from_pretty(&format!("I I\n{k} 0"));
+        Key64::build_many(&[0], &chunk).into_iter().next().unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_prefetch_entry_state() {
+        let mut ht = create_test_join_hash_map(MemoryStateStore::new()).await;
+        let key1 = test_key(1);
+
+        for v in [10i64, 11, 12] {
+            let row = OwnedRow::new(vec![Some(ScalarImpl::Int64(1)), Some(ScalarImpl::Int64(v))]);
+            ht.insert(&key1, JoinRow::new(row, 0)).unwrap();
+        }
+        // `insert` doesn't warm the cache here (pk is not a subset of the join key), so the
+        // matched rows just written are only visible via a state-store fetch, same as after an
+        // actor restart with cache cold but state persisted.
+        assert!(!ht.contains(&key1));
+
+        ht.flush(EpochPair::new_test_epoch(test_epoch(2)))
+            .await
+            .unwrap()
+            .post_yield_barrier(None)
+            .await
+            .unwrap();
+
+        // Enough budget: all 3 matched rows are fetched.
+        let entry = ht.prefetch_entry_state(&key1, 3).await.unwrap();
+        assert_eq!(entry.unwrap().len(), 3);
+
+        // Over budget: bails out with `None` (mirrors `handle_match_rows`'s existing
+        // skip-cache-on-high-amplification behavior) instead of caching a partial entry.
+        let entry = ht.prefetch_entry_state(&key1, 2).await.unwrap();
+        assert!(entry.is_none());
+
+        // A key with no matches at all still prefetches successfully, as an empty entry.
+        let key2 = test_key(2);
+        let entry = ht.prefetch_entry_state(&key2, 3).await.unwrap();
+        assert_eq!(entry.unwrap().len(), 0);
+
+        // Prefetching never mutates the cache by itself; only `update_state` does.
+        assert!(!ht.contains(&key1));
+        let entry = ht.prefetch_entry_state(&key1, 3).await.unwrap().unwrap();
+        ht.update_state(&key1, entry);
+        assert!(ht.contains(&key1));
     }
 }

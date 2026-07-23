@@ -19,6 +19,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use either::Either;
+use futures::stream;
 use itertools::Itertools;
 use multimap::MultiMap;
 use risingwave_common::array::Op;
@@ -202,6 +203,9 @@ pub struct HashJoinExecutor<K: HashKey, S: StateStore, const T: JoinTypePrimitiv
     entry_state_max_rows: usize,
     /// Number of processed rows between periodic manual evictions of the join cache.
     join_cache_evict_interval_rows: u32,
+    /// Max number of distinct join keys per chunk to concurrently prefetch matched-row state
+    /// for, ahead of the sequential per-row join loop.
+    join_state_prefetch_concurrency: usize,
 }
 
 impl<K: HashKey, S: StateStore, const T: JoinTypePrimitive, E: JoinEncoding> std::fmt::Debug
@@ -247,6 +251,7 @@ struct EqJoinArgs<'a, K: HashKey, S: StateStore, E: JoinEncoding> {
     high_join_amplification_threshold: usize,
     entry_state_max_rows: usize,
     join_cache_evict_interval_rows: u32,
+    join_state_prefetch_concurrency: usize,
     join_matched_join_keys: &'a LabelGuardedHistogram,
 }
 
@@ -333,6 +338,11 @@ impl<K: HashKey, S: StateStore, const T: JoinTypePrimitive, E: JoinEncoding>
             .config
             .developer
             .join_hash_map_evict_interval_rows
+            .max(1);
+        let join_state_prefetch_concurrency = ctx
+            .config
+            .developer
+            .join_state_prefetch_concurrency
             .max(1);
         let side_l_column_n = input_l.schema().len();
 
@@ -577,6 +587,7 @@ impl<K: HashKey, S: StateStore, const T: JoinTypePrimitive, E: JoinEncoding>
             high_join_amplification_threshold,
             entry_state_max_rows,
             join_cache_evict_interval_rows,
+            join_state_prefetch_concurrency,
         }
     }
 
@@ -696,6 +707,7 @@ impl<K: HashKey, S: StateStore, const T: JoinTypePrimitive, E: JoinEncoding>
                         high_join_amplification_threshold: self.high_join_amplification_threshold,
                         entry_state_max_rows: self.entry_state_max_rows,
                         join_cache_evict_interval_rows: self.join_cache_evict_interval_rows,
+                        join_state_prefetch_concurrency: self.join_state_prefetch_concurrency,
                         join_matched_join_keys: &left_join_matched_join_keys,
                     }) {
                         left_time += left_start_time.elapsed();
@@ -724,6 +736,7 @@ impl<K: HashKey, S: StateStore, const T: JoinTypePrimitive, E: JoinEncoding>
                         high_join_amplification_threshold: self.high_join_amplification_threshold,
                         entry_state_max_rows: self.entry_state_max_rows,
                         join_cache_evict_interval_rows: self.join_cache_evict_interval_rows,
+                        join_state_prefetch_concurrency: self.join_state_prefetch_concurrency,
                         join_matched_join_keys: &right_join_matched_join_keys,
                     }) {
                         right_time += right_start_time.elapsed();
@@ -961,6 +974,7 @@ impl<K: HashKey, S: StateStore, const T: JoinTypePrimitive, E: JoinEncoding>
             high_join_amplification_threshold,
             entry_state_max_rows,
             join_cache_evict_interval_rows,
+            join_state_prefetch_concurrency,
             join_matched_join_keys,
             ..
         } = args;
@@ -990,6 +1004,56 @@ impl<K: HashKey, S: StateStore, const T: JoinTypePrimitive, E: JoinEncoding>
             ));
 
         let keys = K::build_many(&side_update.join_key_indices, chunk.data_chunk());
+
+        // Concurrently warm the cache for this chunk's distinct, not-yet-cached join keys, so
+        // the loop below mostly sees `CacheResult::Hit` instead of paying one state-store round
+        // trip per row serially (see #22546). Only reads/inserts into the cache; the matching,
+        // degree accounting, and state mutation below are untouched and still run in row order.
+        {
+            let mut keys_to_prefetch: HashSet<K> = HashSet::new();
+            for (r, key) in chunk.rows_with_holes().zip_eq_debug(keys.iter()) {
+                let Some((_, row)) = r else {
+                    continue;
+                };
+                // Skip keys that can never match (same check as the main loop), so we don't
+                // waste a state-store round trip on a key that will take the `NeverMatch` path.
+                let probe_non_null_requirement_satisfied = side_update
+                    .non_null_fields
+                    .iter()
+                    .all(|column_idx| unsafe { row.datum_at_unchecked(*column_idx).is_some() });
+                let build_non_null_requirement_satisfied =
+                    key.null_bitmap().is_subset(side_match.ht.null_matched());
+                if probe_non_null_requirement_satisfied
+                    && build_non_null_requirement_satisfied
+                    && !side_match.ht.contains(key)
+                {
+                    keys_to_prefetch.insert(key.clone());
+                }
+            }
+
+            if !keys_to_prefetch.is_empty() {
+                let ht = &side_match.ht;
+                let prefetch_futs = keys_to_prefetch.into_iter().map(|key| async move {
+                    let entry = ht.prefetch_entry_state(&key, entry_state_max_rows).await?;
+                    Ok::<_, StreamExecutorError>((key, entry))
+                });
+                let mut buffered =
+                    stream::iter(prefetch_futs).buffer_unordered(join_state_prefetch_concurrency);
+                let mut prefetched = Vec::new();
+                while let Some(result) = buffered.next().await {
+                    let (key, entry) = result?;
+                    if let Some(entry) = entry {
+                        prefetched.push((key, entry));
+                    }
+                }
+                // `ht`/`buffered` are no longer used past this point, so mutating
+                // `side_match.ht` here doesn't conflict with the shared borrows above.
+                for (key, entry) in prefetched {
+                    side_match.ht.update_state(&key, entry);
+                }
+            }
+        }
+
         for (r, key) in chunk.rows_with_holes().zip_eq_debug(keys.iter()) {
             let Some((op, row)) = r else {
                 continue;
@@ -3929,6 +3993,60 @@ mod tests {
                 + 1 4 1 9
                 + 3 6 3 10
                 + 5 8 5 11"
+            )
+        );
+
+        Ok(())
+    }
+
+    /// Regression test for the concurrent state-store prefetch pre-pass in `eq_join_oneside`
+    /// (#22546): a chunk with several distinct, not-yet-cached probe keys should still produce
+    /// exactly the same output, in the same row order, as the old fully-sequential path.
+    #[tokio::test]
+    async fn test_streaming_hash_join_concurrent_prefetch() -> StreamExecutorResult<()> {
+        // pk (0, 1) is not a subset of the join key (0), so inserting these rows does not warm
+        // side_r's cache (see `JoinHashMap::insert`'s `pk_contained_in_jk` check) -- they're
+        // only visible via a state-store fetch, same as after an actor restart with cache cold
+        // but state persisted.
+        let chunk_r1 = StreamChunk::from_pretty(
+            "  I I
+             + 1 10
+             + 2 20
+             + 3 30
+             + 4 40
+             + 5 50",
+        );
+        // Probes 4 distinct matching keys plus one unmatched key, all in a single chunk: this
+        // is the shape that drives several concurrent prefetches at once.
+        let chunk_l1 = StreamChunk::from_pretty(
+            "  I I
+             + 1 1
+             + 2 2
+             + 3 3
+             + 4 4
+             + 6 6",
+        );
+
+        let (mut tx_l, mut tx_r, mut hash_join) =
+            create_classical_executor::<{ JoinType::Inner }>(false, false, None).await;
+
+        tx_l.push_barrier(test_epoch(1), false);
+        tx_r.push_barrier(test_epoch(1), false);
+        hash_join.next_unwrap_ready_barrier()?;
+
+        tx_r.push_chunk(chunk_r1);
+        hash_join.next_unwrap_pending();
+
+        tx_l.push_chunk(chunk_l1);
+        let chunk = hash_join.next_unwrap_ready_chunk()?;
+        assert_eq!(
+            chunk,
+            StreamChunk::from_pretty(
+                " I I I I
+                + 1 1 1 10
+                + 2 2 2 20
+                + 3 3 3 30
+                + 4 4 4 40"
             )
         );
 

@@ -406,6 +406,10 @@ pub mod default {
             16
         }
 
+        pub fn streaming_join_state_prefetch_concurrency() -> usize {
+            32
+        }
+
         pub fn streaming_now_progress_ratio() -> Option<f32> {
             None
         }

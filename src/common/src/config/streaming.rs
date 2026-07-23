@@ -233,6 +233,14 @@ pub struct StreamingDeveloperConfig {
     #[serde(default = "default::developer::streaming_join_hash_map_evict_interval_rows")]
     pub join_hash_map_evict_interval_rows: u32,
 
+    /// Max number of distinct join keys per chunk to concurrently prefetch matched-row state
+    /// for, before the normal sequential per-row join loop runs. Higher values hide more
+    /// state-store round-trip latency behind concurrency (helpful when the join has a high
+    /// cache-miss rate), at the cost of more concurrent in-flight state-store reads per actor.
+    /// Values smaller than 1 will be clamped to 1 by the executor.
+    #[serde(default = "default::developer::streaming_join_state_prefetch_concurrency")]
+    pub join_state_prefetch_concurrency: usize,
+
     #[serde(default = "default::developer::streaming_now_progress_ratio")]
     pub now_progress_ratio: Option<f32>,
 
