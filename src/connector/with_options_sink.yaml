@@ -235,6 +235,23 @@ DorisConfig:
   - name: doris.partial_update
     field_type: String
     required: false
+  - name: doris.query_port
+    field_type: String
+    comments: |-
+      The query port of Doris FE (default `9030`), only used when `auto_create` is enabled, since
+      DDL is issued over this `MySQL`-compatible protocol port.
+    required: false
+  - name: auto_create
+    field_type: bool
+    comments: Automatically create the target database and table if they don't exist. Defaults to false.
+    required: false
+    default: Default::default
+  - name: doris.replication_num
+    field_type: String
+    comments: |-
+      Number of replicas for the auto-created table. Only used when `auto_create` is enabled.
+      When unset, the Doris cluster default is used.
+    required: false
   - name: r#type
     field_type: String
     required: true

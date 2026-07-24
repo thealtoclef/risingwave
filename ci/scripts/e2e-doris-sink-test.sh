@@ -48,7 +48,9 @@ CREATE TABLE demo_variant_table(id int, v variant) UNIQUE KEY(\`id\`)
 DISTRIBUTED BY HASH(\`id\`) BUCKETS 1
 PROPERTIES (
     \"replication_allocation\" = \"tag.location.default: 1\"
-);"
+);
+-- Intentionally NOT created here: this is auto-created by RisingWave via the sink's auto_create option.
+DROP TABLE IF EXISTS demo_auto_create_table;"
 
   echo "--- create doris table"
   for _ in $(seq 1 60); do
@@ -74,6 +76,10 @@ sqllogictest -p 4566 -d dev './e2e_test/sink/doris_sink.slt'
 sleep 1
 mysql -uroot -P 9030 -h doris-server -e "select * from demo.demo_bhv_table" > ./query_result.csv
 mysql -uroot -P 9030 -h doris-server -N -B -e "select id, cast(v as string) from demo.demo_variant_table order by id" > ./variant_result.tsv
+# The auto-created table only exists if RisingWave created it via `auto_create`. Fail loudly if it
+# is missing. Note: the upsert sink's validation already rejects a non-UNIQUE-KEY target at
+# CREATE SINK time, so a passing SLT proves the auto-created table is a UNIQUE KEY table.
+mysql -uroot -P 9030 -h doris-server -N -B -e "select v1, v2, v3 from demo.demo_auto_create_table order by v1" > ./auto_create_result.tsv
 
 
 if cat ./query_result.csv | sed '1d; s/\t/,/g' | awk -F "," '{
@@ -100,6 +106,25 @@ END {
 else
   cat ./variant_result.tsv
   echo "The variant output is not as expected."
+  exit 1
+fi
+
+# Verify the auto-created table: it must have been created by RisingWave and contain the row.
+if cat ./auto_create_result.tsv | awk -F "\t" '
+{
+    seen++;
+    gsub(/[[:space:]]/, "", $2);
+    if ($1 == 1 && $2 == "auto" && $3 == 100) {
+        matched++;
+    }
+}
+END {
+    exit !(seen == 1 && matched == 1);
+}'; then
+  echo "Doris auto-create sink check passed"
+else
+  cat ./auto_create_result.tsv
+  echo "The auto-create output is not as expected."
   exit 1
 fi
 

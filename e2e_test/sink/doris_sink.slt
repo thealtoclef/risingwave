@@ -53,6 +53,38 @@ INSERT INTO t6_variant VALUES (1, '{"nested":[1,2]}');
 statement ok
 FLUSH;
 
+# Auto-create: the target Doris table `demo_auto_create_table` is NOT pre-created by the CI
+# setup. Creating this upsert sink should auto-create the database (if missing) and a
+# UNIQUE KEY table over the MySQL-protocol port before the sink starts loading.
+statement ok
+CREATE TABLE t6_auto (v1 int primary key, v2 varchar, v3 bigint);
+
+statement ok
+CREATE MATERIALIZED VIEW mv6_auto AS SELECT * FROM t6_auto;
+
+statement ok
+CREATE SINK s6_auto
+FROM
+    mv6_auto WITH (
+    connector = 'doris',
+    type = 'upsert',
+    primary_key = 'v1',
+    doris.url = 'http://doris-server:8030',
+    doris.user = 'users',
+    doris.password = '123456',
+    doris.database = 'demo',
+    doris.table = 'demo_auto_create_table',
+    doris.query_port = '9030',
+    doris.replication_num = '1',
+    auto_create = 'true'
+);
+
+statement ok
+INSERT INTO t6_auto VALUES (1, 'auto', 100);
+
+statement ok
+FLUSH;
+
 statement ok
 DROP SINK s6;
 
@@ -70,3 +102,12 @@ DROP MATERIALIZED VIEW mv6_variant;
 
 statement ok
 DROP TABLE t6_variant;
+
+statement ok
+DROP SINK s6_auto;
+
+statement ok
+DROP MATERIALIZED VIEW mv6_auto;
+
+statement ok
+DROP TABLE t6_auto;

@@ -19,6 +19,8 @@ use async_trait::async_trait;
 use base64::Engine;
 use base64::engine::general_purpose;
 use bytes::{BufMut, Bytes, BytesMut};
+use mysql_async::Opts;
+use mysql_async::prelude::Queryable;
 use risingwave_common::array::{Op, StreamChunk};
 use risingwave_common::catalog::Schema;
 use risingwave_common::types::DataType;
@@ -26,6 +28,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use serde_with::{DisplayFromStr, serde_as};
 use thiserror_ext::AsReport;
+use url::{Url, form_urlencoded};
 use with_options::WithOptions;
 
 use super::doris_starrocks_connector::{
@@ -42,10 +45,21 @@ use crate::sink::{Sink, SinkParam, SinkWriterParam};
 
 pub const DORIS_SINK: &str = "doris";
 
+// Connection parameters for the MySQL-protocol query port of Doris FE, only used for DDL
+// (e.g. auto-create). Mirrors the values used by the StarRocks sink.
+const DORIS_MYSQL_PREFER_SOCKET: &str = "false";
+// Unlike the StarRocks schema client (which only issues short `SELECT`s), this client sends
+// `CREATE TABLE` DDL, which can exceed the StarRocks default of 1024 bytes for wide tables.
+// `mysql_async` enforces this as a client-side cap on the outbound packet, so a larger value is
+// needed here or wide-table auto-create fails with `PacketTooLarge`.
+const DORIS_MYSQL_MAX_ALLOWED_PACKET: usize = 1024 * 1024;
+const DORIS_MYSQL_WAIT_TIMEOUT: usize = 28800;
+
 const fn default_stream_load_http_timeout_ms() -> u64 {
     30 * 1000
 }
 
+#[serde_as]
 #[derive(Deserialize, Debug, Clone, WithOptions)]
 pub struct DorisCommon {
     #[serde(rename = "doris.url")]
@@ -60,6 +74,18 @@ pub struct DorisCommon {
     pub table: String,
     #[serde(rename = "doris.partial_update")]
     pub partial_update: Option<String>,
+    /// The query port of Doris FE (default `9030`), only used when `auto_create` is enabled, since
+    /// DDL is issued over this `MySQL`-compatible protocol port.
+    #[serde(rename = "doris.query_port")]
+    pub query_port: Option<String>,
+    /// Automatically create the target database and table if they don't exist. Defaults to false.
+    #[serde(default)]
+    #[serde_as(as = "DisplayFromStr")]
+    pub auto_create: bool,
+    /// Number of replicas for the auto-created table. Only used when `auto_create` is enabled.
+    /// When unset, the Doris cluster default is used.
+    #[serde(rename = "doris.replication_num")]
+    pub replication_num: Option<String>,
 }
 
 impl EnforceSecret for DorisCommon {
@@ -77,6 +103,23 @@ impl DorisCommon {
             self.user.clone(),
             self.password.clone(),
         )
+    }
+
+    /// Extract the FE host from `doris.url` (e.g. `http://fe:8030` -> `fe`), used to build the
+    /// `MySQL`-protocol connection for DDL.
+    fn fe_host(&self) -> Result<String> {
+        Ok(Url::parse(&self.url)
+            .map_err(|err| SinkError::DorisStarrocksConnect(anyhow!(err)))?
+            .host_str()
+            .ok_or_else(|| SinkError::DorisStarrocksConnect(anyhow!("Can't get fe host from url")))?
+            .to_owned())
+    }
+
+    /// Build a `MySQL`-protocol client for issuing DDL against Doris FE. Falls back to the
+    /// default Doris FE query port `9030` when `doris.query_port` is not set.
+    pub(crate) async fn build_ddl_client(&self) -> Result<DorisDdlClient> {
+        let port = self.query_port.clone().unwrap_or_else(|| "9030".to_owned());
+        DorisDdlClient::new(self.fe_host()?, port, self.user.clone(), self.password.clone()).await
     }
 }
 
@@ -246,6 +289,209 @@ impl DorisSink {
             },
         }
     }
+
+    /// Map a `RisingWave` data type to the Doris column type used for auto-created tables.
+    fn get_doris_type_string(data_type: &DataType) -> Result<String> {
+        match data_type {
+            DataType::Boolean => Ok("BOOLEAN".to_owned()),
+            DataType::Int16 => Ok("SMALLINT".to_owned()),
+            DataType::Int32 => Ok("INT".to_owned()),
+            DataType::Int64 | DataType::Serial => Ok("BIGINT".to_owned()),
+            DataType::Float32 => Ok("FLOAT".to_owned()),
+            DataType::Float64 => Ok("DOUBLE".to_owned()),
+            DataType::Decimal => Ok("DECIMAL(38, 9)".to_owned()),
+            DataType::Date => Ok("DATE".to_owned()),
+            // Use microsecond precision to match RisingWave's timestamp resolution. Bare `DATETIME`
+            // (scale 0) would silently drop sub-second digits when loading auto-created tables.
+            DataType::Timestamp => Ok("DATETIME(6)".to_owned()),
+            DataType::Varchar => Ok("VARCHAR(65533)".to_owned()),
+            DataType::Jsonb => Ok("JSON".to_owned()),
+            DataType::List(inner) => {
+                Ok(format!("ARRAY<{}>", Self::get_doris_type_string(inner.elem())?))
+            }
+            DataType::Time => Err(SinkError::Doris(
+                "TIME is not supported for Doris sink. Please convert to VARCHAR or other supported types.".to_owned(),
+            )),
+            DataType::Timestamptz => Err(SinkError::Doris(
+                "TIMESTAMP WITH TIMEZONE is not supported for Doris sink as Doris doesn't store time values with timezone information. Please convert to TIMESTAMP first.".to_owned(),
+            )),
+            DataType::Interval => Err(SinkError::Doris(
+                "INTERVAL is not supported for Doris sink. Please convert to VARCHAR or other supported types.".to_owned(),
+            )),
+            DataType::Struct(_) => Err(SinkError::Doris(
+                "STRUCT is not supported for auto-creating Doris tables. Please create the table manually.".to_owned(),
+            )),
+            DataType::Bytea => Err(SinkError::Doris(
+                "BYTEA is not supported for Doris sink. Please convert to VARCHAR or other supported types.".to_owned(),
+            )),
+            DataType::Int256 => Err(SinkError::Doris(
+                "INT256 is not supported for Doris sink.".to_owned(),
+            )),
+            DataType::Map(_) => Err(SinkError::Doris(
+                "MAP is not supported for Doris sink.".to_owned(),
+            )),
+            DataType::Vector(_) => Err(SinkError::Doris(
+                "VECTOR is not supported for Doris sink.".to_owned(),
+            )),
+        }
+    }
+
+    /// Whether a `RisingWave` type maps to a Doris type that is allowed as a key column. Doris
+    /// forbids `FLOAT`/`DOUBLE` and complex types (`JSON`, `ARRAY`, ...) as key columns.
+    fn is_doris_key_type(data_type: &DataType) -> bool {
+        matches!(
+            data_type,
+            DataType::Boolean
+                | DataType::Int16
+                | DataType::Int32
+                | DataType::Int64
+                | DataType::Serial
+                | DataType::Decimal
+                | DataType::Date
+                | DataType::Timestamp
+                | DataType::Varchar
+        )
+    }
+
+    /// Quote an identifier for Doris DDL: wrap in backticks and escape embedded backticks by
+    /// doubling them, so a column/database/table name containing a backtick can't produce
+    /// malformed DDL.
+    fn quote_ident(name: &str) -> String {
+        format!("`{}`", name.replace('`', "``"))
+    }
+
+    /// Build a `CREATE TABLE` statement for the sink schema. Doris requires key columns to be the
+    /// first columns in the table, so key columns are emitted first.
+    fn build_create_table_sql(&self) -> Result<String> {
+        let fields = self.schema.fields();
+
+        // Determine the key columns. Upsert sinks key on the primary key. Append-only sinks use
+        // the primary key when present; otherwise Doris still needs a (duplicate) key, and it must
+        // consist of key-able types, so pick the first such column.
+        let key_indices: Vec<usize> = if !self.pk_indices.is_empty() {
+            self.pk_indices.clone()
+        } else {
+            let first_key_able = fields
+                .iter()
+                .position(|f| Self::is_doris_key_type(&f.data_type))
+                .ok_or_else(|| {
+                    SinkError::Doris(
+                        "Cannot auto-create an append-only Doris table: no column has a type \
+                         usable as a Doris key (e.g. all columns are FLOAT/DOUBLE/JSON). Please \
+                         create the table manually or define a `primary_key`."
+                            .to_owned(),
+                    )
+                })?;
+            vec![first_key_able]
+        };
+
+        // Doris forbids FLOAT/DOUBLE/JSON/complex types as key columns. The append-only fallback
+        // above already picks a key-able column, but the primary-key path must be guarded too, so
+        // an unsupported key type fails with a clear message instead of a raw Doris DDL error.
+        if let Some(&bad) = key_indices
+            .iter()
+            .find(|&&i| !Self::is_doris_key_type(&fields[i].data_type))
+        {
+            return Err(SinkError::Doris(format!(
+                "Cannot auto-create Doris table: column `{}` of type {:?} cannot be used as a Doris \
+                 key column (Doris forbids FLOAT/DOUBLE/JSON/complex types as keys). Please create \
+                 the table manually or choose a different primary key.",
+                fields[bad].name, fields[bad].data_type
+            )));
+        }
+
+        // Order key columns first (in key order), followed by the remaining columns. Loads match
+        // columns by name, so this reordering does not affect ingestion.
+        let mut ordered_indices: Vec<usize> = key_indices.clone();
+        for i in 0..fields.len() {
+            if !key_indices.contains(&i) {
+                ordered_indices.push(i);
+            }
+        }
+
+        let mut columns = Vec::with_capacity(fields.len());
+        for &i in &ordered_indices {
+            let field = &fields[i];
+            columns.push(format!(
+                "{} {}",
+                Self::quote_ident(&field.name),
+                Self::get_doris_type_string(&field.data_type)?
+            ));
+        }
+
+        let key_columns: Vec<String> = key_indices
+            .iter()
+            .map(|&i| Self::quote_ident(&fields[i].name))
+            .collect();
+
+        let mut sql = format!(
+            "CREATE TABLE IF NOT EXISTS {}.{} (\n  {}\n) ENGINE=OLAP\n",
+            Self::quote_ident(&self.config.common.database),
+            Self::quote_ident(&self.config.common.table),
+            columns.join(",\n  ")
+        );
+
+        let key_clause = if self.is_append_only {
+            "DUPLICATE KEY"
+        } else {
+            "UNIQUE KEY"
+        };
+        let key_list = key_columns.join(", ");
+        sql.push_str(&format!("{}({})\n", key_clause, key_list));
+
+        // Choose the distribution, always with AUTO bucketing so Doris sizes the bucket count.
+        // Hashing on the key co-locates rows and is required for UNIQUE KEY (upsert) tables and
+        // sensible when the user gave a primary key. But for an append-only table with no primary
+        // key we picked an arbitrary key-able column above; hashing on it would risk severe bucket
+        // skew if that column has low cardinality (e.g. a boolean), so we distribute rows randomly
+        // instead to spread them evenly.
+        if self.is_append_only && self.pk_indices.is_empty() {
+            sql.push_str("DISTRIBUTED BY RANDOM BUCKETS AUTO\n");
+        } else {
+            sql.push_str(&format!("DISTRIBUTED BY HASH({}) BUCKETS AUTO\n", key_list));
+        }
+
+        let mut properties: Vec<String> = Vec::new();
+        if let Some(replication_num) = &self.config.common.replication_num {
+            properties.push(format!("\"replication_num\" = \"{}\"", replication_num));
+        }
+        if !self.is_append_only {
+            // Required so the target UNIQUE KEY table honors the `__DORIS_DELETE_SIGN__` column
+            // used by upsert deletes.
+            properties.push("\"enable_unique_key_merge_on_write\" = \"true\"".to_owned());
+        }
+        if !properties.is_empty() {
+            sql.push_str(&format!("PROPERTIES (\n  {}\n)", properties.join(",\n  ")));
+        }
+
+        Ok(sql)
+    }
+
+    /// Create the target database and table if they don't already exist. Uses the Doris FE
+    /// `MySQL`-protocol port for DDL.
+    async fn auto_create_database_and_table(&self) -> Result<()> {
+        let mut client = self.config.common.build_ddl_client().await?;
+
+        if !client.database_exists(&self.config.common.database).await? {
+            let create_db_sql = format!(
+                "CREATE DATABASE IF NOT EXISTS {}",
+                Self::quote_ident(&self.config.common.database)
+            );
+            tracing::info!(sql = %create_db_sql, "auto-creating Doris database");
+            client.execute_sql(&create_db_sql).await?;
+        }
+
+        if !client
+            .table_exists(&self.config.common.database, &self.config.common.table)
+            .await?
+        {
+            let create_table_sql = self.build_create_table_sql()?;
+            tracing::info!(sql = %create_table_sql, "auto-creating Doris table");
+            client.execute_sql(&create_table_sql).await?;
+        }
+
+        Ok(())
+    }
 }
 
 impl Sink for DorisSink {
@@ -271,6 +517,10 @@ impl Sink for DorisSink {
             return Err(SinkError::Config(anyhow!(
                 "Primary key not defined for upsert doris sink (please define in `primary_key` field)"
             )));
+        }
+        // Auto-create the database and table if requested, before validating the schema below.
+        if self.config.common.auto_create {
+            self.auto_create_database_and_table().await?;
         }
         // check reachability
         let client = self.config.common.build_get_client();
@@ -524,6 +774,78 @@ impl DorisSchemaClient {
         Ok(schema)
     }
 }
+
+/// A `MySQL`-protocol client against the Doris FE query port, used to issue DDL (auto-create).
+/// Doris FE is `MySQL`-compatible, so this mirrors the StarRocks sink's schema client.
+pub struct DorisDdlClient {
+    conn: mysql_async::Conn,
+}
+
+impl DorisDdlClient {
+    pub async fn new(host: String, port: String, user: String, password: String) -> Result<Self> {
+        // username & password may contain special chars, so we need to URL-encode them,
+        // otherwise `Opts::from_url` may report a `Parse error`.
+        let user = form_urlencoded::byte_serialize(user.as_bytes()).collect::<String>();
+        let password = form_urlencoded::byte_serialize(password.as_bytes()).collect::<String>();
+
+        // Connect without selecting a database, so we can create it if it doesn't exist yet.
+        let conn_uri = format!(
+            "mysql://{}:{}@{}:{}/?prefer_socket={}&max_allowed_packet={}&wait_timeout={}",
+            user,
+            password,
+            host,
+            port,
+            DORIS_MYSQL_PREFER_SOCKET,
+            DORIS_MYSQL_MAX_ALLOWED_PACKET,
+            DORIS_MYSQL_WAIT_TIMEOUT
+        );
+        let pool = mysql_async::Pool::new(
+            Opts::from_url(&conn_uri).map_err(|err| SinkError::DorisStarrocksConnect(anyhow!(err)))?,
+        );
+        let conn = pool
+            .get_conn()
+            .await
+            .map_err(|err| SinkError::DorisStarrocksConnect(anyhow!(err)))?;
+        Ok(Self { conn })
+    }
+
+    pub async fn database_exists(&mut self, db: &str) -> Result<bool> {
+        let query = format!(
+            "SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name = {:?}",
+            db
+        );
+        let count: u64 = self
+            .conn
+            .query_first(query)
+            .await
+            .map_err(|err| SinkError::DorisStarrocksConnect(anyhow!(err)))?
+            .unwrap_or(0);
+        Ok(count > 0)
+    }
+
+    pub async fn table_exists(&mut self, db: &str, table: &str) -> Result<bool> {
+        let query = format!(
+            "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = {:?} AND table_schema = {:?}",
+            table, db
+        );
+        let count: u64 = self
+            .conn
+            .query_first(query)
+            .await
+            .map_err(|err| SinkError::DorisStarrocksConnect(anyhow!(err)))?
+            .unwrap_or(0);
+        Ok(count > 0)
+    }
+
+    pub async fn execute_sql(&mut self, sql: &str) -> Result<()> {
+        self.conn
+            .query_drop(sql)
+            .await
+            .map_err(|err| SinkError::DorisStarrocksConnect(anyhow!(err)))?;
+        Ok(())
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DorisSchema {
     status: i32,
@@ -572,9 +894,13 @@ impl DorisField {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
+    use risingwave_common::catalog::{Field, Schema};
     use risingwave_common::types::DataType;
 
-    use super::DorisSink;
+    use super::{DorisConfig, DorisSink};
+    use crate::sink::SINK_TYPE_APPEND_ONLY;
 
     #[test]
     fn test_jsonb_can_write_to_variant() {
@@ -588,6 +914,118 @@ mod tests {
         assert!(
             DorisSink::check_and_correct_column_type(&DataType::Varchar, "VARIANT".into()).unwrap()
         );
+    }
+
+    fn base_properties(r#type: &str) -> BTreeMap<String, String> {
+        BTreeMap::from([
+            ("doris.url".to_owned(), "http://127.0.0.1:8030".to_owned()),
+            ("doris.user".to_owned(), "root".to_owned()),
+            ("doris.password".to_owned(), "".to_owned()),
+            ("doris.database".to_owned(), "demo".to_owned()),
+            ("doris.table".to_owned(), "sink_table".to_owned()),
+            ("type".to_owned(), r#type.to_owned()),
+        ])
+    }
+
+    fn build_sink(r#type: &str, is_append_only: bool) -> DorisSink {
+        let config = DorisConfig::from_btreemap(base_properties(r#type)).unwrap();
+        let schema = Schema::new(vec![
+            Field::with_name(DataType::Int64, "id"),
+            Field::with_name(DataType::Varchar, "name"),
+            Field::with_name(DataType::Int32, "age"),
+        ]);
+        DorisSink::new(config, schema, vec![0], is_append_only).unwrap()
+    }
+
+    #[test]
+    fn test_build_create_table_sql_upsert_puts_key_first_and_merge_on_write() {
+        let sink = build_sink("upsert", false);
+        let sql = sink.build_create_table_sql().unwrap();
+        assert!(sql.contains("UNIQUE KEY(`id`)"), "sql: {sql}");
+        assert!(
+            sql.contains("DISTRIBUTED BY HASH(`id`) BUCKETS AUTO"),
+            "sql: {sql}"
+        );
+        assert!(
+            sql.contains("\"enable_unique_key_merge_on_write\" = \"true\""),
+            "sql: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_build_create_table_sql_append_only_uses_duplicate_key() {
+        let sink = build_sink(SINK_TYPE_APPEND_ONLY, true);
+        let sql = sink.build_create_table_sql().unwrap();
+        assert!(sql.contains("DUPLICATE KEY(`id`)"), "sql: {sql}");
+        assert!(
+            !sql.contains("enable_unique_key_merge_on_write"),
+            "sql: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_build_create_table_sql_append_only_no_pk_picks_key_able_column() {
+        // Append-only sink with no primary key whose first column (`score`) is a non-key-able
+        // type. The DDL must still declare a valid duplicate key over a key-able column (`id`),
+        // reordered to the front, rather than emitting a keyless table that Doris rejects.
+        let config = DorisConfig::from_btreemap(base_properties(SINK_TYPE_APPEND_ONLY)).unwrap();
+        let schema = Schema::new(vec![
+            Field::with_name(DataType::Float64, "score"),
+            Field::with_name(DataType::Int64, "id"),
+        ]);
+        let sink = DorisSink::new(config, schema, vec![], true).unwrap();
+        let sql = sink.build_create_table_sql().unwrap();
+        assert!(sql.contains("DUPLICATE KEY(`id`)"), "sql: {sql}");
+        // No user-defined key, so distribute randomly rather than hashing on the arbitrarily
+        // picked key column (which could skew badly for a low-cardinality column).
+        assert!(sql.contains("DISTRIBUTED BY RANDOM"), "sql: {sql}");
+    }
+
+    #[test]
+    fn test_build_create_table_sql_append_only_no_key_able_column_errors() {
+        // No primary key and no key-able column: auto-create cannot pick a valid key, so it must
+        // fail with a clear error instead of producing invalid DDL.
+        let config = DorisConfig::from_btreemap(base_properties(SINK_TYPE_APPEND_ONLY)).unwrap();
+        let schema = Schema::new(vec![Field::with_name(DataType::Float64, "score")]);
+        let sink = DorisSink::new(config, schema, vec![], true).unwrap();
+        assert!(sink.build_create_table_sql().is_err());
+    }
+
+    #[test]
+    fn test_build_create_table_sql_upsert_non_key_able_pk_errors() {
+        // Upsert primary key on a non-key-able type (DOUBLE): auto-create must reject it with a
+        // clear error instead of emitting DDL that Doris rejects with a raw low-level error.
+        let config = DorisConfig::from_btreemap(base_properties("upsert")).unwrap();
+        let schema = Schema::new(vec![
+            Field::with_name(DataType::Float64, "score"),
+            Field::with_name(DataType::Int64, "id"),
+        ]);
+        let sink = DorisSink::new(config, schema, vec![0], false).unwrap();
+        assert!(sink.build_create_table_sql().is_err());
+    }
+
+    #[test]
+    fn test_build_create_table_sql_escapes_backtick_in_identifier() {
+        // A column name containing a backtick must be escaped (doubled) so the generated DDL stays
+        // well-formed rather than breaking out of the backtick-quoted identifier.
+        let config = DorisConfig::from_btreemap(base_properties(SINK_TYPE_APPEND_ONLY)).unwrap();
+        let schema = Schema::new(vec![Field::with_name(DataType::Int64, "we`ird")]);
+        let sink = DorisSink::new(config, schema, vec![0], true).unwrap();
+        let sql = sink.build_create_table_sql().unwrap();
+        assert!(sql.contains("`we``ird`"), "sql: {sql}");
+    }
+
+    #[test]
+    fn test_get_doris_type_string() {
+        assert_eq!(
+            DorisSink::get_doris_type_string(&DataType::Int64).unwrap(),
+            "BIGINT"
+        );
+        assert_eq!(
+            DorisSink::get_doris_type_string(&DataType::Int32.list()).unwrap(),
+            "ARRAY<INT>"
+        );
+        assert!(DorisSink::get_doris_type_string(&DataType::Timestamptz).is_err());
     }
 }
 
