@@ -1517,10 +1517,10 @@ SpannerCdcProperties:
   - name: spanner.heartbeat_milliseconds
     field_type: i64
     comments: |-
-      Heartbeat interval in milliseconds for partition health monitoring.
-      Maps to the `heartbeat_milliseconds` argument of the `READ_<change_stream>` TVF.
-      Valid range: 1,000–300,000. Defaults to 2000.
-    required: false
+      Heartbeat interval for partition health monitoring, in milliseconds (default: 2000).
+      Maps directly to the `heartbeat_milliseconds` argument of the
+      `READ_<change_stream_name>` TVF. Valid range per Spanner: 1,000–300,000.
+    required: true
     allow_alter_on_fly: true
   - name: spanner.credentials
     field_type: String
@@ -1541,7 +1541,7 @@ SpannerCdcProperties:
     required: false
   - name: spanner.retry_attempts
     field_type: u32
-    comments: 'Retry attempts for transient failures (default: 3)'
+    comments: 'Retry attempts for transient failures (default: 5)'
     required: false
     allow_alter_on_fly: true
   - name: spanner.retry_backoff_ms
@@ -1563,12 +1563,13 @@ SpannerCdcProperties:
     field_type: u32
     comments: |-
       Maximum consecutive missed heartbeats before a partition stream is
-      considered stalled and restarted (default: 100).
+      considered stalled and restarted (default: 10, matching the Spanner
+      Kafka connector's `connector.spanner.max.missed.heartbeats`).
     required: false
     allow_alter_on_fly: true
   - name: spanner.start_timestamp
-    field_type: String
-    comments: Start timestamp for the change stream query (RFC3339 format; stored internally as microseconds since epoch)
+    field_type: i64
+    comments: Start timestamp for the change stream query (RFC3339 format)
     required: false
     default: Default::default
   - name: auto.schema.change
