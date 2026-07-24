@@ -880,6 +880,7 @@ mod tests {
 
         let variant_json_value = datum_to_json_object(
             &Field {
+                description: None,
                 data_type: DataType::Jsonb,
                 name: "variant_col".into(),
             },
