@@ -592,7 +592,7 @@ services:
       - CASSANDRA_CLUSTER_NAME=cloudinfra
 
   doris-server:
-    image: apache/doris:doris-all-in-one-2.1.0
+    image: yagagagaga/doris-standalone:4.1.0
     ports:
       - 8030:8030
       - 8040:8040
