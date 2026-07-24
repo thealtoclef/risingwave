@@ -149,6 +149,14 @@ pub static SOURCE_ALLOW_ALTER_ON_FLY_FIELDS: LazyLock<HashMap<String, HashSet<St
             "debezium.queue.memory.ratio".to_owned(),
         ].into_iter().collect(),
     ).unwrap();
+    // IcebergProperties
+    map.try_insert(
+        std::any::type_name::<IcebergProperties>().to_owned(),
+        [
+            "io.timeout_sec".to_owned(),
+            "io.max_retries".to_owned(),
+        ].into_iter().collect(),
+    ).unwrap();
     // KafkaProperties
     map.try_insert(
         std::any::type_name::<KafkaProperties>().to_owned(),
@@ -245,6 +253,8 @@ pub static SINK_ALLOW_ALTER_ON_FLY_FIELDS: LazyLock<HashMap<String, HashSet<Stri
     map.try_insert(
         std::any::type_name::<IcebergConfig>().to_owned(),
         [
+            "io.timeout_sec".to_owned(),
+            "io.max_retries".to_owned(),
             "commit_checkpoint_interval".to_owned(),
             "commit_checkpoint_size_threshold_mb".to_owned(),
             "enable_compaction".to_owned(),
@@ -266,9 +276,15 @@ pub static SINK_ALLOW_ALTER_ON_FLY_FIELDS: LazyLock<HashMap<String, HashSet<Stri
             "compaction.write_parquet_compression".to_owned(),
             "compaction.write_parquet_max_row_group_rows".to_owned(),
             "compaction.write_parquet_max_row_group_bytes".to_owned(),
+            "enable_manifest_rewrite".to_owned(),
+            "manifest_rewrite_target_size_mb".to_owned(),
+            "manifest_rewrite_min_count_to_merge".to_owned(),
+            "enable_orphan_file_removal".to_owned(),
+            "orphan_file_min_age_millis".to_owned(),
+            "orphan_file_dry_run".to_owned(),
+            "orphan_file_load_concurrency".to_owned(),
+            "orphan_file_delete_concurrency".to_owned(),
             "enable_dangling_delete_file_removal".to_owned(),
-            "io.timeout_sec".to_owned(),
-            "io.max_retries".to_owned(),
         ].into_iter().collect(),
     ).unwrap();
     // KafkaConfig
@@ -364,6 +380,14 @@ pub static SINK_ALLOW_ALTER_ON_FLY_FIELDS: LazyLock<HashMap<String, HashSet<Stri
 pub static CONNECTION_ALLOW_ALTER_ON_FLY_FIELDS: LazyLock<HashMap<String, HashSet<String>>> = LazyLock::new(|| {
     use crate::connector_common::*;
     let mut map = HashMap::new();
+    // IcebergConnection
+    map.try_insert(
+        std::any::type_name::<IcebergConnection>().to_owned(),
+        [
+            "io.timeout_sec".to_owned(),
+            "io.max_retries".to_owned(),
+        ].into_iter().collect(),
+    ).unwrap();
     // KafkaConnection
     map.try_insert(
         std::any::type_name::<KafkaConnection>().to_owned(),
