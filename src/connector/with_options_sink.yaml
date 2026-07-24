@@ -723,10 +723,16 @@ IcebergConfig:
   - name: commit_checkpoint_size_threshold_mb
     field_type: u64
     comments: |-
-      Commit on the next checkpoint barrier after total buffered write size across all
-      writers exceeds this threshold in MiB. The coordinator sums per-writer byte reports
-      and broadcasts the same commit decision to all writers. Size-based commits are
-      opt-in: leaving this unset (or setting it to 0) disables them.
+      Commit on the next checkpoint barrier after total buffered write size across
+      all writers exceeds this threshold in MiB. The coordinator sums per-writer
+      byte reports and broadcasts the same commit decision to all writers, ensuring
+      vnode-aligned commits at the same epoch.
+
+      Size-based commits are opt-in: leaving this unset (or setting it to `0`)
+      disables them, and commits are driven solely by `commit_checkpoint_interval`.
+      A value around 512 MiB is a good starting point, balancing Iceberg's
+      recommended on-disk file size (128-512 MiB) against the ~3-10x
+      in-memory-to-columnar-compressed ratio.
     required: false
     default: Default::default
     allow_alter_on_fly: true
@@ -800,7 +806,9 @@ IcebergConfig:
     iceberg_engine: true
   - name: snapshot_expiration_retain_max
     field_type: i32
-    comments: The maximum number of snapshots to retain. Snapshots exceeding this count will be expired even if they haven't reached the age threshold.
+    comments: |-
+      The maximum number of snapshots to retain. If set, snapshots exceeding
+      this count will be expired even if they haven't reached the age threshold.
     required: false
     default: Default::default
     allow_alter_on_fly: true
