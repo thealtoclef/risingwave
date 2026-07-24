@@ -733,10 +733,16 @@ IcebergConfig:
   - name: commit_checkpoint_size_threshold_mb
     field_type: u64
     comments: |-
-      Commit on the next checkpoint barrier after total buffered write size across all
-      writers exceeds this threshold in MiB. The coordinator sums per-writer byte reports
-      and broadcasts the same commit decision to all writers. Size-based commits are
-      opt-in: leaving this unset (or setting it to 0) disables them.
+      Commit on the next checkpoint barrier after total buffered write size across
+      all writers exceeds this threshold in MiB. The coordinator sums per-writer
+      byte reports and broadcasts the same commit decision to all writers, ensuring
+      vnode-aligned commits at the same epoch.
+
+      Size-based commits are opt-in: leaving this unset (or setting it to `0`)
+      disables them, and commits are driven solely by `commit_checkpoint_interval`.
+      A value around 512 MiB is a good starting point, balancing Iceberg's
+      recommended on-disk file size (128-512 MiB) against the ~3-10x
+      in-memory-to-columnar-compressed ratio.
     required: false
     default: Default::default
     allow_alter_on_fly: true
@@ -802,7 +808,9 @@ IcebergConfig:
     allow_alter_on_fly: true
   - name: snapshot_expiration_retain_max
     field_type: i32
-    comments: The maximum number of snapshots to retain. Snapshots exceeding this count will be expired even if they haven't reached the age threshold.
+    comments: |-
+      The maximum number of snapshots to retain. If set, snapshots exceeding
+      this count will be expired even if they haven't reached the age threshold.
     required: false
     default: Default::default
     allow_alter_on_fly: true
@@ -911,6 +919,83 @@ IcebergConfig:
       position deletes instead of equality deletes.
     required: false
     default: Default::default
+  - name: enable_manifest_rewrite
+    field_type: bool
+    comments: Whether to enable periodic manifest rewrites for this iceberg sink.
+    required: false
+    default: Default::default
+    allow_alter_on_fly: true
+  - name: manifest_rewrite_target_size_mb
+    field_type: u64
+    comments: |-
+      Manifest files smaller than this size (MB) are candidates for rewriting.
+      Default is 8 MB.
+    required: false
+    default: Some (DEFAULT_MANIFEST_REWRITE_TARGET_SIZE_MB)
+    allow_alter_on_fly: true
+  - name: manifest_rewrite_min_count_to_merge
+    field_type: usize
+    comments: |-
+      Skip the rewrite if fewer than this many manifests match the size predicate.
+      Default is 2.
+    required: false
+    default: Some (DEFAULT_MANIFEST_REWRITE_MIN_COUNT_TO_MERGE)
+    allow_alter_on_fly: true
+  - name: enable_orphan_file_removal
+    field_type: bool
+    comments: |-
+      Whether to enable periodic removal of orphan files for this iceberg sink.
+      Orphan files are files under the table location that are not referenced
+      by any current snapshot or metadata (e.g., left behind by failed writes
+      or aborted compactions).
+    required: false
+    default: Default::default
+    allow_alter_on_fly: true
+  - name: orphan_file_min_age_millis
+    field_type: i64
+    comments: |-
+      Minimum age (in milliseconds) before an unreferenced file is treated as
+      an orphan. Files newer than this threshold are never deleted. Defaults
+      to 7 days to protect in-flight writes and concurrent compactions.
+    required: false
+    default: Default::default
+    allow_alter_on_fly: true
+  - name: orphan_file_dry_run
+    field_type: bool
+    comments: |-
+      Dry-run mode: identify orphan files and log them without deleting.
+      Useful when first enabling the feature to audit what would be removed.
+    required: false
+    default: Default::default
+    allow_alter_on_fly: true
+  - name: orphan_file_load_concurrency
+    field_type: usize
+    comments: |-
+      Override for the parallelism used when loading manifest lists and
+      manifests during orphan scanning. Leaves the library default (16) in
+      place when unset.
+    required: false
+    default: Default::default
+    allow_alter_on_fly: true
+  - name: orphan_file_delete_concurrency
+    field_type: usize
+    comments: |-
+      Override for the parallelism used when deleting orphan files. Leaves the
+      library default (10) in place when unset.
+    required: false
+    default: Default::default
+    allow_alter_on_fly: true
+  - name: enable_dangling_delete_file_removal
+    field_type: bool
+    comments: |-
+      Whether to enable periodic removal of dangling delete files for this
+      iceberg sink. Dangling deletes (position deletes, deletion vectors, and
+      equality deletes that no longer apply to any live data file) are pruned
+      from manifests to reduce metadata overhead and read amplification.
+      Enabled by default.
+    required: false
+    default: 'true'
+    allow_alter_on_fly: true
 KafkaConfig:
   fields:
   - name: topic
