@@ -130,6 +130,7 @@ impl Binder {
                 query,
                 emit_mode,
                 with_options,
+                engine: _,
             } => {
                 let query = self.bind_query(&query)?;
                 let create_view = BoundCreateView::new(

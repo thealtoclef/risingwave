@@ -397,11 +397,13 @@ impl StreamMaterialize {
             webhook_info,
             job_id: None,
             engine: match table_type {
+                // MVs now accept both Hummock (default) and Iceberg engines.
                 TableType::Table => engine,
-                TableType::MaterializedView
-                | TableType::Index
-                | TableType::Internal
-                | TableType::VectorIndex => {
+                TableType::MaterializedView => {
+                    assert_matches!(engine, Engine::Hummock | Engine::Iceberg);
+                    engine
+                }
+                TableType::Index | TableType::Internal | TableType::VectorIndex => {
                     assert_eq!(engine, Engine::Hummock);
                     engine
                 }

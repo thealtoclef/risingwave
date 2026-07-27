@@ -2103,6 +2103,7 @@ impl Parser<'_> {
         } else {
             None
         };
+        let engine = self.parse_engine()?;
         // Optional `WITH [ CASCADED | LOCAL ] CHECK OPTION` is widely supported here.
         Ok(Statement::CreateView {
             if_not_exists,
@@ -2113,6 +2114,7 @@ impl Parser<'_> {
             or_replace,
             with_options,
             emit_mode,
+            engine,
         })
     }
 
@@ -2660,19 +2662,7 @@ impl Parser<'_> {
             None
         };
 
-        let engine = if self.parse_keyword(Keyword::ENGINE) {
-            self.expect_token(&Token::Eq)?;
-            let engine_name = self.parse_object_name()?;
-            if "iceberg".eq_ignore_ascii_case(&engine_name.real_value()) {
-                Engine::Iceberg
-            } else if "hummock".eq_ignore_ascii_case(&engine_name.real_value()) {
-                Engine::Hummock
-            } else {
-                parser_err!("Unsupported engine: {}", engine_name);
-            }
-        } else {
-            Engine::Hummock
-        };
+        let engine = self.parse_engine()?;
 
         Ok(Statement::CreateTable {
             name: table_name,
@@ -3153,6 +3143,22 @@ impl Parser<'_> {
             Ok(Since::Full)
         } else {
             Ok(Since::ProcessTime)
+        }
+    }
+
+    fn parse_engine(&mut self) -> ModalResult<Engine> {
+        if self.parse_keyword(Keyword::ENGINE) {
+            self.expect_token(&Token::Eq)?;
+            let engine_name = self.parse_object_name()?;
+            if "iceberg".eq_ignore_ascii_case(&engine_name.real_value()) {
+                Ok(Engine::Iceberg)
+            } else if "hummock".eq_ignore_ascii_case(&engine_name.real_value()) {
+                Ok(Engine::Hummock)
+            } else {
+                parser_err!("Unsupported engine: {}", engine_name);
+            }
+        } else {
+            Ok(Engine::Hummock)
         }
     }
 

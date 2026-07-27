@@ -262,6 +262,15 @@ impl Engine {
     }
 }
 
+impl From<risingwave_sqlparser::ast::Engine> for Engine {
+    fn from(engine: risingwave_sqlparser::ast::Engine) -> Self {
+        match engine {
+            risingwave_sqlparser::ast::Engine::Hummock => Engine::Hummock,
+            risingwave_sqlparser::ast::Engine::Iceberg => Engine::Iceberg,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Display, Hash, PartialOrd, PartialEq, Eq, Ord)]
 pub enum StreamJobStatus {
     #[default]

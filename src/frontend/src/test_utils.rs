@@ -854,6 +854,17 @@ impl CatalogWriter for MockCatalogWriter {
         todo!()
     }
 
+    async fn create_iceberg_materialized_view(
+        &self,
+        _table_job_info: PbTableJobInfo,
+        _sink_job_info: PbSinkJobInfo,
+        _iceberg_source: PbSource,
+        _if_not_exists: bool,
+        _dependencies: HashSet<ObjectId>,
+    ) -> Result<()> {
+        todo!()
+    }
+
     async fn wait(&self, _job_id: Option<JobId>) -> Result<()> {
         Ok(())
     }

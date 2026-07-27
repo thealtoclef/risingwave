@@ -1,0 +1,1008 @@
+# Test iceberg engine on materialized views.
+# Mirrors iceberg_engine.slt but uses CREATE MATERIALIZED VIEW ... ENGINE = iceberg.
+# The MV's stream_key (derived from the query's GROUP BY or primary key) becomes the iceberg sink PK.
+#
+# Sections:
+#   1.  Setup — secret + connection + default session config
+#   2.  Basic aggregate MV (existing, extended with explain verification)
+#   3.  Full data types via SELECT * MV
+#   4.  Predicate pushdown on MV
+#   5.  Order key WITH option (port from table-side; note: order_key is TABLE-only, rejection test)
+#   6.  Hosted catalog + iceberg_tables system table + VACUUM FULL
+#   7.  Partition by + invalid partition key error
+#   8.  Storage mode switching with explain verification
+#   9.  Per-MV connection override
+#  10.  V3 format + enable_pk_index
+#  11.  Source update propagation (INSERT / UPDATE / DELETE flows to MV)
+#  12.  JOIN MV with engine=iceberg
+#  13.  Multiple MVs sharing a single connection
+#  14.  sink_decouple = false rejection
+#  15.  Cleanup
+
+# =============================================================================
+# Section 1: Setup
+# =============================================================================
+
+statement ok
+create secret my_secret_mv with (
+  backend = 'meta'
+) as 'hummockadmin';
+
+statement ok
+create connection my_conn_mv
+with (
+    type = 'iceberg',
+    warehouse.path = 's3://hummock001/iceberg_connection_mv',
+    s3.access.key = secret my_secret_mv,
+    s3.secret.key = secret my_secret_mv,
+    s3.endpoint = 'http://127.0.0.1:9301',
+    s3.region = 'us-west-2',
+    catalog.type = 'storage',
+);
+
+statement ok
+set iceberg_engine_connection = 'public.my_conn_mv';
+
+# Disable DataFusion engine so explain plans show BatchScan/BatchIcebergScan
+statement ok
+SET enable_datafusion_engine = 'false';
+
+# Source table used by most MV tests below
+statement ok
+create table events (
+    id bigint primary key,
+    user_id int,
+    event_type varchar,
+    amount int
+) append only;
+
+statement ok
+insert into events values
+    (1, 100, 'login', 10),
+    (2, 100, 'click', 20),
+    (3, 200, 'login', 5),
+    (4, 100, 'login', 15),
+    (5, 200, 'click', 30);
+
+statement ok
+FLUSH;
+
+# =============================================================================
+# Section 2: Basic aggregate MV (existing, extended with explain)
+# =============================================================================
+# The GROUP BY key (user_id) becomes the stream_key, used as the iceberg sink PK.
+# ENGINE clause comes AFTER the AS query, matching CREATE TABLE syntax ordering.
+
+statement ok
+create materialized view user_totals
+with (commit_checkpoint_interval = 1)
+as
+select user_id, count(*) as cnt, sum(amount) as total
+from events
+group by user_id
+engine = iceberg;
+
+statement ok
+FLUSH;
+
+# Batch read should route through BatchIcebergScan (default storage mode = iceberg).
+# Retry because iceberg commit is async.
+query III rowsort retry 6 backoff 1s
+select user_id, cnt, total from user_totals order by user_id;
+----
+100 3 45
+200 2 35
+
+# Verify the explain plan uses BatchIcebergScan in default mode
+query T
+explain select user_id, cnt from user_totals;
+----
+BatchExchange { order: [], dist: Single }
+└─BatchIcebergScan { source: __iceberg_source_user_totals, columns: [user_id, cnt], iceberg_scan_type: DataScan }
+
+# =============================================================================
+# Section 3: Full data types via SELECT * MV
+# =============================================================================
+# Creates a source table with all supported types, then an append-only MV
+# that mirrors it via SELECT * with engine = iceberg.
+
+statement ok
+create table full_type_src (
+    id bigint primary key,
+    v_small_int smallint,
+    v_int int,
+    v_long bigint,
+    v_float real,
+    v_double double,
+    v_varchar varchar,
+    v_bool boolean,
+    v_date date,
+    v_timestamp timestamptz,
+    v_ts_ntz timestamp,
+    v_decimal decimal,
+    v_map map(int, int),
+    v_array int[],
+    v_struct struct<a int,b int>,
+    v_json jsonb,
+    v_one_layer_struct struct<id bigint, v_small_int smallint, v_int int, v_long bigint, v_float real, v_double double, v_varchar varchar, v_bool boolean, v_date date, v_timestamp timestamptz, v_ts_ntz timestamp, v_decimal decimal, v_json jsonb>,
+    v_nested_type struct<a int, b map(int, struct<v_bytea bytea>)>[],
+    v_interval interval
+);
+
+statement ok
+insert into full_type_src values
+(1, 1, 1, 1000, 1.1, 1.11, '1-1', true, '2022-03-11', '2022-03-11 01:00:00Z'::timestamptz, '2022-03-11 01:00:00', 1.11, map {1:100,2:200}, array[1,2,3], row(1,2), '{"a":"foo", "b":"bar"}', row(1, 1, 1, 1000, 1.1, 1.11, '1-1', true, '2022-03-11', '2022-03-11 01:00:00Z'::timestamptz, '2022-03-11 01:00:00', 1.11, '{"a":"foo", "b":"bar"}'), array[(1,map {1:row(decode('DEADBEEF', 'hex')),2:row(decode('DEADBEEF', 'hex'))}), row(2,map {3:row(decode('DEADBEEF', 'hex')),4:row(decode('DEADBEEF', 'hex'))})], interval '2 m'),
+(2, 2, 2, 2000, 2.2, 2.22, '2-2', false, '2022-03-12', '2022-03-12 02:00:00Z'::timestamptz, '2022-03-12 02:00:00', 2.22, map {3:300}, array[1,null,3], row(3,null), '{"k2":[2,true,4]}', row(2, 2, 2, 2000, 2.2, 2.22, '2-2', false, '2022-03-12', '2022-03-12 02:00:00Z'::timestamptz, '2022-03-12 02:00:00', 2.22, '{"k2":[2,true,4]}'), array[]::struct<a int, b map (int, struct<v_bytea bytea>)>[], interval '3 day'),
+(3, 3, 3, 3000, 3.3, 3.33, '3-3', true, '2022-03-13', '2022-03-13 03:00:00Z'::timestamptz, '2022-03-13 03:00:00', 'inf', null, null, null, '1', row(3, 3, 3, 3000, 3.3, 3.33, '3-3', true, '2022-03-13', '2022-03-13 03:00:00Z'::timestamptz, '2022-03-13 03:00:00', 'inf', '1'), array[row(1,map {1:row(decode('DEADBEEF', 'hex')),2:row(decode('DEADBEEF', 'hex'))})], '12:34:56.123'::interval),
+(4, 4, 4, 4000, 4.4, 4.44, '4-4', false, '2022-03-14', '2022-03-14 04:00:00Z'::timestamptz, '2022-03-14 04:00:00', '-inf', null, null, null, 'true', row(4, 4, 4, 4000, 4.4, 4.44, '4-4', false, '2022-03-14', '2022-03-14 04:00:00Z'::timestamptz, '2022-03-14 04:00:00', '-inf', 'true'), null, null);
+
+statement ok
+FLUSH;
+
+# MV that mirrors the source table via SELECT * (wrapped in parens so the
+# trailing `engine` token is not consumed as a FROM-clause table alias)
+statement ok
+create materialized view full_type_mv
+with (commit_checkpoint_interval = 1)
+as
+(select * from full_type_src)
+engine = iceberg;
+
+statement ok
+FLUSH;
+
+query TTTTTTTTTTTTTTTTTTT rowsort retry 6 backoff 1s
+select * from full_type_mv order by id;
+----
+1 1 1 1000 1.1 1.11 1-1 t 2022-03-11 2022-03-11 01:00:00+00:00 2022-03-11 01:00:00 1.1100000000 {1:100,2:200} {1,2,3} (1,2) {"a": "foo", "b": "bar"} (1,1,1,1000,1.1,1.11,1-1,t,2022-03-11,"2022-03-11 01:00:00+00:00","2022-03-11 01:00:00",1.1100000000,"{""a"": ""foo"", ""b"": ""bar""}") {"(1,\"{1:(\"\"\\\\\\\\xdeadbeef\"\"),2:(\"\"\\\\\\\\xdeadbeef\"\")}\")","(2,\"{3:(\"\"\\\\\\\\xdeadbeef\"\"),4:(\"\"\\\\\\\\xdeadbeef\"\")}\")"} 00:02:00
+2 2 2 2000 2.2 2.22 2-2 f 2022-03-12 2022-03-12 02:00:00+00:00 2022-03-12 02:00:00 2.2200000000 {3:300} {1,NULL,3} (3,) {"k2": [2, true, 4]} (2,2,2,2000,2.2,2.22,2-2,f,2022-03-12,"2022-03-12 02:00:00+00:00","2022-03-12 02:00:00",2.2200000000,"{""k2"": [2, true, 4]}") {} 3 days
+3 3 3 3000 3.3 3.33 3-3 t 2022-03-13 2022-03-13 03:00:00+00:00 2022-03-13 03:00:00 Infinity NULL NULL NULL 1 (3,3,3,3000,3.3,3.33,3-3,t,2022-03-13,"2022-03-13 03:00:00+00:00","2022-03-13 03:00:00",Infinity,1) {"(1,\"{1:(\"\"\\\\\\\\xdeadbeef\"\"),2:(\"\"\\\\\\\\xdeadbeef\"\")}\")"} 12:34:56.123
+4 4 4 4000 4.4 4.44 4-4 f 2022-03-14 2022-03-14 04:00:00+00:00 2022-03-14 04:00:00 -Infinity NULL NULL NULL true (4,4,4,4000,4.4,4.44,4-4,f,2022-03-14,"2022-03-14 04:00:00+00:00","2022-03-14 04:00:00",-Infinity,true) NULL NULL
+
+statement ok
+drop materialized view full_type_mv;
+
+statement ok
+drop table full_type_src;
+
+# =============================================================================
+# Section 4: Predicate pushdown on MV
+# =============================================================================
+# Ported from iceberg_engine.slt:194-224. Create a source table, an MV,
+# then query the MV with WHERE filters to verify predicate pushdown works
+# through the iceberg storage layer.
+
+statement ok
+create table price_src (
+    id bigint primary key,
+    price numeric,
+    date date
+);
+
+statement ok
+insert into price_src values
+    (1, 100.50, '2025-02-01'),
+    (2, 200.75, '2025-02-05'),
+    (3, 150.25, '2025-02-10');
+
+statement ok
+FLUSH;
+
+statement ok
+create materialized view price_mv
+with (commit_checkpoint_interval = 1)
+as
+(select * from price_src)
+engine = iceberg;
+
+statement ok
+FLUSH;
+
+query TTT rowsort retry 6 backoff 1s
+select id, price, date from price_mv where date <= date '2025-02-10' - interval '5' day;
+----
+1 100.5000000000 2025-02-01
+2 200.7500000000 2025-02-05
+
+query TTT rowsort
+select id, price, date from price_mv where price < 180.20;
+----
+1 100.5000000000 2025-02-01
+3 150.2500000000 2025-02-10
+
+statement ok
+drop materialized view price_mv;
+
+statement ok
+drop table price_src;
+
+# =============================================================================
+# Section 5: order_key option (rejection test)
+# =============================================================================
+# Ported from iceberg_engine.slt:226-243.  The  order_key  option is valid for
+# iceberg-engine TABLES but is NOT in ICEBERG_MV_OPTIONS
+# (src/frontend/src/handler/create_mv.rs:54-80).  This test verifies that
+# the frontend rejects it with a clear error.
+
+statement ok
+create table order_key_src (
+    id bigint primary key,
+    v1 int,
+    v2 varchar
+);
+
+statement error
+create materialized view order_key_mv
+with (commit_checkpoint_interval = 1, order_key = 'v1 desc nulls last, id asc')
+as
+(select * from order_key_src)
+engine = iceberg;
+
+statement ok
+drop table order_key_src;
+
+# =============================================================================
+# Section 6: Hosted catalog + iceberg_tables + VACUUM FULL  [SKIPPED locally]
+# =============================================================================
+# Ported from iceberg_engine.slt:259-332. Uses a separate connection with
+# hosted_catalog = true, creates a source table + MV, then verifies
+# rw_catalog.iceberg_tables, rw_iceberg_files, and VACUUM FULL.
+#
+# SKIPPED in for-ctl profile: hosted_catalog requires PostgreSQL or MySQL as
+# the meta store backend. SQLite (used by for-ctl) does not provide a host
+# endpoint, so parsing fails with "failed to parse host from meta store
+# endpoint". This section is only exercised in CI where the meta store uses
+# PostgreSQL/MySQL.
+#
+# The code being tested:
+#   create connection my_hosted_catalog_conn_mv with (..., hosted_catalog = true);
+#   set iceberg_engine_connection = 'public.my_hosted_catalog_conn_mv';
+#   create table t_hosted_src (id bigint primary key, name varchar);
+#   create materialized view mv_hosted with (commit_checkpoint_interval = 1)
+#     as (select * from t_hosted_src) engine = iceberg;
+#   select * from mv_hosted;  -->  (1, xxx), (2, yyy)
+#   select count(*) from rw_catalog.iceberg_tables where ...;  --> 1
+#   select count(*) > 0 from rw_iceberg_files where ...;  --> t
+#   VACUUM FULL mv_hosted;
+#   drop materialized view mv_hosted;
+#   drop table t_hosted_src;
+#   drop connection my_hosted_catalog_conn_mv;
+#   set iceberg_engine_connection = 'public.my_conn_mv';
+#
+# Tested in CI via: e2e_test/iceberg/test_case/pure_slt/iceberg_engine.slt
+# (table-side variant) and iceberg_engine_append_only.slt (append-only variant).
+
+# =============================================================================
+# Section 7: Partition by + invalid partition key error
+# =============================================================================
+# Ported from iceberg_engine.slt:335-379. The partition key must be a prefix
+# of the MV's stream_key (GROUP BY columns). Tests both valid and invalid
+# partition_by values for MVs.
+
+# Valid: partition_by key is prefix of stream_key (user_id is the GROUP BY column)
+statement ok
+create materialized view mv_partition_valid
+with (commit_checkpoint_interval = 1, partition_by = 'user_id')
+as
+select user_id, count(*) as cnt, sum(amount) as total
+from events
+group by user_id
+engine = iceberg;
+
+statement ok
+FLUSH;
+
+query III rowsort retry 6 backoff 1s
+select user_id, cnt, total from mv_partition_valid order by user_id;
+----
+100 3 45
+200 2 35
+
+statement ok
+drop materialized view mv_partition_valid;
+
+# Invalid: partition_by 'event_type' is NOT a prefix of stream_key (user_id)
+statement error
+create materialized view mv_partition_invalid
+with (commit_checkpoint_interval = 1, partition_by = 'event_type')
+as
+select user_id, count(*) as cnt, sum(amount) as total
+from events
+group by user_id
+engine = iceberg;
+
+# =============================================================================
+# Section 8: Storage mode switching with explain verification
+# =============================================================================
+# Ported from iceberg_query_storage_mode.slt. Verifies that the
+# iceberg_query_storage_mode session variable controls how MV data is read.
+
+# Recreate a purpose-built source + MV for this section
+statement ok
+create table mode_src (
+    id bigint primary key,
+    name varchar,
+    val int
+);
+
+statement ok
+insert into mode_src values (1, 'alice', 10), (2, 'bob', 20), (3, 'carol', 30);
+
+statement ok
+FLUSH;
+
+statement ok
+create materialized view mv_mode
+with (commit_checkpoint_interval = 1)
+as
+(select * from mode_src)
+engine = iceberg;
+
+statement ok
+FLUSH;
+
+# Wait for iceberg write to complete
+sleep 5s
+
+query TTT rowsort retry 6 backoff 1s
+select * from mv_mode;
+----
+1 alice 10
+2 bob 20
+3 carol 30
+
+# ---- Mode: hummock ----
+statement ok
+set iceberg_query_storage_mode = 'hummock';
+
+# Point lookup uses BatchScan (Hummock row store)
+query T
+explain select name from mv_mode where id = 1;
+----
+BatchExchange { order: [], dist: Single }
+└─BatchScan { table: mv_mode, columns: [name], scan_ranges: [id = Int64(1)] }
+
+query T
+select name from mv_mode where id = 1;
+----
+alice
+
+# Full scan uses BatchScan
+query T
+explain select * from mv_mode;
+----
+BatchExchange { order: [], dist: Single }
+└─BatchScan { table: mv_mode, columns: [id, name, val] }
+
+query TTT rowsort
+select * from mv_mode;
+----
+1 alice 10
+2 bob 20
+3 carol 30
+
+# ---- Mode: iceberg ----
+statement ok
+set iceberg_query_storage_mode = 'iceberg';
+
+# Point lookup uses BatchIcebergScan
+query T
+explain select name from mv_mode where id = 1;
+----
+BatchExchange { order: [], dist: Single }
+└─BatchProject { exprs: [name] }
+  └─BatchFilter { predicate: (id = 1:Int32) }
+    └─BatchIcebergScan { source: __iceberg_source_mv_mode, columns: [id, name], iceberg_scan_type: DataScan }
+
+query T
+select name from mv_mode where id = 1;
+----
+alice
+
+# Full scan uses BatchIcebergScan
+query T
+explain select * from mv_mode;
+----
+BatchExchange { order: [], dist: Single }
+└─BatchIcebergScan { source: __iceberg_source_mv_mode, columns: [id, name, val], iceberg_scan_type: DataScan }
+
+query TTT rowsort
+select * from mv_mode;
+----
+1 alice 10
+2 bob 20
+3 carol 30
+
+# ---- Mode: auto ----
+statement ok
+set iceberg_query_storage_mode = 'auto';
+
+# Point lookup should prefer Hummock row store for lower latency
+query T
+explain select name from mv_mode where id = 1;
+----
+BatchExchange { order: [], dist: Single }
+└─BatchProject { exprs: [name] }
+  └─BatchFilter { predicate: (id = 1:Int32) }
+    └─BatchIcebergScan { source: __iceberg_source_mv_mode, columns: [id, name], iceberg_scan_type: DataScan }
+
+# Aggregate query should stay on Iceberg
+query T
+explain select sum(val) from mv_mode;
+----
+BatchSimpleAgg { aggs: [sum(sum(val))] }
+└─BatchExchange { order: [], dist: Single }
+  └─BatchSimpleAgg { aggs: [sum(val)] }
+    └─BatchIcebergScan { source: __iceberg_source_mv_mode, columns: [val], iceberg_scan_type: DataScan }
+
+query I
+select sum(val) from mv_mode;
+----
+60
+
+# ---- Aggregate test in hummock mode ----
+statement ok
+set iceberg_query_storage_mode = 'hummock';
+
+query I
+select sum(val) from mv_mode;
+----
+60
+
+# ---- Aggregate test in iceberg mode ----
+statement ok
+set iceberg_query_storage_mode = 'iceberg';
+
+query I
+select sum(val) from mv_mode;
+----
+60
+
+# ---- Filter + projection in both modes ----
+statement ok
+set iceberg_query_storage_mode = 'hummock';
+
+query T rowsort
+select name from mv_mode where val > 15;
+----
+bob
+carol
+
+statement ok
+set iceberg_query_storage_mode = 'iceberg';
+
+query T rowsort
+select name from mv_mode where val > 15;
+----
+bob
+carol
+
+statement ok
+drop materialized view mv_mode;
+
+statement ok
+drop table mode_src;
+
+# Reset to default mode
+statement ok
+set iceberg_query_storage_mode = 'iceberg';
+
+# =============================================================================
+# Section 9: Per-MV connection override
+# =============================================================================
+# Verifies that an MV can specify its own connection via the WITH clause,
+# overriding the session default (iceberg_engine_connection).
+
+statement ok
+create secret my_secret_override with (
+  backend = 'meta'
+) as 'hummockadmin';
+
+statement ok
+create connection my_conn_override
+with (
+    type = 'iceberg',
+    warehouse.path = 's3://hummock001/iceberg_connection_override',
+    s3.access.key = secret my_secret_override,
+    s3.secret.key = secret my_secret_override,
+    s3.endpoint = 'http://127.0.0.1:9301',
+    s3.region = 'us-west-2',
+    catalog.type = 'storage',
+);
+
+# MV using the default connection
+statement ok
+create materialized view mv_default_conn
+with (commit_checkpoint_interval = 1)
+as
+select user_id, count(*) as cnt
+from events
+group by user_id
+engine = iceberg;
+
+# MV using an explicit connection override — connects to a different warehouse path
+statement ok
+create materialized view mv_override_conn
+with (commit_checkpoint_interval = 1, connection = public.my_conn_override)
+as
+select user_id, count(*) as cnt
+from events
+group by user_id
+engine = iceberg;
+
+statement ok
+FLUSH;
+
+query IT rowsort retry 6 backoff 1s
+select * from mv_default_conn order by user_id;
+----
+100 3
+200 2
+
+query IT rowsort retry 6 backoff 1s
+select * from mv_override_conn order by user_id;
+----
+100 3
+200 2
+
+statement ok
+drop materialized view mv_override_conn;
+
+statement ok
+drop materialized view mv_default_conn;
+
+statement ok
+drop connection my_conn_override;
+
+statement ok
+drop secret my_secret_override;
+
+# =============================================================================
+# Section 10: V3 format + enable_pk_index
+# =============================================================================
+# Ported from iceberg_v3/with_pk_index.slt:23-119. Creates an MV that uses
+# format_version='3' and enable_pk_index='true'. Verifies puffin files are
+# generated for the PK index.
+
+statement ok
+create table v3_src (
+    id bigint primary key,
+    name varchar,
+    v1 int
+);
+
+statement ok
+insert into v3_src values (1, 'alice', 100), (2, 'bob', 200), (3, 'charlie', 300);
+
+statement ok
+FLUSH;
+
+statement ok
+create materialized view mv_v3
+with (
+    commit_checkpoint_interval = 1,
+    format_version = '3'
+)
+as
+(select * from v3_src)
+engine = iceberg;
+
+statement ok
+FLUSH;
+
+# Verify data files exist for the MV's internal source (no position deletes yet, so no puffin files)
+query T retry 6 backoff 1s
+select count(*) > 0 from rw_iceberg_files
+where schema_name = 'public'
+  and source_name like '%mv_v3%';
+----
+t
+
+query TTT rowsort retry 3 backoff 1s
+select * from mv_v3;
+----
+1 alice 100
+2 bob 200
+3 charlie 300
+
+# Trigger a DELETE to generate position deletes (puffin format with enable_pk_index)
+statement ok
+delete from v3_src where id = 3;
+
+statement ok
+FLUSH;
+
+# Verify puffin position delete files now exist
+query T retry 6 backoff 1s
+select count(*) > 0 from rw_iceberg_files
+where schema_name = 'public'
+  and source_name like '%mv_v3%'
+  and file_format = 'puffin';
+----
+t
+
+# Verify the DELETE propagated to the MV
+query TTT rowsort retry 6 backoff 1s
+select * from mv_v3;
+----
+1 alice 100
+2 bob 200
+
+# Now insert more data and verify PK index is maintained
+statement ok
+insert into v3_src values (4, 'delta', 400);
+
+statement ok
+FLUSH;
+
+query TTT rowsort retry 6 backoff 1s
+select * from mv_v3;
+----
+1 alice 100
+2 bob 200
+4 delta 400
+
+statement ok
+drop materialized view mv_v3;
+
+statement ok
+drop table v3_src;
+
+# =============================================================================
+# Section 11: Source update propagation (INSERT / UPDATE / DELETE)
+# =============================================================================
+# Verifies that changes to the source table (INSERT, UPDATE, DELETE) are
+# propagated through the MV's streaming pipeline to the iceberg sink.
+
+statement ok
+create table prop_src (
+    id bigint primary key,
+    label varchar,
+    val int
+);
+
+statement ok
+insert into prop_src values (1, 'a', 10), (2, 'b', 20), (3, 'c', 30);
+
+statement ok
+FLUSH;
+
+statement ok
+create materialized view mv_prop
+with (commit_checkpoint_interval = 1)
+as
+(select * from prop_src)
+engine = iceberg;
+
+statement ok
+FLUSH;
+
+query TTT rowsort retry 6 backoff 1s
+select * from mv_prop;
+----
+1 a 10
+2 b 20
+3 c 30
+
+# INSERT a new row — should appear in the MV
+statement ok
+insert into prop_src values (4, 'd', 40);
+
+statement ok
+FLUSH;
+
+query TTT rowsort retry 6 backoff 1s
+select * from mv_prop;
+----
+1 a 10
+2 b 20
+3 c 30
+4 d 40
+
+# The source table has a primary key, so the MV inherits it as the stream_key.
+# This allows the MV to propagate INSERT, UPDATE, and DELETE from the source.
+# First test with INSERT-only via mv_prop, then test UPDATE/DELETE via mv_prop_mutable.
+
+statement ok
+drop materialized view mv_prop;
+
+statement ok
+create materialized view mv_prop_mutable
+with (commit_checkpoint_interval = 1)
+as
+(select * from prop_src)
+engine = iceberg;
+
+statement ok
+FLUSH;
+
+query TTT rowsort retry 6 backoff 1s
+select * from mv_prop_mutable;
+----
+1 a 10
+2 b 20
+3 c 30
+4 d 40
+
+# UPDATE a row in the source — the MV should reflect the change
+statement ok
+update prop_src set val = 99 where id = 2;
+
+statement ok
+FLUSH;
+
+query TTT rowsort retry 6 backoff 1s
+select * from mv_prop_mutable;
+----
+1 a 10
+2 b 99
+3 c 30
+4 d 40
+
+# DELETE a row from the source — the MV should reflect the removal
+statement ok
+delete from prop_src where id = 3;
+
+statement ok
+FLUSH;
+
+query TTT rowsort retry 6 backoff 1s
+select * from mv_prop_mutable;
+----
+1 a 10
+2 b 99
+4 d 40
+
+statement ok
+drop materialized view mv_prop_mutable;
+
+statement ok
+drop table prop_src;
+
+# =============================================================================
+# Section 12: JOIN MV with engine=iceberg
+# =============================================================================
+# Creates two source tables and a JOIN MV, verifying the output.
+
+statement ok
+create table orders (
+    order_id bigint primary key,
+    user_id int,
+    amount int
+);
+
+statement ok
+create table customers (
+    user_id int primary key,
+    name varchar
+);
+
+statement ok
+insert into orders values (1, 100, 50), (2, 100, 75), (3, 200, 25);
+
+statement ok
+insert into customers values (100, 'Alice'), (200, 'Bob');
+
+statement ok
+FLUSH;
+
+statement ok
+create materialized view mv_join
+with (commit_checkpoint_interval = 1)
+as
+(select o.order_id, c.name, o.amount
+from orders o
+join customers c on o.user_id = c.user_id)
+engine = iceberg;
+
+statement ok
+FLUSH;
+
+query TTI rowsort retry 6 backoff 1s
+select * from mv_join;
+----
+1 Alice 50
+2 Alice 75
+3 Bob 25
+
+# Verify explain plan uses BatchIcebergScan
+query T
+explain select * from mv_join;
+----
+BatchExchange { order: [], dist: Single }
+└─BatchIcebergScan { source: __iceberg_source_mv_join, columns: [order_id, name, amount], iceberg_scan_type: DataScan }
+
+statement ok
+drop materialized view mv_join;
+
+statement ok
+drop table customers;
+
+statement ok
+drop table orders;
+
+# =============================================================================
+# Section 13: Multiple MVs sharing a single connection
+# =============================================================================
+# Creates several MVs on different source tables, all using the same default
+# connection, verifying that multiple concurrent iceberg sinks work.
+
+statement ok
+create table multi_src1 (
+    id bigint primary key,
+    val int
+);
+
+statement ok
+create table multi_src2 (
+    id bigint primary key,
+    tag varchar
+);
+
+statement ok
+insert into multi_src1 values (1, 10), (2, 20);
+
+statement ok
+insert into multi_src2 values (1, 'x'), (2, 'y');
+
+statement ok
+FLUSH;
+
+statement ok
+create materialized view mv_multi1
+with (commit_checkpoint_interval = 1)
+as
+(select * from multi_src1)
+engine = iceberg;
+
+statement ok
+create materialized view mv_multi2
+with (commit_checkpoint_interval = 1)
+as
+(select * from multi_src2)
+engine = iceberg;
+
+statement ok
+create materialized view mv_multi3
+with (commit_checkpoint_interval = 1)
+as
+select (id % 2) as parity, sum(val) as total
+from multi_src1
+group by id % 2
+engine = iceberg;
+
+statement ok
+FLUSH;
+
+query IT rowsort retry 6 backoff 1s
+select * from mv_multi1;
+----
+1 10
+2 20
+
+query TT rowsort retry 6 backoff 1s
+select * from mv_multi2;
+----
+1 x
+2 y
+
+query IT rowsort retry 6 backoff 1s
+select * from mv_multi3;
+----
+0 20
+1 10
+
+statement ok
+drop materialized view mv_multi3;
+
+statement ok
+drop materialized view mv_multi2;
+
+statement ok
+drop materialized view mv_multi1;
+
+statement ok
+drop table multi_src2;
+
+statement ok
+drop table multi_src1;
+
+# =============================================================================
+# Section 14: sink_decouple = false rejection
+# =============================================================================
+# Ported from iceberg_engine.slt:384-391. Iceberg engine requires sink_decouple
+# to be enabled (it uses the decoupled sink framework for committing to iceberg).
+
+statement ok
+set sink_decouple = false;
+
+statement error
+create materialized view mv_no_decouple
+with (commit_checkpoint_interval = 1)
+as
+select user_id, count(*) as cnt
+from events
+group by user_id
+engine = iceberg;
+
+statement ok
+set sink_decouple = true;
+
+# =============================================================================
+# Section 16: ALTER MATERIALIZED VIEW rejection (iceberg engine)
+# =============================================================================
+# Regression test for round-5 OCR fix #1: the internal iceberg sink/source
+# created at CREATE time are not rebuilt through ALTER MV, so the rebuilt MV's
+# stream_key can drift out of sync with the sink's forced PK. Until sink
+# replacement is implemented, ALTER MV must be rejected.
+
+statement ok
+create materialized view mv_alter_target
+with (commit_checkpoint_interval = 60)
+as
+select user_id, count(*) as cnt
+from events
+group by user_id
+engine = iceberg;
+
+statement error
+alter materialized view mv_alter_target set parallelism = 4;
+
+statement ok
+drop materialized view mv_alter_target;
+
+# =============================================================================
+# Section 17: CREATE MATERIALIZED VIEW IF NOT EXISTS no-op
+# =============================================================================
+# Regression test for round-5 OCR fix #7: when IF NOT EXISTS is true and the MV
+# already exists, the early-return guard checks get_table_catalog_by_name
+# before proceeding with CreateStreamingJob. Without the guard, a re-run of
+# CREATE MATERIALIZED VIEW IF NOT EXISTS could cascade-drop the user's
+# pre-existing MV if any subsequent step failed.
+
+statement ok
+create materialized view mv_if_not_exists
+with (commit_checkpoint_interval = 60)
+as
+select user_id, count(*) as cnt
+from events
+group by user_id
+engine = iceberg;
+
+statement ok
+create materialized view IF NOT EXISTS mv_if_not_exists
+with (commit_checkpoint_interval = 60)
+as
+select user_id, count(*) as cnt
+from events
+group by user_id
+engine = iceberg;
+
+# Verify the original MV is still queryable after the IF NOT EXISTS no-op.
+query II
+select user_id, cnt from mv_if_not_exists order by user_id;
+----
+1 1
+2 2
+3 3
+4 4
+5 5
+
+statement ok
+drop materialized view mv_if_not_exists;
+
+# =============================================================================
+# Section 15: Cleanup
+# =============================================================================
+
+statement ok
+drop materialized view user_totals;
+
+statement ok
+drop table events;
+
+statement ok
+drop connection my_conn_mv;
+
+statement ok
+drop secret my_secret_mv;

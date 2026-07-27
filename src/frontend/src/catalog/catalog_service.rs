@@ -308,6 +308,15 @@ pub trait CatalogWriter: Send + Sync {
         dependencies: HashSet<ObjectId>,
     ) -> Result<()>;
 
+    async fn create_iceberg_materialized_view(
+        &self,
+        table_job_info: PbTableJobInfo,
+        sink_job_info: PbSinkJobInfo,
+        iceberg_source: PbSource,
+        if_not_exists: bool,
+        dependencies: HashSet<ObjectId>,
+    ) -> Result<()>;
+
     async fn wait(&self, job_id: Option<JobId>) -> Result<()>;
 }
 
@@ -845,6 +854,25 @@ impl CatalogWriter for CatalogWriterImpl {
         dependencies: HashSet<ObjectId>,
     ) -> Result<()> {
         let version = Box::pin(self.meta_client.create_iceberg_table(
+            table_job_info,
+            sink_job_info,
+            iceberg_source,
+            if_not_exists,
+            dependencies,
+        ))
+        .await?;
+        self.wait_version(version).await
+    }
+
+    async fn create_iceberg_materialized_view(
+        &self,
+        table_job_info: PbTableJobInfo,
+        sink_job_info: PbSinkJobInfo,
+        iceberg_source: PbSource,
+        if_not_exists: bool,
+        dependencies: HashSet<ObjectId>,
+    ) -> Result<()> {
+        let version = Box::pin(self.meta_client.create_iceberg_materialized_view(
             table_job_info,
             sink_job_info,
             iceberg_source,
