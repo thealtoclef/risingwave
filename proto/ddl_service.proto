@@ -259,6 +259,8 @@ message CreateIcebergTableRequest {
   catalog.Source iceberg_source = 3;
 
   bool if_not_exists = 5;
+  // The list of object IDs that this iceberg table depends on (e.g., shared CDC source).
+  repeated uint32 dependencies = 6;
 }
 
 message CreateIcebergTableResponse {
@@ -759,6 +761,10 @@ service DdlService {
   rpc DropMaterializedView(DropMaterializedViewRequest) returns (DropMaterializedViewResponse);
   rpc CreateTable(CreateTableRequest) returns (CreateTableResponse);
   rpc CreateIcebergTable(CreateIcebergTableRequest) returns (CreateIcebergTableResponse);
+  // Create a materialized view with the iceberg engine. Structurally identical
+  // to CreateIcebergTableRequest: `table_info.table` carries the MV's catalog
+  // (table_type = MaterializedView), `table_info.source` is absent.
+  rpc CreateIcebergMaterializedView(CreateIcebergTableRequest) returns (CreateIcebergTableResponse);
   rpc CreateSecret(CreateSecretRequest) returns (CreateSecretResponse);
   rpc DropSecret(DropSecretRequest) returns (DropSecretResponse);
   rpc AlterSecret(AlterSecretRequest) returns (AlterSecretResponse);

@@ -19,7 +19,7 @@ use pgwire::pg_response::{PgResponse, StatementType};
 use risingwave_common::catalog::{ConflictBehavior, FunctionId, SecretId};
 use risingwave_common::hash::VnodeCount;
 use risingwave_common::id::ObjectId;
-use risingwave_sqlparser::ast::{EmitMode, Ident, ObjectName, Query, Statement};
+use risingwave_sqlparser::ast::{EmitMode, Engine, Ident, ObjectName, Query, Statement};
 
 use super::{HandlerArgs, RwPgResponse};
 use crate::TableCatalog;
@@ -77,13 +77,19 @@ pub async fn handle_alter_mv(
     let original_definition = original_catalog.create_sql_ast()?;
 
     // Extract unchanged parts from the original definition
-    let (columns, with_options, emit_mode) = match &original_definition {
+    let (columns, with_options, emit_mode, engine) = match &original_definition {
         Statement::CreateView {
             columns,
             with_options,
             emit_mode,
+            engine,
             ..
-        } => (columns.clone(), with_options.clone(), emit_mode.clone()),
+        } => (
+            columns.clone(),
+            with_options.clone(),
+            emit_mode.clone(),
+            engine.clone(),
+        ),
         _ => {
             return Err(ErrorCode::InternalError(format!(
                 "Expected CREATE MATERIALIZED VIEW statement, got: {:?}",
@@ -103,6 +109,7 @@ pub async fn handle_alter_mv(
         query: new_query.clone(),
         with_options,
         emit_mode: emit_mode.clone(),
+        engine: engine.clone(),
     };
     let handler_args = HandlerArgs::new(session.clone(), &new_definition, Arc::from(""))?;
 
@@ -126,6 +133,7 @@ pub async fn handle_alter_mv(
         dependent_secrets,
         columns,
         emit_mode,
+        engine,
         original_catalog,
     )
     .await
@@ -140,9 +148,24 @@ async fn handle_alter_mv_bound(
     dependent_secrets: HashSet<SecretId>,
     columns: Vec<Ident>,
     emit_mode: Option<EmitMode>,
+    engine: Engine,
     original_catalog: Arc<TableCatalog>,
 ) -> Result<RwPgResponse> {
     let session = handler_args.session.clone();
+
+    // ALTER MATERIALIZED VIEW is not supported for iceberg-engine MVs:
+    // the internal iceberg sink/source are not rebuilt through this path, so the
+    // rebuilt MV's stream_key / PK can drift out of sync with the sink's forced PK
+    // and WITH options. Reject until sink replacement is implemented.
+    if engine == Engine::Iceberg {
+        return Err(ErrorCode::NotSupported(
+            "ALTER MATERIALIZED VIEW ... for iceberg-engine materialized views".to_owned(),
+            "the internal iceberg sink and source cannot be rebuilt through this path; \
+             drop and recreate the materialized view instead"
+                .to_owned(),
+        )
+        .into());
+    }
 
     // TODO(alter-mv): use `ColumnIdGenerator` to generate IDs for MV columns, in order to
     // support schema changes.
@@ -156,6 +179,7 @@ async fn handle_alter_mv_bound(
             dependent_secrets,
             columns,
             emit_mode,
+            engine,
         )?
     };
 

@@ -44,6 +44,7 @@ pub const ICEBERG_WRITE_MODE_COPY_ON_WRITE: &str = "copy-on-write";
 pub const ICEBERG_COMPACTION_TYPE_FULL: &str = "full";
 pub const ICEBERG_COMPACTION_TYPE_SMALL_FILES: &str = "small-files";
 pub const ICEBERG_COMPACTION_TYPE_FILES_WITH_DELETE: &str = "files-with-delete";
+pub const ICEBERG_COMPACTION_TYPE_SMALL_FILES_WITH_DELETE: &str = "small-files-with-delete";
 
 pub const PARTITION_DATA_ID_START: i32 = 1000;
 
@@ -108,6 +109,7 @@ pub const ENABLE_SNAPSHOT_EXPIRATION: &str = "enable_snapshot_expiration";
 pub const WRITE_MODE: &str = "write_mode";
 pub const FORMAT_VERSION: &str = "format_version";
 pub const SNAPSHOT_EXPIRATION_RETAIN_LAST: &str = "snapshot_expiration_retain_last";
+pub const SNAPSHOT_EXPIRATION_RETAIN_MAX: &str = "snapshot_expiration_retain_max";
 pub const SNAPSHOT_EXPIRATION_MAX_AGE_MILLIS: &str = "snapshot_expiration_max_age_millis";
 pub const SNAPSHOT_EXPIRATION_CLEAR_EXPIRED_FILES: &str = "snapshot_expiration_clear_expired_files";
 pub const SNAPSHOT_EXPIRATION_CLEAR_EXPIRED_META_DATA: &str =
@@ -115,11 +117,16 @@ pub const SNAPSHOT_EXPIRATION_CLEAR_EXPIRED_META_DATA: &str =
 pub const ENABLE_MANIFEST_REWRITE: &str = "enable_manifest_rewrite";
 pub const MANIFEST_REWRITE_TARGET_SIZE_BYTES: &str = "manifest_rewrite_target_size_bytes";
 pub const MANIFEST_REWRITE_MIN_COUNT_TO_MERGE: &str = "manifest_rewrite_min_count_to_merge";
+pub const COMMIT_CHECKPOINT_SIZE_THRESHOLD_MB: &str = "commit_checkpoint_size_threshold_mb";
 pub const COMPACTION_MAX_SNAPSHOTS_NUM: &str = "compaction.max_snapshots_num";
 
 pub const COMPACTION_SMALL_FILES_THRESHOLD_MB: &str = "compaction.small_files_threshold_mb";
 
 pub const COMPACTION_DELETE_FILES_COUNT_THRESHOLD: &str = "compaction.delete_files_count_threshold";
+pub const COMPACTION_DELETE_POSITION_RECORDS_COUNT_THRESHOLD: &str =
+    "compaction.delete_position_records_count_threshold";
+pub const COMPACTION_DELETE_EQUALITY_RECORDS_COUNT_THRESHOLD: &str =
+    "compaction.delete_equality_records_count_threshold";
 
 pub const COMPACTION_TRIGGER_SNAPSHOT_COUNT: &str = "compaction.trigger_snapshot_count";
 
@@ -234,6 +241,8 @@ pub enum CompactionType {
     SmallFiles,
     /// Files with delete compaction - only compact files that have associated delete files
     FilesWithDelete,
+    /// Small files with delete compaction - compact small files that have associated delete files
+    SmallFilesWithDelete,
 }
 
 impl CompactionType {
@@ -242,6 +251,7 @@ impl CompactionType {
             CompactionType::Full => ICEBERG_COMPACTION_TYPE_FULL,
             CompactionType::SmallFiles => ICEBERG_COMPACTION_TYPE_SMALL_FILES,
             CompactionType::FilesWithDelete => ICEBERG_COMPACTION_TYPE_FILES_WITH_DELETE,
+            CompactionType::SmallFilesWithDelete => ICEBERG_COMPACTION_TYPE_SMALL_FILES_WITH_DELETE,
         }
     }
 }
@@ -254,12 +264,16 @@ impl std::str::FromStr for CompactionType {
             ICEBERG_COMPACTION_TYPE_FULL => Ok(CompactionType::Full),
             ICEBERG_COMPACTION_TYPE_SMALL_FILES => Ok(CompactionType::SmallFiles),
             ICEBERG_COMPACTION_TYPE_FILES_WITH_DELETE => Ok(CompactionType::FilesWithDelete),
+            ICEBERG_COMPACTION_TYPE_SMALL_FILES_WITH_DELETE => {
+                Ok(CompactionType::SmallFilesWithDelete)
+            }
             _ => Err(SinkError::Config(anyhow!(format!(
-                "invalid compaction_type: {}, must be one of: {}, {}, {}",
+                "invalid compaction_type: {}, must be one of: {}, {}, {}, {}",
                 s,
                 ICEBERG_COMPACTION_TYPE_FULL,
                 ICEBERG_COMPACTION_TYPE_SMALL_FILES,
-                ICEBERG_COMPACTION_TYPE_FILES_WITH_DELETE
+                ICEBERG_COMPACTION_TYPE_FILES_WITH_DELETE,
+                ICEBERG_COMPACTION_TYPE_SMALL_FILES_WITH_DELETE
             )))),
         }
     }

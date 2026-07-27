@@ -15,6 +15,7 @@
 use std::collections::{HashMap, HashSet};
 use std::pin::pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, anyhow};
 use futures::future::select;
@@ -1431,9 +1432,60 @@ impl DdlService for DdlServiceImpl {
                     }
                 }
 
-                if !(original_columns.is_subset(&new_columns)
-                    || original_columns.is_superset(&new_columns))
-                {
+                let original_column_types: HashMap<&str, &DataType> = original_columns
+                    .iter()
+                    .map(|(n, dt)| (n.as_str(), dt))
+                    .collect();
+
+                // Detect new columns and type changes via set difference on the
+                // original (name, type) pairs directly.
+                let mut added_column_names = HashSet::new();
+                for (name, incoming_type) in new_columns.difference(&original_columns) {
+                    // Check if this column name already exists with a different type.
+                    if let Some(original_type) = original_column_types.get(name.as_str()) {
+                        // Same name, different type → type change is unsupported.
+                        tracing::warn!(
+                            target: "auto_schema_change",
+                            table_id = %table.id,
+                            cdc_table_id = table.cdc_table_id,
+                            upstream_ddl = table_change.upstream_ddl,
+                            column = name,
+                            original_type = %original_type,
+                            incoming_type = %incoming_type,
+                            "CDC auto schema change does not support changing column type"
+                        );
+                        let fail_info = format!(
+                            "CDC auto schema change does not support changing column type: column {}, original type {}, incoming type {}",
+                            name, original_type, incoming_type
+                        );
+                        add_auto_schema_change_fail_event_log(
+                            &self.meta_metrics,
+                            table.id,
+                            table.name.clone(),
+                            table_change.cdc_table_id.clone(),
+                            table_change.upstream_ddl.clone(),
+                            &self.env.event_log_manager_ref(),
+                            fail_info,
+                        );
+                        return Err(Status::invalid_argument(
+                            "CDC auto schema change does not support changing column type",
+                        ));
+                    }
+                    // Name not in original → truly new column.
+                    added_column_names.insert(name.as_str());
+                }
+
+                // Ignore upstream dropped columns via the symmetric set difference.
+                let dropped: Vec<_> = original_columns.difference(&new_columns).collect();
+                if !dropped.is_empty() {
+                    self.meta_metrics
+                        .auto_schema_change_failure_cnt
+                        .with_guarded_label_values(&[
+                            table.id.to_string().as_str(),
+                            table.name.as_str(),
+                            "ignored_drop",
+                        ])
+                        .inc();
                     tracing::warn!(target: "auto_schema_change",
                                     table_id = %table.id,
                                     cdc_table_id = table.cdc_table_id,
@@ -1751,6 +1803,7 @@ impl DdlService for DdlServiceImpl {
             sink_info,
             iceberg_source,
             if_not_exists,
+            dependencies,
         } = req;
 
         // 1. create table job
@@ -1759,9 +1812,10 @@ impl DdlService for DdlServiceImpl {
             table,
             fragment_graph,
             job_type,
-        } = table_info.unwrap();
-        let mut table = table.unwrap();
-        let mut fragment_graph = fragment_graph.unwrap();
+        } = table_info.ok_or_else(|| Status::invalid_argument("missing table_info"))?;
+        let mut table = table.ok_or_else(|| Status::invalid_argument("missing table"))?;
+        let mut fragment_graph =
+            fragment_graph.ok_or_else(|| Status::invalid_argument("missing fragment_graph"))?;
         let database_id = table.get_database_id();
         let schema_id = table.get_schema_id();
         let table_name = table.get_name().to_owned();
@@ -1792,7 +1846,7 @@ impl DdlService for DdlServiceImpl {
             .run_command(DdlCommand::CreateStreamingJob {
                 stream_job,
                 fragment_graph,
-                dependencies: HashSet::new(),
+                dependencies: dependencies.iter().map(|&id| ObjectId::new(id)).collect(),
                 resource_type: Self::default_streaming_job_resource_type(),
                 if_not_exists,
                 refresh_interval_sec: None,
@@ -1812,8 +1866,8 @@ impl DdlService for DdlServiceImpl {
         let PbSinkJobInfo {
             sink,
             fragment_graph,
-        } = sink_info.unwrap();
-        let mut sink = sink.unwrap();
+        } = sink_info.ok_or_else(|| Status::invalid_argument("missing sink_info"))?;
+        let mut sink = sink.ok_or_else(|| Status::invalid_argument("missing sink"))?;
 
         // Mark sink as background creation, so that it won't block source creation.
         sink.create_type = PbCreateType::Background as _;
@@ -1830,49 +1884,87 @@ impl DdlService for DdlServiceImpl {
             Some(table_catalog.id)
         };
 
-        let mut fragment_graph = fragment_graph.unwrap();
+        let mut fragment_graph =
+            fragment_graph.ok_or_else(|| Status::invalid_argument("missing fragment_graph"))?;
 
-        assert_eq!(fragment_graph.dependent_table_ids.len(), 1);
-        assert!(
-            risingwave_common::catalog::TableId::from(fragment_graph.dependent_table_ids[0])
-                .is_placeholder()
-        );
+        if fragment_graph.dependent_table_ids.len() != 1 {
+            return Err(Status::invalid_argument(
+                "expected exactly 1 dependent table id",
+            ));
+        }
+        if !risingwave_common::catalog::TableId::from(fragment_graph.dependent_table_ids[0])
+            .is_placeholder()
+        {
+            return Err(Status::invalid_argument(
+                "expected dependent table id to be a placeholder",
+            ));
+        }
         fragment_graph.dependent_table_ids[0] = table_catalog.id;
+        let mut validation_error: Option<Status> = None;
         for fragment in fragment_graph.fragments.values_mut() {
-            stream_graph_visitor::visit_fragment_mut(fragment, |node| match node {
-                NodeBody::StreamScan(scan) => {
-                    scan.table_id = table_catalog.id;
-                    if let Some(table_desc) = &mut scan.table_desc {
-                        assert!(
-                            risingwave_common::catalog::TableId::from(table_desc.table_id)
-                                .is_placeholder()
-                        );
-                        table_desc.table_id = table_catalog.id;
-                        table_desc.maybe_vnode_count = table_catalog.maybe_vnode_count;
-                    }
-                    if let Some(table) = &mut scan.arrangement_table {
-                        assert!(
-                            risingwave_common::catalog::TableId::from(table.id).is_placeholder()
-                        );
-                        *table = table_catalog.clone();
-                    }
+            stream_graph_visitor::visit_fragment_mut(fragment, |node| {
+                if validation_error.is_some() {
+                    return;
                 }
-                NodeBody::BatchPlan(plan) => {
-                    if let Some(table_desc) = &mut plan.table_desc {
-                        assert!(
-                            risingwave_common::catalog::TableId::from(table_desc.table_id)
+                match node {
+                    NodeBody::StreamScan(scan) => {
+                        if !risingwave_common::catalog::TableId::from(scan.table_id)
+                            .is_placeholder()
+                        {
+                            validation_error = Some(Status::invalid_argument(
+                                "expected StreamScan.table_id to be a placeholder",
+                            ));
+                            return;
+                        }
+                        scan.table_id = table_catalog.id;
+                        if let Some(table_desc) = &mut scan.table_desc {
+                            if !risingwave_common::catalog::TableId::from(table_desc.table_id)
                                 .is_placeholder()
-                        );
-                        table_desc.table_id = table_catalog.id;
-                        table_desc.maybe_vnode_count = table_catalog.maybe_vnode_count;
+                            {
+                                validation_error = Some(Status::invalid_argument(
+                                    "expected StreamScan.table_desc.table_id to be a placeholder",
+                                ));
+                                return;
+                            }
+                            table_desc.table_id = table_catalog.id;
+                            table_desc.maybe_vnode_count = table_catalog.maybe_vnode_count;
+                        }
+                        if let Some(table) = &mut scan.arrangement_table {
+                            if !risingwave_common::catalog::TableId::from(table.id).is_placeholder()
+                            {
+                                validation_error = Some(Status::invalid_argument(
+                                    "expected StreamScan.arrangement_table.id to be a placeholder",
+                                ));
+                                return;
+                            }
+                            *table = table_catalog.clone();
+                        }
                     }
+                    NodeBody::BatchPlan(plan) => {
+                        if let Some(table_desc) = &mut plan.table_desc {
+                            if !risingwave_common::catalog::TableId::from(table_desc.table_id)
+                                .is_placeholder()
+                            {
+                                validation_error = Some(Status::invalid_argument(
+                                    "expected BatchPlan.table_desc.table_id to be a placeholder",
+                                ));
+                                return;
+                            }
+                            table_desc.table_id = table_catalog.id;
+                            table_desc.maybe_vnode_count = table_catalog.maybe_vnode_count;
+                        }
+                    }
+                    _ => {}
                 }
-                _ => {}
             });
+        }
+        if let Some(err) = validation_error {
+            return Err(err);
         }
 
         let table_id = table_catalog.id;
         let dependencies = HashSet::from_iter([table_id.into(), schema_id.into()]);
+        let sink_id = sink.id;
         let stream_job = StreamingJob::Sink(sink);
         let res = self
             .ddl_controller
@@ -1908,8 +2000,9 @@ impl DdlService for DdlServiceImpl {
         if let Some(source_rate_limit) = source_rate_limit
             && source_rate_limit != Some(0)
         {
-            let OptionalAssociatedSourceId::AssociatedSourceId(source_id) =
-                table_catalog.optional_associated_source_id.unwrap();
+            let OptionalAssociatedSourceId::AssociatedSourceId(source_id) = table_catalog
+                .optional_associated_source_id
+                .ok_or_else(|| Status::invalid_argument("missing associated source id"))?;
             let (jobs, fragment_nodes) = self
                 .metadata_manager
                 .update_source_rate_limit_by_source_id(source_id, source_rate_limit)
@@ -1929,12 +2022,26 @@ impl DdlService for DdlServiceImpl {
         }
 
         // 4. create iceberg source
-        let iceberg_source = iceberg_source.unwrap();
+        let iceberg_source =
+            iceberg_source.ok_or_else(|| Status::invalid_argument("missing iceberg_source"))?;
         let res = self
             .ddl_controller
             .run_command(DdlCommand::CreateNonSharedSource(iceberg_source))
             .await;
         if res.is_err() {
+            let _ = self
+                .ddl_controller
+                .run_command(DdlCommand::DropStreamingJob {
+                    job_id: StreamingJobId::Sink(sink_id),
+                    drop_mode: DropMode::Cascade,
+                })
+                .await
+                .inspect_err(|err| {
+                    tracing::error!(
+                        error = %err.as_report(),
+                        "Failed to clean up sink after iceberg source creation failure",
+                    );
+                });
             let _ = self
                 .ddl_controller
                 .run_command(DdlCommand::DropStreamingJob {
@@ -1946,6 +2053,383 @@ impl DdlService for DdlServiceImpl {
                     tracing::error!(
                         error = %err.as_report(),
                         "Failed to clean up table after iceberg source creation failure",
+                    );
+                });
+        }
+
+        Ok(Response::new(CreateIcebergTableResponse {
+            status: None,
+            version: res?,
+        }))
+    }
+
+    async fn create_iceberg_materialized_view(
+        &self,
+        request: Request<CreateIcebergTableRequest>,
+    ) -> Result<Response<CreateIcebergTableResponse>, Status> {
+        let req = request.into_inner();
+        let CreateIcebergTableRequest {
+            table_info,
+            sink_info,
+            iceberg_source,
+            if_not_exists,
+            dependencies,
+        } = req;
+
+        // 1. create materialized view job
+        let PbTableJobInfo {
+            source,
+            table,
+            fragment_graph,
+            job_type: _,
+        } = table_info.ok_or_else(|| Status::invalid_argument("missing table_info"))?;
+        let mut table = table.ok_or_else(|| Status::invalid_argument("missing table"))?;
+        let mut fragment_graph =
+            fragment_graph.ok_or_else(|| Status::invalid_argument("missing fragment_graph"))?;
+        let database_id = table.get_database_id();
+        let schema_id = table.get_schema_id();
+        let table_name = table.get_name().to_owned();
+
+        if if_not_exists
+            && self
+                .metadata_manager
+                .catalog_controller
+                .get_table_catalog_by_name(database_id, schema_id, &table_name)
+                .await
+                .map_err(|e| Status::internal(format!("failed to check existing MV: {}", e)))?
+                .is_some()
+        {
+            return Ok(Response::new(CreateIcebergTableResponse {
+                status: None,
+                version: None,
+            }));
+        }
+
+        // Mark table as background creation, so that it won't block sink creation.
+        table.create_type = PbCreateType::Background as _;
+
+        // Set the source rate limit to 0 and reset it back after the iceberg sink is backfilling.
+        let source_rate_limit = if let Some(source) = &source {
+            for fragment in fragment_graph.fragments.values_mut() {
+                stream_graph_visitor::visit_fragment_mut(fragment, |node| {
+                    if let NodeBody::Source(source_node) = node
+                        && let Some(inner) = &mut source_node.source_inner
+                    {
+                        inner.rate_limit = Some(0);
+                    }
+                });
+            }
+            Some(source.rate_limit)
+        } else {
+            None
+        };
+
+        let mv_table_id = table.id;
+        let stream_job = StreamingJob::MaterializedView(table);
+        let _ = self
+            .ddl_controller
+            .run_command(DdlCommand::CreateStreamingJob {
+                stream_job,
+                fragment_graph,
+                dependencies: dependencies.into_iter().map(ObjectId::new).collect(),
+                resource_type: Self::default_streaming_job_resource_type(),
+                if_not_exists,
+                refresh_interval_sec: None,
+                replace_sink: None,
+                since_timestamp_epoch: None,
+            })
+            .await?;
+
+        let table_catalog = match self
+            .metadata_manager
+            .catalog_controller
+            .get_table_catalog_by_name(database_id, schema_id, &table_name)
+            .await
+        {
+            Ok(Some(tc)) => tc,
+            Ok(None) => {
+                let _ = self
+                    .ddl_controller
+                    .run_command(DdlCommand::DropStreamingJob {
+                        job_id: StreamingJobId::MaterializedView(mv_table_id),
+                        drop_mode: DropMode::Cascade,
+                    })
+                    .await;
+                return Err(Status::not_found("Internal error: table not found"));
+            }
+            Err(e) => {
+                let _ = self
+                    .ddl_controller
+                    .run_command(DdlCommand::DropStreamingJob {
+                        job_id: StreamingJobId::MaterializedView(mv_table_id),
+                        drop_mode: DropMode::Cascade,
+                    })
+                    .await;
+                return Err(e.into());
+            }
+        };
+
+        // Wait for the MV's snapshot-backfill to merge the MV's fragments into
+        // `InflightDatabaseInfo`. The internal sink's StreamScan reads from the
+        // MV's fragment, so the MV's fragments must be in `fragment_location`
+        // before the sink's `build_edge` looks them up — otherwise the barrier
+        // worker panics with "no entry found for key" at `info.rs:473`.
+        //
+        // We use `Command::Flush` (no-op checkpoint barrier) repeatedly. Each
+        // barrier runs the merge check at the end of `apply_command`; the merge
+        // itself happens once the snapshot backfill actors have finished
+        // consuming the upstream log store. Empirically the merge for an MV
+        // over an empty upstream converges within ~5 barriers (snapshot epoch
+        // → consume snapshot → consume log store → ready to merge → merge),
+        // so we drive 5 flushes (each up to 30 s) which covers the typical
+        // upstream data without being so long that a wedged cluster hangs the
+        // RPC indefinitely.
+        if let Err(err) = async {
+            for _ in 0..5 {
+                tokio::time::timeout(
+                    Duration::from_secs(30),
+                    self.barrier_scheduler
+                        .run_command(database_id, Command::Flush),
+                )
+                .await
+                .map_err(|_| {
+                    Status::deadline_exceeded("timed out waiting for MV backfill to converge")
+                })??;
+            }
+            Ok(())
+        }
+        .await
+        {
+            let _ = self
+                .ddl_controller
+                .run_command(DdlCommand::DropStreamingJob {
+                    job_id: StreamingJobId::MaterializedView(mv_table_id),
+                    drop_mode: DropMode::Cascade,
+                })
+                .await;
+            return Err(err);
+        }
+
+        // 2. create iceberg sink job
+        let PbSinkJobInfo {
+            sink,
+            fragment_graph,
+        } = sink_info.ok_or_else(|| Status::invalid_argument("missing sink_info"))?;
+        let mut sink = sink.ok_or_else(|| Status::invalid_argument("missing sink"))?;
+
+        // Mark sink as background creation, so that it won't block source creation.
+        sink.create_type = PbCreateType::Background as _;
+
+        let enable_pk_index = sink
+            .properties
+            .get(ENABLE_PK_INDEX)
+            .is_some_and(|v| v.eq_ignore_ascii_case("true"));
+        // The internal iceberg sink is planned before the table catalog exists, so this field
+        // still carries a placeholder table id when the request reaches meta.
+        sink.auto_refresh_schema_from_table = if enable_pk_index {
+            None
+        } else {
+            Some(table_catalog.id)
+        };
+
+        let mut fragment_graph =
+            fragment_graph.ok_or_else(|| Status::invalid_argument("missing fragment_graph"))?;
+
+        if fragment_graph.dependent_table_ids.len() != 1 {
+            return Err(Status::invalid_argument(
+                "expected exactly 1 dependent table id",
+            ));
+        }
+        if !risingwave_common::catalog::TableId::from(fragment_graph.dependent_table_ids[0])
+            .is_placeholder()
+        {
+            return Err(Status::invalid_argument(
+                "expected dependent table id to be a placeholder",
+            ));
+        }
+        fragment_graph.dependent_table_ids[0] = table_catalog.id;
+        // `visit_fragment_mut`'s closure returns `()`, so we accumulate any
+        // placeholder validation error here and surface it after the loop.
+        let mut validation_error: Option<Status> = None;
+        for fragment in fragment_graph.fragments.values_mut() {
+            stream_graph_visitor::visit_fragment_mut(fragment, |node| {
+                if validation_error.is_some() {
+                    return;
+                }
+                match node {
+                    NodeBody::StreamScan(scan) => {
+                        if !risingwave_common::catalog::TableId::from(scan.table_id)
+                            .is_placeholder()
+                        {
+                            validation_error = Some(Status::invalid_argument(
+                                "expected StreamScan.table_id to be a placeholder",
+                            ));
+                            return;
+                        }
+                        scan.table_id = table_catalog.id;
+                        if let Some(table_desc) = &mut scan.table_desc {
+                            if !risingwave_common::catalog::TableId::from(table_desc.table_id)
+                                .is_placeholder()
+                            {
+                                validation_error = Some(Status::invalid_argument(
+                                    "expected StreamScan.table_desc.table_id to be a placeholder",
+                                ));
+                                return;
+                            }
+                            table_desc.table_id = table_catalog.id;
+                            table_desc.maybe_vnode_count = table_catalog.maybe_vnode_count;
+                        }
+                        if let Some(table) = &mut scan.arrangement_table {
+                            if !risingwave_common::catalog::TableId::from(table.id).is_placeholder()
+                            {
+                                validation_error = Some(Status::invalid_argument(
+                                    "expected StreamScan.arrangement_table.id to be a placeholder",
+                                ));
+                                return;
+                            }
+                            *table = table_catalog.clone();
+                        }
+                    }
+                    NodeBody::BatchPlan(plan) => {
+                        if let Some(table_desc) = &mut plan.table_desc {
+                            if !risingwave_common::catalog::TableId::from(table_desc.table_id)
+                                .is_placeholder()
+                            {
+                                validation_error = Some(Status::invalid_argument(
+                                    "expected BatchPlan.table_desc.table_id to be a placeholder",
+                                ));
+                                return;
+                            }
+                            table_desc.table_id = table_catalog.id;
+                            table_desc.maybe_vnode_count = table_catalog.maybe_vnode_count;
+                        }
+                    }
+                    _ => {}
+                }
+            });
+        }
+        if let Some(e) = validation_error {
+            return Err(e);
+        }
+
+        let table_id = table_catalog.id;
+        let sink_id = sink.id;
+        let dependencies = HashSet::from_iter([table_id.into(), schema_id.into()]);
+        let stream_job = StreamingJob::Sink(sink);
+        let res = self
+            .ddl_controller
+            .run_command(DdlCommand::CreateStreamingJob {
+                stream_job,
+                fragment_graph,
+                dependencies,
+                resource_type: Self::default_streaming_job_resource_type(),
+                if_not_exists,
+                refresh_interval_sec: None,
+                replace_sink: None,
+                since_timestamp_epoch: None,
+            })
+            .await;
+
+        if res.is_err() {
+            let _ = self
+                .ddl_controller
+                .run_command(DdlCommand::DropStreamingJob {
+                    job_id: StreamingJobId::MaterializedView(table_id),
+                    drop_mode: DropMode::Cascade,
+                })
+                .await
+                .inspect_err(|err| {
+                    tracing::error!(error = %err.as_report(),
+                        "Failed to clean up materialized view after iceberg sink creation failure",
+                    );
+                });
+            res?;
+        }
+
+        // 3. reset source rate limit back to normal after sink creation
+        if let Some(source_rate_limit) = source_rate_limit
+            && source_rate_limit != Some(0)
+        {
+            let OptionalAssociatedSourceId::AssociatedSourceId(source_id) = table_catalog
+                .optional_associated_source_id
+                .ok_or_else(|| Status::invalid_argument("missing associated source id"))?;
+            let (jobs, fragments) = self
+                .metadata_manager
+                .update_source_rate_limit_by_source_id(source_id, source_rate_limit)
+                .await?;
+            let throttle_config = ThrottleConfig {
+                throttle_type: risingwave_pb::common::ThrottleType::Source.into(),
+                rate_limit: source_rate_limit,
+            };
+            let res = self
+                .barrier_scheduler
+                .run_command(
+                    database_id,
+                    Command::Throttle {
+                        jobs,
+                        config: fragments
+                            .into_iter()
+                            .map(|(fragment_id, stream_node)| {
+                                (fragment_id, (throttle_config, stream_node))
+                            })
+                            .collect(),
+                    },
+                )
+                .await;
+            if let Err(err) = res {
+                let _ = self
+                    .ddl_controller
+                    .run_command(DdlCommand::DropStreamingJob {
+                        job_id: StreamingJobId::Sink(sink_id),
+                        drop_mode: DropMode::Cascade,
+                    })
+                    .await;
+                let _ = self
+                    .ddl_controller
+                    .run_command(DdlCommand::DropStreamingJob {
+                        job_id: StreamingJobId::MaterializedView(table_id),
+                        drop_mode: DropMode::Cascade,
+                    })
+                    .await;
+                return Err(Status::internal(format!(
+                    "failed to reset source rate limit: {}",
+                    err
+                )));
+            }
+        }
+
+        // 4. create iceberg source
+        let iceberg_source =
+            iceberg_source.ok_or_else(|| Status::invalid_argument("missing iceberg_source"))?;
+        let res = self
+            .ddl_controller
+            .run_command(DdlCommand::CreateNonSharedSource(iceberg_source))
+            .await;
+        if res.is_err() {
+            let _ = self
+                .ddl_controller
+                .run_command(DdlCommand::DropStreamingJob {
+                    job_id: StreamingJobId::Sink(sink_id),
+                    drop_mode: DropMode::Cascade,
+                })
+                .await
+                .inspect_err(|err| {
+                    tracing::error!(
+                        error = %err.as_report(),
+                        "Failed to clean up sink after iceberg source creation failure",
+                    );
+                });
+            let _ = self
+                .ddl_controller
+                .run_command(DdlCommand::DropStreamingJob {
+                    job_id: StreamingJobId::MaterializedView(table_id),
+                    drop_mode: DropMode::Cascade,
+                })
+                .await
+                .inspect_err(|err| {
+                    tracing::error!(
+                        error = %err.as_report(),
+                        "Failed to clean up materialized view after iceberg source creation failure",
                     );
                 });
         }

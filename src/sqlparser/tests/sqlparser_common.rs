@@ -23,7 +23,7 @@ use matches::assert_matches;
 use risingwave_sqlparser::ast::JoinOperator::Inner;
 use risingwave_sqlparser::ast::*;
 use risingwave_sqlparser::keywords::ALL_KEYWORDS;
-use risingwave_sqlparser::parser::ParserError;
+use risingwave_sqlparser::parser::{Parser, ParserError};
 use risingwave_sqlparser::test_utils::*;
 
 #[test]
@@ -3263,6 +3263,7 @@ fn parse_create_view() {
             materialized,
             with_options,
             emit_mode,
+            engine: _,
         } => {
             assert_eq!("myschema.myview", name.to_string());
             assert!(if_not_exists);
@@ -3313,6 +3314,7 @@ fn parse_create_view_with_columns() {
             query,
             materialized,
             emit_mode,
+            engine: _,
         } => {
             assert!(!if_not_exists);
             assert_eq!("v", name.to_string());
@@ -3342,6 +3344,7 @@ fn parse_create_or_replace_view() {
             query,
             materialized,
             emit_mode,
+            engine: _,
         } => {
             assert!(!if_not_exists);
             assert_eq!("v", name.to_string());
@@ -3373,6 +3376,7 @@ fn parse_create_or_replace_materialized_view() {
             query,
             materialized,
             emit_mode,
+            engine: _,
         } => {
             assert!(!if_not_exists);
             assert_eq!("v", name.to_string());
@@ -3401,6 +3405,7 @@ fn parse_create_materialized_view() {
             materialized,
             with_options,
             emit_mode,
+            engine: _,
         } => {
             assert!(!if_not_exists);
             assert_eq!("myschema.myview", name.to_string());
@@ -3416,6 +3421,53 @@ fn parse_create_materialized_view() {
 }
 
 #[test]
+fn parse_create_materialized_view_iceberg_engine() {
+    let sql = "CREATE MATERIALIZED VIEW m AS SELECT 1 AS v ENGINE = iceberg";
+    let ast = Parser::parse_sql(sql).unwrap();
+    assert_eq!(ast.len(), 1);
+    match &ast[0] {
+        Statement::CreateView {
+            materialized: true,
+            engine: Engine::Iceberg,
+            ..
+        } => {}
+        _ => panic!(
+            "Expected CREATE MATERIALIZED VIEW with iceberg engine, got: {:?}",
+            ast[0]
+        ),
+    }
+}
+
+#[test]
+fn parse_create_materialized_view_hummock_engine() {
+    let sql = "CREATE MATERIALIZED VIEW m AS SELECT 1 AS v ENGINE = hummock";
+    let ast = Parser::parse_sql(sql).unwrap();
+    assert_eq!(ast.len(), 1);
+    match &ast[0] {
+        Statement::CreateView {
+            materialized: true,
+            engine: Engine::Hummock,
+            ..
+        } => {}
+        _ => panic!(
+            "Expected CREATE MATERIALIZED VIEW with hummock engine, got: {:?}",
+            ast[0]
+        ),
+    }
+}
+
+#[test]
+fn parse_create_materialized_view_invalid_engine() {
+    let sql = "CREATE MATERIALIZED VIEW m AS SELECT 1 AS v ENGINE = foo";
+    let result = Parser::parse_sql(sql);
+    assert!(
+        result.is_err(),
+        "Expected parse error for invalid engine, but got: {:?}",
+        result
+    );
+}
+
+#[test]
 fn parse_create_materialized_view_emit_immediately() {
     let sql = "CREATE MATERIALIZED VIEW myschema.myview AS SELECT foo FROM bar EMIT IMMEDIATELY";
     match verified_stmt(sql) {
@@ -3428,6 +3480,7 @@ fn parse_create_materialized_view_emit_immediately() {
             materialized,
             with_options,
             emit_mode,
+            engine: _,
         } => {
             assert!(!if_not_exists);
             assert_eq!("myschema.myview", name.to_string());
@@ -3534,6 +3587,7 @@ fn parse_create_materialized_view_emit_on_window_close() {
             materialized,
             with_options,
             emit_mode,
+            engine: _,
         } => {
             assert!(!if_not_exists);
             assert_eq!("myschema.myview", name.to_string());

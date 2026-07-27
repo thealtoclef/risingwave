@@ -2044,12 +2044,37 @@ impl MetaClient {
             sink_info: Some(sink_job_info),
             iceberg_source: Some(iceberg_source),
             if_not_exists,
+            dependencies: vec![],
         };
 
         let resp = Box::pin(self.inner.create_iceberg_table(request)).await?;
         Ok(resp
             .version
             .ok_or_else(|| anyhow!("wait version not set"))?)
+    }
+
+    pub async fn create_iceberg_materialized_view(
+        &self,
+        table_job_info: PbTableJobInfo,
+        sink_job_info: PbSinkJobInfo,
+        iceberg_source: PbSource,
+        if_not_exists: bool,
+        dependencies: HashSet<ObjectId>,
+    ) -> Result<WaitVersion> {
+        let request = CreateIcebergTableRequest {
+            table_info: Some(table_job_info),
+            sink_info: Some(sink_job_info),
+            iceberg_source: Some(iceberg_source),
+            if_not_exists,
+            dependencies: dependencies.iter().map(|id| id.as_raw_id()).collect(),
+        };
+
+        let resp = Box::pin(self.inner.create_iceberg_materialized_view(request)).await?;
+        match resp.version {
+            Some(v) => Ok(v),
+            None if if_not_exists => Ok(WaitVersion::default()),
+            None => Err(anyhow!("wait version not set").into()),
+        }
     }
 
     pub async fn list_hosted_iceberg_tables(&self) -> Result<Vec<IcebergTable>> {
@@ -2774,6 +2799,7 @@ macro_rules! for_all_meta_rpc {
             ,{ ddl_client, expire_iceberg_table_snapshots, ExpireIcebergTableSnapshotsRequest, ExpireIcebergTableSnapshotsResponse }
             ,{ ddl_client, create_iceberg_table, CreateIcebergTableRequest, CreateIcebergTableResponse }
             ,{ ddl_client, wait_iceberg_pk_index_sink_epoch, WaitIcebergPkIndexSinkEpochRequest, WaitIcebergPkIndexSinkEpochResponse }
+            ,{ ddl_client, create_iceberg_materialized_view, CreateIcebergTableRequest, CreateIcebergTableResponse }
             ,{ hummock_client, unpin_version_before, UnpinVersionBeforeRequest, UnpinVersionBeforeResponse }
             ,{ hummock_client, get_current_version, GetCurrentVersionRequest, GetCurrentVersionResponse }
             ,{ hummock_client, replay_version_delta, ReplayVersionDeltaRequest, ReplayVersionDeltaResponse }

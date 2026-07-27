@@ -176,7 +176,11 @@ pub async fn handle_execute(
             };
             execute_risingwave_plan(session, plan_fragmenter_result, result_formats).await
         }
-        Statement::CreateView { materialized, .. } if materialized => {
+        Statement::CreateView {
+            materialized,
+            engine,
+            ..
+        } if materialized => {
             // Execute a CREATE MATERIALIZED VIEW
             let BoundResult {
                 bound,
@@ -222,6 +226,7 @@ pub async fn handle_execute(
                 dependent_secrets,
                 columns,
                 emit_mode,
+                engine,
             )
             .await
         }

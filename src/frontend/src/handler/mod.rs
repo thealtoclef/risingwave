@@ -112,6 +112,7 @@ pub mod extended_handle;
 pub mod fetch_cursor;
 mod flush;
 pub mod handle_privilege;
+mod iceberg_engine;
 pub mod kill_process;
 mod prepared_statement;
 pub mod privilege;
@@ -671,6 +672,7 @@ pub async fn handle(
             with_options: _, // It is put in OptimizerContext
             or_replace,      // not supported
             emit_mode,
+            engine,
         } => {
             if or_replace {
                 bail_not_implemented!("CREATE OR REPLACE VIEW");
@@ -683,9 +685,13 @@ pub async fn handle(
                     *query,
                     columns,
                     emit_mode,
+                    engine,
                 )
                 .await
             } else {
+                if !matches!(engine, Engine::Hummock) {
+                    bail_not_implemented!("ENGINE option is only supported for materialized views");
+                }
                 create_view::handle_create_view(handler_args, if_not_exists, name, columns, *query)
                     .await
             }

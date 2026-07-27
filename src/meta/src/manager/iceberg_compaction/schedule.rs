@@ -818,6 +818,7 @@ impl IcebergCompactionManager {
                     CompactionType::Full => TaskType::Full,
                     CompactionType::SmallFiles => TaskType::SmallFiles,
                     CompactionType::FilesWithDelete => TaskType::FilesWithDelete,
+                    CompactionType::SmallFilesWithDelete => TaskType::SmallFiles,
                 }
             },
             iceberg_config.compaction_interval_sec(),

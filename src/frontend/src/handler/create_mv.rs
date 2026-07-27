@@ -21,7 +21,7 @@ use risingwave_common::catalog::{FunctionId, ObjectId, SecretId};
 use risingwave_common::license::Feature;
 use risingwave_pb::ddl_service::streaming_job_resource_type;
 use risingwave_pb::stream_plan::PbStreamFragmentGraph;
-use risingwave_sqlparser::ast::{EmitMode, Ident, ObjectName, Query};
+use risingwave_sqlparser::ast::{EmitMode, Engine, Ident, ObjectName, Query};
 
 use super::RwPgResponse;
 use crate::binder::{Binder, BoundQuery, BoundSetExpr};
@@ -48,6 +48,36 @@ use crate::{TableCatalog, WithOptions};
 
 pub const RESOURCE_GROUP_KEY: &str = "resource_group";
 pub const CLOUD_SERVERLESS_BACKFILL_ENABLED: &str = "cloud.serverless_backfill_enabled";
+
+/// Iceberg engine options valid in `CREATE MATERIALIZED VIEW ... WITH (...)`,
+/// stripped from MV-level validation and routed to the internal iceberg sink.
+pub const ICEBERG_MV_OPTIONS: &[&str] = &[
+    "commit_checkpoint_interval",
+    "enable_compaction",
+    "compaction_interval_sec",
+    "write_mode",
+    "enable_pk_index",
+    "partition_by",
+    "snapshot_expiration_retain_last",
+    "snapshot_expiration_retain_max",
+    "snapshot_expiration_max_age_millis",
+    "snapshot_expiration_clear_expired_files",
+    "snapshot_expiration_clear_expired_meta_data",
+    "format_version",
+    "enable_snapshot_expiration",
+    "commit_checkpoint_size_threshold_mb",
+    "compaction.target_file_size_mb",
+    "compaction.type",
+    "compaction.small_files_threshold_mb",
+    "compaction.delete_files_count_threshold",
+    "compaction.max_snapshots_num",
+    "compaction.trigger_snapshot_count",
+    "compaction.write_parquet_compression",
+    "compaction.write_parquet_max_row_group_rows",
+    "compaction.write_parquet_max_row_group_bytes",
+    "table.properties",
+    "connection",
+];
 
 pub(crate) struct StreamingJobResourceOptions {
     pub resource_group: Option<String>,
@@ -190,6 +220,7 @@ pub async fn handle_create_mv(
     query: Query,
     columns: Vec<Ident>,
     emit_mode: Option<EmitMode>,
+    engine: Engine,
 ) -> Result<RwPgResponse> {
     let (dependent_relations, dependent_udfs, dependent_secrets, bound_query) = {
         let mut binder = Binder::new_for_stream(handler_args.session.as_ref());
@@ -211,6 +242,7 @@ pub async fn handle_create_mv(
         dependent_secrets,
         columns,
         emit_mode,
+        engine,
     )
     .await
 }
@@ -272,8 +304,16 @@ pub async fn handle_create_mv_bound(
     dependent_secrets: HashSet<SecretId>,
     columns: Vec<Ident>,
     emit_mode: Option<EmitMode>,
+    engine: Engine,
 ) -> Result<RwPgResponse> {
     let session = handler_args.session.clone();
+    // For iceberg-engine MVs, the handler needs the original WITH options to route
+    // iceberg sink configuration. Clone handler_args before gen_create_mv_graph consumes it.
+    let iceberg_handler_args = if matches!(engine, Engine::Iceberg) {
+        Some(handler_args.clone())
+    } else {
+        None
+    };
 
     // Check cluster limits
     session.check_cluster_limits().await?;
@@ -292,6 +332,7 @@ pub async fn handle_create_mv_bound(
         "CREATE MATERIALIZED VIEW",
     )?;
 
+    let mv_name = name.clone();
     let (table, graph, dependencies, resource_type, refresh_interval_sec) = {
         gen_create_mv_graph(
             handler_args,
@@ -302,6 +343,7 @@ pub async fn handle_create_mv_bound(
             dependent_secrets,
             columns,
             emit_mode,
+            engine,
         )?
     };
 
@@ -318,6 +360,50 @@ pub async fn handle_create_mv_bound(
             ));
 
     let catalog_writer = session.catalog_writer()?;
+
+    // Reject options not supported for iceberg-engine MVs.
+    if refresh_interval_sec.is_some() {
+        return Err(RwError::from(ErrorCode::InvalidParameterValue(
+            "refresh.interval.sec is not supported for ENGINE = iceberg materialized views"
+                .to_owned(),
+        )));
+    }
+    if resource_type != streaming_job_resource_type::ResourceType::Regular(true) {
+        return Err(RwError::from(ErrorCode::InvalidParameterValue(
+            "resource_type is not supported for ENGINE = iceberg materialized views".to_owned(),
+        )));
+    }
+
+    // Route iceberg-engine MVs through the atomic iceberg creation path
+    // (MV stream job + internal sink + internal source in one meta RPC).
+    if table.is_iceberg_engine_table() {
+        let iceberg_handler_args = iceberg_handler_args.ok_or_else(|| {
+            RwError::from(ErrorCode::InternalError(
+                "iceberg_handler_args must be set when engine is Iceberg".to_owned(),
+            ))
+        })?;
+        // Register the MV as a staging table so the internal sink's
+        // bind_relation_by_name can resolve the MV name during gen_sink_plan.
+        let table_name_str = table.name.clone();
+        session.create_staging_table(table.clone());
+        let _guard = scopeguard::guard((session.clone(), table_name_str), |(session, name)| {
+            session.drop_staging_table(&name)
+        });
+        super::create_table::create_iceberg_engine_mv(
+            session.clone(),
+            iceberg_handler_args,
+            table,
+            graph,
+            mv_name,
+            if_not_exists,
+            dependencies,
+        )
+        .await?;
+        return Ok(PgResponse::empty_result(
+            StatementType::CREATE_MATERIALIZED_VIEW,
+        ));
+    }
+
     execute_with_long_running_notification(
         catalog_writer.create_materialized_view(
             table.to_prost(),
@@ -348,6 +434,7 @@ pub(crate) fn gen_create_mv_graph(
     dependent_secrets: HashSet<SecretId>,
     columns: Vec<Ident>,
     emit_mode: Option<EmitMode>,
+    engine: Engine,
 ) -> Result<(
     TableCatalog,
     PbStreamFragmentGraph,
@@ -358,6 +445,14 @@ pub(crate) fn gen_create_mv_graph(
     let mut with_options = get_with_options(handler_args.clone());
     let refresh_interval_sec = with_options.refresh_interval_sec()?;
     with_options.remove(MV_REFRESH_INTERVAL_SEC_KEY);
+    // For iceberg-engine MVs, iceberg sink options (commit_checkpoint_interval,
+    // write_mode, enable_compaction, etc.) are valid in the WITH clause. Strip them
+    // here so gen_create_mv_graph doesn't reject them. The iceberg handler will read
+    // them from handler_args.with_options.
+    if matches!(engine, Engine::Iceberg) {
+        let iceberg_mv_options: HashSet<&str> = ICEBERG_MV_OPTIONS.iter().copied().collect();
+        with_options.retain(|k, _| !iceberg_mv_options.contains(k.as_str()));
+    }
     let resource_type =
         resolve_streaming_job_resource_type(handler_args.session.as_ref(), &mut with_options)?;
 
@@ -389,6 +484,9 @@ It only indicates the physical clustering of the data, which may improve the per
         emit_mode,
         refresh_interval_sec,
     )?;
+    // `StreamMaterialize::create` is the single source of truth for
+    // `table.engine`; the constructor already assigned it from the
+    // `table_type` / `engine` match arm above — do not overwrite here.
 
     let backfill_order = plan_backfill_order(
         session,

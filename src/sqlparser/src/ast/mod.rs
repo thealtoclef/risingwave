@@ -1331,6 +1331,8 @@ pub enum Statement {
         query: Box<Query>,
         emit_mode: Option<EmitMode>,
         with_options: Vec<SqlOption>,
+        /// `Engine = [hummock | iceberg]`
+        engine: Engine,
     },
     /// CREATE TABLE
     CreateTable {
@@ -2043,6 +2045,7 @@ impl Statement {
                 materialized,
                 with_options,
                 emit_mode,
+                engine,
             } => {
                 write!(
                     f,
@@ -2061,6 +2064,12 @@ impl Statement {
                 write!(f, " AS {}", query)?;
                 if let Some(emit_mode) = emit_mode {
                     write!(f, " EMIT {}", emit_mode)?;
+                }
+                match engine {
+                    Engine::Hummock => {}
+                    Engine::Iceberg => {
+                        write!(f, " ENGINE = {}", engine)?;
+                    }
                 }
                 Ok(())
             }

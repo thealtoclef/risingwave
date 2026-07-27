@@ -51,10 +51,7 @@ pub async fn handle_create_as(
         )
         .into());
     }
-    let engine = match ast_engine {
-        risingwave_sqlparser::ast::Engine::Hummock => risingwave_common::catalog::Engine::Hummock,
-        risingwave_sqlparser::ast::Engine::Iceberg => risingwave_common::catalog::Engine::Iceberg,
-    };
+    let engine = risingwave_common::catalog::Engine::from(ast_engine);
 
     let session = handler_args.session.clone();
 

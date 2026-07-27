@@ -12,30 +12,26 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
 use anyhow::{Context, anyhow};
-use clap::ValueEnum;
 use either::Either;
 use fancy_regex::Regex;
 use fixedbitset::FixedBitSet;
 use itertools::Itertools;
-use percent_encoding::percent_decode_str;
 use pgwire::pg_response::{PgResponse, StatementType};
 use prost::Message as _;
+use risingwave_common::bail_not_implemented;
 use risingwave_common::catalog::{
     CdcTableDesc, ColumnCatalog, ColumnDesc, ConflictBehavior, DEFAULT_SCHEMA_NAME, Engine,
-    ICEBERG_SINK_PREFIX, ICEBERG_SOURCE_PREFIX, RISINGWAVE_ICEBERG_ROW_ID, ROW_ID_COLUMN_NAME,
-    TableId,
+    ICEBERG_SINK_PREFIX, ICEBERG_SOURCE_PREFIX, ObjectId, TableId,
 };
-use risingwave_common::config::MetaBackend;
 use risingwave_common::global_jvm::Jvm;
 use risingwave_common::session_config::sink_decouple::SinkDecouple;
 use risingwave_common::util::sort_util::{ColumnOrder, OrderType};
 use risingwave_common::util::value_encoding::DatumToProtoExt;
-use risingwave_common::{bail, bail_not_implemented};
 use risingwave_connector::source::cdc::external::{
     DATABASE_NAME_KEY, ExternalCdcTableType, ExternalTableConfig, ExternalTableImpl,
     SCHEMA_NAME_KEY, SchemaTableName, TABLE_NAME_KEY,
@@ -43,11 +39,7 @@ use risingwave_connector::source::cdc::external::{
 use risingwave_connector::source::cdc::{
     build_cdc_table_id, normalize_simple_postgres_quoted_table_name,
 };
-use risingwave_connector::{
-    AUTO_SCHEMA_CHANGE_KEY, WithOptionsSecResolved, WithPropertiesExt, source,
-};
-use risingwave_pb::catalog::connection::Info as ConnectionInfo;
-use risingwave_pb::catalog::connection_params::ConnectionType;
+use risingwave_connector::{WithOptionsSecResolved, WithPropertiesExt, source};
 use risingwave_pb::catalog::{PbSource, PbWebhookSourceInfo, WatermarkDesc};
 use risingwave_pb::ddl_service::{PbTableJobType, TableJobType};
 use risingwave_pb::plan_common::column_desc::GeneratedOrDefaultColumn;
@@ -58,10 +50,10 @@ use risingwave_pb::secret::PbSecretRef;
 use risingwave_pb::secret::secret_ref::PbRefAsType;
 use risingwave_pb::stream_plan::StreamFragmentGraph;
 use risingwave_sqlparser::ast::{
-    CdcTableInfo, ColumnDef, ColumnOption, CompatibleFormatEncode, ConnectionRefValue, CreateSink,
-    CreateSinkStatement, CreateSourceStatement, DataType as AstDataType, ExplainOptions, Format,
-    FormatEncodeOptions, Ident, ObjectName, OnConflict, SecretRefAsType, SourceWatermark,
-    Statement, TableConstraint, WebhookSourceInfo, WithProperties,
+    CdcTableInfo, ColumnDef, ColumnOption, CompatibleFormatEncode, CreateSink, CreateSinkStatement,
+    CreateSourceStatement, DataType as AstDataType, ExplainOptions, Format, FormatEncodeOptions,
+    Ident, ObjectName, OnConflict, SecretRefAsType, SourceWatermark, Statement, TableConstraint,
+    WebhookSourceInfo, WithProperties,
 };
 use risingwave_sqlparser::parser::IncludeOption;
 use thiserror_ext::AsReport;
@@ -99,13 +91,11 @@ use crate::{Binder, Explain, TableCatalog, WithOptions};
 mod col_id_gen;
 pub use col_id_gen::*;
 use risingwave_connector::sink::SinkParam;
-use risingwave_connector::sink::iceberg::{
-    ENABLE_COMPACTION, IcebergConfig, IcebergSink, is_iceberg_engine_option,
-    parse_partition_by_exprs, validate_order_key_columns,
-};
+use risingwave_connector::sink::iceberg::IcebergSink;
 use risingwave_pb::ddl_service::create_iceberg_table_request::{PbSinkJobInfo, PbTableJobInfo};
 
 use crate::handler::create_sink::{SinkPlanContext, gen_sink_plan};
+use crate::handler::iceberg_engine;
 
 fn ensure_column_options_supported(c: &ColumnDef) -> Result<()> {
     for option_def in &c.options {
@@ -1679,10 +1669,7 @@ pub async fn handle_create_table(
 
     session.check_cluster_limits().await?;
 
-    let engine = match ast_engine {
-        risingwave_sqlparser::ast::Engine::Hummock => Engine::Hummock,
-        risingwave_sqlparser::ast::Engine::Iceberg => Engine::Iceberg,
-    };
+    let engine = Engine::from(ast_engine);
 
     if let Either::Right(resp) = session.check_relation_name_duplicated(
         table_name.clone(),
@@ -1773,82 +1760,6 @@ pub async fn handle_create_table(
     Ok(PgResponse::empty_result(StatementType::CREATE_TABLE))
 }
 
-fn build_iceberg_engine_sink_options(
-    mut sink_options: BTreeMap<String, String>,
-    user_options: &WithOptions,
-    table: &TableCatalog,
-    primary_key: &[String],
-) -> Result<BTreeMap<String, String>> {
-    sink_options.extend(
-        user_options
-            .iter()
-            .filter(|(key, _)| is_iceberg_engine_option(key))
-            .map(|(key, value)| (key.clone(), value.clone())),
-    );
-
-    sink_options
-        .entry(ENABLE_COMPACTION.to_owned())
-        .or_insert_with(|| "true".to_owned());
-    sink_options.insert(
-        "type".to_owned(),
-        if table.append_only {
-            "append-only"
-        } else {
-            "upsert"
-        }
-        .to_owned(),
-    );
-
-    // Supply the table primary key while parsing the typed config. In PK-index mode the
-    // planner derives it from the upstream stream key, so it is removed again below.
-    if !table.append_only {
-        sink_options.insert("primary_key".to_owned(), primary_key.join(","));
-    }
-
-    sink_options.insert("create_table_if_not_exists".to_owned(), "true".to_owned());
-    sink_options.insert("is_exactly_once".to_owned(), "true".to_owned());
-
-    let config = IcebergConfig::from_btreemap(sink_options.clone())?;
-
-    if let Some(partition_by) = &config.partition_by {
-        let mut partition_columns = vec![];
-        for (column, _) in parse_partition_by_exprs(partition_by.clone())? {
-            table
-                .columns()
-                .iter()
-                .find(|col| col.name().eq_ignore_ascii_case(&column))
-                .ok_or_else(|| {
-                    ErrorCode::InvalidInputSyntax(format!(
-                        "Partition source column does not exist in schema: {}",
-                        column
-                    ))
-                })?;
-
-            partition_columns.push(column);
-        }
-
-        ensure_partition_columns_are_prefix_of_primary_key(&partition_columns, primary_key)
-            .map_err(|_| {
-                ErrorCode::InvalidInputSyntax(
-                    "The partition columns should be the prefix of the primary key".to_owned(),
-                )
-            })?;
-    }
-
-    if let Some(order_key) = &config.order_key {
-        validate_order_key_columns(order_key, table.columns().iter().map(|col| col.name()))
-            .map_err(|err| ErrorCode::InvalidInputSyntax(err.to_report_string()))?;
-    }
-
-    if config.enable_pk_index {
-        sink_options.remove("primary_key");
-    } else {
-        sink_options.insert(AUTO_SCHEMA_CHANGE_KEY.to_owned(), "true".to_owned());
-    }
-
-    Ok(sink_options)
-}
-
 /// Iceberg table engine is composed of hummock table, iceberg sink and iceberg source.
 ///
 /// 1. fetch iceberg engine options from the meta node. Or use iceberg engine connection provided by users.
@@ -1857,7 +1768,6 @@ fn build_iceberg_engine_sink_options(
 /// 4. create an iceberg source
 ///
 /// See <https://github.com/risingwavelabs/risingwave/issues/21586> for an architecture diagram.
-#[allow(clippy::too_many_arguments)]
 pub async fn create_iceberg_engine_table(
     session: Arc<SessionImpl>,
     handler_args: HandlerArgs,
@@ -1868,165 +1778,38 @@ pub async fn create_iceberg_engine_table(
     job_type: PbTableJobType,
     if_not_exists: bool,
 ) -> Result<()> {
-    let rw_db_name = session
-        .env()
-        .catalog_reader()
-        .read_guard()
-        .get_database_by_id(table.database_id)?
-        .name()
-        .to_owned();
-    let rw_schema_name = session
-        .env()
-        .catalog_reader()
-        .read_guard()
-        .get_schema_by_id(table.database_id, table.schema_id)?
-        .name()
-        .clone();
-    let iceberg_catalog_name = rw_db_name.clone();
-    let iceberg_database_name = rw_schema_name.clone();
-    let iceberg_table_name = table_name.0.last().unwrap().real_value();
+    // 1. Resolve the iceberg connection.
+    let resolved = iceberg_engine::resolve_iceberg_connection(
+        &session,
+        &handler_args,
+        &table,
+        &table_name,
+        "table",
+    )
+    .await?;
+    let with_common = resolved.with_common;
+    let connection_ref = resolved.connection_ref;
 
-    let iceberg_engine_connection: String = session.config().iceberg_engine_connection();
-    let sink_decouple = session.config().sink_decouple();
-    if matches!(sink_decouple, SinkDecouple::Disable) {
-        bail!(
-            "Iceberg engine table only supports with sink decouple, try `set sink_decouple = true` to resolve it"
-        );
-    }
+    // 2. Build sink_with via the shared helper.
+    let pks = iceberg_engine::derive_table_pks(&table);
+    let sink_decouple_enabled = !matches!(session.config().sink_decouple(), SinkDecouple::Disable);
+    let sink_iceberg_options =
+        iceberg_engine::build_iceberg_sink_with_options(iceberg_engine::BuildSinkOptionsCtx {
+            handler_args: &handler_args,
+            table: &table,
+            pks: &pks,
+            source: source.as_mut(),
+            is_mv: false,
+            entity_kind: "table",
+            sink_decouple_enabled,
+        })?;
 
-    let mut connection_ref = BTreeMap::new();
-    let with_common = if iceberg_engine_connection.is_empty() {
-        bail!("to use iceberg engine table, the variable `iceberg_engine_connection` must be set.");
-    } else {
-        let parts: Vec<&str> = iceberg_engine_connection.split('.').collect();
-        assert_eq!(parts.len(), 2);
-        let connection_catalog =
-            session.get_connection_by_name(Some(parts[0].to_owned()), parts[1])?;
-        if let ConnectionInfo::ConnectionParams(params) = &connection_catalog.info {
-            if params.connection_type == ConnectionType::Iceberg as i32 {
-                // With iceberg engine connection:
-                connection_ref.insert(
-                    "connection".to_owned(),
-                    ConnectionRefValue {
-                        connection_name: ObjectName::from(vec![
-                            Ident::from(parts[0]),
-                            Ident::from(parts[1]),
-                        ]),
-                    },
-                );
+    // Merge connection-level with_common props with iceberg-specific sink options.
+    let mut sink_with = with_common.clone();
+    sink_with.extend(sink_iceberg_options);
 
-                let mut with_common = BTreeMap::new();
-                with_common.insert("connector".to_owned(), "iceberg".to_owned());
-                with_common.insert("database.name".to_owned(), iceberg_database_name);
-                with_common.insert("table.name".to_owned(), iceberg_table_name);
-
-                let hosted_catalog = params
-                    .properties
-                    .get("hosted_catalog")
-                    .map(|s| s.eq_ignore_ascii_case("true"))
-                    .unwrap_or(false);
-                if hosted_catalog {
-                    let meta_client = session.env().meta_client();
-                    let meta_store_endpoint = meta_client.get_meta_store_endpoint().await?;
-
-                    let meta_store_endpoint =
-                        url::Url::parse(&meta_store_endpoint).map_err(|_| {
-                            ErrorCode::InternalError(
-                                "failed to parse the meta store endpoint".to_owned(),
-                            )
-                        })?;
-                    let meta_store_backend = meta_store_endpoint.scheme().to_owned();
-                    let meta_store_user = meta_store_endpoint.username().to_owned();
-                    let meta_store_password = match meta_store_endpoint.password() {
-                        Some(password) => percent_decode_str(password)
-                            .decode_utf8()
-                            .map_err(|_| {
-                                ErrorCode::InternalError(
-                                    "failed to parse password from meta store endpoint".to_owned(),
-                                )
-                            })?
-                            .into_owned(),
-                        None => "".to_owned(),
-                    };
-                    let meta_store_host = meta_store_endpoint
-                        .host_str()
-                        .ok_or_else(|| {
-                            ErrorCode::InternalError(
-                                "failed to parse host from meta store endpoint".to_owned(),
-                            )
-                        })?
-                        .to_owned();
-                    let meta_store_port = meta_store_endpoint.port().ok_or_else(|| {
-                        ErrorCode::InternalError(
-                            "failed to parse port from meta store endpoint".to_owned(),
-                        )
-                    })?;
-                    let meta_store_database = meta_store_endpoint
-                        .path()
-                        .trim_start_matches('/')
-                        .to_owned();
-
-                    let Ok(meta_backend) = MetaBackend::from_str(&meta_store_backend, true) else {
-                        bail!("failed to parse meta backend: {}", meta_store_backend);
-                    };
-
-                    let catalog_uri = match meta_backend {
-                        MetaBackend::Postgres => {
-                            format!(
-                                "jdbc:postgresql://{}:{}/{}",
-                                meta_store_host, meta_store_port, meta_store_database
-                            )
-                        }
-                        MetaBackend::Mysql => {
-                            format!(
-                                "jdbc:mysql://{}:{}/{}",
-                                meta_store_host, meta_store_port, meta_store_database
-                            )
-                        }
-                        MetaBackend::Sqlite | MetaBackend::Sql | MetaBackend::Mem => {
-                            bail!(
-                                "Unsupported meta backend for iceberg engine table: {}",
-                                meta_store_backend
-                            );
-                        }
-                    };
-
-                    with_common.insert("catalog.type".to_owned(), "jdbc".to_owned());
-                    with_common.insert("catalog.uri".to_owned(), catalog_uri);
-                    with_common.insert("catalog.jdbc.user".to_owned(), meta_store_user);
-                    with_common.insert("catalog.jdbc.password".to_owned(), meta_store_password);
-                    with_common.insert("catalog.name".to_owned(), iceberg_catalog_name);
-                }
-
-                with_common
-            } else {
-                return Err(RwError::from(ErrorCode::InvalidParameterValue(
-                    "Only iceberg connection could be used in iceberg engine".to_owned(),
-                )));
-            }
-        } else {
-            return Err(RwError::from(ErrorCode::InvalidParameterValue(
-                "Private Link Service has been deprecated. Please create a new connection instead."
-                    .to_owned(),
-            )));
-        }
-    };
-
-    // Iceberg sinks require a primary key, if none is provided, we will use the _row_id column
-    // Fetch primary key from columns
-    let mut pks = table
-        .pk_column_names()
-        .iter()
-        .map(|c| c.to_string())
-        .collect::<Vec<String>>();
-
-    // For the table without primary key. We will use `_row_id` as primary key.
-    if pks.len() == 1 && pks[0].eq(ROW_ID_COLUMN_NAME) {
-        pks = vec![RISINGWAVE_ICEBERG_ROW_ID.to_owned()];
-    }
-
+    // 3. Construct the sink statement (preserved from original).
     let sink_from = CreateSink::From(table_name.clone());
-
     let mut sink_name = table_name.clone();
     *sink_name.0.last_mut().unwrap() = Ident::from(
         (ICEBERG_SINK_PREFIX.to_owned() + &sink_name.0.last().unwrap().real_value()).as_str(),
@@ -2043,49 +1826,25 @@ pub async fn create_iceberg_engine_table(
         into_table_name: None,
     };
 
-    let mut sink_handler_args = handler_args.clone();
+    // 4. gen_sink_plan + build_graph (preserved from original).
+    let (sink_graph, sink_catalog) = {
+        let mut sink_handler_args = handler_args.clone();
+        sink_handler_args.with_options =
+            WithOptions::new(sink_with, Default::default(), connection_ref.clone());
+        let SinkPlanContext {
+            sink_plan,
+            sink_catalog,
+            ..
+        } = gen_sink_plan(sink_handler_args, create_sink_stmt, None, true).await?;
+        let sink_graph = build_graph(sink_plan, Some(GraphJobType::Sink))?;
+        (sink_graph, sink_catalog)
+    };
 
-    let sink_with = build_iceberg_engine_sink_options(
-        with_common.clone(),
-        &handler_args.with_options,
-        &table,
-        &pks,
-    )?;
+    // 5. JVM init (MUST happen before the JDBC catalog creates the iceberg table, otherwise
+    //    a failure leaves a partially created engine table).
+    let _ = Jvm::get_or_init()?;
 
-    if let Some(source) = source.as_mut() {
-        source
-            .with_properties
-            .retain(|key, _| !is_iceberg_engine_option(key));
-    }
-
-    // sink_with.insert(SINK_SNAPSHOT_OPTION.to_owned(), "false".to_owned());
-    //
-    // Note: in theory, we don't need to backfill from the table to the sink,
-    // but we don't have atomic DDL now https://github.com/risingwavelabs/risingwave/issues/21863
-    // so it may have potential data loss problem on the first barrier.
-    //
-    // For non-append-only table, we can always solve it by the initial sink with backfill, since
-    // data will be present in hummock table.
-    //
-    // For append-only table, we need to be more careful.
-    //
-    // The possible cases for a table:
-    // - For table without connector: it doesn't matter, since there's no data before the table is created
-    // - For table with connector: we workarounded it by setting SOURCE_RATE_LIMIT to 0
-    //   + If we support blocking DDL for table with connector, we need to be careful.
-    // - For table with an upstream job: Specifically, CDC table from shared CDC source.
-    //   + Data may come from both upstream connector, and CDC table backfill, so we need to pause both of them.
-    //   + For now we don't support APPEND ONLY CDC table, so it's safe.
-
-    sink_handler_args.with_options =
-        WithOptions::new(sink_with, Default::default(), connection_ref.clone());
-    let SinkPlanContext {
-        sink_plan,
-        sink_catalog,
-        ..
-    } = gen_sink_plan(sink_handler_args, create_sink_stmt, None, true).await?;
-    let sink_graph = build_graph(sink_plan, Some(GraphJobType::Sink))?;
-
+    // 6. Build source and catalog.
     let mut source_name = table_name.clone();
     *source_name.0.last_mut().unwrap() = Ident::from(
         (ICEBERG_SOURCE_PREFIX.to_owned() + &source_name.0.last().unwrap().real_value()).as_str(),
@@ -2113,17 +1872,30 @@ pub async fn create_iceberg_engine_table(
     let (with_properties, refresh_mode) =
         bind_connector_props(&source_handler_args, &format_encode, true)?;
 
-    // Create iceberg sink table, used for iceberg source column binding. See `bind_columns_from_source_for_non_cdc` for more details.
-    // TODO: We can derive the columns directly from table definition in the future, so that we don't need to pre-create the table catalog.
-    let (iceberg_catalog, table_identifier) = {
-        let sink_param = SinkParam::try_from_sink_catalog(sink_catalog.clone())?;
-        let iceberg_sink = IcebergSink::try_from(sink_param)?;
-        iceberg_sink.create_table_if_not_exists().await?;
+    // Create iceberg sink table, used for iceberg source column binding.
+    let sink_param = SinkParam::try_from_sink_catalog(sink_catalog.clone())?;
+    let iceberg_sink = IcebergSink::try_from(sink_param)?;
+    iceberg_sink.create_table_if_not_exists().await?;
 
-        let iceberg_catalog = iceberg_sink.config.create_catalog().await?;
-        let table_identifier = iceberg_sink.config.full_table_name()?;
-        (iceberg_catalog, table_identifier)
-    };
+    let iceberg_catalog = iceberg_sink.config.create_catalog().await?;
+    let table_identifier = iceberg_sink.config.full_table_name()?;
+
+    // Best-effort cleanup guard: drops the pre-created external iceberg table on any
+    // error between creation here and the meta RPC returning success.
+    let _guard = scopeguard::guard(
+        (iceberg_catalog.clone(), table_identifier.clone()),
+        |(catalog, ident)| {
+            tokio::spawn(async move {
+                let _ = catalog.drop_table(&ident).await.inspect_err(|err| {
+                    tracing::error!(
+                        "failed to drop iceberg table {} after error in create path: {}",
+                        ident,
+                        err.as_report()
+                    );
+                });
+            });
+        },
+    );
 
     let create_source_type = CreateSourceType::for_newly_created(&session, &*with_properties);
     let (columns_from_resolve_source, source_info) = bind_columns_from_source(
@@ -2155,10 +1927,7 @@ pub async fn create_iceberg_engine_table(
     )
     .await?;
 
-    // before we create the table, ensure the JVM is initialized as we use jdbc catalog right now.
-    // If JVM isn't initialized successfully, current not atomic ddl will result in a partially created iceberg engine table.
-    let _ = Jvm::get_or_init()?;
-
+    // 7. Execute the meta RPC.
     let catalog_writer = session.catalog_writer()?;
     let action = match job_type {
         TableJobType::SharedCdcSource => LongRunningNotificationAction::MonitorBackfillJob,
@@ -2185,19 +1954,200 @@ pub async fn create_iceberg_engine_table(
     )
     .await;
 
-    if res.is_err() {
-        let _ = iceberg_catalog
-            .drop_table(&table_identifier)
-            .await
-            .inspect_err(|err| {
-                tracing::error!(
-                    "failed to drop iceberg table {} after create iceberg engine table failed: {}",
-                    table_identifier,
-                    err.as_report()
-                );
+    res?;
+
+    // Success: disarm the cleanup guard so it does not drop the now-committed table.
+    std::mem::forget(_guard);
+
+    Ok(())
+}
+
+pub async fn create_iceberg_engine_mv(
+    session: Arc<SessionImpl>,
+    handler_args: HandlerArgs,
+    table: TableCatalog,
+    graph: StreamFragmentGraph,
+    table_name: ObjectName,
+    if_not_exists: bool,
+    dependencies: HashSet<ObjectId>,
+) -> Result<()> {
+    // 1. Resolve the iceberg connection.
+    let resolved = iceberg_engine::resolve_iceberg_connection(
+        &session,
+        &handler_args,
+        &table,
+        &table_name,
+        "materialized view",
+    )
+    .await?;
+    let with_common = resolved.with_common;
+    let connection_ref = resolved.connection_ref;
+
+    // 2. Build sink_with via the shared helper.
+    let pks = iceberg_engine::derive_mv_pks(&table);
+    let sink_decouple_enabled = !matches!(session.config().sink_decouple(), SinkDecouple::Disable);
+    let sink_iceberg_options =
+        iceberg_engine::build_iceberg_sink_with_options(iceberg_engine::BuildSinkOptionsCtx {
+            handler_args: &handler_args,
+            table: &table,
+            pks: &pks,
+            source: None,
+            is_mv: true,
+            entity_kind: "materialized view",
+            sink_decouple_enabled,
+        })?;
+
+    // Merge connection-level with_common props with iceberg-specific sink options.
+    let mut sink_with = with_common.clone();
+    sink_with.extend(sink_iceberg_options);
+
+    // 3. Construct the sink statement.
+    let sink_from = CreateSink::From(table_name.clone());
+    let mut sink_name = table_name.clone();
+    *sink_name.0.last_mut().unwrap() = Ident::from(
+        (ICEBERG_SINK_PREFIX.to_owned() + &sink_name.0.last().unwrap().real_value()).as_str(),
+    );
+    let create_sink_stmt = CreateSinkStatement {
+        or_replace: false,
+        if_not_exists: false,
+        sink_name,
+        with_properties: WithProperties(vec![]),
+        sink_from,
+        columns: vec![],
+        emit_mode: None,
+        sink_schema: None,
+        into_table_name: None,
+    };
+
+    // 4. gen_sink_plan + build_graph.
+    let (sink_graph, sink_catalog) = {
+        let mut sink_handler_args = handler_args.clone();
+        sink_handler_args.with_options =
+            WithOptions::new(sink_with, Default::default(), connection_ref.clone());
+        let SinkPlanContext {
+            sink_plan,
+            sink_catalog,
+            ..
+        } = gen_sink_plan(sink_handler_args, create_sink_stmt, None, true).await?;
+        let sink_graph = build_graph(sink_plan, Some(GraphJobType::Sink))?;
+        (sink_graph, sink_catalog)
+    };
+
+    // 5. JVM init (MUST happen before the JDBC catalog creates the iceberg table, otherwise
+    //    a failure leaves a partially created engine table).
+    let _ = Jvm::get_or_init()?;
+
+    // 6. Build source and catalog.
+    let mut source_name = table_name.clone();
+    *source_name.0.last_mut().unwrap() = Ident::from(
+        (ICEBERG_SOURCE_PREFIX.to_owned() + &source_name.0.last().unwrap().real_value()).as_str(),
+    );
+    let create_source_stmt = CreateSourceStatement {
+        temporary: false,
+        if_not_exists: false,
+        columns: vec![],
+        source_name,
+        wildcard_idx: Some(0),
+        constraints: vec![],
+        with_properties: WithProperties(vec![]),
+        format_encode: CompatibleFormatEncode::V2(FormatEncodeOptions::none()),
+        source_watermarks: vec![],
+        include_column_options: vec![],
+    };
+
+    let mut source_handler_args = handler_args.clone();
+    let source_with = with_common;
+    source_handler_args.with_options =
+        WithOptions::new(source_with, Default::default(), connection_ref);
+
+    let overwrite_options = OverwriteOptions::new(&mut source_handler_args);
+    let format_encode = create_source_stmt.format_encode.into_v2_with_warning();
+    let (with_properties, refresh_mode) =
+        bind_connector_props(&source_handler_args, &format_encode, true)?;
+
+    // Create iceberg sink table, used for iceberg source column binding.
+    let sink_param = SinkParam::try_from_sink_catalog(sink_catalog.clone())?;
+    let iceberg_sink = IcebergSink::try_from(sink_param)?;
+    iceberg_sink.create_table_if_not_exists().await?;
+
+    let iceberg_catalog = iceberg_sink.config.create_catalog().await?;
+    let table_identifier = iceberg_sink.config.full_table_name()?;
+
+    // Best-effort cleanup guard: drops the pre-created external iceberg table on any
+    // error between creation here and the meta RPC returning success.
+    let _guard = scopeguard::guard(
+        (iceberg_catalog.clone(), table_identifier.clone()),
+        |(catalog, ident)| {
+            tokio::spawn(async move {
+                let _ = catalog.drop_table(&ident).await.inspect_err(|err| {
+                    tracing::error!(
+                        "failed to drop iceberg table {} after error in create path: {}",
+                        ident,
+                        err.as_report()
+                    );
+                });
             });
-        res?
-    }
+        },
+    );
+
+    let create_source_type = CreateSourceType::for_newly_created(&session, &*with_properties);
+    let (columns_from_resolve_source, source_info) = bind_columns_from_source(
+        &session,
+        &format_encode,
+        Either::Left(&with_properties),
+        create_source_type,
+    )
+    .await?;
+    let mut col_id_gen = ColumnIdGenerator::new_initial();
+
+    let iceberg_source_catalog = bind_create_source_or_table_with_connector(
+        source_handler_args,
+        create_source_stmt.source_name,
+        format_encode,
+        with_properties,
+        &create_source_stmt.columns,
+        create_source_stmt.constraints,
+        create_source_stmt.wildcard_idx,
+        create_source_stmt.source_watermarks,
+        columns_from_resolve_source,
+        source_info,
+        create_source_stmt.include_column_options,
+        &mut col_id_gen,
+        create_source_type,
+        overwrite_options.source_rate_limit,
+        SqlColumnStrategy::FollowChecked,
+        refresh_mode,
+    )
+    .await?;
+
+    // 7. Execute the meta RPC.
+    let catalog_writer = session.catalog_writer()?;
+    let res = execute_with_long_running_notification(
+        catalog_writer.create_iceberg_materialized_view(
+            PbTableJobInfo {
+                source: None,
+                table: Some(table.to_prost()),
+                fragment_graph: Some(graph),
+                job_type: PbTableJobType::Unspecified as i32,
+            },
+            PbSinkJobInfo {
+                sink: Some(sink_catalog.to_proto()),
+                fragment_graph: Some(sink_graph),
+            },
+            iceberg_source_catalog.to_prost(),
+            if_not_exists,
+            dependencies,
+        ),
+        &session,
+        "CREATE MATERIALIZED VIEW",
+        LongRunningNotificationAction::MonitorBackfillJob,
+    )
+    .await;
+
+    res?;
+
+    // Success: disarm the cleanup guard so it does not drop the now-committed table.
+    std::mem::forget(_guard);
 
     Ok(())
 }
@@ -2226,26 +2176,6 @@ pub fn check_create_table_with_source(
         })?;
     }
     Ok(format_encode)
-}
-
-fn ensure_partition_columns_are_prefix_of_primary_key(
-    partition_columns: &[String],
-    primary_key_columns: &[String],
-) -> std::result::Result<(), String> {
-    if partition_columns.len() > primary_key_columns.len() {
-        return Err("Partition columns cannot be longer than primary key columns.".to_owned());
-    }
-
-    for (i, partition_col) in partition_columns.iter().enumerate() {
-        if primary_key_columns.get(i) != Some(partition_col) {
-            return Err(format!(
-                "Partition column '{}' is not a prefix of the primary key.",
-                partition_col
-            ));
-        }
-    }
-
-    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2286,10 +2216,7 @@ pub async fn generate_stream_graph_for_replace_table(
         .clone()
         .map(|format_encode| format_encode.into_v2_with_warning());
 
-    let engine = match engine {
-        risingwave_sqlparser::ast::Engine::Hummock => Engine::Hummock,
-        risingwave_sqlparser::ast::Engine::Iceberg => Engine::Iceberg,
-    };
+    let engine = Engine::from(engine);
 
     let is_drop_connector =
         original_catalog.associated_source_id().is_some() && format_encode.is_none();
