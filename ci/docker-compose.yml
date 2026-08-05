@@ -592,12 +592,15 @@ services:
       - CASSANDRA_CLUSTER_NAME=cloudinfra
 
   doris-server:
-    image: apache/doris:doris-all-in-one-2.1.0
+    image: yagagagaga/doris-standalone:4.1.0
     ports:
       - 8030:8030
       - 8040:8040
+      - 9030:9030
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9030"]
+      # 9030 speaks the MySQL protocol, so curl can never succeed against it. Use the FE HTTP
+      # port, whose /api/health also reports the backend count the sink needs to load data.
+      test: ["CMD", "curl", "-f", "http://localhost:8030/api/health"]
       interval: 5s
       timeout: 5s
       retries: 30

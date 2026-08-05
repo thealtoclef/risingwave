@@ -300,7 +300,19 @@ fn datum_to_json_object(
             }
         },
         (DataType::Timestamptz, ScalarRefImpl::Timestamptz(v)) => {
-            match config.timestamptz_handling_mode {
+            // Per-column override for Doris: when the target column is `TIMESTAMPTZ`, switch
+            // into a tz-bearing string (`...Z`) so Doris accepts the value as the same UTC instant
+            // and only re-renders the offset on read. Columns mapped to `DATETIME` keep the
+            // configured (typically naive-UTC) mode.
+            let mode = match &config.custom_json_type {
+                CustomJsonType::Doris(cfg)
+                    if cfg.tstz_target_columns.contains(field.name.as_str()) =>
+                {
+                    TimestamptzHandlingMode::UtcString
+                }
+                _ => config.timestamptz_handling_mode,
+            };
+            match mode {
                 TimestamptzHandlingMode::UtcString => {
                     let parsed = v.to_datetime_utc();
                     let v = parsed.to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
@@ -766,6 +778,7 @@ mod tests {
             custom_json_type: CustomJsonType::Doris(DorisJsonConfig {
                 decimal_scale,
                 variant_columns: HashSet::default(),
+                tstz_target_columns: HashSet::default(),
             }),
             jsonb_handling_mode: JsonbHandlingMode::String,
         };
@@ -821,6 +834,7 @@ mod tests {
             custom_json_type: CustomJsonType::Doris(DorisJsonConfig {
                 decimal_scale: HashMap::default(),
                 variant_columns: HashSet::default(),
+                tstz_target_columns: HashSet::default(),
             }),
             jsonb_handling_mode: JsonbHandlingMode::String,
         };
@@ -896,6 +910,7 @@ mod tests {
                 custom_json_type: CustomJsonType::Doris(DorisJsonConfig {
                     decimal_scale: HashMap::default(),
                     variant_columns: HashSet::from(["variant_col".to_owned()]),
+                    tstz_target_columns: HashSet::default(),
                 }),
                 jsonb_handling_mode: JsonbHandlingMode::String,
             },
@@ -996,5 +1011,57 @@ mod tests {
                 .to_string();
         let ans = r#"{"fields":[{"field":"v1","optional":true,"type":"boolean"},{"field":"v2","optional":true,"type":"int16"},{"field":"v3","optional":true,"type":"int32"},{"field":"v4","optional":true,"type":"float"},{"field":"v5","optional":true,"type":"string"},{"field":"v6","optional":true,"type":"int32"},{"field":"v7","optional":true,"type":"string"},{"field":"v8","optional":true,"type":"int64"},{"field":"v9","optional":true,"type":"string"},{"field":"v10","fields":[{"field":"a","optional":true,"type":"int64"},{"field":"b","optional":true,"type":"string"},{"field":"c","fields":[{"field":"aa","optional":true,"type":"int64"},{"field":"bb","optional":true,"type":"double"}],"optional":true,"type":"struct"}],"optional":true,"type":"struct"},{"field":"v11","items":{"items":{"fields":[{"field":"aa","optional":true,"type":"int64"},{"field":"bb","optional":true,"type":"double"}],"optional":true,"type":"struct"},"optional":true,"type":"array"},"optional":true,"type":"array"},{"field":"12","optional":true,"type":"string"},{"field":"13","optional":true,"type":"string"},{"field":"14","optional":true,"type":"string"}],"name":"test","optional":false,"type":"struct"}"#;
         assert_eq!(schema, ans);
+    }
+
+    #[test]
+    fn test_doris_tstz_target_columns_force_rfc3339_format() {
+        // When the Doris column type is `TIMESTAMPTZ`, the encoder must emit a tz-bearing string
+        // (`...Z`) regardless of the global `timestamptz_handling_mode` so Doris stores the
+        // value as a UTC instant. A column *not* listed in `tstz_target_columns` keeps the
+        // configured (typically naive-UTC) mode.
+        let doris_override = JsonEncoderConfig {
+            time_handling_mode: TimeHandlingMode::String,
+            date_handling_mode: DateHandlingMode::String,
+            timestamp_handling_mode: TimestampHandlingMode::String,
+            timestamptz_handling_mode: TimestamptzHandlingMode::UtcWithoutSuffix,
+            custom_json_type: CustomJsonType::Doris(DorisJsonConfig {
+                decimal_scale: HashMap::default(),
+                variant_columns: HashSet::default(),
+                tstz_target_columns: HashSet::from(["ts_tz".to_owned()]),
+            }),
+            jsonb_handling_mode: JsonbHandlingMode::String,
+        };
+        let tstz_field = Field {
+            description: None,
+            data_type: DataType::Timestamptz,
+            name: "ts_tz".to_owned(),
+        };
+        let naive_field = Field {
+            description: None,
+            data_type: DataType::Timestamptz,
+            name: "ts_naive".to_owned(),
+        };
+
+        // Same timestamp value used for both columns.
+        let parsed: risingwave_common::types::Timestamptz =
+            "2024-01-02T03:04:05.123456Z".parse().unwrap();
+
+        let overridden = datum_to_json_object(
+            &tstz_field,
+            Some(ScalarImpl::Timestamptz(parsed).as_scalar_ref_impl()),
+            &doris_override,
+        )
+        .unwrap();
+        // RFC3339 with `Z`, microsecond precision.
+        assert_eq!(overridden, json!("2024-01-02T03:04:05.123456Z"));
+
+        let naive = datum_to_json_object(
+            &naive_field,
+            Some(ScalarImpl::Timestamptz(parsed).as_scalar_ref_impl()),
+            &doris_override,
+        )
+        .unwrap();
+        // Not in tstz_target_columns, so the global UtcWithoutSuffix mode applies.
+        assert_eq!(naive, json!("2024-01-02 03:04:05.123456"));
     }
 }
