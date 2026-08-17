@@ -33,7 +33,7 @@ futures = { version = "0.3", default-features = false, features = ["alloc"] }
 futures-async-stream = { workspace = true }
 hex = "0.4"
 iceberg = { workspace = true }
-iceberg-compaction-core = { git = "https://github.com/thealtoclef/iceberg-compaction.git", rev = "171dd6b2bcb3726f5bf6869ea687f14afda18c34" }
+iceberg-compaction-core = { git = "https://github.com/thealtoclef/iceberg-compaction.git", rev = "8bf2218bc66754e87b4efbac03862494e35ac5e9" }
 itertools = { workspace = true }
 libc = "0.2"
 lz4 = "1.28.0"
