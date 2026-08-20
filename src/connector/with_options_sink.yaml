@@ -282,6 +282,29 @@ DorisConfig:
       enabled.
       When unset, the Doris cluster default is used.
     required: false
+  - name: doris.buckets
+    field_type: u32
+    comments: |-
+      Number of buckets (tablets) for the auto-created table, defaults to 16. Only used when
+      `auto_create` is enabled.
+
+      Doris fixes the bucket count when the partition is created and it cannot be changed
+      afterwards — `ALTER TABLE ... MODIFY DISTRIBUTION` only applies to partitions created later,
+      and is rejected outright on the non-partitioned table auto-create emits. Getting this wrong
+      therefore means recreating the table and reloading it.
+
+      This is why auto-create does not use `BUCKETS AUTO`: Doris derives that from the
+      `estimate_partition_size` property, which defaults to 10GB and yields a single-digit bucket
+      count regardless of how much data the sink will actually write. Buckets are what spreads
+      writes, compaction and (on a UNIQUE KEY table) delete-bitmap work across backends, so too
+      few of them caps ingest throughput no matter how much sink parallelism is configured.
+
+      Doris sizes tablets at 1-10GB compressed, capped at 128 buckets per partition, so the
+      default suits a target holding tens of GB. Raise it for a larger table; the cost of too many
+      buckets is frontend metadata memory and more small segment files per load, which is far
+      cheaper than the cost of too few.
+    required: false
+    default: '16'
   - name: r#type
     field_type: String
     required: true
@@ -318,9 +341,15 @@ DorisConfig:
   - name: doris.max_batch_size_bytes
     field_type: u64
     comments: |-
-      The maximum payload size in bytes of a single Doris stream load, defaults to 32MB. Once
+      The maximum payload size in bytes of a single Doris stream load, defaults to 128MB. Once
       the current load reaches the cap it is committed and a new one is started, so this also
       bounds the memory a writer holds for an in-flight load.
+
+      Every split is a separate committed load, so this is also what governs how many Doris
+      transactions a large write costs: one new table version each, and on a UNIQUE KEY
+      merge-on-write table one delete-bitmap computation each. Raising it is the cheapest way to
+      reduce that pressure during a large backfill, at the cost of more writer memory; Doris
+      itself accepts up to 10GB per load (`streaming_load_max_mb`).
 
       The cap defaults to a finite value because closing a load is what commits it in Doris, so
       with `commit_checkpoint_interval` above 1 one request stays open for the whole interval.
@@ -333,7 +362,7 @@ DorisConfig:
       A single row whose payload exceeds the cap is still sent, as a load of its own, since a row
       cannot be split across loads.
     required: false
-    default: 32 * 1024 * 1024
+    default: 128 * 1024 * 1024
     allow_alter_on_fly: true
   - name: doris.strict_mode
     field_type: bool

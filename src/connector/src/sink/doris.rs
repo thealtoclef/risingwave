@@ -63,7 +63,12 @@ const fn default_stream_load_http_timeout_ms() -> u64 {
 /// Default cap on the payload of a single stream load. See
 /// [`DorisConfig::max_batch_size_bytes`] for why this defaults to a finite value.
 const fn default_max_batch_size_bytes() -> u64 {
-    32 * 1024 * 1024
+    128 * 1024 * 1024
+}
+
+/// Default bucket count for an auto-created table. See [`DorisCommon::buckets`].
+const fn default_buckets() -> u32 {
+    16
 }
 
 const fn default_strict_mode() -> bool {
@@ -123,6 +128,27 @@ pub struct DorisCommon {
     /// When unset, the Doris cluster default is used.
     #[serde(rename = "doris.replication_num")]
     pub replication_num: Option<String>,
+    /// Number of buckets (tablets) for the auto-created table, defaults to 16. Only used when
+    /// `auto_create` is enabled.
+    ///
+    /// Doris fixes the bucket count when the partition is created and it cannot be changed
+    /// afterwards — `ALTER TABLE ... MODIFY DISTRIBUTION` only applies to partitions created later,
+    /// and is rejected outright on the non-partitioned table auto-create emits. Getting this wrong
+    /// therefore means recreating the table and reloading it.
+    ///
+    /// This is why auto-create does not use `BUCKETS AUTO`: Doris derives that from the
+    /// `estimate_partition_size` property, which defaults to 10GB and yields a single-digit bucket
+    /// count regardless of how much data the sink will actually write. Buckets are what spreads
+    /// writes, compaction and (on a UNIQUE KEY table) delete-bitmap work across backends, so too
+    /// few of them caps ingest throughput no matter how much sink parallelism is configured.
+    ///
+    /// Doris sizes tablets at 1-10GB compressed, capped at 128 buckets per partition, so the
+    /// default suits a target holding tens of GB. Raise it for a larger table; the cost of too many
+    /// buckets is frontend metadata memory and more small segment files per load, which is far
+    /// cheaper than the cost of too few.
+    #[serde(rename = "doris.buckets", default = "default_buckets")]
+    #[serde_as(as = "DisplayFromStr")]
+    pub buckets: u32,
 }
 
 impl EnforceSecret for DorisCommon {
@@ -209,9 +235,15 @@ pub struct DorisConfig {
     #[with_option(allow_alter_on_fly)]
     pub commit_checkpoint_interval: u64,
 
-    /// The maximum payload size in bytes of a single Doris stream load, defaults to 32MB. Once
+    /// The maximum payload size in bytes of a single Doris stream load, defaults to 128MB. Once
     /// the current load reaches the cap it is committed and a new one is started, so this also
     /// bounds the memory a writer holds for an in-flight load.
+    ///
+    /// Every split is a separate committed load, so this is also what governs how many Doris
+    /// transactions a large write costs: one new table version each, and on a UNIQUE KEY
+    /// merge-on-write table one delete-bitmap computation each. Raising it is the cheapest way to
+    /// reduce that pressure during a large backfill, at the cost of more writer memory; Doris
+    /// itself accepts up to 10GB per load (`streaming_load_max_mb`).
     ///
     /// The cap defaults to a finite value because closing a load is what commits it in Doris, so
     /// with `commit_checkpoint_interval` above 1 one request stays open for the whole interval.
@@ -287,6 +319,11 @@ impl DorisConfig {
         if config.max_batch_size_bytes == 0 {
             return Err(SinkError::Config(anyhow!(
                 "`doris.max_batch_size_bytes` must be greater than 0"
+            )));
+        }
+        if config.common.buckets == 0 {
+            return Err(SinkError::Config(anyhow!(
+                "`doris.buckets` must be greater than 0"
             )));
         }
         // The value is interpolated into the `PROPERTIES` clause of the auto-create DDL, so reject
@@ -783,16 +820,22 @@ impl DorisSink {
         let key_list = key_columns.join(", ");
         sql.push_str(&format!("{}({})\n", key_clause, key_list));
 
-        // Choose the distribution, always with AUTO bucketing so Doris sizes the bucket count.
-        // Hashing on the key co-locates rows and is required for UNIQUE KEY (upsert) tables and
-        // sensible when the user gave a primary key. But for an append-only table with no primary
-        // key we picked an arbitrary key-able column above; hashing on it would risk severe bucket
-        // skew if that column has low cardinality (e.g. a boolean), so we distribute rows randomly
-        // instead to spread them evenly.
+        // Choose the distribution. Hashing on the key co-locates rows and is required for UNIQUE KEY
+        // (upsert) tables and sensible when the user gave a primary key. But for an append-only
+        // table with no primary key we picked an arbitrary key-able column above; hashing on it
+        // would risk severe bucket skew if that column has low cardinality (e.g. a boolean), so we
+        // distribute rows randomly instead to spread them evenly.
+        //
+        // The bucket count is always explicit; see [`DorisCommon::buckets`] for why `AUTO` is not
+        // used.
+        let buckets = self.config.common.buckets;
         if self.is_append_only && self.pk_indices.is_empty() {
-            sql.push_str("DISTRIBUTED BY RANDOM BUCKETS AUTO\n");
+            sql.push_str(&format!("DISTRIBUTED BY RANDOM BUCKETS {}\n", buckets));
         } else {
-            sql.push_str(&format!("DISTRIBUTED BY HASH({}) BUCKETS AUTO\n", key_list));
+            sql.push_str(&format!(
+                "DISTRIBUTED BY HASH({}) BUCKETS {}\n",
+                key_list, buckets
+            ));
         }
 
         let mut properties: Vec<String> = Vec::new();
@@ -1439,7 +1482,7 @@ mod tests {
         let sql = sink.build_create_table_sql().unwrap();
         assert!(sql.contains("UNIQUE KEY(`id`)"), "sql: {sql}");
         assert!(
-            sql.contains("DISTRIBUTED BY HASH(`id`) BUCKETS AUTO"),
+            sql.contains("DISTRIBUTED BY HASH(`id`) BUCKETS 16"),
             "sql: {sql}"
         );
         assert!(
@@ -1474,7 +1517,23 @@ mod tests {
         assert!(sql.contains("DUPLICATE KEY(`id`)"), "sql: {sql}");
         // No user-defined key, so distribute randomly rather than hashing on the arbitrarily
         // picked key column (which could skew badly for a low-cardinality column).
-        assert!(sql.contains("DISTRIBUTED BY RANDOM"), "sql: {sql}");
+        assert!(
+            sql.contains("DISTRIBUTED BY RANDOM BUCKETS 16"),
+            "sql: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_build_create_table_sql_uses_configured_bucket_count() {
+        let mut properties = base_properties("upsert");
+        properties.insert("doris.buckets".to_owned(), "64".to_owned());
+        let config = DorisConfig::from_btreemap(properties).unwrap();
+        let sink = DorisSink::new(config, upsert_schema(), vec![0], false).unwrap();
+        let sql = sink.build_create_table_sql().unwrap();
+        assert!(
+            sql.contains("DISTRIBUTED BY HASH(`id`) BUCKETS 64"),
+            "sql: {sql}"
+        );
     }
 
     #[test]
@@ -1578,6 +1637,7 @@ mod tests {
             partial_update: None,
             auto_create: true,
             replication_num: None,
+            buckets: super::default_buckets(),
         };
         assert_eq!(common.get_query_url().unwrap(), "mysql://doris-server:9030");
     }
@@ -1597,6 +1657,7 @@ mod tests {
             partial_update: None,
             auto_create: true,
             replication_num: None,
+            buckets: super::default_buckets(),
         };
         let err = common.get_query_url().unwrap_err();
         let msg = format!("{}", err);
@@ -1916,10 +1977,38 @@ mod tests {
     fn test_config_defaults() {
         let config = DorisConfig::from_btreemap(base_properties(SINK_TYPE_APPEND_ONLY)).unwrap();
         assert_eq!(config.commit_checkpoint_interval, 10);
-        assert_eq!(config.max_batch_size_bytes, 32 * 1024 * 1024);
+        assert_eq!(config.max_batch_size_bytes, 128 * 1024 * 1024);
         assert!(config.strict_mode);
         assert_eq!(config.stream_load_http_timeout_ms, 60 * 1000);
         assert!(!config.common.auto_create);
+        assert_eq!(config.common.buckets, 16);
+    }
+
+    #[test]
+    fn test_config_rejects_zero_buckets() {
+        let mut properties = base_properties(SINK_TYPE_APPEND_ONLY);
+        properties.insert("doris.buckets".to_owned(), "0".to_owned());
+        let err = DorisConfig::from_btreemap(properties).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("`doris.buckets` must be greater than 0"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_config_rejects_non_numeric_buckets() {
+        // The value is interpolated into the auto-create DDL, and `AUTO` in particular must not be
+        // accepted: Doris derives it from `estimate_partition_size` and yields a bucket count far
+        // too low for a large table, with no way to change it afterwards.
+        for value in ["auto", "AUTO", "-1", "1; drop table t"] {
+            let mut properties = base_properties(SINK_TYPE_APPEND_ONLY);
+            properties.insert("doris.buckets".to_owned(), value.to_owned());
+            assert!(
+                DorisConfig::from_btreemap(properties).is_err(),
+                "`doris.buckets` = {value:?} should be rejected"
+            );
+        }
     }
 
     #[test]
