@@ -121,6 +121,7 @@ opensearch = { version = "2.3.0", features = ["rustls-tls"] }
 openssl = { workspace = true }
 parking_lot = { workspace = true }
 parquet = { version = "58", features = ["async"] }
+arrow-58-ipc = { package = "arrow-ipc", version = "58" }
 parse-display = "0.10"
 paste = "1"
 pg_bigdecimal = { git = "https://github.com/risingwavelabs/rust-pg_bigdecimal", rev = "0b7893d88894ca082b4525f94f812da034486f7c" }

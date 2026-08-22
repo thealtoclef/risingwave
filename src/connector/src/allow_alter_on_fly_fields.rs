@@ -247,6 +247,10 @@ pub static SINK_ALLOW_ALTER_ON_FLY_FIELDS: LazyLock<HashMap<String, HashSet<Stri
         std::any::type_name::<DorisConfig>().to_owned(),
         [
             "doris.stream_load.http.timeout.ms".to_owned(),
+            "doris.format".to_owned(),
+            "commit_checkpoint_interval".to_owned(),
+            "doris.max_batch_size_bytes".to_owned(),
+            "doris.strict_mode".to_owned(),
         ].into_iter().collect(),
     ).unwrap();
     // IcebergConfig

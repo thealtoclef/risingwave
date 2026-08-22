@@ -71,6 +71,7 @@ use decouple_checkpoint_log_sink::{
     COMMIT_CHECKPOINT_INTERVAL, DEFAULT_COMMIT_CHECKPOINT_INTERVAL_WITH_SINK_DECOUPLE,
     DEFAULT_COMMIT_CHECKPOINT_INTERVAL_WITHOUT_SINK_DECOUPLE,
 };
+use doris::DORIS_SINK;
 use futures::future::BoxFuture;
 use opendal::Error as OpendalError;
 use prometheus::Registry;
@@ -767,7 +768,12 @@ impl SinkWriterParam {
 fn is_sink_support_commit_checkpoint_interval(sink_name: &str) -> bool {
     matches!(
         sink_name,
-        ICEBERG_SINK | CLICKHOUSE_SINK | STARROCKS_SINK | DELTALAKE_SINK | SNOWFLAKE_SINK_V2
+        ICEBERG_SINK
+            | CLICKHOUSE_SINK
+            | STARROCKS_SINK
+            | DORIS_SINK
+            | DELTALAKE_SINK
+            | SNOWFLAKE_SINK_V2
     )
 }
 pub trait Sink: TryFrom<SinkParam, Error = SinkError> {

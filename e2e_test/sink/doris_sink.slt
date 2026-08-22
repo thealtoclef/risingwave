@@ -1,3 +1,16 @@
+# The `s6_decoupled` case near the end of this file deliberately leaves its objects behind: `DROP
+# SINK` does not drain a decoupled sink's log store, and nothing a test can issue does either, so
+# its rows have to land through natural interval commits while this file runs and the CI script
+# asserts them afterwards. Drop those leftovers up front so the file can be re-run in place.
+statement ok
+DROP SINK IF EXISTS s6_decoupled;
+
+statement ok
+DROP MATERIALIZED VIEW IF EXISTS mv6_decoupled;
+
+statement ok
+DROP TABLE IF EXISTS t6_decoupled;
+
 statement ok
 set sink_decouple = false;
 
@@ -21,8 +34,47 @@ FROM
     force_append_only='true'
 );
 
+# An invalid value must be rejected by the frontend, which validates before issuing any barrier, so
+# this is safe to run against a sink using the in-memory log store. Altering to a *valid* value is
+# covered further down on the decoupled sink; see the comment there for why it cannot be done here.
+statement error must be greater than 0
+ALTER SINK s6 CONNECTOR WITH (
+    commit_checkpoint_interval = '0'
+);
+
 statement ok
 INSERT INTO t6 VALUES (1, 1, 1, 1.1, 1.2, 'test', '2013-01-01', '2013-01-01 01:01:01' , false, '{"a":1}');
+
+statement ok
+FLUSH;
+
+# Same `doris.url` (FE on 8030) for schema, but `doris.stream_load_url` overrides the
+# stream-load endpoint so the sink writes directly to the BE on 8040 and skips the
+# FE → BE 307 redirect. `doris.url` is still used for the `/_schema` lookup during sink
+# creation, so the FE must remain reachable for that purpose.
+statement ok
+CREATE TABLE t6_direct (v1 int primary key, v2 smallint, v3 bigint, v4 real, v5 float, v6 varchar, v7 date, v8 timestamp, v9 boolean, v10 jsonb);
+
+statement ok
+CREATE MATERIALIZED VIEW mv6_direct AS SELECT * FROM t6_direct;
+
+statement ok
+CREATE SINK s6_direct
+FROM
+    mv6_direct WITH (
+    connector = 'doris',
+    type = 'append-only',
+    doris.url = 'http://doris-server:8030',
+    doris.stream_load_url = 'http://doris-server:8040',
+    doris.user = 'users',
+    doris.password = '123456',
+    doris.database = 'demo',
+    doris.table = 'demo_stream_load_url_table',
+    force_append_only = 'true'
+);
+
+statement ok
+INSERT INTO t6_direct VALUES (2, 2, 2, 2.1, 2.2, 'direct', '2014-02-02', '2014-02-02 02:02:02', true, '{"b":2}');
 
 statement ok
 FLUSH;
@@ -53,6 +105,302 @@ INSERT INTO t6_variant VALUES (1, '{"nested":[1,2]}');
 statement ok
 FLUSH;
 
+# Auto-create: the target Doris table `demo_auto_create_table` is NOT pre-created by the CI
+# setup. Creating this upsert sink should auto-create the database (if missing) and a
+# UNIQUE KEY table over the MySQL-protocol port before the sink starts loading.
+statement ok
+CREATE TABLE t6_auto (v1 int primary key, v2 varchar, v3 bigint);
+
+statement ok
+CREATE MATERIALIZED VIEW mv6_auto AS SELECT * FROM t6_auto;
+
+statement ok
+CREATE SINK s6_auto
+FROM
+    mv6_auto WITH (
+    connector = 'doris',
+    type = 'upsert',
+    primary_key = 'v1',
+    doris.url = 'http://doris-server:8030',
+    doris.query_url = 'mysql://doris-server:9030',
+    doris.user = 'users',
+    doris.password = '123456',
+    doris.database = 'demo',
+    doris.table = 'demo_auto_create_table',
+    doris.replication_num = '1',
+    auto_create = 'true'
+);
+
+statement ok
+INSERT INTO t6_auto VALUES (1, 'auto', 100);
+
+statement ok
+FLUSH;
+
+# Auto-create with `doris.partition_by` in the bare (LIST) form emits
+# `AUTO PARTITION BY LIST(`v1`, `v2`)()`, so the auto-created table is partitioned on the
+# enumerated `(v1, v2)` key values. The sink's partition-column validation runs before any DDL
+# (both columns exist in the sink schema, are key columns, and are LIST-allowable types).
+statement ok
+CREATE TABLE t6_part (v1 int primary key, v2 varchar, v3 bigint);
+
+statement ok
+CREATE MATERIALIZED VIEW mv6_part AS SELECT * FROM t6_part;
+
+statement ok
+CREATE SINK s6_part
+FROM
+    mv6_part WITH (
+    connector = 'doris',
+    type = 'upsert',
+    primary_key = 'v1,v2',
+    doris.url = 'http://doris-server:8030',
+    doris.query_url = 'mysql://doris-server:9030',
+    doris.user = 'users',
+    doris.password = '123456',
+    doris.database = 'demo',
+    doris.table = 'demo_auto_partition_table',
+    doris.replication_num = '1',
+    doris.partition_by = 'v1,v2',
+    auto_create = 'true'
+);
+
+statement ok
+INSERT INTO t6_part VALUES (1, 'a', 100), (2, 'b', 200);
+
+statement ok
+FLUSH;
+
+# The upsert auto-LIST table is a UNIQUE KEY table, which cannot use RANDOM distribution, so the
+# sink sizes the buckets from the alive BE count: `DISTRIBUTED BY HASH(`v1`,`v2`) BUCKETS <n>`.
+system ok retry 10 backoff 1s
+test "$(mysql -uroot -N -B -h doris-server -P 9030 -e "show create table demo.demo_auto_partition_table;" | grep -c 'DISTRIBUTED BY HASH')" = "1"
+
+# TIMESTAMPTZ: RisingWave's `timestamptz` value should land in Doris's native `TIMESTAMPTZ`
+# column (Doris 4.x) with the underlying UTC instant preserved. Doris stores in UTC and
+# re-renders in the session timezone at read time. The encoder emits RFC3339 with `Z` so
+# Doris interprets the string as the correct UTC instant instead of using the session TZ.
+statement ok
+CREATE TABLE t6_tstz (v1 int primary key, v2 timestamptz);
+
+statement ok
+CREATE MATERIALIZED VIEW mv6_tstz AS SELECT * FROM t6_tstz;
+
+statement ok
+CREATE SINK s6_tstz
+FROM
+    mv6_tstz WITH (
+    connector = 'doris',
+    type = 'upsert',
+    primary_key = 'v1',
+    doris.url = 'http://doris-server:8030',
+    doris.user = 'users',
+    doris.password = '123456',
+    doris.database = 'demo',
+    doris.table = 'demo_tstz_table'
+);
+
+statement ok
+INSERT INTO t6_tstz VALUES (1, '2024-01-02 03:04:05.123456+00:00'::timestamptz);
+
+statement ok
+FLUSH;
+
+# An upsert sink whose schema covers only part of the Doris table would replace the whole row on
+# every update, silently resetting the columns it never mentions. That is rejected unless partial
+# update is enabled.
+statement ok
+CREATE TABLE t6_partial (v1 int primary key, v2 varchar);
+
+statement ok
+CREATE MATERIALIZED VIEW mv6_partial AS SELECT * FROM t6_partial;
+
+statement error doris.partial_update
+CREATE SINK s6_partial_rejected
+FROM
+    mv6_partial WITH (
+    connector = 'doris',
+    type = 'upsert',
+    primary_key = 'v1',
+    doris.url = 'http://doris-server:8030',
+    doris.user = 'users',
+    doris.password = '123456',
+    doris.database = 'demo',
+    doris.table = 'demo_partial_update_table'
+);
+
+# With `doris.partial_update` on, only `v1`/`v2` are sent, so `v3` keeps the value the CI fixture
+# seeded. This also covers the `columns` request header, which Doris requires for partial updates.
+statement ok
+CREATE SINK s6_partial
+FROM
+    mv6_partial WITH (
+    connector = 'doris',
+    type = 'upsert',
+    primary_key = 'v1',
+    doris.url = 'http://doris-server:8030',
+    doris.user = 'users',
+    doris.password = '123456',
+    doris.database = 'demo',
+    doris.table = 'demo_partial_update_table',
+    doris.partial_update = 'true'
+);
+
+statement ok
+INSERT INTO t6_partial VALUES (1, 'patched');
+
+statement ok
+FLUSH;
+
+# A Doris integer column narrower than the RisingWave one is rejected: Doris would store an
+# out-of-range value as NULL and still report the load as a success.
+statement ok
+CREATE TABLE t6_narrow (v1 int primary key, v2 int);
+
+statement ok
+CREATE MATERIALIZED VIEW mv6_narrow AS SELECT * FROM t6_narrow;
+
+statement error Column type don't match
+CREATE SINK s6_narrow
+FROM
+    mv6_narrow WITH (
+    connector = 'doris',
+    type = 'append-only',
+    force_append_only = 'true',
+    doris.url = 'http://doris-server:8030',
+    doris.user = 'users',
+    doris.password = '123456',
+    doris.database = 'demo',
+    doris.table = 'demo_narrow_table'
+);
+
+# A small `doris.max_batch_size_bytes` forces the writer to split one chunk across several stream
+# loads. Every row must still land exactly once: each split is an independently committed load, and
+# the sink verifies each one's loaded-row accounting separately.
+statement ok
+CREATE TABLE t6_split (v1 int primary key, v2 varchar);
+
+statement ok
+CREATE MATERIALIZED VIEW mv6_split AS SELECT * FROM t6_split;
+
+statement ok
+CREATE SINK s6_split
+FROM
+    mv6_split WITH (
+    connector = 'doris',
+    type = 'append-only',
+    force_append_only = 'true',
+    doris.url = 'http://doris-server:8030',
+    doris.user = 'users',
+    doris.password = '123456',
+    doris.database = 'demo',
+    doris.table = 'demo_split_table',
+    doris.max_batch_size_bytes = '64'
+);
+
+statement error must be greater than 0
+ALTER SINK s6_split CONNECTOR WITH (
+    doris.max_batch_size_bytes = '0'
+);
+
+# Each row's JSON is roughly 40 bytes, so a 64-byte cap admits one row per load and the three rows
+# below are split across three separate Doris loads.
+statement ok
+INSERT INTO t6_split VALUES (1, 'aaaaaaaaaaaaaaaaaaaa'), (2, 'bbbbbbbbbbbbbbbbbbbb'), (3, 'cccccccccccccccccccc');
+
+statement ok
+FLUSH;
+
+# `commit_checkpoint_interval` > 1 batches several checkpoints into one Doris stream load, which
+# needs sink decoupling. Deliberately no `DROP SINK` for this case: dropping a decoupled sink does
+# not flush it, so the rows must land through natural interval commits during the run. The CI
+# script asserts the contents with a bounded retry loop to absorb the decoupled reader's lag.
+statement ok
+set sink_decouple = true;
+
+statement ok
+CREATE TABLE t6_decoupled (v1 int primary key, v2 varchar);
+
+statement ok
+CREATE MATERIALIZED VIEW mv6_decoupled AS SELECT * FROM t6_decoupled;
+
+statement ok
+CREATE SINK s6_decoupled
+FROM
+    mv6_decoupled WITH (
+    connector = 'doris',
+    type = 'upsert',
+    primary_key = 'v1',
+    doris.url = 'http://doris-server:8030',
+    doris.user = 'users',
+    doris.password = '123456',
+    doris.database = 'demo',
+    doris.table = 'demo_decoupled_table',
+    commit_checkpoint_interval = '2'
+);
+
+# Four insert/update rounds, so more than one interval window closes during the run. Rows 1 and 2
+# are rewritten in later rounds, which puts repeated primary keys inside a single stream load —
+# the one case where the sink's loaded-rows accounting check could legitimately diverge if Doris
+# counted merge-on-write dedup before reporting `NumberLoadedRows`.
+statement ok
+INSERT INTO t6_decoupled VALUES (1, 'r1'), (2, 'r1');
+
+statement ok
+FLUSH;
+
+statement ok
+UPDATE t6_decoupled SET v2 = 'r2' WHERE v1 = 1;
+
+statement ok
+FLUSH;
+
+statement ok
+INSERT INTO t6_decoupled VALUES (3, 'r3');
+
+statement ok
+FLUSH;
+
+statement ok
+UPDATE t6_decoupled SET v2 = 'r4' WHERE v1 = 2;
+
+statement ok
+FLUSH;
+
+# Both new options must be alterable on the fly: `commit_checkpoint_interval` to retune commit
+# frequency, and `doris.strict_mode` as the documented escape hatch for a sink stalled on an
+# unconvertible row. Both are altered in one statement.
+#
+# This runs against the *decoupled* sink on purpose. A sink created with `sink_decouple = false`
+# uses the bounded in-memory log store, which cannot rewind, so `ALTER SINK ... CONNECTOR WITH`
+# applies the change by deliberately triggering a cluster recovery — and the statement itself then
+# races that recovery, failing with `failed to collect barrier` often enough to be flaky. A
+# decoupled sink rewinds its log reader and applies the change in place, so this is deterministic.
+#
+# The rounds above have already run at `commit_checkpoint_interval = 2`, so lowering it to 1 here
+# does not weaken that coverage. Rewinding re-sends rows the sink may have already committed, which
+# is idempotent on this UNIQUE KEY merge-on-write table and leaves the expected contents unchanged.
+statement ok
+ALTER SINK s6_decoupled CONNECTOR WITH (
+    commit_checkpoint_interval = '1',
+    doris.strict_mode = 'false'
+);
+
+query I
+select count(*)
+from rw_sinks
+where name = 's6_decoupled'
+  and definition ILIKE '%commit_checkpoint_interval = ''1''%'
+  and definition ILIKE '%doris.strict_mode = ''false''%';
+----
+1
+
+statement ok
+FLUSH;
+
+statement ok
+set sink_decouple = false;
+
 statement ok
 DROP SINK s6;
 
@@ -63,6 +411,15 @@ statement ok
 DROP TABLE t6;
 
 statement ok
+DROP SINK s6_direct;
+
+statement ok
+DROP MATERIALIZED VIEW mv6_direct;
+
+statement ok
+DROP TABLE t6_direct;
+
+statement ok
 DROP SINK s6_variant;
 
 statement ok
@@ -70,3 +427,264 @@ DROP MATERIALIZED VIEW mv6_variant;
 
 statement ok
 DROP TABLE t6_variant;
+
+statement ok
+DROP SINK s6_auto;
+
+statement ok
+DROP MATERIALIZED VIEW mv6_auto;
+
+statement ok
+DROP TABLE t6_auto;
+
+statement ok
+DROP SINK s6_part;
+
+statement ok
+DROP MATERIALIZED VIEW mv6_part;
+
+statement ok
+DROP TABLE t6_part;
+
+statement ok
+DROP SINK s6_tstz;
+
+statement ok
+DROP MATERIALIZED VIEW mv6_tstz;
+
+statement ok
+DROP TABLE t6_tstz;
+
+statement ok
+DROP SINK s6_partial;
+
+statement ok
+DROP MATERIALIZED VIEW mv6_partial;
+
+statement ok
+DROP TABLE t6_partial;
+
+statement ok
+DROP MATERIALIZED VIEW mv6_narrow;
+
+statement ok
+DROP TABLE t6_narrow;
+
+statement ok
+DROP SINK s6_split;
+
+statement ok
+DROP MATERIALIZED VIEW mv6_split;
+
+statement ok
+DROP TABLE t6_split;
+
+# Arrow + full type coverage. This auto-creates a Doris table covering the RisingWave types the
+# sink supports, and loads through `doris.format = 'arrow'` — the Arrow IPC path. It is also the
+# regression test for the Arrow routing bug where `Jsonb` columns (whose Arrow field is a `Utf8`
+# extension) were routed to a fallback that rejected them.
+#
+# `DECIMAL` is covered here too: Doris historically crashed the BE on a decimal arrow load
+# (`DataTypeDecimalSerDe::read_column_from_arrow` segfaulted on a Utf8 decimal array), but the
+# Doris fix that accepts decimal-as-string on the Arrow path is now required for this case to pass.
+statement ok
+CREATE TABLE t6_arrow (v1 int primary key, v2 smallint, v3 bigint, v4 real, v5 float, v6 varchar, v7 date, v8 timestamp, v9 boolean, v10 jsonb, v11 decimal, v12 time, v13 interval, v14 bytea, v15 rw_int256, v16 struct<a int, b varchar>, v17 varchar[], v18 map(varchar, int));
+
+statement ok
+CREATE MATERIALIZED VIEW mv6_arrow AS SELECT * FROM t6_arrow;
+
+statement ok
+CREATE SINK s6_arrow
+FROM
+    mv6_arrow WITH (
+    connector = 'doris',
+    type = 'upsert',
+    primary_key = 'v1',
+    doris.url = 'http://doris-server:8030',
+    doris.query_url = 'mysql://doris-server:9030',
+    doris.stream_load_url = 'http://doris-server:8040',
+    doris.user = 'users',
+    doris.password = '123456',
+    doris.database = 'demo',
+    doris.table = 'demo_arrow_table',
+    doris.replication_num = '1',
+    doris.format = 'arrow',
+    auto_create = 'true'
+);
+
+statement ok
+INSERT INTO t6_arrow VALUES (1, 2, 3, 4.5, 5.5, 'arrow', '2024-01-02', '2024-01-02 03:04:05', true, '{"a":1}', 1234567.89, '18:20:49', interval '4 hour', decode('De00BeEf', 'hex'), '123456789012345678901234567890'::rw_int256, row(1, 's'), array['a','b'], map {'k1': 1});
+
+statement ok
+FLUSH;
+
+# The arrow load committed. Check the row landed with the values that matter (id, jsonb, the
+# complex types, the decimal, the text fallbacks) rather than every column, keeping the assertion
+# robust to Doris text casts.
+system ok retry 10 backoff 1s
+test "$(mysql -uroot -N -B -h doris-server -P 9030 -e "select count(*) from demo.demo_arrow_table;")" = "1" && test "$(mysql -uroot -N -B -h doris-server -P 9030 -e "select v11 = 1234567.89 from demo.demo_arrow_table;")" = "1"
+
+statement ok
+DROP SINK s6_arrow;
+
+statement ok
+DROP MATERIALIZED VIEW mv6_arrow;
+
+statement ok
+DROP TABLE t6_arrow;
+
+# Append-only auto-create with no primary key. The sink omits `DISTRIBUTED BY` from the DDL, so
+# Doris auto-generates `DISTRIBUTED BY RANDOM BUCKETS AUTO` and auto-sizes the bucket count
+# (instead of the sink hashing on an arbitrary key-able column, which could skew). The assertion
+# below checks the created table carries that auto-generated distribution.
+statement ok
+CREATE TABLE t6_apnd (v1 int, v2 varchar, v3 bigint);
+
+statement ok
+CREATE MATERIALIZED VIEW mv6_apnd AS SELECT * FROM t6_apnd;
+
+statement ok
+CREATE SINK s6_apnd
+FROM
+    mv6_apnd WITH (
+    connector = 'doris',
+    type = 'append-only',
+    force_append_only = 'true',
+    doris.url = 'http://doris-server:8030',
+    doris.query_url = 'mysql://doris-server:9030',
+    doris.user = 'users',
+    doris.password = '123456',
+    doris.database = 'demo',
+    doris.table = 'demo_auto_append_table',
+    doris.replication_num = '1',
+    auto_create = 'true'
+);
+
+statement ok
+INSERT INTO t6_apnd VALUES (1, 'a', 100), (2, 'b', 200);
+
+statement ok
+FLUSH;
+
+# The append-only no-pk table was auto-distributed (`DISTRIBUTED BY RANDOM BUCKETS AUTO`), and
+# both rows landed. This asserts the sink omitted `DISTRIBUTED BY` so Doris generated RANDOM
+# (an explicit `DISTRIBUTED BY HASH(...) BUCKETS AUTO` would not match).
+system ok retry 10 backoff 1s
+test "$(mysql -uroot -N -B -h doris-server -P 9030 -e "select count(*) from demo.demo_auto_append_table;")" = "2" && test "$(mysql -uroot -N -B -h doris-server -P 9030 -e "show create table demo.demo_auto_append_table;" | grep -c 'DISTRIBUTED BY RANDOM')" = "1"
+
+statement ok
+DROP SINK s6_apnd;
+
+statement ok
+DROP MATERIALIZED VIEW mv6_apnd;
+
+statement ok
+DROP TABLE t6_apnd;
+
+# Auto-RANGE partition: `doris.partition_by = 'month(v2)'` emits
+# `AUTO PARTITION BY RANGE(date_trunc(`v2`, 'month'))()`. This exercises the RANGE form (which
+# keeps `BUCKETS AUTO`) and the date-trunc granularity. `demo_auto_range_table` is not
+# pre-created; the sink auto-creates it. The partition column `v2` must be a key column (Doris
+# requires partition columns to be key columns), so it is part of the sink's `primary_key`.
+statement ok
+CREATE TABLE t6_range (v1 int, v2 timestamp, PRIMARY KEY (v1, v2));
+
+statement ok
+CREATE MATERIALIZED VIEW mv6_range AS SELECT * FROM t6_range;
+
+statement ok
+CREATE SINK s6_range
+FROM
+    mv6_range WITH (
+    connector = 'doris',
+    type = 'upsert',
+    primary_key = 'v1,v2',
+    doris.url = 'http://doris-server:8030',
+    doris.query_url = 'mysql://doris-server:9030',
+    doris.user = 'users',
+    doris.password = '123456',
+    doris.database = 'demo',
+    doris.table = 'demo_auto_range_table',
+    doris.replication_num = '1',
+    doris.partition_by = 'month(v2)',
+    auto_create = 'true'
+);
+
+statement ok
+INSERT INTO t6_range VALUES (1, '2024-01-15 10:00:00'), (2, '2024-02-20 11:30:00');
+
+statement ok
+FLUSH;
+
+system ok retry 10 backoff 1s
+test "$(mysql -uroot -N -B -h doris-server -P 9030 -e "select count(*) from demo.demo_auto_range_table;")" = "2"
+
+statement ok
+DROP SINK s6_range;
+
+statement ok
+DROP MATERIALIZED VIEW mv6_range;
+
+statement ok
+DROP TABLE t6_range;
+
+# Auto schema change: a `CREATE SINK ... FROM <table>` with `auto.schema.change = 'true'`. Adding
+# and dropping a column on the source table must be applied to the Doris target by the sink
+# coordinator via `ALTER TABLE ... ADD/DROP COLUMN`.
+statement ok
+CREATE TABLE t6_schema (v1 int primary key, v2 varchar);
+
+statement ok
+CREATE SINK s6_schema
+FROM
+    t6_schema WITH (
+    connector = 'doris',
+    type = 'upsert',
+    primary_key = 'v1',
+    doris.url = 'http://doris-server:8030',
+    doris.query_url = 'mysql://doris-server:9030',
+    doris.user = 'users',
+    doris.password = '123456',
+    doris.database = 'demo',
+    doris.table = 'demo_schema_change_table',
+    doris.replication_num = '1',
+    auto.schema.change = 'true',
+    auto_create = 'true'
+);
+
+statement ok
+INSERT INTO t6_schema VALUES (1, 'a');
+
+statement ok
+FLUSH;
+
+# Add a column: the coordinator should ALTER the Doris table to add `v3`.
+statement ok
+ALTER TABLE t6_schema ADD COLUMN v3 int;
+
+statement ok
+FLUSH;
+
+# The Doris target now has the added `v3` column.
+system ok retry 10 backoff 1s
+test "$(mysql -uroot -N -B -h doris-server -P 9030 -e "select count(*) from information_schema.columns where table_schema='demo' and table_name='demo_schema_change_table' and column_name='v3';")" = "1"
+
+statement ok
+ALTER TABLE t6_schema DROP COLUMN v3;
+
+statement ok
+FLUSH;
+
+# The Doris target has dropped `v3` again.
+system ok retry 10 backoff 1s
+test "$(mysql -uroot -N -B -h doris-server -P 9030 -e "select count(*) from information_schema.columns where table_schema='demo' and table_name='demo_schema_change_table' and column_name='v3';")" = "0"
+
+statement ok
+DROP SINK s6_schema;
+
+statement ok
+DROP TABLE t6_schema;
+
+# `s6_decoupled` / `mv6_decoupled` / `t6_decoupled` are intentionally left in place: the CI script
+# asserts the Doris contents after this file finishes, and dropping a decoupled sink does not flush
+# it. Cleanup relies on container teardown in CI, or `./risedev slt-clean` locally.
