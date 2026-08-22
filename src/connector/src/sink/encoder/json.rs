@@ -103,7 +103,9 @@ impl JsonEncoder {
         doris_config: DorisJsonConfig,
     ) -> Self {
         let config = JsonEncoderConfig {
-            time_handling_mode: TimeHandlingMode::Milli,
+            // `Time` has no Doris column type and is stored as text via the fallback (a `STRING`
+            // column), so emit it as `"HH:MM:SS.ffffff"` rather than a bare millisecond integer.
+            time_handling_mode: TimeHandlingMode::String,
             date_handling_mode: DateHandlingMode::String,
             timestamp_handling_mode: TimestampHandlingMode::String,
             timestamptz_handling_mode: TimestamptzHandlingMode::UtcWithoutSuffix,
@@ -256,12 +258,21 @@ fn datum_to_json_object(
         (DataType::Int64, ScalarRefImpl::Int64(v)) => {
             json!(v)
         }
+        // `Int256` is stored as text in Doris (via the fallback), so emit it as its plain decimal
+        // string — the same `ToText` form used by the Arrow path — rather than a JSON number (which
+        // would lose precision past 2^53).
+        (DataType::Int256, ScalarRefImpl::Int256(v)) => {
+            json!(v.to_text())
+        }
         (DataType::Serial, ScalarRefImpl::Serial(v)) => {
-            if matches!(&config.custom_json_type, CustomJsonType::Turbopuffer) {
-                json!(v.into_inner())
-            } else {
-                // The serial type needs to be handled as a string to prevent primary key conflicts caused by the precision issues of JSON numbers.
-                json!(format!("{:#018x}", v.into_inner()))
+            match &config.custom_json_type {
+                CustomJsonType::Turbopuffer => json!(v.into_inner()),
+                // Doris stores the value as text (a `STRING` column), so emit the plain decimal
+                // form — the same as the Arrow path and what `SELECT` shows — rather than hex.
+                CustomJsonType::Doris(_) => json!(v.to_text()),
+                // The generic path keeps a hex string so the value survives JSON number precision
+                // loss (serial is often a primary key).
+                _ => json!(format!("{:#018x}", v.into_inner())),
             }
         }
         (DataType::Float32, ScalarRefImpl::Float32(v)) => {
@@ -276,8 +287,12 @@ fn datum_to_json_object(
         // Doris/Starrocks will convert out-of-bounds decimal and -INF, INF, NAN to NULL
         (DataType::Decimal, ScalarRefImpl::Decimal(mut v)) => match &config.custom_json_type {
             CustomJsonType::Doris(config) => {
-                let s = config.decimal_scale.get(&field.name).unwrap();
-                v.rescale(*s as u32);
+                // The per-column scale map is keyed by top-level column name. Nested decimals
+                // (inside LIST/MAP/STRUCT) have no such entry — emit them at their own scale
+                // rather than panicking.
+                if let Some(s) = config.decimal_scale.get(&field.name) {
+                    v.rescale(*s as u32);
+                }
                 json!(v.to_text())
             }
             CustomJsonType::Turbopuffer => {
@@ -300,7 +315,19 @@ fn datum_to_json_object(
             }
         },
         (DataType::Timestamptz, ScalarRefImpl::Timestamptz(v)) => {
-            match config.timestamptz_handling_mode {
+            // Per-column override for Doris: when the target column is `TIMESTAMPTZ`, switch
+            // into a tz-bearing string (`...Z`) so Doris accepts the value as the same UTC instant
+            // and only re-renders the offset on read. Columns mapped to `DATETIME` keep the
+            // configured (typically naive-UTC) mode.
+            let mode = match &config.custom_json_type {
+                CustomJsonType::Doris(cfg)
+                    if cfg.tstz_target_columns.contains(field.name.as_str()) =>
+                {
+                    TimestamptzHandlingMode::UtcString
+                }
+                _ => config.timestamptz_handling_mode,
+            };
+            match mode {
                 TimestamptzHandlingMode::UtcString => {
                     let parsed = v.to_datetime_utc();
                     let v = parsed.to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
@@ -377,6 +404,26 @@ fn datum_to_json_object(
                 vec.push(value);
             }
             json!(vec)
+        }
+        (DataType::Map(map_type), ScalarRefImpl::Map(map_ref)) => {
+            // Doris accepts a MAP column as a JSON object whose keys are strings, so each
+            // `(key, value)` pair becomes an object member. The key may be any Doris-supported
+            // scalar type; it is stringified here just as it would appear in the JSON body.
+            let mut obj = serde_json::Map::with_capacity(map_ref.iter().len());
+            for (k, v) in map_ref.iter() {
+                let key =
+                    datum_to_json_object(&Field::unnamed(map_type.key().clone()), Some(k), config)?;
+                let value =
+                    datum_to_json_object(&Field::unnamed(map_type.value().clone()), v, config)?;
+                // `Value::to_string()` JSON-encodes, so a string key would land as the literal
+                // `"\"foo\""` (quotes included). Unwrap it: Doris map keys are plain strings.
+                let key = match key {
+                    Value::String(s) => s,
+                    other => other.to_string(),
+                };
+                obj.insert(key, value);
+            }
+            Value::Object(obj)
         }
         (DataType::Vector(_), ScalarRefImpl::Vector(vector)) => {
             let elems = vector.as_raw_slice();
@@ -517,8 +564,8 @@ fn type_as_json_schema(rw_type: &DataType) -> Map<String, Value> {
 mod tests {
     use risingwave_common::row::OwnedRow;
     use risingwave_common::types::{
-        Date, Decimal, Interval, Scalar, ScalarImpl, StructRef, StructType, StructValue, Time,
-        Timestamp,
+        Date, Decimal, Interval, ListValue, MapType, MapValue, Scalar, ScalarImpl, StructRef,
+        StructType, StructValue, Time, Timestamp,
     };
 
     use super::*;
@@ -766,6 +813,7 @@ mod tests {
             custom_json_type: CustomJsonType::Doris(DorisJsonConfig {
                 decimal_scale,
                 variant_columns: HashSet::default(),
+                tstz_target_columns: HashSet::default(),
             }),
             jsonb_handling_mode: JsonbHandlingMode::String,
         };
@@ -821,6 +869,7 @@ mod tests {
             custom_json_type: CustomJsonType::Doris(DorisJsonConfig {
                 decimal_scale: HashMap::default(),
                 variant_columns: HashSet::default(),
+                tstz_target_columns: HashSet::default(),
             }),
             jsonb_handling_mode: JsonbHandlingMode::String,
         };
@@ -896,12 +945,55 @@ mod tests {
                 custom_json_type: CustomJsonType::Doris(DorisJsonConfig {
                     decimal_scale: HashMap::default(),
                     variant_columns: HashSet::from(["variant_col".to_owned()]),
+                    tstz_target_columns: HashSet::default(),
                 }),
                 jsonb_handling_mode: JsonbHandlingMode::String,
             },
         )
         .unwrap();
         assert_eq!(variant_json_value, json!({"nested": [1, 2, 3]}));
+    }
+
+    #[test]
+    fn test_doris_map_encoding() {
+        // A Doris `MAP<K,V>` column is encoded as a JSON object with string keys, e.g.
+        // `{1: "a", 2: "b"}` becomes `{"1":"a","2":"b"}`.
+        let config = JsonEncoderConfig {
+            time_handling_mode: TimeHandlingMode::String,
+            date_handling_mode: DateHandlingMode::String,
+            timestamp_handling_mode: TimestampHandlingMode::String,
+            timestamptz_handling_mode: TimestamptzHandlingMode::UtcString,
+            custom_json_type: CustomJsonType::Doris(DorisJsonConfig {
+                decimal_scale: HashMap::default(),
+                variant_columns: HashSet::default(),
+                tstz_target_columns: HashSet::default(),
+            }),
+            jsonb_handling_mode: JsonbHandlingMode::String,
+        };
+        let map_type = MapType::from_kv(DataType::Int32, DataType::Varchar);
+        let keys = ListValue::from_datum_iter(
+            &DataType::Int32,
+            [Some(ScalarImpl::Int32(1)), Some(ScalarImpl::Int32(2))],
+        );
+        let values = ListValue::from_datum_iter(
+            &DataType::Varchar,
+            [
+                Some(ScalarImpl::Utf8("a".into())),
+                Some(ScalarImpl::Utf8("b".into())),
+            ],
+        );
+        let map = MapValue::try_from_kv(keys, values).unwrap();
+        let value = datum_to_json_object(
+            &Field {
+                description: None,
+                data_type: DataType::Map(map_type),
+                name: "m".into(),
+            },
+            Some(ScalarImpl::Map(map).as_scalar_ref_impl()),
+            &config,
+        )
+        .unwrap();
+        assert_eq!(value, json!({"1":"a","2":"b"}));
     }
 
     #[test]
@@ -996,5 +1088,113 @@ mod tests {
                 .to_string();
         let ans = r#"{"fields":[{"field":"v1","optional":true,"type":"boolean"},{"field":"v2","optional":true,"type":"int16"},{"field":"v3","optional":true,"type":"int32"},{"field":"v4","optional":true,"type":"float"},{"field":"v5","optional":true,"type":"string"},{"field":"v6","optional":true,"type":"int32"},{"field":"v7","optional":true,"type":"string"},{"field":"v8","optional":true,"type":"int64"},{"field":"v9","optional":true,"type":"string"},{"field":"v10","fields":[{"field":"a","optional":true,"type":"int64"},{"field":"b","optional":true,"type":"string"},{"field":"c","fields":[{"field":"aa","optional":true,"type":"int64"},{"field":"bb","optional":true,"type":"double"}],"optional":true,"type":"struct"}],"optional":true,"type":"struct"},{"field":"v11","items":{"items":{"fields":[{"field":"aa","optional":true,"type":"int64"},{"field":"bb","optional":true,"type":"double"}],"optional":true,"type":"struct"},"optional":true,"type":"array"},"optional":true,"type":"array"},{"field":"12","optional":true,"type":"string"},{"field":"13","optional":true,"type":"string"},{"field":"14","optional":true,"type":"string"}],"name":"test","optional":false,"type":"struct"}"#;
         assert_eq!(schema, ans);
+    }
+
+    #[test]
+    fn test_doris_tstz_target_columns_force_rfc3339_format() {
+        // When the Doris column type is `TIMESTAMPTZ`, the encoder must emit a tz-bearing string
+        // (`...Z`) regardless of the global `timestamptz_handling_mode` so Doris stores the
+        // value as a UTC instant. A column *not* listed in `tstz_target_columns` keeps the
+        // configured (typically naive-UTC) mode.
+        let doris_override = JsonEncoderConfig {
+            time_handling_mode: TimeHandlingMode::String,
+            date_handling_mode: DateHandlingMode::String,
+            timestamp_handling_mode: TimestampHandlingMode::String,
+            timestamptz_handling_mode: TimestamptzHandlingMode::UtcWithoutSuffix,
+            custom_json_type: CustomJsonType::Doris(DorisJsonConfig {
+                decimal_scale: HashMap::default(),
+                variant_columns: HashSet::default(),
+                tstz_target_columns: HashSet::from(["ts_tz".to_owned()]),
+            }),
+            jsonb_handling_mode: JsonbHandlingMode::String,
+        };
+        let tstz_field = Field {
+            description: None,
+            data_type: DataType::Timestamptz,
+            name: "ts_tz".to_owned(),
+        };
+        let naive_field = Field {
+            description: None,
+            data_type: DataType::Timestamptz,
+            name: "ts_naive".to_owned(),
+        };
+
+        // Same timestamp value used for both columns.
+        let parsed: risingwave_common::types::Timestamptz =
+            "2024-01-02T03:04:05.123456Z".parse().unwrap();
+
+        let overridden = datum_to_json_object(
+            &tstz_field,
+            Some(ScalarImpl::Timestamptz(parsed).as_scalar_ref_impl()),
+            &doris_override,
+        )
+        .unwrap();
+        // RFC3339 with `Z`, microsecond precision.
+        assert_eq!(overridden, json!("2024-01-02T03:04:05.123456Z"));
+
+        let naive = datum_to_json_object(
+            &naive_field,
+            Some(ScalarImpl::Timestamptz(parsed).as_scalar_ref_impl()),
+            &doris_override,
+        )
+        .unwrap();
+        // Not in tstz_target_columns, so the global UtcWithoutSuffix mode applies.
+        assert_eq!(naive, json!("2024-01-02 03:04:05.123456"));
+    }
+
+    #[test]
+    fn test_doris_fallback_types_encode_as_strings() {
+        // Types with no natural Doris column are stored as text, so the Doris encoder must emit
+        // them as plain strings (`ToText` form / base64) rather than ints or native JSON numbers.
+        let config = JsonEncoderConfig {
+            // `Time` is `"HH:MM:SS.ffffff"` (this is the mode `new_with_doris` sets).
+            time_handling_mode: TimeHandlingMode::String,
+            date_handling_mode: DateHandlingMode::String,
+            timestamp_handling_mode: TimestampHandlingMode::String,
+            timestamptz_handling_mode: TimestamptzHandlingMode::UtcWithoutSuffix,
+            custom_json_type: CustomJsonType::Doris(DorisJsonConfig {
+                decimal_scale: HashMap::default(),
+                variant_columns: HashSet::default(),
+                tstz_target_columns: HashSet::default(),
+            }),
+            jsonb_handling_mode: JsonbHandlingMode::String,
+        };
+
+        let field_of = |data_type: DataType| Field {
+            description: None,
+            data_type,
+            name: "c".to_owned(),
+        };
+
+        // `Time` is `"HH:MM:SS.ffffff"`, not a millisecond integer.
+        let time = datum_to_json_object(
+            &field_of(DataType::Time),
+            Some(
+                ScalarImpl::Time(Time::from_num_seconds_from_midnight_uncheck(1000, 0))
+                    .as_scalar_ref_impl(),
+            ),
+            &config,
+        )
+        .unwrap();
+        assert_eq!(time, json!("00:16:40.000000"));
+
+        // `Int256` is its plain decimal string (lossless, unlike a JSON number).
+        let int256 = datum_to_json_object(
+            &field_of(DataType::Int256),
+            Some(ScalarImpl::Int256(risingwave_common::types::Int256::from(42_i64)).as_scalar_ref_impl()),
+            &config,
+        )
+        .unwrap();
+        assert_eq!(int256, json!("42"));
+
+        // `Serial` is its plain decimal form (Doris stores it in a `BIGINT` column, and the
+        // stream-load converter parses the numeric string into it), not hex.
+        let serial = datum_to_json_object(
+            &field_of(DataType::Serial),
+            Some(ScalarImpl::Serial(risingwave_common::types::Serial::from(1_i64)).as_scalar_ref_impl()),
+            &config,
+        )
+        .unwrap();
+        assert_eq!(serial, json!("1"));
     }
 }
