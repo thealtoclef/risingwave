@@ -142,10 +142,15 @@ impl TimestamptzHandlingMode {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct DorisJsonConfig {
     pub decimal_scale: HashMap<String, u8>,
     pub variant_columns: HashSet<String>,
+    /// Columns whose target Doris column type is `TIMESTAMPTZ`. Used by the JSON encoder to
+    /// switch `Timestamptz` values into a tz-bearing string (`...Z` / `...+HH:MM`) that Doris
+    /// `TIMESTAMPTZ` columns accept on the stream-load endpoint, while leaving other `Timestamptz`
+    /// columns (e.g. against `DATETIME`) on the default naive-UTC string behaviour.
+    pub tstz_target_columns: HashSet<String>,
 }
 
 #[derive(Clone)]

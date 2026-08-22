@@ -220,6 +220,31 @@ DorisConfig:
   - name: doris.url
     field_type: String
     required: true
+  - name: doris.query_url
+    field_type: String
+    comments: |-
+      The full MySQL-protocol Doris FE URL with an explicit port, used for DDL when
+      `create_table_if_not_exists` is enabled or schema change is used, e.g. `mysql://query-fe:9030`.
+    required: false
+  - name: doris.stream_load_url
+    field_type: String
+    comments: |-
+      The HTTP endpoint used for stream-load (`_stream_load`) requests. This must be a Doris BE
+      HTTP address (e.g. `http://be:8040`), or something that forwards to one; setting it makes
+      the sink stop probing for the FE → BE redirect, so an FE address here is rejected with an
+      error on the first load. When unset, stream loads go to the FE on `doris.url` and follow the
+      FE → BE 307 redirect.
+
+      Set this when the network topology makes the FE-issued redirect unusable: the FE
+      advertises BE addresses that aren't routable from RisingWave (a common Kubernetes case),
+      or the BEs are only reachable through a Service / load balancer. The FE on `doris.url` is
+      still used for schema (`/_schema`) lookups during sink creation, so it must remain
+      reachable for that purpose.
+
+      What you give up: the FE's load balancing across BEs and its failover away from a dead BE.
+      A single bare BE address is a single point of failure. Only one address is accepted; point
+      it at a Service or load balancer if you need more than one BE behind it.
+    required: false
   - name: doris.user
     field_type: String
     required: true
@@ -234,15 +259,146 @@ DorisConfig:
     required: true
   - name: doris.partial_update
     field_type: String
+    comments: |-
+      Enable partial update, so a sink whose schema covers only some of the target table's
+      columns updates just those columns instead of replacing the whole row. Accepts exactly
+      `'true'` or `'false'`.
     required: false
+  - name: create_table_if_not_exists
+    field_type: bool
+    comments: |-
+      Automatically create the target database and table if they don't exist. Defaults to false.
+      Accepts exactly `'true'` or `'false'`; other spellings are rejected.
+
+      The DDL runs during sink validation, so if `CREATE SINK` fails afterwards for an unrelated
+      reason the Doris table is left behind. This is deliberate: dropping a table because sink
+      creation failed would be a far worse failure mode.
+    required: false
+    default: Default::default
+  - name: doris.replication_num
+    field_type: String
+    comments: |-
+      Number of replicas for the auto-created table. Only used when
+      `create_table_if_not_exists` is enabled.
+      When unset, the Doris cluster default is used.
+    required: false
+  - name: partition_by
+    field_type: String
+    comments: |-
+      Partition the auto-created table by the given columns, materialized by Doris's
+      auto-partitioning. Only used when `create_table_if_not_exists` is enabled.
+
+      The value selects the partition kind by its shape, mirroring the Iceberg sink's
+      `partition_by` option:
+      - `month(ts)` (a date-trunc granularity applied to one column) partitions by RANGE:
+      `AUTO PARTITION BY RANGE(date_trunc(`ts`, 'month'))()`. The granularity is one of
+      `year`, `month`, `week`, `day`, `hour`, and the column must map to a Doris
+      `DATE`/`DATETIME`/`TIMESTAMPTZ` type (a RisingWave `Date`, `Timestamp`, or
+      `Timestamptz`).
+      - bare column(s) partition by LIST: `a` becomes
+      `AUTO PARTITION BY LIST(`a`)()`, and `a, b` becomes a multi-column
+      `AUTO PARTITION BY LIST(`a`, `b`)()`. Each column must be a key column with a
+      Doris-allowable LIST partition type.
+
+      The function form and the bare form cannot be mixed: `month(ts), id` is rejected.
+      Because Doris auto-RANGE only accepts a `date_trunc` expression, a bare column
+      can only mean LIST, so the shape alone determines the partition kind.
+    required: false
+  - name: doris.timestamptz_as_datetime
+    field_type: bool
+    comments: |-
+      Store RisingWave `timestamptz` values in a Doris `DATETIME` column, accepting that the
+      timezone is lost. Defaults to false.
+
+      Doris 4 added a native `TIMESTAMPTZ` column (a UTC microsecond instant, rendered in the
+      session timezone on read), which is what the sink uses by default. Doris 3 has no such
+      type, so a `timestamptz` can only be written there as `DATETIME`, where Doris interprets
+      the value in the session timezone — the stored instant then depends on the FE/BE
+      `time_zone` setting rather than on the value. Set this option to accept that loss for a
+      Doris 3 target.
+    required: true
   - name: r#type
     field_type: String
     required: true
   - name: doris.stream_load.http.timeout.ms
     field_type: u64
-    comments: The timeout in milliseconds for stream load http request, defaults to 30 seconds.
+    comments: |-
+      The timeout in milliseconds for stream load http request. The default, 30 seconds, matches
+      Doris's default per-load timeout (`streaming_load_max_seconds`), not a hardcoded Doris limit.
     required: false
     default: 30 * 1000
+    allow_alter_on_fly: true
+  - name: doris.format
+    field_type: String
+    comments: |-
+      The stream-load body format, `"json"` (default) or `"arrow"`. Arrow is faster to ingest
+      because Doris reads the typed columns directly instead of parsing a JSON text body, and it
+      supports every type JSON does, including complex types.
+    required: false
+    default: DORIS_FORMAT_JSON . to_owned ()
+    allow_alter_on_fly: true
+  - name: commit_checkpoint_interval
+    field_type: u64
+    comments: |-
+      Set this option to a positive integer n and RisingWave will commit data to Doris every n
+      checkpoints. A value greater than 1 requires the `sink_decouple` session config to be
+      enabled. The default comes from the shared `DEFAULT_COMMIT_CHECKPOINT_INTERVAL_WITH_SINK_DECOUPLE`.
+
+      Doris has no multi-load transaction API, so every commit is one stream load and therefore
+      one new table version. Committing on every checkpoint is the main cause of the Doris
+      `-235 TOO_MANY_VERSIONS` error and of severe write amplification, which is why the default
+      is greater than 1.
+
+      The cost is latency and a wider replay window: a failure mid-interval replays up to n
+      checkpoints. On a UNIQUE KEY table that is idempotent, but on an append-only DUPLICATE KEY
+      table the replayed rows become real duplicate rows.
+    required: false
+    default: DEFAULT_COMMIT_CHECKPOINT_INTERVAL_WITH_SINK_DECOUPLE
+    allow_alter_on_fly: true
+  - name: doris.max_batch_size_bytes
+    field_type: u64
+    comments: |-
+      The maximum payload size in bytes of a single Doris stream load. Once
+      the current load reaches the cap it is committed and a new one is started, so this also
+      bounds the memory a writer holds for an in-flight load.
+
+      The cap is per writer: each sink actor runs its own stream load, so the total in-flight
+      payload scales with the sink's parallelism. The default is sized so a single writer stays
+      well under Doris's own per-load limit (default 100MB) without the total growing to the
+      limit times the actor count.
+
+      Note that a split here is *not* atomic with the rest of the epoch: each split is an
+      independently committed Doris load, so a mid-epoch failure leaves earlier splits committed
+      and they are re-sent on replay.
+
+      A single row whose payload exceeds the cap is still sent, as a load of its own, since a row
+      cannot be split across loads.
+    required: false
+    default: 32 * 1024 * 1024
+    allow_alter_on_fly: true
+  - name: doris.strict_mode
+    field_type: bool
+    comments: |-
+      Enable Doris strict mode, defaults to true. Accepts exactly `'true'` or `'false'`.
+
+      With strict mode on, a value Doris cannot convert to the target column type is counted as
+      a filtered row instead of being silently stored as NULL. Since the sink never raises
+      Doris's `max_filter_ratio` above 0, a filtered row fails the load, which surfaces the bad
+      value instead of corrupting the column.
+
+      The cost is that a single unconvertible row stalls the sink, retrying in place. To get
+      moving again at the price of the old silent-NULL behaviour, run
+      `ALTER SINK <name> CONNECTOR WITH (doris.strict_mode = 'false')` — this takes effect
+      immediately, even while the sink is stuck retrying.
+
+      Strict mode does **not** cover range restrictions: a value of the right type but outside
+      the column's declared range (for example a decimal exceeding its declared precision) is
+      still stored as NULL regardless of this setting. Nor does it cover precision truncation —
+      the Doris column's declared precision governs, so a `DATETIME(0)` target silently drops the
+      sub-second digits of a RisingWave `timestamp`, which Doris considers a successful
+      conversion. Declare the target column with the precision you want (`DATETIME(6)`).
+    required: false
+    default: 'true'
     allow_alter_on_fly: true
 DynamoDbConfig:
   fields:
