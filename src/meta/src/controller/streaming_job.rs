@@ -36,6 +36,7 @@ use risingwave_common::{bail, current_cluster_version};
 use risingwave_connector::allow_alter_on_fly_fields::check_sink_allow_alter_on_fly_fields;
 use risingwave_connector::connector_common::validate_connection;
 use risingwave_connector::error::ConnectorError;
+use risingwave_connector::sink::decouple_checkpoint_log_sink::COMMIT_CHECKPOINT_INTERVAL;
 use risingwave_connector::sink::file_sink::fs::FsSink;
 use risingwave_connector::sink::{CONNECTOR_TYPE_KEY, SinkError};
 use risingwave_connector::source::{
@@ -2951,7 +2952,8 @@ impl CatalogController {
             .one(&txn)
             .await?
             .ok_or_else(|| MetaError::catalog_id_not_found(ObjectType::Sink.as_str(), sink_id))?;
-        validate_sink_props(&sink, &props)?;
+        let is_decoupled = is_sink_decoupled(&txn, sink_id).await?;
+        validate_sink_props(&sink, &props, is_decoupled)?;
         let definition = sink.definition.clone();
         let [mut stmt]: [_; 1] = Parser::parse_sql(&definition)
             .map_err(|e| SinkError::Config(anyhow!(e)))?
@@ -3021,7 +3023,8 @@ impl CatalogController {
             .one(&txn)
             .await?
             .ok_or_else(|| MetaError::catalog_id_not_found(ObjectType::Sink.as_str(), sink_id))?;
-        validate_sink_props(&sink, &props)?;
+        let is_decoupled = is_sink_decoupled(&txn, sink_id).await?;
+        validate_sink_props(&sink, &props, is_decoupled)?;
 
         let definition = sink.definition.clone();
         let [mut stmt]: [_; 1] = Parser::parse_sql(&definition)
@@ -3710,7 +3713,47 @@ impl CatalogController {
     }
 }
 
-fn validate_sink_props(sink: &sink::Model, props: &BTreeMap<String, String>) -> MetaResult<()> {
+/// Whether the sink uses the KV log store (i.e. is commit-decoupled), determined from its persisted
+/// fragment. The CREATE-time session config `sink_decouple` is not persisted on the sink catalog, so
+/// the actual log store type in the fragment is the authoritative decouple state.
+async fn is_sink_decoupled(
+    txn: &DatabaseTransaction,
+    sink_id: SinkId,
+) -> MetaResult<bool> {
+    let fragments: Vec<(FragmentId, i32, StreamNode)> = Fragment::find()
+        .select_only()
+        .columns([
+            fragment::Column::FragmentId,
+            fragment::Column::FragmentTypeMask,
+            fragment::Column::StreamNode,
+        ])
+        .filter(fragment::Column::JobId.eq(sink_id))
+        .into_tuple()
+        .all(txn)
+        .await?;
+
+    let mut is_decoupled = false;
+    for (_, fragment_type_mask, stream_node) in fragments {
+        if fragment_type_mask & FragmentTypeFlag::Sink as i32 == 0 {
+            continue;
+        }
+        let stream_node = stream_node.to_protobuf();
+        visit_stream_node_body(&stream_node, |body| {
+            if let PbNodeBody::Sink(node) = body
+                && node.log_store_type == PbSinkLogStoreType::KvLogStore as i32
+            {
+                is_decoupled = true;
+            }
+        });
+    }
+    Ok(is_decoupled)
+}
+
+fn validate_sink_props(
+    sink: &sink::Model,
+    props: &BTreeMap<String, String>,
+    is_decoupled: bool,
+) -> MetaResult<()> {
     // Validate that props can be altered
     match sink.properties.inner_ref().get(CONNECTOR_TYPE_KEY) {
         Some(connector) => {
@@ -3725,7 +3768,25 @@ fn validate_sink_props(sink: &sink::Model, props: &BTreeMap<String, String>) -> 
                 {
                     let mut new_props = sink.properties.0.clone();
                     new_props.extend(props.clone());
-                    SinkType::validate_alter_config(&new_props)
+                    SinkType::validate_alter_config(&new_props)?;
+
+                    // The CREATE-time gate rejects `commit_checkpoint_interval > 1` when sink
+                    // decoupling is disabled (see `set_default_commit_checkpoint_interval`), but
+                    // `ALTER SINK ... CONNECTOR WITH` used to bypass it because the decouple state
+                    // is not persisted on the sink catalog. Re-enforce the same invariant here using
+                    // the persisted log store type.
+                    if let Some(interval) = new_props.get(COMMIT_CHECKPOINT_INTERVAL) {
+                        let interval = interval.parse::<u64>().map_err(|e| {
+                            SinkError::Config(anyhow!("invalid `commit_checkpoint_interval`: {e}"))
+                        })?;
+                        if interval > 1 && !is_decoupled {
+                            return Err(SinkError::Config(anyhow!(
+                                "config conflict: `commit_checkpoint_interval` larger than 1 means that sink decouple must be enabled, but this sink was created with sink_decouple = false"
+                            ))
+                            .into());
+                        }
+                    }
+                    Ok(())
                 },
                 |sink: &str| Err(SinkError::Config(anyhow!("unsupported sink type {}", sink)))
             )?

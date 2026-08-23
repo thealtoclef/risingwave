@@ -48,6 +48,18 @@ CREATE TABLE demo_variant_table(id int, v variant) UNIQUE KEY(\`id\`)
 DISTRIBUTED BY HASH(\`id\`) BUCKETS 1
 PROPERTIES (
     \"replication_allocation\" = \"tag.location.default: 1\"
+);
+DROP TABLE IF EXISTS demo_singleton_max;
+CREATE TABLE demo_singleton_max(mx bigint) DUPLICATE KEY(\`mx\`)
+DISTRIBUTED BY RANDOM BUCKETS 1
+PROPERTIES (
+    \"replication_allocation\" = \"tag.location.default: 1\"
+);
+DROP TABLE IF EXISTS demo_finding2_test;
+CREATE TABLE demo_finding2_test(v1 int, v2 varchar(100)) UNIQUE KEY(\`v1\`)
+DISTRIBUTED BY HASH(\`v1\`) BUCKETS 1
+PROPERTIES (
+    \"replication_allocation\" = \"tag.location.default: 1\"
 );"
 
   echo "--- create doris table"

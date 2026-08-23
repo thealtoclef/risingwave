@@ -21,6 +21,7 @@ use anyhow::anyhow;
 use async_trait::async_trait;
 use risingwave_common::bail;
 use risingwave_common::bitmap::Bitmap;
+use risingwave_common::hash::VnodeBitmapExt;
 use risingwave_pb::connector_service::SinkMetadata;
 use tracing::{info, warn};
 
@@ -64,13 +65,15 @@ impl<W: SinkWriter<CommitMetadata = Option<SinkMetadata>>> CoordinatedLogSinker<
                 .sink_coordinate_client()
                 .await,
             param,
+            // A singleton-distributed upstream (e.g. a global aggregate) has exactly one actor
+            // and meta renders it with `vnode_bitmap = None`. It still needs coordination (the
+            // coordinator applies schema changes exactly once), so fall back to the canonical
+            // singleton bitmap: a single actor owns all vnodes, which the coordinator aligns
+            // correctly (see `AligningRequests` in the sink coordination service).
             vnode_bitmap: writer_param
                 .vnode_bitmap
-                .as_ref()
-                .ok_or_else(|| {
-                    anyhow!("sink needs coordination and should not have singleton input")
-                })?
-                .clone(),
+                .clone()
+                .unwrap_or_else(|| Bitmap::singleton_arc().as_ref().clone()),
             commit_checkpoint_interval,
             commit_checkpoint_size_threshold_bytes,
             sink_writer_metrics: SinkWriterMetrics::new(writer_param),

@@ -401,6 +401,51 @@ FLUSH;
 statement ok
 set sink_decouple = false;
 
+# Regression test: `ALTER SINK ... CONNECTOR WITH (commit_checkpoint_interval > 1)` on a sink
+# created with `sink_decouple = false` (in-memory log store) must be rejected, matching the
+# CREATE-time gate. Previously the ALTER bypassed the gate because the decouple state is not
+# persisted on the sink catalog; now the meta ALTER path checks the sink's actual log store type.
+statement ok
+CREATE TABLE t6_decouple_gate (v1 int primary key, v2 varchar);
+
+statement ok
+CREATE MATERIALIZED VIEW mv6_decouple_gate AS SELECT * FROM t6_decouple_gate;
+
+statement ok
+CREATE SINK s6_decouple_gate
+FROM
+    mv6_decouple_gate WITH (
+    connector = 'doris',
+    type = 'append-only',
+    doris.url = 'http://doris-server:8030',
+    doris.user = 'users',
+    doris.password = '123456',
+    doris.database = 'demo',
+    doris.table = 'demo_finding2_test',
+    force_append_only = 'true',
+    commit_checkpoint_interval = '1'
+);
+
+statement error config conflict: `commit_checkpoint_interval` larger than 1 means that sink decouple must be enabled
+ALTER SINK s6_decouple_gate CONNECTOR WITH (
+    commit_checkpoint_interval = '2'
+);
+
+# Lowering the interval (or keeping it at 1) on a non-decoupled sink is still allowed.
+statement ok
+ALTER SINK s6_decouple_gate CONNECTOR WITH (
+    commit_checkpoint_interval = '1'
+);
+
+statement ok
+DROP SINK s6_decouple_gate;
+
+statement ok
+DROP MATERIALIZED VIEW mv6_decouple_gate;
+
+statement ok
+DROP TABLE t6_decouple_gate;
+
 statement ok
 DROP SINK s6;
 
@@ -627,6 +672,48 @@ DROP MATERIALIZED VIEW mv6_range;
 
 statement ok
 DROP TABLE t6_range;
+
+# A coordinated sink over a singleton-distributed upstream (a global aggregate) must start and
+# stream instead of failing at actor start with `sink needs coordination and should not have
+# singleton input`. Regression test for the singleton-input fix in `CoordinatedLogSinker`.
+statement ok
+CREATE TABLE t6_singleton (v1 int);
+
+statement ok
+CREATE MATERIALIZED VIEW mv6_singleton AS SELECT max(v1) AS mx FROM t6_singleton;
+
+statement ok
+CREATE SINK s6_singleton
+FROM
+    mv6_singleton WITH (
+    connector = 'doris',
+    type = 'append-only',
+    doris.url = 'http://doris-server:8030',
+    doris.user = 'users',
+    doris.password = '123456',
+    doris.database = 'demo',
+    doris.table = 'demo_singleton_max',
+    force_append_only = 'true'
+);
+
+statement ok
+INSERT INTO t6_singleton VALUES (1), (2), (3);
+
+statement ok
+FLUSH;
+
+# `max` is deterministic: the aggregated value must reach Doris.
+system ok retry 10 backoff 1s
+test "$(mysql -uroot -N -B -h doris-server -P 9030 -e "select max(mx) from demo.demo_singleton_max where mx is not null;")" = "3"
+
+statement ok
+DROP SINK s6_singleton;
+
+statement ok
+DROP MATERIALIZED VIEW mv6_singleton;
+
+statement ok
+DROP TABLE t6_singleton;
 
 # Auto schema change: a `CREATE SINK ... FROM <table>` with `auto.schema.change = 'true'`. Adding
 # and dropping a column on the source table must be applied to the Doris target by the sink
