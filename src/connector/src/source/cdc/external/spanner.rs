@@ -62,6 +62,14 @@ use crate::source::cdc::external::{
     ExternalTableReader, SchemaTableName,
 };
 
+/// Cap on concurrent partition executions per split during CDC backfill.
+///
+/// Each partition runs as an independent read and buffers its full result set
+/// before yielding, so this bounds both in-flight reads and peak memory per
+/// split. Balanced to keep the split read well-parallelized without
+/// over-fanning out.
+const DEFAULT_MAX_CONCURRENT_PARTITIONS: usize = 16;
+
 /// A position in the Spanner change stream, used as the CDC offset.
 ///
 /// Ordered by the commit timestamp (microseconds since epoch), which is what the
@@ -909,16 +917,11 @@ impl SpannerExternalTableReader {
         let partition_count = partitions.len();
         tracing::info!(partition_count, "split_snapshot_read: fanning out");
 
-        // Fan out all partitions and stream completed partition batches.
-        //
-        // Each partition future materializes its full result set into a
-        // `Vec<OwnedRow>` before yielding. `buffer_unordered` therefore
-        // holds completed partition batches, not row-yielding streams.
-        // Peak memory scales with the number of in-flight partitions
-        // multiplied by the average partition size; both are bounded by
-        // Spanner's `PartitionOptions` (default partition sizing) and
-        // the gRPC channel pool (default 4, env: `SPANNER_NUM_CHANNELS`),
-        // which caps in-flight RPC concurrency at the network layer.
+        // Fan out partitions and stream completed batches. Each partition
+        // future materializes its full result set into a `Vec<OwnedRow>` before
+        // yielding, so `buffer_unordered` holds completed batches rather than
+        // row-yielding streams. In-flight reads and peak memory per split are
+        // bounded by `DEFAULT_MAX_CONCURRENT_PARTITIONS`.
         let mut stream = futures::stream::iter(partitions.into_iter().map(|p| {
             let p = p.set_data_boost(data_boost);
             let db = db_client.clone();
@@ -932,7 +935,7 @@ impl SpannerExternalTableReader {
                 Ok::<_, anyhow::Error>(out)
             }
         }))
-        .buffer_unordered(partition_count.max(1));
+        .buffer_unordered(DEFAULT_MAX_CONCURRENT_PARTITIONS);
 
         while let Some(batch) = stream.next().await {
             for row in batch? {
