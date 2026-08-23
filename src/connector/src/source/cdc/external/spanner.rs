@@ -35,12 +35,10 @@
 use std::str::FromStr;
 
 use anyhow::{Context, anyhow};
-use futures::pin_mut;
 use futures::stream::BoxStream;
-use futures::StreamExt;
+use futures::{StreamExt, pin_mut};
 use futures_async_stream::try_stream;
-use google_cloud_auth::credentials::service_account;
-use google_cloud_auth::credentials::Credentials;
+use google_cloud_auth::credentials::{Credentials, service_account};
 use google_cloud_spanner::client::{DatabaseClient, Spanner};
 use google_cloud_spanner::model::PartitionOptions;
 use google_cloud_spanner::result::Row as SpannerRow;
@@ -48,12 +46,11 @@ use google_cloud_spanner::statement::Statement;
 use google_cloud_spanner::transaction::{
     BeginTransactionOption, MultiUseReadOnlyTransaction, TimestampBound,
 };
-use time::OffsetDateTime;
-
 use risingwave_common::bail;
 use risingwave_common::catalog::{ColumnDesc, ColumnId, Field, Schema};
 use risingwave_common::row::{OwnedRow, Row as OwnedRowTrait};
 use risingwave_common::types::{DataType, Datum, F32, F64, ListType, ScalarImpl};
+use time::OffsetDateTime;
 
 use crate::error::{ConnectorError, ConnectorResult};
 use crate::source::CdcTableSnapshotSplit;
@@ -61,6 +58,14 @@ use crate::source::cdc::external::{
     CDC_TABLE_SPLIT_ID_START, CdcOffset, CdcTableSnapshotSplitOption, ExternalTableConfig,
     ExternalTableReader, SchemaTableName,
 };
+
+/// Cap on concurrent partition executions per split during CDC backfill.
+///
+/// Each partition runs as an independent read and buffers its full result set
+/// before yielding, so this bounds both in-flight reads and peak memory per
+/// split. Balanced to keep the split read well-parallelized without
+/// over-fanning out.
+const DEFAULT_MAX_CONCURRENT_PARTITIONS: usize = 16;
 
 /// A position in the Spanner change stream, used as the CDC offset.
 ///
@@ -123,7 +128,7 @@ impl SpannerOffset {
 // Schema discovery
 // ---------------------------------------------------------------------------
 
-/// Discovers table schema and primary keys from Spanner INFORMATION_SCHEMA.
+/// Discovers table schema and primary keys from Spanner `INFORMATION_SCHEMA`.
 pub struct SpannerExternalTable {
     column_descs: Vec<ColumnDesc>,
     pk_names: Vec<String>,
@@ -137,8 +142,8 @@ impl SpannerExternalTable {
     ) -> ConnectorResult<Self> {
         let table_name = config.table.clone();
 
-        let column_descs = Self::discover_columns(db_client, &table_name).await?;
-        let pk_names = Self::discover_primary_keys(db_client, &table_name).await?;
+        let column_descs = Box::pin(Self::discover_columns(db_client, &table_name)).await?;
+        let pk_names = Box::pin(Self::discover_primary_keys(db_client, &table_name)).await?;
 
         if pk_names.is_empty() {
             bail!(
@@ -237,8 +242,8 @@ impl SpannerExternalTable {
 ///
 /// Implements two-level parallelism:
 /// 1. **Inter-actor**: PK range splits distribute work across compute nodes
-/// 2. **Intra-actor**: Within each PK range, uses Spanner's partition_query to
-///    further parallelize reads using BatchReadOnlyTransaction
+/// 2. **Intra-actor**: Within each PK range, uses Spanner's `partition_query` to
+///    further parallelize reads using `BatchReadOnlyTransaction`
 ///
 /// All snapshot reads use **strong** (latest) reads. The CDC offset is the read
 /// timestamp resolved by a strong read-only transaction, obtained on demand in
@@ -300,7 +305,7 @@ impl SpannerExternalTableReader {
             field_names,
             pk_names,
             pk_types,
-            table_name: external_table.table_name().to_string(),
+            table_name: external_table.table_name().to_owned(),
             enable_databoost,
             db_client,
         })
@@ -327,9 +332,9 @@ impl ExternalTableReader for SpannerExternalTableReader {
         let read_ts = txn.read_timestamp().ok_or_else(|| {
             anyhow!("Spanner did not return a read timestamp for the strong read-only transaction")
         })?;
-        Ok(CdcOffset::Spanner(SpannerOffset::new(spanner_ts_to_micros(
-            &read_ts,
-        ))))
+        Ok(CdcOffset::Spanner(SpannerOffset::new(
+            spanner_ts_to_micros(&read_ts),
+        )))
     }
 
     fn snapshot_read(
@@ -389,9 +394,9 @@ impl ExternalTableReader for SpannerExternalTableReader {
 }
 
 impl SpannerExternalTableReader {
-    /// Returns the split column as a `Field` based on the backfill_split_pk_column_index.
+    /// Returns the split column as a `Field` based on the `backfill_split_pk_column_index`.
     ///
-    /// Follows Postgres CDC's split_column pattern.
+    /// Follows Postgres CDC's `split_column` pattern.
     fn split_column(&self, options: &CdcTableSnapshotSplitOption) -> Field {
         let idx = options.backfill_split_pk_column_index as usize;
         Field::new(&self.pk_names[idx], self.pk_types[idx].clone())
@@ -651,18 +656,18 @@ impl SpannerExternalTableReader {
 
             // Safeguard: if boundary equals left bound (all rows have same PK value),
             // find next distinct greater value (follows Postgres CDC's next_greater_bound)
-            if let Some(Some(ref inner)) = next_right {
-                if *inner == next_left_bound_inclusive {
-                    // All rows_per_split rows have the same PK value - find next distinct
-                    next_right = self
-                        .next_greater_bound(
-                            &mut txn,
-                            &next_left_bound_inclusive,
-                            &max_value,
-                            &split_column,
-                        )
-                        .await?;
-                }
+            if let Some(Some(ref inner)) = next_right
+                && *inner == next_left_bound_inclusive
+            {
+                // All rows_per_split rows have the same PK value - find next distinct
+                next_right = self
+                    .next_greater_bound(
+                        &mut txn,
+                        &next_left_bound_inclusive,
+                        &max_value,
+                        &split_column,
+                    )
+                    .await?;
             }
 
             if let Some(next_right) = next_right {
@@ -780,7 +785,7 @@ impl SpannerExternalTableReader {
             .context("snapshot query failed")?;
 
         while let Some(row) = rows.next().await.transpose().context("row read failed")? {
-            yield spanner_row_to_owned_row(&row, &fields)?;
+            yield spanner_row_to_owned_row(&row, fields)?;
         }
     }
 
@@ -788,10 +793,10 @@ impl SpannerExternalTableReader {
     ///
     /// Two-level parallelism:
     /// 1. **Inter-actor**: This split is one PK range assigned to this actor
-    /// 2. **Intra-actor**: Within this PK range, uses Spanner's partition_query
+    /// 2. **Intra-actor**: Within this PK range, uses Spanner's `partition_query`
     ///    to further parallelize reads
     ///
-    /// Creates a strong (latest) BatchReadOnlyTransaction, then uses partition_query
+    /// Creates a strong (latest) `BatchReadOnlyTransaction`, then uses `partition_query`
     /// with WHERE clause filtering for intra-actor parallelism. The change-log is
     /// reconciled against this read via the offsets captured by
     /// [`ExternalTableReader::current_cdc_offset`] before and after the read.
@@ -909,16 +914,11 @@ impl SpannerExternalTableReader {
         let partition_count = partitions.len();
         tracing::info!(partition_count, "split_snapshot_read: fanning out");
 
-        // Fan out all partitions and stream completed partition batches.
-        //
-        // Each partition future materializes its full result set into a
-        // `Vec<OwnedRow>` before yielding. `buffer_unordered` therefore
-        // holds completed partition batches, not row-yielding streams.
-        // Peak memory scales with the number of in-flight partitions
-        // multiplied by the average partition size; both are bounded by
-        // Spanner's `PartitionOptions` (default partition sizing) and
-        // the gRPC channel pool (default 4, env: `SPANNER_NUM_CHANNELS`),
-        // which caps in-flight RPC concurrency at the network layer.
+        // Fan out partitions and stream completed batches. Each partition
+        // future materializes its full result set into a `Vec<OwnedRow>` before
+        // yielding, so `buffer_unordered` holds completed batches rather than
+        // row-yielding streams. In-flight reads and peak memory per split are
+        // bounded by `DEFAULT_MAX_CONCURRENT_PARTITIONS`.
         let mut stream = futures::stream::iter(partitions.into_iter().map(|p| {
             let p = p.set_data_boost(data_boost);
             let db = db_client.clone();
@@ -932,7 +932,7 @@ impl SpannerExternalTableReader {
                 Ok::<_, anyhow::Error>(out)
             }
         }))
-        .buffer_unordered(partition_count.max(1));
+        .buffer_unordered(DEFAULT_MAX_CONCURRENT_PARTITIONS);
 
         while let Some(batch) = stream.next().await {
             for row in batch? {
@@ -954,7 +954,7 @@ fn is_supported_even_split_data_type(data_type: &DataType) -> bool {
     )
 }
 
-/// Convert i64 to ScalarImpl based on data type (follows Postgres CDC's to_int_scalar)
+/// Convert i64 to `ScalarImpl` based on data type (follows Postgres CDC's `to_int_scalar`)
 fn to_int_scalar(i: i64, data_type: &DataType) -> ScalarImpl {
     match data_type {
         DataType::Int16 => ScalarImpl::Int16(i.try_into().unwrap()),
@@ -968,7 +968,7 @@ fn to_int_scalar(i: i64, data_type: &DataType) -> ScalarImpl {
 
 /// Tries to increase the split ID, returns an error if overflow.
 ///
-/// Follows Postgres CDC's try_increase_split_id pattern.
+/// Follows Postgres CDC's `try_increase_split_id` pattern.
 fn try_increase_split_id(split_id: &mut i64) -> ConnectorResult<()> {
     match split_id.checked_add(1) {
         Some(s) => {
@@ -993,7 +993,7 @@ fn add_scalar_param(
         ScalarImpl::Int64(v) => stmt.add_param(name, v),
         ScalarImpl::Float32(v) => stmt.add_param(name, &(v.0 as f64)),
         ScalarImpl::Float64(v) => stmt.add_param(name, &v.0),
-        ScalarImpl::Utf8(v) => stmt.add_param(name, &v.as_ref().to_string()),
+        ScalarImpl::Utf8(v) => stmt.add_param(name, &v.as_ref().to_owned()),
         ScalarImpl::Bool(v) => stmt.add_param(name, v),
         ScalarImpl::Decimal(v) => stmt.add_param(name, &v.to_string()),
         _ => panic!(
@@ -1019,8 +1019,8 @@ fn build_pk_filter_sql(pk_names: &[String]) -> String {
     for i in 0..pk_names.len() {
         let mut parts = Vec::with_capacity(i + 1);
         // All preceding columns must be equal
-        for j in 0..i {
-            parts.push(format!("{} = @pk{}", cols[j], j));
+        for (j, col) in cols.iter().enumerate().take(i) {
+            parts.push(format!("{} = @pk{}", col, j));
         }
         // The i-th column must be strictly greater
         parts.push(format!("{} > @pk{}", cols[i], i));
@@ -1126,7 +1126,7 @@ pub fn rfc3339_to_micros(s: &str) -> ConnectorResult<i64> {
     )
 }
 
-/// Convert microseconds since epoch to OffsetDateTime.
+/// Convert microseconds since epoch to `OffsetDateTime`.
 pub fn micros_to_offset_datetime(micros: i64) -> ConnectorResult<OffsetDateTime> {
     Ok(
         OffsetDateTime::from_unix_timestamp_nanos((micros as i128) * 1000)
@@ -1231,11 +1231,21 @@ pub(crate) fn spanner_type_to_rw_type(spanner_type: &str) -> ConnectorResult<Dat
 /// Extracts a single typed cell from a Spanner row as a `ScalarImpl`.
 ///
 /// Follows the same pattern as `postgres_cell_to_scalar_impl` in the Postgres CDC parser.
-fn spanner_cell_to_scalar_impl(row: &SpannerRow, data_type: &DataType, idx: usize) -> Option<ScalarImpl> {
+fn spanner_cell_to_scalar_impl(
+    row: &SpannerRow,
+    data_type: &DataType,
+    idx: usize,
+) -> Option<ScalarImpl> {
     match data_type {
-        DataType::Boolean => { let v: Option<bool> = row.try_get(idx).ok(); v.map(ScalarImpl::Bool) },
+        DataType::Boolean => {
+            let v: Option<bool> = row.try_get(idx).ok();
+            v.map(ScalarImpl::Bool)
+        }
 
-        DataType::Int64 => { let v: Option<i64> = row.try_get(idx).ok(); v.map(ScalarImpl::Int64) },
+        DataType::Int64 => {
+            let v: Option<i64> = row.try_get(idx).ok();
+            v.map(ScalarImpl::Int64)
+        }
 
         DataType::Int32 => {
             let v: Option<i64> = row.try_get(idx).ok();
@@ -1278,9 +1288,9 @@ fn spanner_cell_to_scalar_impl(row: &SpannerRow, data_type: &DataType, idx: usiz
         DataType::Timestamptz => {
             use risingwave_common::types::Timestamptz;
             let v: Option<time::OffsetDateTime> = row.try_get(idx).ok();
-            v.map(|v| {
+            v.and_then(|v| {
                 let micros = (v.unix_timestamp_nanos() / 1000) as i64;
-                ScalarImpl::Timestamptz(Timestamptz::from_micros(micros))
+                Timestamptz::from_micros(micros).map(ScalarImpl::Timestamptz)
             })
         }
 
@@ -1307,19 +1317,20 @@ fn spanner_cell_to_scalar_impl(row: &SpannerRow, data_type: &DataType, idx: usiz
             use risingwave_common::types::Decimal;
             // Spanner stores NUMERIC as string on the wire; read as String and parse.
             let s: Option<String> = row.try_get(idx).ok();
-            s.and_then(|s| Decimal::from_str(&s).ok()).map(ScalarImpl::Decimal)
+            s.and_then(|s| Decimal::from_str(&s).ok())
+                .map(ScalarImpl::Decimal)
         }
 
         DataType::Jsonb => {
             // Handle JSON and STRUCT types (stored as JSON string)
             let s: Option<String> = row.try_get(idx).ok();
-            s.and_then(|s| {
+            s.map(|s| {
                 // Try to parse as JSON first
                 if let Ok(json) = serde_json::from_str::<serde_json::Value>(&s) {
-                    Some(ScalarImpl::Jsonb(json.into()))
+                    ScalarImpl::Jsonb(json.into())
                 } else {
                     // If not valid JSON, wrap as string
-                    Some(ScalarImpl::Jsonb(serde_json::json!(s).into()))
+                    ScalarImpl::Jsonb(serde_json::json!(s).into())
                 }
             })
         }
@@ -1369,6 +1380,18 @@ mod tests {
     fn test_spanner_offset() {
         let offset = SpannerOffset::new(1234567890);
         assert_eq!(offset.timestamp, 1234567890);
+    }
+
+    #[test]
+    fn test_table_type_offset_parser_supports_spanner() {
+        // The legacy (non-parallelized) CDC backfill resolves the offset parser from the
+        // table type before the reader exists.
+        let parser = crate::source::cdc::external::ExternalCdcTableType::Spanner
+            .get_cdc_offset_parser()
+            .unwrap();
+        let offset = CdcOffset::Spanner(SpannerOffset::new(1234567890));
+        let parsed = parser(&serde_json::to_string(&offset).unwrap()).unwrap();
+        assert_eq!(parsed, offset);
     }
 
     #[test]
