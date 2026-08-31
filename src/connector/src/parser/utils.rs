@@ -24,6 +24,7 @@ use risingwave_pb::data::DataType as PbDataType;
 use crate::aws_utils::load_file_descriptor_from_s3;
 use crate::connector_common::AwsAuthProps;
 use crate::error::ConnectorResult;
+use crate::gcs_utils::load_file_descriptor_from_gcs;
 use crate::source::SourceMeta;
 
 macro_rules! log_error {
@@ -97,6 +98,8 @@ macro_rules! only_parse_payload {
 /// * local file, for on-premise or testing.
 /// * http/https, for common usage.
 /// * s3 file location format: <s3://bucket_name/file_name>
+/// * gcs file location format: <gs://bucket_name/file_name>, authenticated with
+///   Application Default Credentials (ADC), so no HMAC key is needed.
 pub(super) async fn bytes_from_url(
     url: &Url,
     config: Option<&AwsAuthProps>,
@@ -113,6 +116,7 @@ pub(super) async fn bytes_from_url(
         }
         ("https" | "http", _) => Ok(download_from_http(url).await?.into()),
         ("s3", Some(config)) => load_file_descriptor_from_s3(url, config).await,
+        ("gs", _) => load_file_descriptor_from_gcs(url).await,
         (scheme, _) => bail!("path scheme `{scheme}` is not supported"),
     }
 }
