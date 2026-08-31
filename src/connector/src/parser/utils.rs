@@ -116,7 +116,7 @@ pub(super) async fn bytes_from_url(
         }
         ("https" | "http", _) => Ok(download_from_http(url).await?.into()),
         ("s3", Some(config)) => load_file_descriptor_from_s3(url, config).await,
-        ("gs" | "gcs", _) => load_file_descriptor_from_gcs(url).await,
+        ("gs", _) => load_file_descriptor_from_gcs(url).await,
         (scheme, _) => bail!("path scheme `{scheme}` is not supported"),
     }
 }

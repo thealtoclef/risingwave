@@ -34,7 +34,7 @@ fn parse_gcs_url(location: &Url) -> ConnectorResult<(&str, &str)> {
 
 /// Load a schema file from Google Cloud Storage.
 ///
-/// Location format: `gs://bucket_name/path/to/file` (`gcs://` is also accepted).
+/// Location format: `gs://bucket_name/path/to/file`.
 ///
 /// Authentication uses Application Default Credentials (ADC). No credential is
 /// configured explicitly: opendal's `GoogleCredentialLoader` resolves it from
@@ -71,8 +71,7 @@ mod tests {
             ("my-bucket", "path/to/schema.avsc")
         );
 
-        // `gcs://` is accepted as well.
-        let url = Url::parse("gcs://my-bucket/schema.proto").unwrap();
+        let url = Url::parse("gs://my-bucket/schema.proto").unwrap();
         assert_eq!(parse_gcs_url(&url).unwrap(), ("my-bucket", "schema.proto"));
 
         // Bucket names may contain dots.
