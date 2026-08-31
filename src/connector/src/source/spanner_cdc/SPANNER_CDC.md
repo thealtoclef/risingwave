@@ -741,7 +741,7 @@ PROTO types are mapped to `BYTEA` and ENUM types map to `VARCHAR`. If you see NU
 | `mod.rs` | Source properties (`SpannerCdcProperties`) and connector constants |
 | `enumerator/mod.rs` | Split enumeration (`SpannerCdcSplitEnumerator`) — creates single split with `split_id = source_id.as_raw_id()` |
 | `source/reader.rs` | CDC streaming reader — follows Debezium pattern (background task → mpsc channel → rx.recv) |
-| `source/message.rs` | `TaggedChangeRecord → SourceMessage` conversion; uses `SourceMeta::DebeziumCdc` so messages flow through the standard Debezium CDC path in `PlainParser` |
+| `source/message.rs` | `Mod → SourceMessage` conversion (via `ChangeRecordContext`, built once per `DataChangeRecord`); uses `SourceMeta::DebeziumCdc` so messages flow through the standard Debezium CDC path in `PlainParser` |
 | `split.rs` | Split definition (`SpannerCdcSplit`) — partition token, parent tokens, offset, index |
 | `schema_track.rs` | Shared schema registry for automatic schema evolution; deduplicates schema change events across partitions; emits Debezium-format JSON schema change messages |
 | `types.rs` | Spanner data type definitions, JSON serialization, and `spanner_type_name_to_rw_type` mapping used during schema change parsing |

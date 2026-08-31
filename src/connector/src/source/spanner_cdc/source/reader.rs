@@ -56,7 +56,7 @@ use time::OffsetDateTime;
 use tokio::sync::mpsc;
 use tokio_retry::strategy::{ExponentialBackoff, jitter};
 
-use super::TaggedChangeRecord;
+use super::{ChangeRecordContext, build_source_message};
 use crate::error::{ConnectorError, ConnectorResult as Result};
 use crate::parser::ParserConfig;
 use crate::source::cdc::DebeziumCdcMeta;
@@ -854,16 +854,20 @@ async fn execute_query(
                     }
                 }
 
-                for modification in &data_change.mods {
-                    let tagged = TaggedChangeRecord {
-                        split_id: split_id.clone(),
-                        database_name: database.to_owned(),
-                        data_change: data_change.clone(),
-                        modification: modification.clone(),
-                    };
-                    let mut msg = SourceMessage::from(tagged);
-                    msg.offset = offset_str.clone();
-                    messages.push(msg);
+                // Column types and the rest of the record header are the same for every
+                // mod, so derive them once per record instead of once per row. Skipped
+                // entirely for records that carry no mods (e.g. schema-change only).
+                if !data_change.mods.is_empty() {
+                    let column_types = data_change.column_type_map();
+                    let ctx = ChangeRecordContext::new(database, data_change, &column_types);
+                    for modification in &data_change.mods {
+                        messages.push(build_source_message(
+                            split_id,
+                            &ctx,
+                            modification,
+                            &offset_str,
+                        ));
+                    }
                 }
             }
 
