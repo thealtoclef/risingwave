@@ -22,6 +22,8 @@
 //!
 //! Reference: <https://cloud.google.com/spanner/docs/change-streams/details>
 
+use std::collections::HashMap;
+
 use parse_display::{Display, FromStr};
 use risingwave_common::types::{DataType, ListType};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -637,21 +639,16 @@ impl Mod {
     /// Note: `_rw_offset` and `_rw_table_name` are separate SOURCE columns,
     /// not part of the payload JSON.
     ///
-    /// The `data_change_record` parameter provides column type information to correctly
+    /// The `column_types` parameter provides column type information to correctly
     /// convert values (e.g., keep zipcode "02101" as string, not convert to number 2101).
+    /// It is shared by every `Mod` of the same `DataChangeRecord`, so the caller builds
+    /// it once per record via [`DataChangeRecord::column_type_map`] rather than per mod.
     pub fn to_json_map(
         &self,
         mod_type: &str,
-        data_change_record: &DataChangeRecord,
+        column_types: &HashMap<&str, TypeCode>,
     ) -> Result<serde_json::Map<String, JsonValue>, serde_json::Error> {
         let mut result = serde_json::Map::new();
-
-        // Build a map of column name to type code for type-aware conversion
-        let column_types: std::collections::HashMap<String, TypeCode> = data_change_record
-            .column_types
-            .iter()
-            .map(|ct| (ct.name.clone(), ct.type_code()))
-            .collect();
 
         // Spanner change streams encode all values as JSON strings regardless of the
         // underlying column type. Convert numeric types (INT64, FLOAT64, etc.) back
@@ -719,14 +716,16 @@ impl Mod {
                 if let Some(k) = keys {
                     let keys_map: serde_json::Map<String, JsonValue> = serde_json::from_str(k)?;
                     for (key, value) in keys_map {
-                        merged.insert(key.clone(), convert_value(&key, value));
+                        let converted = convert_value(&key, value);
+                        merged.insert(key, converted);
                     }
                 }
 
                 if let Some(v) = values {
                     let values_map: serde_json::Map<String, JsonValue> = serde_json::from_str(v)?;
                     for (key, value) in values_map {
-                        merged.insert(key.clone(), convert_value(&key, value));
+                        let converted = convert_value(&key, value);
+                        merged.insert(key, converted);
                     }
                 }
 
@@ -790,6 +789,17 @@ impl DataChangeRecord {
     pub fn commit_time(&self) -> OffsetDateTime {
         self.commit_timestamp
     }
+
+    /// Column name -> type code, for [`Mod::to_json_map`].
+    ///
+    /// `column_types` is schema metadata shared by every `Mod` in the record, so this
+    /// must be built once per record and reused, not rebuilt per mod.
+    pub fn column_type_map(&self) -> HashMap<&str, TypeCode> {
+        self.column_types
+            .iter()
+            .map(|ct| (ct.name.as_str(), ct.type_code()))
+            .collect()
+    }
 }
 
 impl ChildPartitionsRecord {
@@ -801,5 +811,133 @@ impl ChildPartitionsRecord {
 impl HeartbeatRecord {
     pub fn heartbeat_time(&self) -> OffsetDateTime {
         self.timestamp
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn column(name: &str, code: TypeCode, is_primary_key: bool, ordinal: i64) -> ColumnType {
+        ColumnType {
+            name: name.to_owned(),
+            spanner_type: SpannerType::simple(code),
+            is_primary_key,
+            ordinal_position: ordinal,
+        }
+    }
+
+    /// A record with an INT64 primary key, an INT64 measure, and a STRING column
+    /// whose values look numeric (the zipcode case).
+    fn record_with_mods(mods: Vec<Mod>) -> DataChangeRecord {
+        DataChangeRecord {
+            commit_timestamp: OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap(),
+            record_sequence: "0".to_owned(),
+            server_transaction_id: "txn-1".to_owned(),
+            is_last_record_in_transaction_in_partition: true,
+            table_name: "accounts".to_owned(),
+            value_capture_type: "OLD_AND_NEW_VALUES".to_owned(),
+            column_types: vec![
+                column("id", TypeCode::Int64, true, 1),
+                column("balance", TypeCode::Int64, false, 2),
+                column("zipcode", TypeCode::String, false, 3),
+            ],
+            mods,
+            mod_type: "INSERT".to_owned(),
+            number_of_records_in_transaction: 1,
+            number_of_partitions_in_transaction: 1,
+            transaction_tag: String::new(),
+            is_system_transaction: false,
+        }
+    }
+
+    fn insert_mod(id: i64, balance: i64, zipcode: &str) -> Mod {
+        Mod {
+            keys: Some(format!(r#"{{"id":"{id}"}}"#)),
+            new_values: Some(format!(
+                r#"{{"balance":"{balance}","zipcode":"{zipcode}"}}"#
+            )),
+            old_values: None,
+        }
+    }
+
+    /// The map must carry every column, with the same type codes the old
+    /// per-mod construction produced.
+    #[test]
+    fn test_column_type_map_covers_all_columns() {
+        let record = record_with_mods(vec![]);
+        let map = record.column_type_map();
+
+        assert_eq!(map.len(), record.column_types.len());
+        for ct in &record.column_types {
+            assert_eq!(
+                map.get(ct.name.as_str()),
+                Some(&ct.type_code()),
+                "column {} missing or mistyped",
+                ct.name
+            );
+        }
+    }
+
+    /// Guards the refactor that hoisted the column-type map out of `to_json_map`:
+    /// a map built once per record must produce byte-identical output to one built
+    /// fresh for every mod.
+    #[test]
+    fn test_to_json_map_shared_map_matches_fresh_map() {
+        let record = record_with_mods(vec![
+            insert_mod(1, 100, "02101"),
+            insert_mod(2, 200, "94103"),
+            insert_mod(3, 300, "10001"),
+        ]);
+        let shared = record.column_type_map();
+
+        for m in &record.mods {
+            let fresh: HashMap<&str, TypeCode> = record
+                .column_types
+                .iter()
+                .map(|ct| (ct.name.as_str(), ct.type_code()))
+                .collect();
+
+            let with_shared = m.to_json_map(&record.mod_type, &shared).unwrap();
+            let with_fresh = m.to_json_map(&record.mod_type, &fresh).unwrap();
+
+            assert_eq!(with_shared, with_fresh);
+        }
+    }
+
+    /// The map is what drives numeric coercion, so pin the actual conversion too:
+    /// INT64 columns become JSON numbers, STRING columns stay strings even when
+    /// their contents look numeric.
+    #[test]
+    fn test_to_json_map_applies_column_types() {
+        let record = record_with_mods(vec![insert_mod(7, 4200, "02101")]);
+        let map = record.column_type_map();
+
+        let json = record.mods[0].to_json_map(&record.mod_type, &map).unwrap();
+
+        assert_eq!(json["op"], JsonValue::String("c".to_owned()));
+        assert_eq!(json["before"], JsonValue::Null);
+        let after = json["after"].as_object().unwrap();
+        assert_eq!(after["id"], JsonValue::from(7));
+        assert_eq!(after["balance"], JsonValue::from(4200));
+        // Leading zero must survive: STRING column, not a number.
+        assert_eq!(after["zipcode"], JsonValue::String("02101".to_owned()));
+    }
+
+    /// An empty type map (record carried no `column_types`) must not coerce
+    /// anything, and must not error.
+    #[test]
+    fn test_to_json_map_without_column_types() {
+        let map: HashMap<&str, TypeCode> = HashMap::new();
+        let m = insert_mod(1, 100, "02101");
+
+        let json = m.to_json_map("INSERT", &map).unwrap();
+        let after = json["after"].as_object().unwrap();
+        assert_eq!(after["id"], JsonValue::String("1".to_owned()));
+        assert_eq!(after["balance"], JsonValue::String("100".to_owned()));
     }
 }
