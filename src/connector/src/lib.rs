@@ -40,6 +40,7 @@ use duration_str::parse_std;
 use serde::de;
 
 pub mod aws_utils;
+pub mod gcs_utils;
 
 pub mod allow_alter_on_fly_fields;
 

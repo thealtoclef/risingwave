@@ -329,7 +329,7 @@ pub struct AvroProperties {
 /// WIP: may cover protobuf and json schema later.
 #[derive(Debug, Clone)]
 pub enum SchemaLocation {
-    /// Avsc from `https://`, `s3://` or `file://`.
+    /// Avsc from `https://`, `s3://`, `gs://` or `file://`.
     File {
         url: String,
         aws_auth_props: Option<AwsAuthProps>, // for s3
