@@ -366,41 +366,32 @@ pub fn parse_change_record_column(
 
 impl ChangeStreamRecord {
     fn from_json_object(obj: &serde_json::Map<String, JsonValue>) -> anyhow::Result<Self> {
-        let parse_array = |key: &str| -> anyhow::Result<JsonValue> {
-            Ok(obj.get(key).cloned().unwrap_or(JsonValue::Array(vec![])))
-        };
-
-        let mut data_change_record = Vec::new();
-        for v in parse_array("data_change_record")?
-            .as_array()
-            .cloned()
-            .unwrap_or_default()
-        {
-            data_change_record.push(DataChangeRecord::from_json(&v)?);
-        }
-
-        let mut heartbeat_record = Vec::new();
-        for v in parse_array("heartbeat_record")?
-            .as_array()
-            .cloned()
-            .unwrap_or_default()
-        {
-            heartbeat_record.push(HeartbeatRecord::from_json(&v)?);
-        }
-
-        let mut child_partitions_record = Vec::new();
-        for v in parse_array("child_partitions_record")?
-            .as_array()
-            .cloned()
-            .unwrap_or_default()
-        {
-            child_partitions_record.push(ChildPartitionsRecord::from_json(&v)?);
+        // Borrow the elements of an ARRAY field. A missing field, or one that is
+        // not an array, reads as empty — only one of the three arrays is
+        // populated per record.
+        fn array_field<'a>(
+            obj: &'a serde_json::Map<String, JsonValue>,
+            key: &str,
+        ) -> &'a [JsonValue] {
+            match obj.get(key) {
+                Some(JsonValue::Array(a)) => a.as_slice(),
+                _ => &[],
+            }
         }
 
         Ok(Self {
-            data_change_record,
-            heartbeat_record,
-            child_partitions_record,
+            data_change_record: array_field(obj, "data_change_record")
+                .iter()
+                .map(DataChangeRecord::from_json)
+                .collect::<anyhow::Result<Vec<_>>>()?,
+            heartbeat_record: array_field(obj, "heartbeat_record")
+                .iter()
+                .map(HeartbeatRecord::from_json)
+                .collect::<anyhow::Result<Vec<_>>>()?,
+            child_partitions_record: array_field(obj, "child_partitions_record")
+                .iter()
+                .map(ChildPartitionsRecord::from_json)
+                .collect::<anyhow::Result<Vec<_>>>()?,
         })
     }
 }
@@ -926,6 +917,103 @@ mod tests {
         assert_eq!(after["balance"], JsonValue::from(4200));
         // Leading zero must survive: STRING column, not a number.
         assert_eq!(after["zipcode"], JsonValue::String("02101".to_owned()));
+    }
+
+    fn obj(v: JsonValue) -> serde_json::Map<String, JsonValue> {
+        v.as_object().unwrap().clone()
+    }
+
+    fn data_change_json() -> JsonValue {
+        serde_json::json!({
+            "commit_timestamp": "2025-01-01T00:00:00Z",
+            "record_sequence": "0",
+            "server_transaction_id": "txn-1",
+            "is_last_record_in_transaction_in_partition": true,
+            "table_name": "accounts",
+            "value_capture_type": "NEW_ROW_AND_OLD_VALUES",
+            "column_types": [
+                {"name": "id", "type": {"code": "INT64"}, "is_primary_key": true, "ordinal_position": 1}
+            ],
+            "mods": [{"keys": "{\"id\":\"1\"}", "new_values": "{}", "old_values": null}],
+            "mod_type": "INSERT",
+            "number_of_records_in_transaction": 1,
+            "number_of_partitions_in_transaction": 1,
+            "transaction_tag": "",
+            "is_system_transaction": false
+        })
+    }
+
+    /// Each of the three arrays is read out of the enclosing object into its own
+    /// field, and the other two stay empty (Spanner populates exactly one).
+    #[test]
+    fn test_change_stream_record_parses_each_array() {
+        let dcr = ChangeStreamRecord::from_json_object(&obj(serde_json::json!({
+            "data_change_record": [data_change_json()],
+        })))
+        .unwrap();
+        assert_eq!(dcr.data_change_record.len(), 1);
+        assert_eq!(dcr.data_change_record[0].table_name, "accounts");
+        assert_eq!(dcr.data_change_record[0].mods.len(), 1);
+        assert!(dcr.heartbeat_record.is_empty());
+        assert!(dcr.child_partitions_record.is_empty());
+
+        let hb = ChangeStreamRecord::from_json_object(&obj(serde_json::json!({
+            "heartbeat_record": [{"timestamp": "2025-01-01T00:00:00Z"}],
+        })))
+        .unwrap();
+        assert_eq!(hb.heartbeat_record.len(), 1);
+        assert!(hb.data_change_record.is_empty());
+
+        let cpr = ChangeStreamRecord::from_json_object(&obj(serde_json::json!({
+            "child_partitions_record": [{
+                "start_timestamp": "2025-01-01T00:00:00Z",
+                "record_sequence": "0",
+                "child_partitions": [{"token": "C1", "parent_partition_tokens": ["P1"]}],
+            }],
+        })))
+        .unwrap();
+        assert_eq!(cpr.child_partitions_record.len(), 1);
+        assert_eq!(
+            cpr.child_partitions_record[0].child_partitions[0].token,
+            "C1"
+        );
+    }
+
+    /// A field that is absent, null, or not an array reads as empty rather than
+    /// erroring — the lenient shape the SDK's STRUCT decoding relies on.
+    #[test]
+    fn test_change_stream_record_tolerates_missing_and_non_array_fields() {
+        let empty = ChangeStreamRecord::from_json_object(&obj(serde_json::json!({}))).unwrap();
+        assert!(empty.data_change_record.is_empty());
+        assert!(empty.heartbeat_record.is_empty());
+        assert!(empty.child_partitions_record.is_empty());
+
+        let odd = ChangeStreamRecord::from_json_object(&obj(serde_json::json!({
+            "data_change_record": null,
+            "heartbeat_record": "not-an-array",
+            "child_partitions_record": [],
+        })))
+        .unwrap();
+        assert!(odd.data_change_record.is_empty());
+        assert!(odd.heartbeat_record.is_empty());
+        assert!(odd.child_partitions_record.is_empty());
+    }
+
+    /// A malformed element still fails the whole record — the refactor must not
+    /// turn a parse error into a silently dropped record.
+    #[test]
+    fn test_change_stream_record_propagates_element_error() {
+        let mut bad = data_change_json();
+        bad.as_object_mut().unwrap().remove("table_name");
+
+        let err = ChangeStreamRecord::from_json_object(&obj(serde_json::json!({
+            "data_change_record": [bad],
+        })))
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("table_name"),
+            "unexpected error: {err}"
+        );
     }
 
     /// An empty type map (record carried no `column_types`) must not coerce
