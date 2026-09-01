@@ -70,25 +70,22 @@ pub fn build_source_message(
     // The `source` sub-object mirrors the Debezium source envelope so that INCLUDE TIMESTAMP,
     // INCLUDE database_name, and INCLUDE table_name columns resolve correctly when
     // parse_debezium_chunk re-parses the stored payload without row_meta.
-    let mod_json = modification
-        .to_json_map(ctx.mod_type, ctx.column_types)
-        .and_then(|mut inner| {
-            let mut source = serde_json::Map::new();
-            source.insert("ts_ms".to_string(), serde_json::Value::from(source_ts_ms));
-            source.insert(
-                "db".to_string(),
-                serde_json::Value::String(ctx.database_name.to_owned()),
-            );
-            source.insert(
-                "table".to_string(),
-                serde_json::Value::String(ctx.table_name.to_owned()),
-            );
-            inner.insert("source".to_string(), serde_json::Value::Object(source));
-            let mut envelope = serde_json::Map::new();
-            envelope.insert("payload".to_string(), serde_json::Value::Object(inner));
-            serde_json::to_vec(&envelope).map_err(Into::into)
-        })
-        .expect("Spanner change record serialization to JSON should never fail");
+    let mut inner = modification.to_json_map(ctx.mod_type, ctx.column_types);
+    let mut source = serde_json::Map::new();
+    source.insert("ts_ms".to_string(), serde_json::Value::from(source_ts_ms));
+    source.insert(
+        "db".to_string(),
+        serde_json::Value::String(ctx.database_name.to_owned()),
+    );
+    source.insert(
+        "table".to_string(),
+        serde_json::Value::String(ctx.table_name.to_owned()),
+    );
+    inner.insert("source".to_string(), serde_json::Value::Object(source));
+    let mut envelope = serde_json::Map::new();
+    envelope.insert("payload".to_string(), serde_json::Value::Object(inner));
+    let mod_json =
+        serde_json::to_vec(&envelope).expect("serializing a JSON object to bytes is infallible");
 
     SourceMessage {
         key: None,
@@ -111,7 +108,7 @@ mod tests {
 
     use super::*;
     use crate::source::cdc::CdcMessageType;
-    use crate::source::spanner_cdc::types::{ColumnType, SpannerType, TypeCode};
+    use crate::source::spanner_cdc::types::{CellMap, ColumnType, SpannerType, TypeCode};
 
     const DB: &str = "test-db";
     const TABLE: &str = "accounts";
@@ -127,10 +124,14 @@ mod tests {
         }
     }
 
+    fn cells(json: &str) -> Option<CellMap> {
+        Some(serde_json::from_str(json).unwrap())
+    }
+
     fn insert_mod(id: i64, owner: &str) -> Mod {
         Mod {
-            keys: Some(format!(r#"{{"id":"{id}"}}"#)),
-            new_values: Some(format!(r#"{{"owner":"{owner}"}}"#)),
+            keys: cells(&format!(r#"{{"id":"{id}"}}"#)),
+            new_values: cells(&format!(r#"{{"owner":"{owner}"}}"#)),
             old_values: None,
         }
     }
@@ -238,14 +239,14 @@ mod tests {
         let mut record = multi_mod_record();
         record.mods = vec![
             Mod {
-                keys: Some(r#"{"id":"1"}"#.to_owned()),
-                new_values: Some(r#"{"owner":"alice"}"#.to_owned()),
+                keys: cells(r#"{"id":"1"}"#),
+                new_values: cells(r#"{"owner":"alice"}"#),
                 old_values: None,
             },
             Mod {
-                keys: Some(r#"{"id":"2"}"#.to_owned()),
+                keys: cells(r#"{"id":"2"}"#),
                 // No `owner` at all for this row.
-                new_values: Some("{}".to_owned()),
+                new_values: cells("{}"),
                 old_values: None,
             },
         ];

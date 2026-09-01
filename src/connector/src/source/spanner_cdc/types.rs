@@ -299,18 +299,24 @@ impl ColumnType {
     }
 }
 
-/// `mods` row in a `data_change_record`. The change-stream TVF encodes all
-/// cell values as JSON strings (regardless of column type). `keys`/`new_values`/
-/// `old_values` are each `MAP<column_name, value>` serialized as a JSON
-/// object-as-string.
+/// A `MAP<column_name, value>` cell of a `mods` row, already decoded.
+///
+/// The change-stream TVF types these cells as `JSON`, so the Spanner SDK parses
+/// them for us; keeping the parsed form avoids serializing back to a string only
+/// to parse it again in [`Mod::to_json_map`].
+pub type CellMap = serde_json::Map<String, JsonValue>;
+
+/// `mods` row in a `data_change_record`. Individual cell *values* inside each map
+/// are still JSON strings regardless of the underlying column type — see
+/// [`Mod::to_json_map`], which restores their real types from `column_types`.
 ///
 /// `action_id`-style columns are preserved: they appear as keys in the map
 /// and pass through `to_json_map` unmodified.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Mod {
-    pub keys: Option<String>,
-    pub new_values: Option<String>,
-    pub old_values: Option<String>,
+    pub keys: Option<CellMap>,
+    pub new_values: Option<CellMap>,
+    pub old_values: Option<CellMap>,
 }
 
 #[derive(Debug, Clone)]
@@ -357,38 +363,41 @@ pub fn parse_change_record_column(
             ));
         }
     };
-    let obj = inner
-        .as_object()
-        .ok_or_else(|| anyhow::anyhow!("ChangeRecord inner element is not an object: {}", inner))?;
+    let obj = match inner {
+        JsonValue::Object(obj) => obj,
+        other => {
+            return Err(anyhow::anyhow!(
+                "ChangeRecord inner element is not an object: {}",
+                other
+            ));
+        }
+    };
 
     Ok(vec![ChangeStreamRecord::from_json_object(obj)?])
 }
 
 impl ChangeStreamRecord {
-    fn from_json_object(obj: &serde_json::Map<String, JsonValue>) -> anyhow::Result<Self> {
-        // Borrow the elements of an ARRAY field. A missing field, or one that is
-        // not an array, reads as empty — only one of the three arrays is
-        // populated per record.
-        fn array_field<'a>(
-            obj: &'a serde_json::Map<String, JsonValue>,
-            key: &str,
-        ) -> &'a [JsonValue] {
-            match obj.get(key) {
-                Some(JsonValue::Array(a)) => a.as_slice(),
-                _ => &[],
+    fn from_json_object(mut obj: serde_json::Map<String, JsonValue>) -> anyhow::Result<Self> {
+        // Take an ARRAY field out of the map so its elements can be *moved* into
+        // the parsers instead of copied. A missing field, or one that is not an
+        // array, reads as empty — only one of the three is populated per record.
+        fn array_field(obj: &mut serde_json::Map<String, JsonValue>, key: &str) -> Vec<JsonValue> {
+            match obj.remove(key) {
+                Some(JsonValue::Array(a)) => a,
+                _ => Vec::new(),
             }
         }
 
         Ok(Self {
-            data_change_record: array_field(obj, "data_change_record")
-                .iter()
+            data_change_record: array_field(&mut obj, "data_change_record")
+                .into_iter()
                 .map(DataChangeRecord::from_json)
                 .collect::<anyhow::Result<Vec<_>>>()?,
-            heartbeat_record: array_field(obj, "heartbeat_record")
+            heartbeat_record: array_field(&mut obj, "heartbeat_record")
                 .iter()
                 .map(HeartbeatRecord::from_json)
                 .collect::<anyhow::Result<Vec<_>>>()?,
-            child_partitions_record: array_field(obj, "child_partitions_record")
+            child_partitions_record: array_field(&mut obj, "child_partitions_record")
                 .iter()
                 .map(ChildPartitionsRecord::from_json)
                 .collect::<anyhow::Result<Vec<_>>>()?,
@@ -397,10 +406,21 @@ impl ChangeStreamRecord {
 }
 
 impl DataChangeRecord {
-    fn from_json(v: &JsonValue) -> anyhow::Result<Self> {
-        let obj = v
-            .as_object()
-            .ok_or_else(|| anyhow::anyhow!("DataChangeRecord is not an object, got: {}", v))?;
+    fn from_json(v: JsonValue) -> anyhow::Result<Self> {
+        let mut obj = match v {
+            JsonValue::Object(obj) => obj,
+            other => {
+                return Err(anyhow::anyhow!(
+                    "DataChangeRecord is not an object, got: {}",
+                    other
+                ));
+            }
+        };
+        // Taken out before the accessor closures below borrow `obj`, so the mods
+        // can be moved into `Mod::from_json` rather than cloned.
+        let column_types_json = obj.remove("column_types");
+        let mods_json = obj.remove("mods");
+
         let get_str = |k: &str| -> anyhow::Result<String> {
             obj.get(k)
                 .and_then(|v| v.as_str())
@@ -428,16 +448,16 @@ impl DataChangeRecord {
         )
         .map_err(|e| anyhow::anyhow!("invalid commit_timestamp '{}': {}", commit_ts_str, e))?;
 
-        let column_types = match obj.get("column_types") {
+        let column_types = match column_types_json {
             Some(JsonValue::Array(a)) => a
                 .iter()
                 .map(ColumnType::from_json)
                 .collect::<anyhow::Result<Vec<_>>>()?,
             _ => vec![],
         };
-        let mods = match obj.get("mods") {
+        let mods = match mods_json {
             Some(JsonValue::Array(a)) => a
-                .iter()
+                .into_iter()
                 .map(Mod::from_json)
                 .collect::<anyhow::Result<Vec<_>>>()?,
             _ => vec![],
@@ -514,27 +534,39 @@ impl ColumnType {
 }
 
 impl Mod {
-    fn from_json(v: &JsonValue) -> anyhow::Result<Self> {
-        let obj = v
-            .as_object()
-            .ok_or_else(|| anyhow::anyhow!("Mod is not an object, got: {}", v))?;
-        let cell_to_string = |k: &str| -> Option<String> {
-            // Cell values arrive as JSON objects (MAP<name, value>) from the
-            // SDK's STRUCT decoding, or as JSON-string-encoded objects from
-            // older wire formats. Preserve the existing string-of-JSON shape
-            // because `to_json_map` parses it as JSON.
-            match obj.get(k) {
-                Some(JsonValue::String(s)) => Some(s.clone()),
-                Some(v @ JsonValue::Object(_)) => Some(v.to_string()),
-                Some(JsonValue::Null) | None => None,
-                Some(other) => Some(other.to_string()),
-            }
+    /// Consumes the JSON value so each already-parsed cell map can be moved out
+    /// rather than copied.
+    fn from_json(v: JsonValue) -> anyhow::Result<Self> {
+        let mut obj = match v {
+            JsonValue::Object(obj) => obj,
+            other => return Err(anyhow::anyhow!("Mod is not an object, got: {}", other)),
         };
 
+        // The TVF declares these cells as JSON, so the SDK has already parsed
+        // them into objects — take them as they are. A JSON-string-encoded object
+        // is the fallback shape (emitted when the SDK has no type metadata) and is
+        // parsed here, once, instead of on every read in `to_json_map`.
+        fn cell(k: &str, v: Option<JsonValue>) -> anyhow::Result<Option<CellMap>> {
+            match v {
+                None | Some(JsonValue::Null) => Ok(None),
+                Some(JsonValue::Object(map)) => Ok(Some(map)),
+                // An absent cell is also spelled as the empty string on the wire.
+                Some(JsonValue::String(s)) if s.is_empty() => Ok(None),
+                Some(JsonValue::String(s)) => serde_json::from_str(&s)
+                    .map(Some)
+                    .map_err(|e| anyhow::anyhow!("Mod.{}: invalid JSON object '{}': {}", k, s, e)),
+                Some(other) => Err(anyhow::anyhow!(
+                    "Mod.{}: expected a JSON object or string, got: {}",
+                    k,
+                    other
+                )),
+            }
+        }
+
         Ok(Self {
-            keys: cell_to_string("keys"),
-            new_values: cell_to_string("new_values"),
-            old_values: cell_to_string("old_values"),
+            keys: cell("keys", obj.remove("keys"))?,
+            new_values: cell("new_values", obj.remove("new_values"))?,
+            old_values: cell("old_values", obj.remove("old_values"))?,
         })
     }
 }
@@ -634,17 +666,19 @@ impl Mod {
     /// convert values (e.g., keep zipcode "02101" as string, not convert to number 2101).
     /// It is shared by every `Mod` of the same `DataChangeRecord`, so the caller builds
     /// it once per record via [`DataChangeRecord::column_type_map`] rather than per mod.
-    pub fn to_json_map(
-        &self,
-        mod_type: &str,
-        column_types: &HashMap<&str, TypeCode>,
-    ) -> Result<serde_json::Map<String, JsonValue>, serde_json::Error> {
+    ///
+    /// Infallible: the cell maps were validated when the `Mod` was parsed.
+    pub fn to_json_map(&self, mod_type: &str, column_types: &HashMap<&str, TypeCode>) -> CellMap {
         let mut result = serde_json::Map::new();
 
         // Spanner change streams encode all values as JSON strings regardless of the
         // underlying column type. Convert numeric types (INT64, FLOAT64, etc.) back
         // to JSON numbers using the `column_types` metadata.
-        let convert_value = |column_name: &str, value: JsonValue| -> JsonValue {
+        //
+        // Takes the value by reference and clones only on the pass-through paths:
+        // a cell that really does convert becomes a fresh `Number`, so cloning its
+        // string first would be wasted work.
+        let convert_value = |column_name: &str, value: &JsonValue| -> JsonValue {
             match value {
                 JsonValue::String(s) => {
                     // Check the actual column type
@@ -688,9 +722,9 @@ impl Mod {
                         }
                     }
                     // Keep as string (either not numeric column, or parsing failed)
-                    JsonValue::String(s)
+                    JsonValue::String(s.clone())
                 }
-                _ => value,
+                _ => value.clone(),
             }
         };
 
@@ -698,52 +732,35 @@ impl Mod {
         // Spanner change streams encode ALL values as JSON strings regardless of the
         // underlying column type (INT64, FLOAT64, BOOL, etc.). We use `convert_value`
         // to restore proper JSON types based on the `column_types` metadata.
-        let merge_keys_and_values =
-            |keys: &Option<String>,
-             values: &Option<String>|
-             -> Result<serde_json::Map<String, JsonValue>, serde_json::Error> {
-                let mut merged = serde_json::Map::new();
-
-                if let Some(k) = keys {
-                    let keys_map: serde_json::Map<String, JsonValue> = serde_json::from_str(k)?;
-                    for (key, value) in keys_map {
-                        let converted = convert_value(&key, value);
-                        merged.insert(key, converted);
-                    }
+        // Values overwrite keys on collision, so keys must be inserted first.
+        let merge_keys_and_values = |keys: &Option<CellMap>, values: &Option<CellMap>| -> CellMap {
+            let mut merged = serde_json::Map::new();
+            for cells in [keys, values].into_iter().flatten() {
+                for (key, value) in cells {
+                    merged.insert(key.clone(), convert_value(key, value));
                 }
-
-                if let Some(v) = values {
-                    let values_map: serde_json::Map<String, JsonValue> = serde_json::from_str(v)?;
-                    for (key, value) in values_map {
-                        let converted = convert_value(&key, value);
-                        merged.insert(key, converted);
-                    }
-                }
-
-                Ok(merged)
-            };
+            }
+            merged
+        };
 
         // Parse before and after values based on operation type
         let (before, after, op) = match mod_type {
             "INSERT" => {
                 // INSERT: before is null, after has keys + new_values
-                let after_data = merge_keys_and_values(&self.keys, &self.new_values)?;
+                let after_data = merge_keys_and_values(&self.keys, &self.new_values);
                 (JsonValue::Null, JsonValue::Object(after_data), "c")
             }
             "UPDATE" => {
                 // UPDATE: before has keys + old_values (if available), after has keys + new_values
-                let after_data = merge_keys_and_values(&self.keys, &self.new_values)?;
+                let after_data = merge_keys_and_values(&self.keys, &self.new_values);
 
-                // For NEW_ROW capture type, old_values is None, empty string, or empty JSON object.
+                // For NEW_ROW capture type, old_values is absent or an empty map.
                 // In this case, set before to null AND change op to "c" (CREATE) to ensure
                 // the DebeziumParser treats this as an INSERT operation, not an UPDATE with retract.
-                let has_old_values = self.old_values.as_ref().map_or(false, |v| {
-                    // Check if the JSON string is non-empty and not just "{}"
-                    !v.is_empty() && v != "{}"
-                });
+                let has_old_values = self.old_values.as_ref().is_some_and(|m| !m.is_empty());
 
                 let (before_data, op_val) = if has_old_values {
-                    let merged = merge_keys_and_values(&self.keys, &self.old_values)?;
+                    let merged = merge_keys_and_values(&self.keys, &self.old_values);
                     (JsonValue::Object(merged), "u")
                 } else {
                     // NEW_ROW capture type: no old values, treat as INSERT
@@ -754,12 +771,12 @@ impl Mod {
             }
             "DELETE" => {
                 // DELETE: before has keys + old_values (or just keys if old_values not available), after is null
-                let before_data = merge_keys_and_values(&self.keys, &self.old_values)?;
+                let before_data = merge_keys_and_values(&self.keys, &self.old_values);
                 (JsonValue::Object(before_data), JsonValue::Null, "d")
             }
             _ => {
                 // Unknown operation type - treat as INSERT
-                let data = merge_keys_and_values(&self.keys, &self.new_values)?;
+                let data = merge_keys_and_values(&self.keys, &self.new_values);
                 (JsonValue::Null, JsonValue::Object(data), "c")
             }
         };
@@ -768,7 +785,7 @@ impl Mod {
         result.insert("after".to_string(), after);
         result.insert("op".to_string(), JsonValue::String(String::from(op)));
 
-        Ok(result)
+        result
     }
 }
 
@@ -846,14 +863,73 @@ mod tests {
         }
     }
 
+    fn cells(json: &str) -> Option<CellMap> {
+        Some(serde_json::from_str(json).unwrap())
+    }
+
     fn insert_mod(id: i64, balance: i64, zipcode: &str) -> Mod {
         Mod {
-            keys: Some(format!(r#"{{"id":"{id}"}}"#)),
-            new_values: Some(format!(
+            keys: cells(&format!(r#"{{"id":"{id}"}}"#)),
+            new_values: cells(&format!(
                 r#"{{"balance":"{balance}","zipcode":"{zipcode}"}}"#
             )),
             old_values: None,
         }
+    }
+
+    /// The SDK parses JSON-typed cells for us, so the object shape is the one
+    /// that arrives in production; a JSON-string-encoded object is the fallback.
+    /// Both must land on the same `Mod`, and neither may re-serialize.
+    #[test]
+    fn test_mod_from_json_accepts_object_and_string_cells() {
+        let as_object = Mod::from_json(serde_json::json!({
+            "keys": {"id": "1"},
+            "new_values": {"balance": "100"},
+            "old_values": null,
+        }))
+        .unwrap();
+        let as_string = Mod::from_json(serde_json::json!({
+            "keys": r#"{"id":"1"}"#,
+            "new_values": r#"{"balance":"100"}"#,
+            "old_values": null,
+        }))
+        .unwrap();
+
+        assert_eq!(as_object.keys, as_string.keys);
+        assert_eq!(as_object.new_values, as_string.new_values);
+        assert_eq!(as_object.keys, cells(r#"{"id":"1"}"#));
+        assert!(as_object.old_values.is_none());
+    }
+
+    /// An absent cell is spelled three ways on the wire — missing, null, and the
+    /// empty string. All three must read as `None` so an UPDATE with no old
+    /// values is still downgraded to an insert rather than failing to parse.
+    #[test]
+    fn test_mod_from_json_absent_cells() {
+        let m = Mod::from_json(serde_json::json!({
+            "keys": {"id": "1"},
+            "new_values": null,
+            "old_values": "",
+        }))
+        .unwrap();
+        assert!(m.new_values.is_none());
+        assert!(m.old_values.is_none());
+
+        let m = Mod::from_json(serde_json::json!({"keys": {"id": "1"}})).unwrap();
+        assert!(m.new_values.is_none());
+        assert!(m.old_values.is_none());
+    }
+
+    /// A cell that is neither an object nor a JSON-object string is rejected at
+    /// parse time, where the error can propagate, rather than deeper in the
+    /// pipeline where it used to panic.
+    #[test]
+    fn test_mod_from_json_rejects_non_object_cell() {
+        let err = Mod::from_json(serde_json::json!({"keys": 42})).unwrap_err();
+        assert!(err.to_string().contains("keys"), "unexpected error: {err}");
+
+        let err = Mod::from_json(serde_json::json!({"keys": "not json"})).unwrap_err();
+        assert!(err.to_string().contains("keys"), "unexpected error: {err}");
     }
 
     /// The map must carry every column, with the same type codes the old
@@ -893,8 +969,8 @@ mod tests {
                 .map(|ct| (ct.name.as_str(), ct.type_code()))
                 .collect();
 
-            let with_shared = m.to_json_map(&record.mod_type, &shared).unwrap();
-            let with_fresh = m.to_json_map(&record.mod_type, &fresh).unwrap();
+            let with_shared = m.to_json_map(&record.mod_type, &shared);
+            let with_fresh = m.to_json_map(&record.mod_type, &fresh);
 
             assert_eq!(with_shared, with_fresh);
         }
@@ -908,7 +984,7 @@ mod tests {
         let record = record_with_mods(vec![insert_mod(7, 4200, "02101")]);
         let map = record.column_type_map();
 
-        let json = record.mods[0].to_json_map(&record.mod_type, &map).unwrap();
+        let json = record.mods[0].to_json_map(&record.mod_type, &map);
 
         assert_eq!(json["op"], JsonValue::String("c".to_owned()));
         assert_eq!(json["before"], JsonValue::Null);
@@ -917,6 +993,47 @@ mod tests {
         assert_eq!(after["balance"], JsonValue::from(4200));
         // Leading zero must survive: STRING column, not a number.
         assert_eq!(after["zipcode"], JsonValue::String("02101".to_owned()));
+    }
+
+    fn update_mod(old_values: Option<CellMap>) -> Mod {
+        Mod {
+            keys: cells(r#"{"id":"1"}"#),
+            new_values: cells(r#"{"balance":"100","zipcode":"02101"}"#),
+            old_values,
+        }
+    }
+
+    fn update_json(m: Mod) -> CellMap {
+        let mut record = record_with_mods(vec![m]);
+        record.mod_type = "UPDATE".to_owned();
+        let map = record.column_type_map();
+        record.mods[0].to_json_map(&record.mod_type, &map)
+    }
+
+    /// An UPDATE carrying no old values must be downgraded to an insert: a
+    /// Debezium `u` would retract a row the connector cannot reconstruct.
+    /// Guards the switch from a string comparison (`v != "{}"`) to an emptiness
+    /// check on the parsed map.
+    #[test]
+    fn test_to_json_map_update_without_old_values_becomes_insert() {
+        for old_values in [None, cells("{}")] {
+            let json = update_json(update_mod(old_values));
+            assert_eq!(json["op"], JsonValue::String("c".to_owned()));
+            assert_eq!(json["before"], JsonValue::Null);
+            assert_eq!(json["after"]["balance"], JsonValue::from(100));
+        }
+    }
+
+    /// With real old values the event stays an update, and `before` carries the
+    /// keys merged with them.
+    #[test]
+    fn test_to_json_map_update_with_old_values_stays_update() {
+        let json = update_json(update_mod(cells(r#"{"balance":"50"}"#)));
+
+        assert_eq!(json["op"], JsonValue::String("u".to_owned()));
+        assert_eq!(json["before"]["id"], JsonValue::from(1));
+        assert_eq!(json["before"]["balance"], JsonValue::from(50));
+        assert_eq!(json["after"]["balance"], JsonValue::from(100));
     }
 
     fn obj(v: JsonValue) -> serde_json::Map<String, JsonValue> {
@@ -947,7 +1064,7 @@ mod tests {
     /// field, and the other two stay empty (Spanner populates exactly one).
     #[test]
     fn test_change_stream_record_parses_each_array() {
-        let dcr = ChangeStreamRecord::from_json_object(&obj(serde_json::json!({
+        let dcr = ChangeStreamRecord::from_json_object(obj(serde_json::json!({
             "data_change_record": [data_change_json()],
         })))
         .unwrap();
@@ -957,14 +1074,14 @@ mod tests {
         assert!(dcr.heartbeat_record.is_empty());
         assert!(dcr.child_partitions_record.is_empty());
 
-        let hb = ChangeStreamRecord::from_json_object(&obj(serde_json::json!({
+        let hb = ChangeStreamRecord::from_json_object(obj(serde_json::json!({
             "heartbeat_record": [{"timestamp": "2025-01-01T00:00:00Z"}],
         })))
         .unwrap();
         assert_eq!(hb.heartbeat_record.len(), 1);
         assert!(hb.data_change_record.is_empty());
 
-        let cpr = ChangeStreamRecord::from_json_object(&obj(serde_json::json!({
+        let cpr = ChangeStreamRecord::from_json_object(obj(serde_json::json!({
             "child_partitions_record": [{
                 "start_timestamp": "2025-01-01T00:00:00Z",
                 "record_sequence": "0",
@@ -983,12 +1100,12 @@ mod tests {
     /// erroring — the lenient shape the SDK's STRUCT decoding relies on.
     #[test]
     fn test_change_stream_record_tolerates_missing_and_non_array_fields() {
-        let empty = ChangeStreamRecord::from_json_object(&obj(serde_json::json!({}))).unwrap();
+        let empty = ChangeStreamRecord::from_json_object(obj(serde_json::json!({}))).unwrap();
         assert!(empty.data_change_record.is_empty());
         assert!(empty.heartbeat_record.is_empty());
         assert!(empty.child_partitions_record.is_empty());
 
-        let odd = ChangeStreamRecord::from_json_object(&obj(serde_json::json!({
+        let odd = ChangeStreamRecord::from_json_object(obj(serde_json::json!({
             "data_change_record": null,
             "heartbeat_record": "not-an-array",
             "child_partitions_record": [],
@@ -1006,7 +1123,7 @@ mod tests {
         let mut bad = data_change_json();
         bad.as_object_mut().unwrap().remove("table_name");
 
-        let err = ChangeStreamRecord::from_json_object(&obj(serde_json::json!({
+        let err = ChangeStreamRecord::from_json_object(obj(serde_json::json!({
             "data_change_record": [bad],
         })))
         .unwrap_err();
@@ -1023,7 +1140,7 @@ mod tests {
         let map: HashMap<&str, TypeCode> = HashMap::new();
         let m = insert_mod(1, 100, "02101");
 
-        let json = m.to_json_map("INSERT", &map).unwrap();
+        let json = m.to_json_map("INSERT", &map);
         let after = json["after"].as_object().unwrap();
         assert_eq!(after["id"], JsonValue::String("1".to_owned()));
         assert_eq!(after["balance"], JsonValue::String("100".to_owned()));
