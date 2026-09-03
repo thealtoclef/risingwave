@@ -3451,7 +3451,19 @@ impl CatalogController {
                             connector_type.as_str(),
                             SinkType,
                             {
-                                let mut new_sink_props = sink.properties.0.clone();
+                                // Same as `validate_sink_props`: `sink.properties` holds the
+                                // plaintext options only, so secret-backed ones must be resolved
+                                // before validating. Kept local to the check -- the copy that is
+                                // persisted below must stay unresolved.
+                                let mut new_sink_props = LocalSecretManager::global()
+                                    .fill_secrets(
+                                        sink.properties.0.clone(),
+                                        sink.secret_ref
+                                            .clone()
+                                            .map(|secret_ref| secret_ref.to_protobuf())
+                                            .unwrap_or_default(),
+                                    )
+                                    .map_err(|e| SinkError::Config(anyhow!(e)))?;
                                 new_sink_props.extend(alter_props.clone());
                                 SinkType::validate_alter_config(&new_sink_props)
                             },
