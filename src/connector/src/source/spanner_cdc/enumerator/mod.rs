@@ -15,6 +15,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use google_cloud_spanner::client::DatabaseClient;
 use google_cloud_spanner::statement::Statement;
 use risingwave_common::bail;
 use risingwave_common::id::SourceId;
@@ -30,6 +31,7 @@ pub struct SpannerCdcSplitEnumerator {
     source_id: SourceId,
     properties: SpannerCdcProperties,
     metrics: Arc<EnumeratorMetrics>,
+    client: DatabaseClient,
 }
 
 #[async_trait]
@@ -75,6 +77,7 @@ impl SplitEnumerator for SpannerCdcSplitEnumerator {
             source_id,
             properties,
             metrics: context.metrics.clone(),
+            client,
         })
     }
 
@@ -94,8 +97,8 @@ impl SplitEnumerator for SpannerCdcSplitEnumerator {
         // Report the current Spanner timestamp as the source position metric.
         // This queries Spanner's CURRENT_TIMESTAMP() to reflect how far along the
         // change stream source is, assuming the reader always catches up by design.
-        let client = self.properties.create_client().await?;
-        let mut rows = client
+        let mut rows = self
+            .client
             .single_use()
             .build()
             .execute_query(Statement::builder("SELECT CURRENT_TIMESTAMP()").build())
