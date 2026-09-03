@@ -95,10 +95,12 @@ const fn default_strict_mode() -> bool {
 #[derive(Deserialize, Debug, Clone, WithOptions)]
 pub struct DorisCommon {
     #[serde(rename = "doris.url")]
+    #[with_option(allow_alter_on_fly)]
     pub url: String,
     /// The full MySQL-protocol Doris FE URL with an explicit port, used for DDL when
     /// `create_table_if_not_exists` is enabled or schema change is used, e.g. `mysql://query-fe:9030`.
     #[serde(rename = "doris.query_url")]
+    #[with_option(allow_alter_on_fly)]
     pub query_url: Option<String>,
     /// The HTTP endpoint used for stream-load (`_stream_load`) requests. This must be a Doris BE
     /// HTTP address (e.g. `http://be:8040`), or something that forwards to one; setting it makes
@@ -116,6 +118,7 @@ pub struct DorisCommon {
     /// A single bare BE address is a single point of failure. Only one address is accepted; point
     /// it at a Service or load balancer if you need more than one BE behind it.
     #[serde(rename = "doris.stream_load_url")]
+    #[with_option(allow_alter_on_fly)]
     pub stream_load_url: Option<String>,
     #[serde(rename = "doris.user")]
     pub user: String,
@@ -364,6 +367,45 @@ impl DorisConfig {
                 "`doris.replication_num` must be a positive integer, got {:?}",
                 replication_num
             )));
+        }
+        // The URL options are only parsed when a client is built, which for an alter happens
+        // after the statement has already succeeded. Parse them here so a malformed address is
+        // rejected by `CREATE SINK` / `ALTER SINK` itself, instead of wedging the writer in a
+        // retry loop (or, for `doris.query_url`, only surfacing on the next schema change).
+        for (key, value, example) in [
+            ("doris.url", Some(&config.common.url), "http://fe:8030"),
+            (
+                "doris.stream_load_url",
+                config.common.stream_load_url.as_ref(),
+                "http://be:8040",
+            ),
+        ] {
+            let Some(value) = value else { continue };
+            let parsed = Url::parse(value).map_err(|e| {
+                SinkError::Config(anyhow!(
+                    "`{}` must be a valid URL (e.g. `{}`), got {:?}: {}",
+                    key,
+                    example,
+                    value,
+                    e
+                ))
+            })?;
+            // Both options are HTTP bases, so anything but `http`/`https` (a `mysql://` address
+            // pasted in from `doris.query_url`, say) cannot work. A URL without a host is
+            // likewise unusable even though it parses: `fe:8030` parses as scheme `fe`.
+            if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+                return Err(SinkError::Config(anyhow!(
+                    "`{}` must be an http(s) URL with a host (e.g. `{}`), got {:?}",
+                    key,
+                    example,
+                    value
+                )));
+            }
+        }
+        // Reuses the DDL client's own option parsing, which also enforces the `mysql` scheme and
+        // an explicit port. Building `Opts` opens no connection.
+        if let Some(query_url) = &config.common.query_url {
+            build_ddl_opts(query_url, &config.common.user, &config.common.password)?;
         }
         // `partition_by` only shapes the auto-created table, so it is meaningless without
         // `create_table_if_not_exists`. Parsing it here also surfaces grammar errors at config time (before any

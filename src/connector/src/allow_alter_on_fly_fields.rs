@@ -246,6 +246,9 @@ pub static SINK_ALLOW_ALTER_ON_FLY_FIELDS: LazyLock<HashMap<String, HashSet<Stri
     map.try_insert(
         std::any::type_name::<DorisConfig>().to_owned(),
         [
+            "doris.url".to_owned(),
+            "doris.query_url".to_owned(),
+            "doris.stream_load_url".to_owned(),
             "doris.stream_load.http.timeout.ms".to_owned(),
             "doris.format".to_owned(),
             "commit_checkpoint_interval".to_owned(),

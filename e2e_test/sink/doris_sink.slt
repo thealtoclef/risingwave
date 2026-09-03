@@ -42,6 +42,31 @@ ALTER SINK s6 CONNECTOR WITH (
     commit_checkpoint_interval = '0'
 );
 
+# The endpoint options are alterable too, and a malformed value for any of them is likewise
+# rejected before any barrier: they are only parsed when a client is built, so without the
+# config-time check these statements would succeed and leave the sink retrying an address it can
+# never use.
+statement error must be a valid URL
+ALTER SINK s6 CONNECTOR WITH (
+    doris.stream_load_url = 'not-a-url'
+);
+
+# Parses, but as scheme `doris-server` with no host, so no HTTP client can be built from it.
+statement error must be an http\(s\) URL with a host
+ALTER SINK s6 CONNECTOR WITH (
+    doris.url = 'doris-server:8030'
+);
+
+statement error scheme must be 'mysql'
+ALTER SINK s6 CONNECTOR WITH (
+    doris.query_url = 'http://doris-server:9030'
+);
+
+statement error must include an explicit port
+ALTER SINK s6 CONNECTOR WITH (
+    doris.query_url = 'mysql://doris-server'
+);
+
 statement ok
 INSERT INTO t6 VALUES (1, 1, 1, 1.1, 1.2, 'test', '2013-01-01', '2013-01-01 01:01:01' , false, '{"a":1}');
 
@@ -367,9 +392,17 @@ UPDATE t6_decoupled SET v2 = 'r4' WHERE v1 = 2;
 statement ok
 FLUSH;
 
-# Both new options must be alterable on the fly: `commit_checkpoint_interval` to retune commit
-# frequency, and `doris.strict_mode` as the documented escape hatch for a sink stalled on an
-# unconvertible row. Both are altered in one statement.
+# These options must be alterable on the fly: `commit_checkpoint_interval` to retune commit
+# frequency, `doris.strict_mode` as the documented escape hatch for a sink stalled on an
+# unconvertible row, and the endpoint options (`doris.stream_load_url` to repoint loads at a BE or
+# load balancer, `doris.query_url` to point DDL at a different FE) so a moved Doris cluster does
+# not require recreating the sink. All are altered in one statement.
+#
+# `http://doris-server:8040` is the same reachable BE that `s6_direct` loads to above, so after the
+# alter this sink keeps loading — through the direct-to-BE path this time, with the FE → BE redirect
+# probe skipped — rather than silently stalling on an unreachable endpoint. `doris.query_url` is
+# only used for schema-change DDL, which this sink never issues, so setting it is inert here beyond
+# proving the option is accepted.
 #
 # This runs against the *decoupled* sink on purpose. A sink created with `sink_decouple = false`
 # uses the bounded in-memory log store, which cannot rewind, so `ALTER SINK ... CONNECTOR WITH`
@@ -383,7 +416,9 @@ FLUSH;
 statement ok
 ALTER SINK s6_decoupled CONNECTOR WITH (
     commit_checkpoint_interval = '1',
-    doris.strict_mode = 'false'
+    doris.strict_mode = 'false',
+    doris.stream_load_url = 'http://doris-server:8040',
+    doris.query_url = 'mysql://doris-server:9030'
 );
 
 query I
@@ -391,7 +426,9 @@ select count(*)
 from rw_sinks
 where name = 's6_decoupled'
   and definition ILIKE '%commit_checkpoint_interval = ''1''%'
-  and definition ILIKE '%doris.strict_mode = ''false''%';
+  and definition ILIKE '%doris.strict_mode = ''false''%'
+  and definition ILIKE '%doris.stream_load_url = ''http://doris-server:8040''%'
+  and definition ILIKE '%doris.query_url = ''mysql://doris-server:9030''%';
 ----
 1
 
