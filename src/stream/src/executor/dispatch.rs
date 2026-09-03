@@ -393,12 +393,57 @@ impl DispatchExecutorInner {
             }
         }
 
+        // Applied after the barrier is dispatched, so the switch lands on the same barrier the
+        // downstream uses to adopt the new assignment.
+        if let Some(updates) = cdc_scan_actor_idleness(mutation) {
+            for dispatcher in &mut self.dispatchers {
+                dispatcher.update_data_suppression(&updates);
+            }
+            // Only carried on assignment barriers, which are rare, so this is not a hot path.
+            // Without it a silent change in data routing leaves no trace to diagnose from.
+            let (suppressed, resumed): (Vec<_>, Vec<_>) =
+                updates.iter().partition(|(_, idle)| **idle);
+            tracing::info!(
+                actor_id = %self.actor_id,
+                suppressed = ?suppressed.iter().map(|(id, _)| **id).collect_vec(),
+                resumed = ?resumed.iter().map(|(id, _)| **id).collect_vec(),
+                "updated CDC scan data suppression"
+            );
+        }
+
         // After stopping the downstream mview, the outputs of some dispatcher might be empty and we
         // should clean up them.
         self.dispatchers.retain(|d| !d.is_empty());
 
         Ok(())
     }
+}
+
+/// Whether each CDC scan actor named by this barrier's split assignment was left with no split.
+/// `ParallelizedCdcBackfillExecutor` drops every chunk such an actor receives before doing any
+/// work on it, so the delivery itself -- a per-output serialization and, for a remote actor, the
+/// exchange bytes -- is the whole cost.
+///
+/// An assignment covers a single CDC table job, or only the rescheduled fragments, so the result
+/// is a per-actor delta rather than the complete set of idle actors: replacing the set wholesale
+/// would drop the actors of every other CDC table on the next assignment barrier. `None` means
+/// this barrier carries no assignment at all and the caller should keep its current view.
+fn cdc_scan_actor_idleness(mutation: &Mutation) -> Option<HashMap<ActorId, bool>> {
+    let assignment = match mutation {
+        Mutation::Add(add) => &add.actor_cdc_table_snapshot_splits,
+        Mutation::Update(update) => &update.actor_cdc_table_snapshot_splits,
+        _ => return None,
+    };
+    if assignment.splits.is_empty() {
+        return None;
+    }
+    Some(
+        assignment
+            .splits
+            .iter()
+            .map(|(actor_id, (splits, _))| (*actor_id, splits.is_empty()))
+            .collect(),
+    )
 }
 
 impl DispatchExecutor {
@@ -717,6 +762,13 @@ macro_rules! impl_dispatcher {
                 }
             }
 
+            pub fn update_data_suppression(&mut self, updates: &HashMap<ActorId, bool>) {
+                match self {
+                    $(Self::$variant_name(inner) => inner.update_data_suppression(updates), )*
+                    Self::Failed(..) => {},
+                }
+            }
+
             pub fn add_outputs(&mut self, outputs: impl IntoIterator<Item = Output>) {
                 match self {
                     $(Self::$variant_name(inner) => inner.add_outputs(outputs), )*
@@ -770,6 +822,11 @@ trait Dispatcher: Debug + 'static {
     fn dispatch_barriers(&mut self, barrier: DispatcherBarriers) -> impl DispatchFuture<'_>;
     /// Dispatch a watermark to downstream actors, generally by broadcasting it.
     fn dispatch_watermark(&mut self, watermark: Watermark) -> impl DispatchFuture<'_>;
+
+    /// Start or stop sending data to the given actors, leaving actors absent from `updates`
+    /// alone. A suppressed actor keeps receiving barriers and watermarks, so it stays aligned and
+    /// can be given data again later. No-op unless the dispatcher fans out.
+    fn update_data_suppression(&mut self, _updates: &HashMap<ActorId, bool>) {}
 
     /// Add new outputs to the dispatcher.
     fn add_outputs(&mut self, outputs: impl IntoIterator<Item = Output>);
@@ -1098,6 +1155,7 @@ pub struct BroadcastDispatcher {
     outputs: HashMap<ActorId, Output>,
     output_mapping: DispatchOutputMapping,
     dispatcher_id: DispatcherId,
+    data_suppressed_actors: HashSet<ActorId>,
 }
 
 impl BroadcastDispatcher {
@@ -1110,6 +1168,7 @@ impl BroadcastDispatcher {
             outputs: Self::into_pairs(outputs).collect(),
             output_mapping,
             dispatcher_id,
+            data_suppressed_actors: HashSet::new(),
         }
     }
 
@@ -1125,8 +1184,19 @@ impl BroadcastDispatcher {
 impl Dispatcher for BroadcastDispatcher {
     async fn dispatch_data(&mut self, chunk: StreamChunk) -> StreamResult<()> {
         let chunk = self.output_mapping.apply(chunk);
+        if self.data_suppressed_actors.is_empty() {
+            return broadcast_concurrent(
+                self.outputs.values_mut(),
+                DispatcherMessageBatch::Chunk(chunk),
+            )
+            .await;
+        }
+        let suppressed = &self.data_suppressed_actors;
         broadcast_concurrent(
-            self.outputs.values_mut(),
+            self.outputs
+                .iter_mut()
+                .filter(|(actor_id, _)| !suppressed.contains(*actor_id))
+                .map(|(_, output)| output),
             DispatcherMessageBatch::Chunk(chunk),
         )
         .await
@@ -1153,6 +1223,18 @@ impl Dispatcher for BroadcastDispatcher {
         Ok(())
     }
 
+    fn update_data_suppression(&mut self, updates: &HashMap<ActorId, bool>) {
+        for (actor_id, suppressed) in updates {
+            if *suppressed {
+                // Recorded even if the actor is not an output yet, so one added later by
+                // `add_outputs` is still covered.
+                self.data_suppressed_actors.insert(*actor_id);
+            } else {
+                self.data_suppressed_actors.remove(actor_id);
+            }
+        }
+    }
+
     fn add_outputs(&mut self, outputs: impl IntoIterator<Item = Output>) {
         self.outputs.extend(Self::into_pairs(outputs));
     }
@@ -1161,6 +1243,9 @@ impl Dispatcher for BroadcastDispatcher {
         self.outputs
             .extract_if(|actor_id, _| actor_ids.contains(actor_id))
             .count();
+        // Drop suppression state for actors that are gone, so it cannot outlive them.
+        self.data_suppressed_actors
+            .retain(|actor_id| !actor_ids.contains(actor_id));
     }
 
     fn dispatcher_id(&self) -> DispatcherId {
@@ -1269,6 +1354,8 @@ mod tests {
     use risingwave_common::types::DataType;
     use risingwave_common::util::epoch::test_epoch;
     use risingwave_common::util::hash_util::Crc32FastBuilder;
+    use risingwave_connector::source::CdcTableSnapshotSplitRaw;
+    use risingwave_connector::source::cdc::CdcTableSnapshotSplitAssignmentWithGeneration;
     use risingwave_expr::expr::{InputRefExpression, NonStrictExpression};
     use risingwave_pb::stream_plan::{DispatcherType, PbDispatchOutputMapping};
     use tokio::sync::mpsc::unbounded_channel;
@@ -1795,5 +1882,125 @@ mod tests {
                 + 1",
             )
         );
+    }
+
+    fn cdc_split(split_id: i64) -> CdcTableSnapshotSplitRaw {
+        CdcTableSnapshotSplitRaw {
+            split_id,
+            left_bound_inclusive: vec![],
+            right_bound_exclusive: vec![],
+        }
+    }
+
+    fn cdc_assignment(
+        entries: impl IntoIterator<Item = (ActorId, Vec<CdcTableSnapshotSplitRaw>)>,
+    ) -> CdcTableSnapshotSplitAssignmentWithGeneration {
+        CdcTableSnapshotSplitAssignmentWithGeneration::new(
+            entries
+                .into_iter()
+                .map(|(actor_id, splits)| (actor_id, (splits, 1)))
+                .collect(),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_broadcast_dispatcher_data_suppression() {
+        let actor_ids = [ActorId::new(1), ActorId::new(2), ActorId::new(3)];
+        let (txs, mut rxs): (Vec<_>, Vec<_>) =
+            actor_ids.iter().map(|_| channel_for_test()).collect();
+        let outputs = actor_ids
+            .iter()
+            .zip_eq_fast(txs)
+            .map(|(actor_id, tx)| Output::new(*actor_id, tx))
+            .collect_vec();
+        let mut dispatcher =
+            BroadcastDispatcher::new(outputs, DispatchOutputMapping::Simple(vec![0]), 0.into());
+
+        // Suppress the middle output only.
+        dispatcher.update_data_suppression(&HashMap::from_iter([(actor_ids[1], true)]));
+
+        let chunk = StreamChunk::from_pretty(
+            "  I
+             + 1",
+        );
+        dispatcher.dispatch_data(chunk).await.unwrap();
+        rxs[0].try_recv().unwrap().as_chunk().unwrap();
+        assert!(rxs[1].try_recv().is_err(), "suppressed output got a chunk");
+        rxs[2].try_recv().unwrap().as_chunk().unwrap();
+
+        // Barriers and watermarks must still reach every output, so a suppressed actor stays
+        // aligned and can be given data again.
+        let barrier = Barrier::new_test_barrier(test_epoch(1)).into_dispatcher();
+        dispatcher.dispatch_barriers(vec![barrier]).await.unwrap();
+        for rx in &mut rxs {
+            rx.try_recv().unwrap().as_barrier_batch().unwrap();
+        }
+
+        let watermark = Watermark::new(0, DataType::Int64, ScalarImpl::Int64(1));
+        dispatcher.dispatch_watermark(watermark).await.unwrap();
+        for rx in &mut rxs {
+            rx.try_recv().unwrap().as_watermark().unwrap();
+        }
+
+        // An update that does not mention a suppressed actor must leave it suppressed, since an
+        // assignment only ever covers one CDC table job.
+        dispatcher.update_data_suppression(&HashMap::from_iter([(actor_ids[2], false)]));
+        let chunk = StreamChunk::from_pretty(
+            "  I
+             + 2",
+        );
+        dispatcher.dispatch_data(chunk).await.unwrap();
+        rxs[0].try_recv().unwrap().as_chunk().unwrap();
+        assert!(rxs[1].try_recv().is_err(), "suppression was dropped early");
+        rxs[2].try_recv().unwrap().as_chunk().unwrap();
+
+        // Lifting the suppression restores a plain broadcast.
+        dispatcher.update_data_suppression(&HashMap::from_iter([(actor_ids[1], false)]));
+        let chunk = StreamChunk::from_pretty(
+            "  I
+             + 2",
+        );
+        dispatcher.dispatch_data(chunk).await.unwrap();
+        for rx in &mut rxs {
+            rx.try_recv().unwrap().as_chunk().unwrap();
+        }
+
+        // Suppression state must not outlive the actor it refers to, or a later actor reusing
+        // the id would silently start out suppressed.
+        dispatcher.update_data_suppression(&HashMap::from_iter([(actor_ids[1], true)]));
+        dispatcher.remove_outputs(&HashSet::from_iter([actor_ids[1]]));
+        assert!(dispatcher.data_suppressed_actors.is_empty());
+    }
+
+    #[test]
+    fn test_cdc_scan_actor_idleness() {
+        let (busy, idle) = (ActorId::new(1), ActorId::new(2));
+        let assignment = || cdc_assignment([(busy, vec![cdc_split(1)]), (idle, vec![])]);
+
+        // Every actor named by the assignment is reported, so that an actor which regained a
+        // split is resumed. Actors of other jobs are absent and thus left alone.
+        for mutation in [
+            Mutation::Update(UpdateMutation {
+                actor_cdc_table_snapshot_splits: assignment(),
+                ..Default::default()
+            }),
+            Mutation::Add(AddMutation {
+                actor_cdc_table_snapshot_splits: assignment(),
+                ..Default::default()
+            }),
+        ] {
+            assert_eq!(
+                cdc_scan_actor_idleness(&mutation),
+                Some(HashMap::from_iter([(busy, false), (idle, true)]))
+            );
+        }
+
+        // A barrier that carries no assignment must leave the current view untouched, whether it
+        // is an assignment-bearing mutation with nothing to say or an unrelated one.
+        assert_eq!(
+            cdc_scan_actor_idleness(&Mutation::Update(UpdateMutation::default())),
+            None
+        );
+        assert_eq!(cdc_scan_actor_idleness(&Mutation::Pause), None);
     }
 }
