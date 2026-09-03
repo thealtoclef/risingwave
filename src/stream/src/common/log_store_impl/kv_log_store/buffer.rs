@@ -16,7 +16,6 @@ use std::collections::VecDeque;
 use std::mem::size_of;
 use std::ops::DerefMut;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use await_tree::InstrumentAwait;
 use parking_lot::{Mutex, MutexGuard};
@@ -30,15 +29,6 @@ use tokio::sync::Notify;
 use crate::common::log_store_impl::kv_log_store::{
     KvLogStoreMetrics, ReaderTruncationOffsetType, SeqId,
 };
-
-/// Minimum interval between two refreshes of the buffer gauges.
-///
-/// Refreshing walks both queues and re-estimates the heap size of every buffered
-/// chunk, so its cost grows with the buffer length. Doing it on every buffer
-/// operation makes the total cost quadratic in the buffer length, which becomes a
-/// significant share of the CPU when a sink falls behind and the buffer grows
-/// large. The gauges are diagnostic only, so a bounded refresh rate is enough.
-const BUFFER_METRICS_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Clone)]
 pub(crate) enum LogStoreBufferItem {
@@ -79,6 +69,27 @@ impl EstimateSize for LogStoreBufferItem {
     }
 }
 
+/// Number of rows an item contributes to `buffer_unconsumed_row_count`.
+fn item_row_count(item: &LogStoreBufferItem) -> usize {
+    match item {
+        LogStoreBufferItem::StreamChunk { chunk, .. } => chunk.cardinality(),
+        LogStoreBufferItem::Flushed {
+            start_seq_id,
+            end_seq_id,
+            ..
+        } => (end_seq_id - start_seq_id) as usize,
+        LogStoreBufferItem::Barrier { .. } => 0,
+    }
+}
+
+/// Number of epochs an item contributes to `buffer_unconsumed_epoch_count`.
+fn item_epoch_count(item: &LogStoreBufferItem) -> usize {
+    match item {
+        LogStoreBufferItem::Barrier { .. } => 1,
+        _ => 0,
+    }
+}
+
 struct LogStoreBufferInner {
     /// Items not read by log reader. Newer item at the front
     unconsumed_queue: VecDeque<(u64, LogStoreBufferItem)>,
@@ -94,49 +105,26 @@ struct LogStoreBufferInner {
 
     metrics: KvLogStoreMetrics,
 
-    /// When the buffer gauges were last recomputed. `None` before the first refresh.
-    last_metrics_update: Option<Instant>,
+    /// Running aggregates over the two queues, maintained incrementally by the
+    /// `*_stats` helpers below, which saturate rather than wrap or panic, following
+    /// `HeapSizeReporter` in `stream/src/cache/managed_lru.rs`. Recomputing them by walking the queues on every
+    /// buffer operation makes the cost quadratic in the buffer length, which becomes
+    /// a significant share of the CPU when a sink falls behind and the buffer grows
+    /// to millions of items.
+    unconsumed_memory_bytes: usize,
+    consumed_memory_bytes: usize,
+    unconsumed_row_count: usize,
+    unconsumed_epoch_count: usize,
 }
 
 impl LogStoreBufferInner {
-    /// Refresh the buffer gauges, at most once per [`BUFFER_METRICS_UPDATE_INTERVAL`].
-    fn update_buffer_metrics(&mut self) {
-        if let Some(last_update) = self.last_metrics_update
-            && last_update.elapsed() < BUFFER_METRICS_UPDATE_INTERVAL
-        {
-            return;
-        }
-        self.update_buffer_metrics_force();
-    }
-
-    fn update_buffer_metrics_force(&mut self) {
-        self.last_metrics_update = Some(Instant::now());
-        let mut epoch_count = 0;
-        let mut row_count = 0;
-        let mut memory_bytes = 0;
-        for (_, item) in &self.unconsumed_queue {
-            match item {
-                LogStoreBufferItem::StreamChunk { chunk, .. } => {
-                    row_count += chunk.cardinality();
-                }
-                LogStoreBufferItem::Flushed {
-                    start_seq_id,
-                    end_seq_id,
-                    ..
-                } => {
-                    row_count += (end_seq_id - start_seq_id) as usize;
-                }
-                LogStoreBufferItem::Barrier { .. } => {
-                    epoch_count += 1;
-                }
-            }
-            memory_bytes += item.estimated_size();
-        }
-        for (_, item) in &self.consumed_queue {
-            memory_bytes += item.estimated_size();
-        }
-        self.metrics.buffer_unconsumed_epoch_count.set(epoch_count);
-        self.metrics.buffer_unconsumed_row_count.set(row_count as _);
+    fn update_buffer_metrics(&self) {
+        self.metrics
+            .buffer_unconsumed_epoch_count
+            .set(self.unconsumed_epoch_count as _);
+        self.metrics
+            .buffer_unconsumed_row_count
+            .set(self.unconsumed_row_count as _);
         self.metrics
             .buffer_unconsumed_item_count
             .set(self.unconsumed_queue.len() as _);
@@ -146,7 +134,57 @@ impl LogStoreBufferInner {
                 .map(|(epoch, _)| *epoch)
                 .unwrap_or_default() as _,
         );
-        self.metrics.buffer_memory_bytes.set(memory_bytes as _);
+        self.metrics.buffer_memory_bytes.set(
+            self.unconsumed_memory_bytes
+                .saturating_add(self.consumed_memory_bytes) as _,
+        );
+    }
+
+    /// Add `item`'s contribution to the unconsumed aggregates. Does not touch the queue.
+    fn add_unconsumed_stats(&mut self, item: &LogStoreBufferItem) {
+        self.unconsumed_memory_bytes = self
+            .unconsumed_memory_bytes
+            .saturating_add(item.estimated_size());
+        self.unconsumed_row_count = self
+            .unconsumed_row_count
+            .saturating_add(item_row_count(item));
+        self.unconsumed_epoch_count = self
+            .unconsumed_epoch_count
+            .saturating_add(item_epoch_count(item));
+    }
+
+    /// Remove `item`'s contribution from the unconsumed aggregates. Does not touch the queue.
+    fn sub_unconsumed_stats(&mut self, item: &LogStoreBufferItem) {
+        self.unconsumed_memory_bytes = self
+            .unconsumed_memory_bytes
+            .saturating_sub(item.estimated_size());
+        self.unconsumed_row_count = self
+            .unconsumed_row_count
+            .saturating_sub(item_row_count(item));
+        self.unconsumed_epoch_count = self
+            .unconsumed_epoch_count
+            .saturating_sub(item_epoch_count(item));
+    }
+
+    /// Add `item`'s contribution to the consumed aggregates. Does not touch the queue.
+    fn add_consumed_stats(&mut self, item: &LogStoreBufferItem) {
+        self.consumed_memory_bytes = self
+            .consumed_memory_bytes
+            .saturating_add(item.estimated_size());
+    }
+
+    /// Remove `item`'s contribution from the consumed aggregates. Does not touch the queue.
+    fn sub_consumed_stats(&mut self, item: &LogStoreBufferItem) {
+        self.consumed_memory_bytes = self
+            .consumed_memory_bytes
+            .saturating_sub(item.estimated_size());
+    }
+
+    /// Pop the oldest consumed item, keeping the aggregates in sync.
+    fn pop_consumed_back(&mut self) {
+        if let Some((_, item)) = self.consumed_queue.pop_back() {
+            self.sub_consumed_stats(&item);
+        }
     }
 
     fn can_add_stream_chunk(&self) -> bool {
@@ -157,21 +195,12 @@ impl LogStoreBufferInner {
         if let LogStoreBufferItem::StreamChunk { .. } = item {
             unreachable!("StreamChunk should call try_add_item")
         }
-        let is_barrier = if let LogStoreBufferItem::Barrier { .. } = &item {
+        if let LogStoreBufferItem::Barrier { .. } = &item {
             self.next_chunk_id = 0;
-            true
-        } else {
-            false
-        };
-        self.unconsumed_queue.push_front((epoch, item));
-        // Barriers arrive at a bounded rate, so it is safe to always refresh on them.
-        // This also keeps the gauges from going stale while the throttle skips the
-        // high-frequency chunk operations.
-        if is_barrier {
-            self.update_buffer_metrics_force();
-        } else {
-            self.update_buffer_metrics();
         }
+        self.add_unconsumed_stats(&item);
+        self.unconsumed_queue.push_front((epoch, item));
+        self.update_buffer_metrics();
     }
 
     pub(crate) fn try_add_stream_chunk(
@@ -187,16 +216,15 @@ impl LogStoreBufferInner {
             let chunk_id = self.next_chunk_id;
             self.next_chunk_id += 1;
             self.row_count += chunk.cardinality();
-            self.unconsumed_queue.push_front((
-                epoch,
-                LogStoreBufferItem::StreamChunk {
-                    chunk,
-                    start_seq_id,
-                    end_seq_id,
-                    flushed: false,
-                    chunk_id,
-                },
-            ));
+            let item = LogStoreBufferItem::StreamChunk {
+                chunk,
+                start_seq_id,
+                end_seq_id,
+                flushed: false,
+                chunk_id,
+            };
+            self.add_unconsumed_stats(&item);
+            self.unconsumed_queue.push_front((epoch, item));
             self.update_buffer_metrics();
             None
         }
@@ -204,6 +232,10 @@ impl LogStoreBufferInner {
 
     fn pop_item(&mut self) -> Option<(u64, LogStoreBufferItem)> {
         if let Some((epoch, item)) = self.unconsumed_queue.pop_back() {
+            self.sub_unconsumed_stats(&item);
+            // The item is cloned into the consumed queue, so it is counted in both
+            // queues until truncated. This matches the previous behaviour.
+            self.add_consumed_stats(&item);
             self.consumed_queue.push_front((epoch, item.clone()));
             self.update_buffer_metrics();
             Some((epoch, item))
@@ -220,15 +252,16 @@ impl LogStoreBufferInner {
         new_vnode_bitmap: Bitmap,
     ) {
         let curr_chunk_size = (end_seq_id - start_seq_id + 1) as usize;
-        let merged = if let Some((
+        // Decide first, without holding a mutable borrow, so that the merge below can
+        // read the item's size before and after mutating it.
+        let can_merge = if let Some((
             item_epoch,
             LogStoreBufferItem::Flushed {
                 start_seq_id: prev_start_seq_id,
                 end_seq_id: prev_end_seq_id,
-                vnode_bitmap,
                 ..
             },
-        )) = self.unconsumed_queue.front_mut()
+        )) = self.unconsumed_queue.front()
             && let prev_chunk_size = (*prev_end_seq_id - *prev_start_seq_id + 1) as usize
             && curr_chunk_size + prev_chunk_size <= self.chunk_size
         {
@@ -242,12 +275,38 @@ impl LogStoreBufferInner {
                 epoch, *item_epoch,
                 "epoch of newly added flushed item must be the same as the last flushed item"
             );
+            true
+        } else {
+            false
+        };
+
+        if can_merge {
+            // Extending the item changes its row count, and OR-ing the vnode bitmap can
+            // change its heap size in place (a compact `Bitmap` reports zero heap size).
+            // So take the item out, re-derive its contribution, and put it back, rather
+            // than assuming the contribution is unchanged.
+            let (item_epoch, mut item) = self
+                .unconsumed_queue
+                .pop_front()
+                .expect("checked to be a mergeable flushed item above");
+            self.sub_unconsumed_stats(&item);
+            let LogStoreBufferItem::Flushed {
+                end_seq_id: prev_end_seq_id,
+                vnode_bitmap,
+                ..
+            } = &mut item
+            else {
+                unreachable!("checked to be a flushed item above")
+            };
             *prev_end_seq_id = end_seq_id;
             *vnode_bitmap |= new_vnode_bitmap;
-            true
+            self.add_unconsumed_stats(&item);
+            self.unconsumed_queue.push_front((item_epoch, item));
+            self.update_buffer_metrics();
         } else {
             let chunk_id = self.next_chunk_id;
             self.next_chunk_id += 1;
+            // `add_item` refreshes the gauges.
             self.add_item(
                 epoch,
                 LogStoreBufferItem::Flushed {
@@ -257,11 +316,6 @@ impl LogStoreBufferInner {
                     chunk_id,
                 },
             );
-            false
-        };
-        // The `else` branch already refreshed the gauges via `add_item`.
-        if merged {
-            self.update_buffer_metrics();
         }
     }
 
@@ -278,11 +332,13 @@ impl LogStoreBufferInner {
     fn rewind(&mut self, log_store_rewind_start_epoch: Option<u64>) {
         let rewind_start_epoch = log_store_rewind_start_epoch.unwrap_or(0);
         while let Some((epoch, item)) = self.consumed_queue.pop_front() {
+            self.sub_consumed_stats(&item);
             if epoch > rewind_start_epoch {
+                self.add_unconsumed_stats(&item);
                 self.unconsumed_queue.push_back((epoch, item));
             }
         }
-        self.update_buffer_metrics_force();
+        self.update_buffer_metrics();
     }
 
     fn clear(&mut self) {
@@ -291,6 +347,10 @@ impl LogStoreBufferInner {
         self.next_chunk_id = 0;
         self.truncation_list.clear();
         self.row_count = 0;
+        self.unconsumed_memory_bytes = 0;
+        self.consumed_memory_bytes = 0;
+        self.unconsumed_row_count = 0;
+        self.unconsumed_epoch_count = 0;
     }
 }
 
@@ -493,7 +553,7 @@ impl LogStoreBufferReceiver {
                     let end_seq_id = *end_seq_id;
                     if chunk_offset <= offset {
                         inner.row_count -= chunk.cardinality();
-                        inner.consumed_queue.pop_back();
+                        inner.pop_consumed_back();
                         if flushed {
                             latest_offset = Some((epoch, Some(end_seq_id)));
                         }
@@ -512,7 +572,7 @@ impl LogStoreBufferReceiver {
                         chunk_id: *chunk_id,
                     };
                     if chunk_offset <= offset {
-                        inner.consumed_queue.pop_back();
+                        inner.pop_consumed_back();
                         latest_offset = Some((epoch, Some(end_seq_id)));
                     } else {
                         break;
@@ -521,7 +581,7 @@ impl LogStoreBufferReceiver {
                 LogStoreBufferItem::Barrier { .. } => {
                     let chunk_offset = TruncateOffset::Barrier { epoch };
                     if chunk_offset <= offset {
-                        inner.consumed_queue.pop_back();
+                        inner.pop_consumed_back();
                         latest_offset = Some((epoch, None));
                     } else {
                         break;
@@ -561,7 +621,10 @@ pub(crate) fn new_log_store_buffer(
         truncation_list: VecDeque::new(),
         next_chunk_id: 0,
         metrics,
-        last_metrics_update: None,
+        unconsumed_memory_bytes: 0,
+        consumed_memory_bytes: 0,
+        unconsumed_row_count: 0,
+        unconsumed_epoch_count: 0,
     });
     let update_notify = Arc::new(Notify::new());
     let truncate_notify = Arc::new(Notify::new());
