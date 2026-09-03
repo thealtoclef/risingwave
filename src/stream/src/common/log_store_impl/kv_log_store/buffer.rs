@@ -16,6 +16,7 @@ use std::collections::VecDeque;
 use std::mem::size_of;
 use std::ops::DerefMut;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use await_tree::InstrumentAwait;
 use parking_lot::{Mutex, MutexGuard};
@@ -29,6 +30,15 @@ use tokio::sync::Notify;
 use crate::common::log_store_impl::kv_log_store::{
     KvLogStoreMetrics, ReaderTruncationOffsetType, SeqId,
 };
+
+/// Minimum interval between two refreshes of the buffer gauges.
+///
+/// Refreshing walks both queues and re-estimates the heap size of every buffered
+/// chunk, so its cost grows with the buffer length. Doing it on every buffer
+/// operation makes the total cost quadratic in the buffer length, which becomes a
+/// significant share of the CPU when a sink falls behind and the buffer grows
+/// large. The gauges are diagnostic only, so a bounded refresh rate is enough.
+const BUFFER_METRICS_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Clone)]
 pub(crate) enum LogStoreBufferItem {
@@ -83,10 +93,24 @@ struct LogStoreBufferInner {
     next_chunk_id: ChunkId,
 
     metrics: KvLogStoreMetrics,
+
+    /// When the buffer gauges were last recomputed. `None` before the first refresh.
+    last_metrics_update: Option<Instant>,
 }
 
 impl LogStoreBufferInner {
-    fn update_buffer_metrics(&self) {
+    /// Refresh the buffer gauges, at most once per [`BUFFER_METRICS_UPDATE_INTERVAL`].
+    fn update_buffer_metrics(&mut self) {
+        if let Some(last_update) = self.last_metrics_update
+            && last_update.elapsed() < BUFFER_METRICS_UPDATE_INTERVAL
+        {
+            return;
+        }
+        self.update_buffer_metrics_force();
+    }
+
+    fn update_buffer_metrics_force(&mut self) {
+        self.last_metrics_update = Some(Instant::now());
         let mut epoch_count = 0;
         let mut row_count = 0;
         let mut memory_bytes = 0;
@@ -133,11 +157,21 @@ impl LogStoreBufferInner {
         if let LogStoreBufferItem::StreamChunk { .. } = item {
             unreachable!("StreamChunk should call try_add_item")
         }
-        if let LogStoreBufferItem::Barrier { .. } = &item {
+        let is_barrier = if let LogStoreBufferItem::Barrier { .. } = &item {
             self.next_chunk_id = 0;
-        }
+            true
+        } else {
+            false
+        };
         self.unconsumed_queue.push_front((epoch, item));
-        self.update_buffer_metrics();
+        // Barriers arrive at a bounded rate, so it is safe to always refresh on them.
+        // This also keeps the gauges from going stale while the throttle skips the
+        // high-frequency chunk operations.
+        if is_barrier {
+            self.update_buffer_metrics_force();
+        } else {
+            self.update_buffer_metrics();
+        }
     }
 
     pub(crate) fn try_add_stream_chunk(
@@ -186,7 +220,7 @@ impl LogStoreBufferInner {
         new_vnode_bitmap: Bitmap,
     ) {
         let curr_chunk_size = (end_seq_id - start_seq_id + 1) as usize;
-        if let Some((
+        let merged = if let Some((
             item_epoch,
             LogStoreBufferItem::Flushed {
                 start_seq_id: prev_start_seq_id,
@@ -210,6 +244,7 @@ impl LogStoreBufferInner {
             );
             *prev_end_seq_id = end_seq_id;
             *vnode_bitmap |= new_vnode_bitmap;
+            true
         } else {
             let chunk_id = self.next_chunk_id;
             self.next_chunk_id += 1;
@@ -222,8 +257,12 @@ impl LogStoreBufferInner {
                     chunk_id,
                 },
             );
+            false
+        };
+        // The `else` branch already refreshed the gauges via `add_item`.
+        if merged {
+            self.update_buffer_metrics();
         }
-        self.update_buffer_metrics();
     }
 
     fn add_truncate_offset(&mut self, (epoch, seq_id): ReaderTruncationOffsetType) {
@@ -243,7 +282,7 @@ impl LogStoreBufferInner {
                 self.unconsumed_queue.push_back((epoch, item));
             }
         }
-        self.update_buffer_metrics();
+        self.update_buffer_metrics_force();
     }
 
     fn clear(&mut self) {
@@ -522,6 +561,7 @@ pub(crate) fn new_log_store_buffer(
         truncation_list: VecDeque::new(),
         next_chunk_id: 0,
         metrics,
+        last_metrics_update: None,
     });
     let update_notify = Arc::new(Notify::new());
     let truncate_notify = Arc::new(Notify::new());
