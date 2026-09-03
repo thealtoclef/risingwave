@@ -220,12 +220,14 @@ DorisConfig:
   - name: doris.url
     field_type: String
     required: true
+    allow_alter_on_fly: true
   - name: doris.query_url
     field_type: String
     comments: |-
       The full MySQL-protocol Doris FE URL with an explicit port, used for DDL when
       `create_table_if_not_exists` is enabled or schema change is used, e.g. `mysql://query-fe:9030`.
     required: false
+    allow_alter_on_fly: true
   - name: doris.stream_load_url
     field_type: String
     comments: |-
@@ -245,6 +247,7 @@ DorisConfig:
       A single bare BE address is a single point of failure. Only one address is accepted; point
       it at a Service or load balancer if you need more than one BE behind it.
     required: false
+    allow_alter_on_fly: true
   - name: doris.user
     field_type: String
     required: true
