@@ -673,6 +673,10 @@ impl<S: StateStore> ParallelizedCdcBackfillExecutor<S> {
                         yield Message::Barrier(barrier);
                     }
                     Message::Chunk(chunk) => {
+                        // Invariant: an actor with no splits drops ALL upstream data, live events
+                        // included. The upstream dispatcher relies on this to stop sending data to
+                        // such actors (`cdc_scan_actor_idleness` in `dispatch.rs`); if this ever
+                        // starts consuming data without splits, that suppression loses rows.
                         if actor_snapshot_splits.is_empty() {
                             continue;
                         }
@@ -772,6 +776,8 @@ fn filter_stream_chunk(
     snapshot_split_column_index: usize,
     split_key_unsigned: bool,
 ) -> Option<StreamChunk> {
+    // No bound means no splits: drop everything. See the invariant note in the chunk arm of
+    // the main loop; `cdc_scan_actor_idleness` in `dispatch.rs` depends on it.
     let Some((left, right)) = bound else {
         return None;
     };
