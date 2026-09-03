@@ -3723,7 +3723,19 @@ fn validate_sink_props(sink: &sink::Model, props: &BTreeMap<String, String>) -> 
                 connector_type.as_str(),
                 SinkType,
                 {
-                    let mut new_props = sink.properties.0.clone();
+                    // `sink.properties` holds the plaintext options only; secret-backed ones
+                    // live in `sink.secret_ref`. Resolve them before validating, or every alter
+                    // of a sink that takes a required field from a secret fails with a spurious
+                    // "missing field" error.
+                    let mut new_props = LocalSecretManager::global()
+                        .fill_secrets(
+                            sink.properties.0.clone(),
+                            sink.secret_ref
+                                .clone()
+                                .map(|secret_ref| secret_ref.to_protobuf())
+                                .unwrap_or_default(),
+                        )
+                        .map_err(|e| SinkError::Config(anyhow!(e)))?;
                     new_props.extend(props.clone());
                     SinkType::validate_alter_config(&new_props)
                 },
