@@ -15,7 +15,7 @@ on:
         type: string
       cargo_profile:
         description: "Cargo profile to build with"
-        default: production
+        default: thin-production
         required: true
         type: string
   push:
@@ -38,4 +38,4 @@ jobs:
       dockerfile_path: docker/Dockerfile
       build_args: |
         GIT_SHA=${{ github.sha }}
-        CARGO_PROFILE=${{ github.event.inputs.cargo_profile || 'production' }}
+        CARGO_PROFILE=${{ github.event.inputs.cargo_profile || 'thin-production' }}
