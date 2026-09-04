@@ -2202,14 +2202,17 @@ impl CatalogController {
                         .one(txn)
                         .await?;
                 let columns = ColumnCatalogArray::from(finish_sink_context.columns);
+                let downstream_pk = I32Array::from(finish_sink_context.downstream_pk);
                 Sink::update(sink::ActiveModel {
                     sink_id: Set(finish_sink_context.original_sink_id),
                     columns: Set(columns.clone()),
+                    downstream_pk: Set(downstream_pk.clone()),
                     ..Default::default()
                 })
                 .exec(txn)
                 .await?;
                 sink.columns = columns;
+                sink.downstream_pk = downstream_pk;
                 objects.push(PbObject {
                     object_info: Some(PbObjectInfo::Sink(
                         ObjectModel(sink, sink_obj.unwrap(), sink_streaming_job.clone()).into(),
@@ -3847,6 +3850,7 @@ pub struct FinishAutoRefreshSchemaSinkContext {
     pub tmp_sink_id: SinkId,
     pub original_sink_id: SinkId,
     pub columns: Vec<PbColumnCatalog>,
+    pub downstream_pk: Vec<i32>,
     pub new_log_store_table: Option<Box<PbTable>>,
 }
 

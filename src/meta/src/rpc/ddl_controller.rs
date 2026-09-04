@@ -1718,7 +1718,7 @@ impl DdlController {
                     let sink_ctx = sink_job_fragments.ctx;
                     let original_sink_fragment =
                         sink_job_fragments.fragments.into_values().next().unwrap();
-                    let (new_sink_fragment, new_schema, new_log_store_table) =
+                    let (new_sink_fragment, new_schema, new_log_store_table, new_downstream_pk) =
                         rewrite_refresh_schema_sink_fragment(
                             &original_sink_fragment,
                             &sink,
@@ -1746,6 +1746,7 @@ impl DdlController {
                         original_sink: sink,
                         original_fragment: original_sink_fragment,
                         new_schema,
+                        new_downstream_pk,
                         newly_add_fields: newly_added_columns
                             .iter()
                             .map(|col| Field::from(&col.column_desc))
@@ -1810,6 +1811,7 @@ impl DdlController {
                             tmp_sink_id: sink.tmp_sink_id,
                             original_sink_id: sink.original_sink.id,
                             columns: sink.new_schema.clone(),
+                            downstream_pk: sink.new_downstream_pk.clone(),
                             new_log_store_table: sink.new_log_store_table.clone(),
                         })
                         .collect()
