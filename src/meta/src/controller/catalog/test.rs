@@ -18,12 +18,13 @@ mod tests {
     use risingwave_meta_model::table::HandleConflictBehavior;
     use risingwave_pb::catalog::subscription::SubscriptionState;
     use risingwave_pb::catalog::{PbSinkType, StreamSourceInfo};
-    use risingwave_pb::common::{HostAddress, WorkerNode, WorkerType, worker_node};
+    use risingwave_pb::common::HostAddress;
     use risingwave_pb::meta::SubscribeType;
-    use risingwave_pb::stream_plan::PbStreamNode;
     use tokio::sync::{mpsc, oneshot};
 
     use crate::controller::catalog::*;
+    use crate::manager::WorkerKey;
+    use crate::model::FragmentDownstreamRelation;
 
     const TEST_DATABASE_ID: DatabaseId = DatabaseId::new(1);
     const TEST_SCHEMA_ID: SchemaId = SchemaId::new(2);
@@ -79,33 +80,10 @@ mod tests {
         Ok(())
     }
 
-    async fn insert_test_fragment(
-        txn: &DatabaseTransaction,
-        fragment_id: FragmentId,
-        job_id: JobId,
-        state_table_ids: TableIdArray,
-    ) -> MetaResult<()> {
-        fragment::ActiveModel {
-            fragment_id: Set(fragment_id),
-            job_id: Set(job_id),
-            fragment_type_mask: Set(0),
-            distribution_type: Set(fragment::DistributionType::Hash),
-            stream_node: Set(StreamNode::from(&PbStreamNode::default())),
-            state_table_ids: Set(state_table_ids),
-            upstream_fragment_id: Set(I32Array::default()),
-            vnode_count: Set(1),
-            parallelism: Set(None),
-        }
-        .insert(txn)
-        .await?;
-        Ok(())
-    }
-
     async fn insert_test_streaming_job(
         txn: &DatabaseTransaction,
         name: &str,
         has_result_table: bool,
-        policy: Option<CacheRefillPolicy>,
     ) -> MetaResult<(JobId, Option<TableId>, TableId)> {
         let object_type = if has_result_table {
             ObjectType::Table
@@ -147,7 +125,7 @@ mod tests {
         )
         .await?;
 
-        insert_test_streaming_job_model(txn, job_id, policy).await?;
+        insert_test_streaming_job_model(txn, job_id).await?;
 
         Ok((job_id, result_table_id, internal_table_id))
     }
@@ -155,511 +133,10 @@ mod tests {
     async fn insert_test_streaming_job_model(
         txn: &DatabaseTransaction,
         job_id: JobId,
-        policy: Option<CacheRefillPolicy>,
     ) -> MetaResult<()> {
         streaming_job::ActiveModel {
             job_id: Set(job_id),
             job_status: Set(JobStatus::Created),
-            create_type: Set(CreateType::Foreground),
-            timezone: Set(None),
-            config_override: Set(policy.map(|policy| {
-                format!(
-                    "[streaming.developer]\ncache_refill_policy = \"{}\"\n",
-                    policy
-                )
-            })),
-            adaptive_parallelism_strategy: Set(None),
-            parallelism: Set(StreamingParallelism::Adaptive),
-            backfill_parallelism: Set(None),
-            backfill_adaptive_parallelism_strategy: Set(None),
-            backfill_orders: Set(None),
-            max_parallelism: Set(1),
-            specific_resource_group: Set(None),
-            is_serverless_backfill: Set(false),
-            refresh_interval_sec: Set(None),
-        }
-        .insert(txn)
-        .await?;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_table_refill_catalog_snapshot_classifies_table_identity() -> MetaResult<()> {
-        let mgr = CatalogController::new(MetaSrvEnv::for_test().await).await?;
-        let inner = mgr.inner.write().await;
-        let txn = inner.db.begin().await?;
-
-        let (mv_job, Some(mv_result), mv_internal) =
-            insert_test_streaming_job(&txn, "mv_both", true, Some(CacheRefillPolicy::Both)).await?
-        else {
-            unreachable!()
-        };
-        let (default_job, Some(_default_result), default_internal) =
-            insert_test_streaming_job(&txn, "mv_default", true, None).await?
-        else {
-            unreachable!()
-        };
-        let (sink_job, None, sink_internal) = insert_test_streaming_job(
-            &txn,
-            "sink_streaming",
-            false,
-            Some(CacheRefillPolicy::Streaming),
-        )
-        .await?
-        else {
-            unreachable!()
-        };
-
-        let result_fragment = FragmentId::new(100);
-        let internal_fragment = FragmentId::new(101);
-        let sink_fragment = FragmentId::new(102);
-        for (fragment_id, job_id, table_ids) in [
-            (result_fragment, mv_job, vec![mv_result, mv_internal]),
-            (internal_fragment, default_job, vec![default_internal]),
-            (sink_fragment, sink_job, vec![sink_internal]),
-        ] {
-            insert_test_fragment(&txn, fragment_id, job_id, TableIdArray(table_ids)).await?;
-        }
-        txn.commit().await?;
-        drop(inner);
-
-        let serving_infos = mgr.fragment_serving_infos().await?;
-        assert_eq!(serving_infos.len(), 3);
-        assert_eq!(
-            serving_infos[&result_fragment].result_table_id,
-            Some(mv_result)
-        );
-        assert_eq!(serving_infos[&internal_fragment].result_table_id, None);
-        assert_eq!(serving_infos[&sink_fragment].result_table_id, None);
-
-        let policies = mgr.table_cache_refill_policies_snapshot().await?;
-        assert_eq!(
-            policies
-                .table_policies
-                .into_iter()
-                .map(|policy| (policy.table_id, policy.policy))
-                .collect::<HashMap<_, _>>(),
-            HashMap::from([(
-                mv_result.as_raw_id(),
-                CacheRefillPolicy::Both.to_protobuf() as i32,
-            )])
-        );
-        assert_eq!(
-            policies
-                .internal_table_policies
-                .into_iter()
-                .map(|policy| (policy.table_id, policy.policy))
-                .collect::<HashMap<_, _>>(),
-            HashMap::from([
-                (
-                    mv_internal.as_raw_id(),
-                    CacheRefillPolicy::Both.to_protobuf() as i32,
-                ),
-                (
-                    sink_internal.as_raw_id(),
-                    CacheRefillPolicy::Streaming.to_protobuf() as i32,
-                ),
-            ])
-        );
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_foreground_creating_catalog_lifecycle() -> MetaResult<()> {
-        let env = MetaSrvEnv::for_test().await;
-        let (tx, mut notification_rx) = mpsc::unbounded_channel();
-        env.notification_manager().insert_sender(
-            SubscribeType::Frontend,
-            WorkerKey(HostAddress {
-                host: "localhost".to_owned(),
-                port: 1234,
-            }),
-            tx,
-        );
-        let mgr = CatalogController::new(env).await?;
-        let inner = mgr.inner.write().await;
-        let txn = inner.db.begin().await?;
-
-        // A foreground table and its internal table are both visible while creating.
-        let (job_id, Some(table_id), internal_table_id) =
-            insert_test_streaming_job(&txn, "creating_table", true, None).await?
-        else {
-            unreachable!()
-        };
-        let associated_source_id = CatalogController::create_object(
-            &txn,
-            ObjectType::Source,
-            TEST_OWNER_ID,
-            Some(TEST_DATABASE_ID),
-            Some(TEST_SCHEMA_ID),
-        )
-        .await?
-        .oid
-        .as_source_id();
-        Source::insert(source::ActiveModel::from(PbSource {
-            id: associated_source_id,
-            schema_id: TEST_SCHEMA_ID,
-            database_id: TEST_DATABASE_ID,
-            name: "creating_table_source".to_owned(),
-            owner: TEST_OWNER_ID as _,
-            optional_associated_table_id: Some(
-                risingwave_pb::catalog::source::OptionalAssociatedTableId::AssociatedTableId(
-                    table_id,
-                ),
-            ),
-            ..Default::default()
-        }))
-        .exec(&txn)
-        .await?;
-        table::ActiveModel {
-            table_id: Set(table_id),
-            table_type: Set(TableType::Table),
-            optional_associated_source_id: Set(Some(associated_source_id)),
-            ..Default::default()
-        }
-        .update(&txn)
-        .await?;
-        streaming_job::ActiveModel {
-            job_id: Set(job_id),
-            job_status: Set(JobStatus::Initial),
-            ..Default::default()
-        }
-        .update(&txn)
-        .await?;
-
-        // A foreground index and its index table are both visible while creating.
-        let (_primary_job_id, Some(primary_table_id), _) =
-            insert_test_streaming_job(&txn, "primary_table", true, None).await?
-        else {
-            unreachable!()
-        };
-        let index_job_id = CatalogController::create_object(
-            &txn,
-            ObjectType::Index,
-            TEST_OWNER_ID,
-            Some(TEST_DATABASE_ID),
-            Some(TEST_SCHEMA_ID),
-        )
-        .await?
-        .oid
-        .as_job_id();
-        let index_table_id = index_job_id.as_mv_table_id();
-        insert_test_table(
-            &txn,
-            index_table_id,
-            "creating_index",
-            TableType::Index,
-            None,
-            "",
-        )
-        .await?;
-        index::ActiveModel {
-            index_id: Set(index_job_id.as_index_id()),
-            name: Set("creating_index".to_owned()),
-            index_table_id: Set(index_table_id),
-            primary_table_id: Set(primary_table_id),
-            index_items: Set(vec![].into()),
-            index_column_properties: Set(None),
-            index_columns_len: Set(0),
-        }
-        .insert(&txn)
-        .await?;
-        insert_test_streaming_job_model(&txn, index_job_id, None).await?;
-        streaming_job::ActiveModel {
-            job_id: Set(index_job_id),
-            job_status: Set(JobStatus::Initial),
-            ..Default::default()
-        }
-        .update(&txn)
-        .await?;
-
-        // A creating shared source is included in restart snapshots as well.
-        let source_job_id = CatalogController::create_object(
-            &txn,
-            ObjectType::Source,
-            TEST_OWNER_ID,
-            Some(TEST_DATABASE_ID),
-            Some(TEST_SCHEMA_ID),
-        )
-        .await?
-        .oid
-        .as_job_id();
-        Source::insert(source::ActiveModel::from(PbSource {
-            id: source_job_id.as_shared_source_id(),
-            schema_id: TEST_SCHEMA_ID,
-            database_id: TEST_DATABASE_ID,
-            name: "creating_shared_source".to_owned(),
-            owner: TEST_OWNER_ID as _,
-            info: Some(StreamSourceInfo {
-                cdc_source_job: true,
-                ..Default::default()
-            }),
-            ..Default::default()
-        }))
-        .exec(&txn)
-        .await?;
-        insert_test_streaming_job_model(&txn, source_job_id, None).await?;
-        streaming_job::ActiveModel {
-            job_id: Set(source_job_id),
-            job_status: Set(JobStatus::Initial),
-            ..Default::default()
-        }
-        .update(&txn)
-        .await?;
-
-        let sink_job_id = CatalogController::create_object(
-            &txn,
-            ObjectType::Sink,
-            TEST_OWNER_ID,
-            Some(TEST_DATABASE_ID),
-            Some(TEST_SCHEMA_ID),
-        )
-        .await?
-        .oid
-        .as_job_id();
-        Sink::insert(sink::ActiveModel::from(PbSink {
-            id: sink_job_id.as_sink_id(),
-            schema_id: TEST_SCHEMA_ID,
-            database_id: TEST_DATABASE_ID,
-            name: "creating_sink".to_owned(),
-            owner: TEST_OWNER_ID as _,
-            sink_type: PbSinkType::AppendOnly as i32,
-            ..Default::default()
-        }))
-        .exec(&txn)
-        .await?;
-        insert_test_streaming_job_model(&txn, sink_job_id, None).await?;
-        streaming_job::ActiveModel {
-            job_id: Set(sink_job_id),
-            job_status: Set(JobStatus::Initial),
-            ..Default::default()
-        }
-        .update(&txn)
-        .await?;
-
-        txn.commit().await?;
-
-        let (catalog, _) = inner.snapshot().await?;
-        assert!(!catalog.2.iter().any(|table| table.id == table_id));
-        assert!(!catalog.2.iter().any(|table| table.id == internal_table_id));
-        assert!(!catalog.2.iter().any(|table| table.id == index_table_id));
-        assert!(
-            !catalog
-                .3
-                .iter()
-                .any(|source| source.id == associated_source_id)
-        );
-        assert!(
-            !catalog
-                .3
-                .iter()
-                .any(|source| source.id == source_job_id.as_shared_source_id())
-        );
-        assert!(
-            !catalog
-                .6
-                .iter()
-                .any(|index| index.id == index_job_id.as_index_id())
-        );
-        assert!(
-            !catalog
-                .4
-                .iter()
-                .any(|sink| sink.id == sink_job_id.as_sink_id())
-        );
-
-        drop(inner);
-
-        let downstreams = FragmentDownstreamRelation::new();
-        let mut add_notifications = vec![];
-        for creating_job_id in [job_id, index_job_id, source_job_id, sink_job_id] {
-            mgr.post_collect_job_fragments(creating_job_id, &downstreams, None, None, None, true)
-                .await?;
-            let notification = notification_rx
-                .recv()
-                .await
-                .expect("frontend should receive a creating notification")
-                .expect("creating notification should be valid");
-            assert_eq!(notification.operation(), NotificationOperation::Add);
-            let object_group = match notification.info {
-                Some(NotificationInfo::ObjectGroup(object_group)) => object_group,
-                other => panic!("unexpected notification: {other:?}"),
-            };
-            add_notifications.push(object_group);
-        }
-
-        assert!(add_notifications[0].objects.iter().any(|object| matches!(
-            &object.object_info,
-            Some(PbObjectInfo::Table(table)) if table.id == table_id
-        )));
-        assert!(add_notifications[0].objects.iter().any(|object| matches!(
-            &object.object_info,
-            Some(PbObjectInfo::Table(table)) if table.id == internal_table_id
-        )));
-        assert!(add_notifications[0].objects.iter().any(|object| matches!(
-            &object.object_info,
-            Some(PbObjectInfo::Source(source)) if source.id == associated_source_id
-        )));
-        assert!(add_notifications[1].objects.iter().any(|object| matches!(
-            &object.object_info,
-            Some(PbObjectInfo::Table(table)) if table.id == index_table_id
-        )));
-        assert!(add_notifications[1].objects.iter().any(|object| matches!(
-            &object.object_info,
-            Some(PbObjectInfo::Index(index)) if index.id == index_job_id.as_index_id()
-        )));
-        assert!(add_notifications[2].objects.iter().any(|object| matches!(
-            &object.object_info,
-            Some(PbObjectInfo::Source(source)) if source.id == source_job_id.as_shared_source_id()
-        )));
-        assert!(add_notifications[3].objects.iter().any(|object| matches!(
-            &object.object_info,
-            Some(PbObjectInfo::Sink(sink)) if sink.id == sink_job_id.as_sink_id()
-        )));
-
-        let inner = mgr.inner.write().await;
-        let (catalog, _) = inner.snapshot().await?;
-        assert!(catalog.2.iter().any(|table| table.id == table_id));
-        assert!(catalog.2.iter().any(|table| table.id == internal_table_id));
-        assert!(catalog.2.iter().any(|table| table.id == index_table_id));
-        assert!(
-            catalog
-                .3
-                .iter()
-                .any(|source| source.id == source_job_id.as_shared_source_id())
-        );
-        assert!(
-            catalog
-                .6
-                .iter()
-                .any(|index| index.id == index_job_id.as_index_id())
-        );
-        assert!(
-            catalog
-                .4
-                .iter()
-                .any(|sink| sink.id == sink_job_id.as_sink_id())
-        );
-
-        let txn = inner.db.begin().await?;
-        let (operation, _, _, _) = mgr.finish_streaming_job_inner(&txn, job_id).await?;
-        assert_eq!(operation, NotificationOperation::Update);
-        let (operation, _, _, _) = mgr.finish_streaming_job_inner(&txn, index_job_id).await?;
-        assert_eq!(operation, NotificationOperation::Update);
-        let (operation, _, _, _) = mgr.finish_streaming_job_inner(&txn, source_job_id).await?;
-        assert_eq!(operation, NotificationOperation::Update);
-        let (operation, _, _, _) = mgr.finish_streaming_job_inner(&txn, sink_job_id).await?;
-        assert_eq!(operation, NotificationOperation::Update);
-        txn.commit().await?;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_alter_streaming_job_cache_refill_policy_notifies_hummock() -> MetaResult<()> {
-        let env = MetaSrvEnv::for_test().await;
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        env.notification_manager().insert_sender(
-            SubscribeType::Hummock,
-            WorkerKey(HostAddress {
-                host: "localhost".to_owned(),
-                port: 1234,
-            }),
-            tx,
-        );
-        let mgr = CatalogController::new(env).await?;
-
-        let inner = mgr.inner.write().await;
-        let txn = inner.db.begin().await?;
-        let (_job, Some(result_table_id), internal_table_id) =
-            insert_test_streaming_job(&txn, "mv_cache_refill", true, None).await?
-        else {
-            unreachable!()
-        };
-        txn.commit().await?;
-        drop(inner);
-
-        mgr.alter_streaming_job_config(
-            result_table_id.as_job_id(),
-            HashMap::from([(
-                STREAMING_CACHE_REFILL_POLICY_CONFIG_PATH.to_owned(),
-                "\"both\"".to_owned(),
-            )]),
-            vec![],
-        )
-        .await?;
-
-        let response = rx
-            .recv()
-            .await
-            .expect("should receive hummock notification")
-            .expect("notification should be ok");
-        assert_eq!(response.operation(), NotificationOperation::Update);
-        let info = response.info;
-        let Some(NotificationInfo::TableRefillRuntimeConfig(config)) = info else {
-            panic!("unexpected notification: {:?}", info);
-        };
-        assert!(config.serving_table_vnode_mappings.is_none());
-        let policies = config
-            .table_cache_refill_policies
-            .expect("policy snapshot should be present");
-        assert_eq!(
-            policies
-                .table_policies
-                .into_iter()
-                .map(|policy| (policy.table_id, policy.policy))
-                .collect::<HashMap<_, _>>(),
-            HashMap::from([(
-                result_table_id.as_raw_id(),
-                CacheRefillPolicy::Both.to_protobuf() as i32,
-            )])
-        );
-        assert_eq!(
-            policies
-                .internal_table_policies
-                .into_iter()
-                .map(|policy| (policy.table_id, policy.policy))
-                .collect::<HashMap<_, _>>(),
-            HashMap::from([(
-                internal_table_id.as_raw_id(),
-                CacheRefillPolicy::Both.to_protobuf() as i32,
-            )])
-        );
-
-        Ok(())
-    }
-
-    async fn insert_dirty_creating_job_with_fragment(
-        mgr: &CatalogController,
-        fragment_id: FragmentId,
-        vnode_count: i32,
-    ) -> MetaResult<(JobId, TableId)> {
-        let inner = mgr.inner.write().await;
-        let txn = inner.db.begin().await?;
-        let job_obj = CatalogController::create_object(
-            &txn,
-            ObjectType::Table,
-            TEST_OWNER_ID,
-            Some(TEST_DATABASE_ID),
-            Some(TEST_SCHEMA_ID),
-        )
-        .await?;
-        let job_id = job_obj.oid.as_job_id();
-        let table_id = job_id.as_mv_table_id();
-        insert_test_table(
-            &txn,
-            table_id,
-            "mv_dirty_serving_mapping",
-            TableType::MaterializedView,
-            None,
-            "CREATE MATERIALIZED VIEW mv_dirty_serving_mapping AS SELECT 1",
-        )
-        .await?;
-        streaming_job::ActiveModel {
-            job_id: Set(job_id),
-            job_status: Set(JobStatus::Creating),
             create_type: Set(CreateType::Foreground),
             timezone: Set(None),
             config_override: Set(None),
@@ -673,65 +150,8 @@ mod tests {
             is_serverless_backfill: Set(false),
             refresh_interval_sec: Set(None),
         }
-        .insert(&txn)
+        .insert(txn)
         .await?;
-        fragment::ActiveModel {
-            fragment_id: Set(fragment_id),
-            job_id: Set(job_id),
-            fragment_type_mask: Set(0),
-            distribution_type: Set(DistributionType::Hash),
-            stream_node: Set(StreamNode::default()),
-            state_table_ids: Set(Vec::<TableId>::new().into()),
-            upstream_fragment_id: Set(Vec::<i32>::new().into()),
-            vnode_count: Set(vnode_count),
-            parallelism: Set(None),
-        }
-        .insert(&txn)
-        .await?;
-        txn.commit().await?;
-        drop(inner);
-
-        Ok((job_id, table_id))
-    }
-
-    #[tokio::test]
-    async fn test_dirty_cleanup_reconcile_removes_stale_serving_vnode_mapping() -> MetaResult<()> {
-        let mgr = CatalogController::new(MetaSrvEnv::for_test().await).await?;
-        let fragment_id = FragmentId::new(42);
-        insert_dirty_creating_job_with_fragment(
-            &mgr,
-            fragment_id,
-            VirtualNode::COUNT_FOR_TEST as i32,
-        )
-        .await?;
-
-        let worker = WorkerNode {
-            id: WorkerId::new(1),
-            r#type: WorkerType::ComputeNode.into(),
-            host: Some(HostAddress {
-                host: "localhost".to_owned(),
-                port: 1,
-            }),
-            state: worker_node::State::Running as i32,
-            property: Some(worker_node::Property {
-                is_serving: true,
-                parallelism: 1,
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        let serving_vnode_mapping = ServingVnodeMapping::default();
-        let initial_snapshot = mgr.fragment_serving_infos().await?;
-        serving_vnode_mapping.upsert(&initial_snapshot, std::slice::from_ref(&worker), None);
-        assert!(serving_vnode_mapping.all().contains_key(&fragment_id));
-
-        mgr.clean_dirty_creating_jobs(Some(TEST_DATABASE_ID))
-            .await?;
-        let current_snapshot = mgr.fragment_serving_infos().await?;
-        assert!(!current_snapshot.contains_key(&fragment_id));
-
-        serving_vnode_mapping.reconcile(&current_snapshot, &[worker], None);
-        assert!(!serving_vnode_mapping.all().contains_key(&fragment_id));
 
         Ok(())
     }
@@ -1173,7 +593,10 @@ mod tests {
                 "upstream view should be removed"
             );
             assert!(
-                View::find_by_id(downstream_view_id).one(db).await?.is_none(),
+                View::find_by_id(downstream_view_id)
+                    .one(db)
+                    .await?
+                    .is_none(),
                 "cross-database downstream view should also be removed"
             );
             assert!(
@@ -1201,12 +624,8 @@ mod tests {
 
         // Cleanup: drop the other database (also exercises DROP DATABASE
         // cascade with no remaining cross-db dependents).
-        mgr.drop_object(
-            ObjectType::Database,
-            other_database_id,
-            DropMode::Cascade,
-        )
-        .await?;
+        mgr.drop_object(ObjectType::Database, other_database_id, DropMode::Cascade)
+            .await?;
 
         Ok(())
     }
@@ -1302,7 +721,10 @@ mod tests {
             "upstream view should be removed"
         );
         assert!(
-            View::find_by_id(downstream_view_id).one(db).await?.is_none(),
+            View::find_by_id(downstream_view_id)
+                .one(db)
+                .await?
+                .is_none(),
             "cross-database downstream view should also be removed"
         );
 
