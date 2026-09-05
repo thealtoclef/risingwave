@@ -22,6 +22,7 @@ use itertools::Itertools;
 use risingwave_common::bail;
 use risingwave_common::catalog::DatabaseId;
 use risingwave_common::hash::{ActorMapping, VnodeBitmapExt};
+use risingwave_common::util::cdc_filter_expr::cdc_filter_table_names;
 use risingwave_connector::source::{SplitId, SplitMetaData};
 use risingwave_meta_model::{
     StreamingParallelism, WorkerId, fragment, fragment_relation, object, streaming_job,
@@ -948,6 +949,12 @@ pub(crate) fn build_reschedule_commands(
                     dispatcher_type,
                     dist_key_indices.into_u32_array(),
                     pb_mapping,
+                    // The `CdcFilter` predicate is fixed at plan time, so read it from the
+                    // pre-scaling fragment; rescaling never changes it.
+                    all_prev_fragments
+                        .get(downstream_fragment_id)
+                        .map(|fragment| cdc_filter_table_names(Some(&fragment.nodes)))
+                        .unwrap_or_default(),
                 );
 
                 for (actor_id, dispatcher) in dispatchers {

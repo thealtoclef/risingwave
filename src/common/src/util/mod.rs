@@ -16,6 +16,7 @@ pub use self::prost::*;
 
 pub mod addr;
 pub mod batch_spill_config;
+pub mod cdc_filter_expr;
 pub mod chunk_coalesce;
 pub mod column_index_mapping;
 pub mod compress;
