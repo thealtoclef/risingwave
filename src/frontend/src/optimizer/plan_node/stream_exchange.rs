@@ -172,6 +172,7 @@ impl StreamNode for StreamExchange {
                     r#type: DispatcherType::NoShuffle as i32,
                     dist_key_indices: vec![],
                     output_mapping,
+                    cdc_table_names: vec![],
                 })
             } else {
                 Some(DispatchStrategy {
@@ -188,6 +189,7 @@ impl StreamNode for StreamExchange {
                         _ => vec![],
                     },
                     output_mapping,
+                    cdc_table_names: vec![],
                 })
             },
         }))

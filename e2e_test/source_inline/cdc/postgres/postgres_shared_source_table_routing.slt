@@ -1,0 +1,118 @@
+control substitution on
+
+# A shared CDC source fans out to one `CdcFilter` per dependent table. The dispatcher routes each
+# row to the table its `_rw_table_name` names instead of broadcasting to all of them, so this test
+# asserts that each table still receives exactly its own rows and nothing else.
+
+statement ok
+drop table if exists routed_orders;
+
+statement ok
+drop table if exists routed_items;
+
+statement ok
+drop source if exists routed_source;
+
+system ok
+PGDATABASE=${PGDATABASE:-postgres} psql -c "
+    SELECT pg_terminate_backend(active_pid)
+    FROM pg_replication_slots
+    WHERE slot_name = 'table_routing_slot' AND active_pid IS NOT NULL;
+    SELECT pg_sleep(1);
+    SELECT pg_drop_replication_slot(slot_name)
+    FROM pg_replication_slots
+    WHERE slot_name = 'table_routing_slot';
+    DROP PUBLICATION IF EXISTS table_routing_pub;
+    DROP TABLE IF EXISTS public.routed_orders CASCADE;
+    DROP TABLE IF EXISTS public.routed_items CASCADE;
+    CREATE TABLE public.routed_orders (id int primary key, label varchar);
+    CREATE TABLE public.routed_items (id int primary key, label varchar);
+    INSERT INTO public.routed_orders VALUES (1, 'order-snapshot');
+    INSERT INTO public.routed_items VALUES (1, 'item-snapshot');
+    CREATE PUBLICATION table_routing_pub FOR TABLE public.routed_orders, public.routed_items;
+    "
+
+statement ok
+create source routed_source with (
+    connector = 'postgres-cdc',
+    hostname = '${PGHOST:localhost}',
+    port = '${PGPORT:5432}',
+    username = '${PGUSER:$USER}',
+    password = '${PGPASSWORD:}',
+    database.name = '${PGDATABASE:postgres}',
+    schema.name = 'public',
+    publication.name = 'table_routing_pub',
+    slot.name = 'table_routing_slot'
+);
+
+statement ok
+create table routed_orders (id int primary key, label varchar)
+from routed_source table 'public.routed_orders';
+
+statement ok
+create table routed_items (id int primary key, label varchar)
+from routed_source table 'public.routed_items';
+
+# Backfill runs before the dispatcher predicate matters, but both tables must still be correct.
+query IT retry 30 backoff 1s
+select id, label from routed_orders order by id;
+----
+1 order-snapshot
+
+query IT retry 30 backoff 1s
+select id, label from routed_items order by id;
+----
+1 item-snapshot
+
+# Interleave writes to both upstream tables so the source emits chunks that mix table names.
+system ok
+PGDATABASE=${PGDATABASE:-postgres} psql -c "
+    INSERT INTO public.routed_orders VALUES (2, 'order-stream');
+    INSERT INTO public.routed_items VALUES (2, 'item-stream');
+    INSERT INTO public.routed_orders VALUES (3, 'order-stream');
+    UPDATE public.routed_items SET label = 'item-updated' WHERE id = 1;
+    DELETE FROM public.routed_orders WHERE id = 1;
+    "
+
+query IT retry 30 backoff 1s
+select id, label from routed_orders order by id;
+----
+2 order-stream
+3 order-stream
+
+query IT retry 30 backoff 1s
+select id, label from routed_items order by id;
+----
+1 item-updated
+2 item-stream
+
+# Neither table may pick up the other's rows. `routed_items` has no id 3, and `routed_orders` has
+# no row still labelled `item-%`, so a misrouted row would show up as a non-zero count here.
+query I
+select count(*) from routed_orders where label like 'item-%';
+----
+0
+
+query I
+select count(*) from routed_items where label like 'order-%';
+----
+0
+
+statement ok
+drop source routed_source cascade;
+
+sleep 2s
+
+system ok
+PGDATABASE=${PGDATABASE:-postgres} psql -c "
+    SELECT pg_terminate_backend(active_pid)
+    FROM pg_replication_slots
+    WHERE slot_name = 'table_routing_slot' AND active_pid IS NOT NULL;
+    SELECT pg_sleep(1);
+    SELECT pg_drop_replication_slot(slot_name)
+    FROM pg_replication_slots
+    WHERE slot_name = 'table_routing_slot';
+    DROP PUBLICATION IF EXISTS table_routing_pub;
+    DROP TABLE IF EXISTS public.routed_orders CASCADE;
+    DROP TABLE IF EXISTS public.routed_items CASCADE;
+    "

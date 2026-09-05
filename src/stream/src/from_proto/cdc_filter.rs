@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use risingwave_common::types::ScalarImpl;
+use risingwave_common::util::cdc_filter_expr::RW_TABLE_NAME_COLUMN_IDX;
 use risingwave_common::util::value_encoding::serialize_datum;
 use risingwave_expr::expr::build_non_strict_from_prost;
 use risingwave_pb::expr::expr_node::{RexNode, Type as ExprType};
@@ -23,12 +24,6 @@ use super::*;
 use crate::executor::FilterExecutor;
 
 pub struct CdcFilterExecutorBuilder;
-
-/// Column index of `_rw_table_name` in CDC source chunks.
-///
-/// Current CDC source schema is `(payload, _rw_offset, _rw_table_name)`.
-/// Keep this value in sync with CDC source schema definition.
-const RW_TABLE_NAME_COLUMN_IDX: u32 = 2;
 
 impl_stream_node_body!(CdcFilter(CdcFilterNode) => CdcFilterExecutorBuilder);
 

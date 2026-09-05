@@ -26,6 +26,7 @@ use risingwave_common::hash::{VnodeCount, VnodeCountCompat};
 use risingwave_common::id::JobId;
 use risingwave_common::system_param::AdaptiveParallelismStrategy;
 use risingwave_common::system_param::adaptive_parallelism_strategy::parse_strategy;
+use risingwave_common::util::cdc_filter_expr::cdc_filter_table_names;
 use risingwave_common::util::stream_graph_visitor::visit_stream_node_body;
 use risingwave_connector::source::SplitImpl;
 use risingwave_connector::source::cdc::CdcScanOptions;
@@ -666,6 +667,32 @@ impl CatalogController {
             Arc<HashMap<crate::model::ActorId, Option<Bitmap>>>,
         );
 
+        // The `CdcFilter` predicate lives on the downstream fragment's node, which the shared
+        // actor info does not carry, so read it from the catalog.
+        let target_fragment_ids: Vec<FragmentId> = fragment_relations
+            .iter()
+            .map(|relation| relation.target_fragment_id)
+            .unique()
+            .collect();
+        // Restrict to `CdcFilter` fragments so recovery does not load every downstream fragment's
+        // plan blob just to find the handful that carry a predicate.
+        let cdc_table_names_by_fragment: HashMap<FragmentId, Vec<String>> = FragmentModel::find()
+            .select_only()
+            .columns([fragment::Column::FragmentId, fragment::Column::StreamNode])
+            .filter(fragment::Column::FragmentId.is_in(target_fragment_ids))
+            .filter(FragmentTypeMask::intersects(FragmentTypeFlag::CdcFilter))
+            .into_tuple::<(FragmentId, StreamNode)>()
+            .all(c)
+            .await?
+            .into_iter()
+            .map(|(fragment_id, stream_node)| {
+                (
+                    fragment_id,
+                    cdc_filter_table_names(Some(&stream_node.to_protobuf())),
+                )
+            })
+            .collect();
+
         let shared_info = self.env.shared_actor_infos();
         let mut fragment_actor_cache: HashMap<FragmentId, FragmentActorInfo> = HashMap::new();
         let get_fragment_actors = |fragment_id: FragmentId| async move {
@@ -741,6 +768,10 @@ impl CatalogController {
                 dispatcher_type,
                 dist_key_indices.into_u32_array(),
                 output_mapping,
+                cdc_table_names_by_fragment
+                    .get(&target_fragment_id)
+                    .cloned()
+                    .unwrap_or_default(),
             );
             let actor_dispatchers_map = actor_dispatchers_map
                 .entry(source_fragment_id as _)

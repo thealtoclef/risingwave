@@ -515,6 +515,7 @@ impl stream_plan::Dispatcher {
             r#type: self.r#type,
             dist_key_indices: self.dist_key_indices.clone(),
             output_mapping: self.output_mapping.clone(),
+            cdc_table_names: self.cdc_table_names.clone(),
         }
     }
 }

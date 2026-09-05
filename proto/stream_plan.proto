@@ -1276,6 +1276,10 @@ message DispatchStrategy {
   DispatcherType type = 1;
   repeated uint32 dist_key_indices = 2;
   DispatchOutputMapping output_mapping = 3;
+  // `_rw_table_name` values accepted by the downstream `CdcFilter`, used to skip sends on the
+  // shared CDC source fanout. Empty means no filtering. This is only an optimization, as
+  // `CdcFilter` still enforces the predicate downstream.
+  repeated string cdc_table_names = 4;
 }
 
 // A dispatcher redistribute messages.
@@ -1295,6 +1299,10 @@ message Dispatcher {
   uint32 dispatcher_id = 4;
   // Number of downstreams decides how many endpoints a dispatcher should dispatch.
   repeated uint32 downstream_actor_id = 5;
+  // `_rw_table_name` values accepted by the downstream `CdcFilter`, used to skip sends on the
+  // shared CDC source fanout. Empty means no filtering. This is only an optimization, as
+  // `CdcFilter` still enforces the predicate downstream.
+  repeated string cdc_table_names = 7;
 }
 
 // A StreamActor is a running fragment of the overall stream graph,

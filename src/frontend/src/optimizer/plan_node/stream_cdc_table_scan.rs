@@ -221,12 +221,14 @@ impl StreamCdcTableScan {
                 r#type: DispatcherType::Broadcast as _,
                 dist_key_indices: vec![],
                 output_mapping: PbDispatchOutputMapping::identical(cdc_source_schema.len()).into(),
+                cdc_table_names: vec![],
             }
         } else {
             DispatchStrategy {
                 r#type: DispatcherType::Simple as _,
                 dist_key_indices: vec![], // simple exchange doesn't need dist key
                 output_mapping: PbDispatchOutputMapping::identical(cdc_source_schema.len()).into(),
+                cdc_table_names: vec![],
             }
         };
         // Add a simple exchange node between filter and stream scan
