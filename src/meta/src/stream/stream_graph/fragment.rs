@@ -27,6 +27,7 @@ use risingwave_common::catalog::{
 };
 use risingwave_common::hash::VnodeCount;
 use risingwave_common::id::JobId;
+use risingwave_common::util::cdc_filter_expr::cdc_filter_table_names;
 use risingwave_common::util::iter_util::ZipEqFast;
 use risingwave_common::util::stream_graph_visitor::{
     self, visit_stream_node_cont, visit_stream_node_cont_mut,
@@ -744,6 +745,7 @@ fn rewrite_project_node(
     Ok(())
 }
 
+#[expect(clippy::type_complexity)]
 pub fn rewrite_refresh_schema_sink_fragment(
     original_sink_fragment: &Fragment,
     sink: &PbSink,
@@ -1833,6 +1835,11 @@ impl CompleteStreamFragmentGraph {
                                         CDC_SOURCE_COLUMN_NUM as _,
                                     )
                                     .into(),
+                                    // Let the dispatcher skip rows belonging to other tables
+                                    // sharing this source. Empty means no filtering.
+                                    cdc_table_names: cdc_filter_table_names(
+                                        fragment.inner.node.as_ref(),
+                                    ),
                                 },
                             }
                         }
@@ -1911,6 +1918,7 @@ impl CompleteStreamFragmentGraph {
                                         r#type: DispatcherType::NoShuffle as _,
                                         dist_key_indices: vec![], // not used for `NoShuffle`
                                         output_mapping: Some(output_mapping),
+                                        cdc_table_names: vec![],
                                     },
                                 }
                             } else {
@@ -2028,6 +2036,7 @@ impl CompleteStreamFragmentGraph {
                         r#type: *dispatcher_type as i32,
                         output_mapping: Some(output_mapping),
                         dist_key_indices,
+                        cdc_table_names: vec![],
                     },
                 };
 
@@ -2101,12 +2110,14 @@ fn mv_on_mv_dispatch_strategy(
                 r#type: DispatcherType::Hash as _,
                 dist_key_indices,
                 output_mapping: Some(output_mapping),
+                cdc_table_names: vec![],
             }
         } else {
             DispatchStrategy {
                 r#type: DispatcherType::Simple as _,
                 dist_key_indices: vec![], // empty for Simple
                 output_mapping: Some(output_mapping),
+                cdc_table_names: vec![],
             }
         }
     } else {
@@ -2114,6 +2125,7 @@ fn mv_on_mv_dispatch_strategy(
             r#type: DispatcherType::NoShuffle as _,
             dist_key_indices: vec![], // not used for `NoShuffle`
             output_mapping: Some(output_mapping),
+            cdc_table_names: vec![],
         }
     }
 }
