@@ -30,6 +30,7 @@ use risingwave_common::array::arrow::{
 };
 use risingwave_common::array::{Array, ArrayError, ArrayImpl, Op, StreamChunk, StreamChunkBuilder};
 use risingwave_common::catalog::Schema;
+use risingwave_common::id::SinkId;
 use risingwave_common::row::Row;
 use risingwave_common::types::DataType;
 use risingwave_common::util::iter_util::ZipEqFast;
@@ -1502,6 +1503,7 @@ impl Sink for DorisSink {
             self.schema.clone(),
             self.pk_indices.clone(),
             self.is_append_only,
+            self.param.sink_id,
         )
         .await?;
 
@@ -1656,15 +1658,17 @@ fn arrow_schema_with_delete_sign(schema: &arrow_schema_58::Schema) -> arrow_sche
 
 /// Log a committed stream load from its Doris response. Both write paths emit the same line so a
 /// `load_time_ms` that is dominated by the commit window stands out from Doris's own timings.
-fn log_stream_load_response(res: &serde_json::Value) {
+fn log_stream_load_response(sink_id: SinkId, res: &serde_json::Value) {
     let Ok(res) = DorisInsertResultResponse::deserialize(res) else {
         tracing::warn!(
+            sink_id = %sink_id,
             response = %res,
             "failed to parse stream load response for logging"
         );
         return;
     };
     tracing::info!(
+        sink_id = %sink_id,
         txn_id = res.txn_id,
         label = %res.label,
         status = %res.status,
@@ -1693,6 +1697,7 @@ pub struct DorisSinkWriter {
     format: String,
     /// Arrow schema for the Arrow path, `None` when `format` is `json`.
     arrow_schema: Option<Arc<arrow_schema_58::Schema>>,
+    sink_id: SinkId,
     /// Rows accumulated for the next Arrow load.
     arrow_pending: Option<StreamChunkBuilder>,
     /// Estimated heap size of `arrow_pending`, the trigger for splitting a load.
@@ -1717,6 +1722,7 @@ impl DorisSinkWriter {
         schema: Schema,
         pk_indices: Vec<usize>,
         is_append_only: bool,
+        sink_id: SinkId,
     ) -> Result<Self> {
         let mut decimal_map = HashMap::default();
         let mut variant_columns = HashSet::default();
@@ -1788,6 +1794,7 @@ impl DorisSinkWriter {
             arrow_schema,
             arrow_pending: None,
             arrow_pending_size: 0,
+            sink_id,
         })
     }
 
@@ -1843,7 +1850,7 @@ impl DorisSinkWriter {
             return Ok(());
         }
         let res = self.inserter_inner_builder.send_body(bytes.into()).await?;
-        log_stream_load_response(&res);
+        log_stream_load_response(self.sink_id, &res);
         Ok(())
     }
 
@@ -2043,7 +2050,7 @@ impl DorisSinkWriter {
                 .map_err(|e| SinkError::Doris(format!("arrow writer error: {}", e.as_report())))?;
         }
         let res = self.inserter_inner_builder.send_body(buf.into()).await?;
-        log_stream_load_response(&res);
+        log_stream_load_response(self.sink_id, &res);
         Ok(())
     }
 }
@@ -2514,7 +2521,7 @@ mod tests {
         let mut properties = properties;
         properties.insert("doris.url".to_owned(), url.to_string());
         let config = DorisConfig::from_btreemap(properties).unwrap();
-        let writer = DorisSinkWriter::new(config.clone(), upsert_schema(), vec![], true)
+        let writer = DorisSinkWriter::new(config.clone(), upsert_schema(), vec![], true, SinkId::new(1))
             .await
             .unwrap();
         let mut writer = writer;
