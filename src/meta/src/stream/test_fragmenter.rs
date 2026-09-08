@@ -226,6 +226,7 @@ fn make_stream_fragments() -> Vec<StreamFragment> {
                 r#type: DispatcherType::Hash as i32,
                 dist_key_indices: vec![0],
                 output_mapping: PbDispatchOutputMapping::simple(vec![0, 1, 2]).into(),
+                cdc_table_names: vec![],
             }),
         }))),
         fields: vec![
@@ -384,6 +385,7 @@ fn make_fragment_edges() -> Vec<StreamFragmentEdge> {
                 r#type: DispatcherType::Simple as i32,
                 dist_key_indices: vec![],
                 output_mapping: PbDispatchOutputMapping::identical(0).into(), /* dummy length as it's not used */
+                cdc_table_names: vec![],
             }),
             link_id: 4,
             upstream_id: 1.into(),
@@ -394,6 +396,7 @@ fn make_fragment_edges() -> Vec<StreamFragmentEdge> {
                 r#type: DispatcherType::Hash as i32,
                 dist_key_indices: vec![0],
                 output_mapping: PbDispatchOutputMapping::identical(0).into(), /* dummy length as it's not used */
+                cdc_table_names: vec![],
             }),
             link_id: 1,
             upstream_id: 2.into(),

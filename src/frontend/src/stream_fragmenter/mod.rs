@@ -610,6 +610,7 @@ fn build_fragment(
                                     ref_fragment_node.fields.len(),
                                 )
                                 .into(),
+                                cdc_table_names: vec![],
                             };
 
                             let no_shuffle_exchange_operator_id = state.gen_operator_id();

@@ -73,6 +73,7 @@ fn dispatch_no_shuffle(output_indices: Vec<u32>) -> DispatchStrategy {
         r#type: DispatcherType::NoShuffle.into(),
         dist_key_indices: vec![],
         output_mapping: PbDispatchOutputMapping::simple(output_indices).into(),
+        cdc_table_names: vec![],
     }
 }
 
@@ -85,6 +86,7 @@ fn dispatch_consistent_hash_shuffle(
         r#type: DispatcherType::Hash.into(),
         dist_key_indices,
         output_mapping: PbDispatchOutputMapping::simple(output_indices).into(),
+        cdc_table_names: vec![],
     }
 }
 

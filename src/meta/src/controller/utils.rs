@@ -1558,6 +1558,7 @@ pub fn compose_dispatchers(
     dispatcher_type: DispatcherType,
     dist_key_indices: Vec<u32>,
     output_mapping: PbDispatchOutputMapping,
+    cdc_table_names: Vec<String>,
 ) -> (
     HashMap<crate::model::ActorId, PbDispatcher>,
     Option<HashMap<crate::model::ActorId, crate::model::ActorId>>,
@@ -1586,6 +1587,7 @@ pub fn compose_dispatchers(
                 ),
                 dispatcher_id: target_fragment_id,
                 downstream_actor_id: target_fragment_actors.keys().copied().collect(),
+                cdc_table_names: cdc_table_names.clone(),
             };
             (
                 source_fragment_actors
@@ -1603,6 +1605,7 @@ pub fn compose_dispatchers(
                 hash_mapping: None,
                 dispatcher_id: target_fragment_id,
                 downstream_actor_id: target_fragment_actors.keys().copied().collect(),
+                cdc_table_names: cdc_table_names.clone(),
             };
             (
                 source_fragment_actors
@@ -1635,6 +1638,7 @@ pub fn compose_dispatchers(
                             hash_mapping: None,
                             dispatcher_id: target_fragment_id,
                             downstream_actor_id: vec![downstream_actor_id],
+                            cdc_table_names: cdc_table_names.clone(),
                         },
                     )
                 })

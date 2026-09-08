@@ -15,6 +15,7 @@
 use std::collections::{HashMap, HashSet};
 
 use risingwave_common::bitmap::Bitmap;
+use risingwave_common::util::cdc_filter_expr::cdc_filter_table_names;
 use risingwave_meta_model::WorkerId;
 use risingwave_meta_model::fragment::DistributionType;
 use risingwave_pb::common::{ActorInfo, HostAddress, WorkerNode};
@@ -41,6 +42,8 @@ pub(super) struct EdgeBuilderFragmentInfo {
     actors: HashMap<ActorId, Option<Bitmap>>,
     actor_location: HashMap<ActorId, HostAddress>,
     partial_graph_id: PartialGraphId,
+    /// `_rw_table_name` values this fragment's `CdcFilter` accepts, if any.
+    cdc_table_names: Vec<String>,
 }
 
 impl EdgeBuilderFragmentInfo {
@@ -65,6 +68,7 @@ impl EdgeBuilderFragmentInfo {
             actors,
             actor_location,
             partial_graph_id,
+            cdc_table_names: cdc_filter_table_names(Some(&info.nodes)),
         }
     }
 
@@ -96,6 +100,7 @@ impl EdgeBuilderFragmentInfo {
             actors,
             actor_location,
             partial_graph_id,
+            cdc_table_names: cdc_filter_table_names(Some(&info.nodes)),
         }
     }
 
@@ -126,6 +131,7 @@ impl EdgeBuilderFragmentInfo {
             actors,
             actor_location,
             partial_graph_id,
+            cdc_table_names: cdc_filter_table_names(Some(&fragment.nodes)),
         }
     }
 }
@@ -265,7 +271,16 @@ impl FragmentEdgeBuilder {
             downstream.dispatcher_type,
             downstream.dist_key_indices.clone(),
             downstream.output_mapping.clone(),
+            downstream_fragment.cdc_table_names.clone(),
         );
+        if !downstream_fragment.cdc_table_names.is_empty() {
+            tracing::info!(
+                %fragment_id,
+                downstream_fragment_id = %downstream.downstream_fragment_id,
+                tables = ?downstream_fragment.cdc_table_names,
+                "routing shared cdc source by table name"
+            );
+        }
         if let Some(no_shuffle_map) = no_shuffle_map {
             self.result
                 .actor_new_no_shuffle

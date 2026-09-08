@@ -20,12 +20,13 @@ use std::time::Duration;
 use anyhow::anyhow;
 use futures::FutureExt;
 use itertools::Itertools;
-use risingwave_common::array::Op;
+use risingwave_common::array::{Array, ArrayImpl, DataChunk, Op};
 use risingwave_common::bitmap::BitmapBuilder;
 use risingwave_common::config::StreamingConfig;
 use risingwave_common::hash::{ActorMapping, ExpandedActorMapping, VirtualNode};
 use risingwave_common::metrics::LabelGuardedIntCounter;
 use risingwave_common::row::RowExt;
+use risingwave_common::util::cdc_filter_expr::RW_TABLE_NAME_COLUMN_IDX;
 use risingwave_common::util::iter_util::ZipEqFast;
 use risingwave_pb::stream_plan::update_mutation::PbDispatcherUpdate;
 use risingwave_pb::stream_plan::{self, PbDispatcher};
@@ -723,6 +724,7 @@ impl DispatcherImpl {
                     output,
                     output_mapping,
                     dispatcher.dispatcher_id,
+                    dispatcher.cdc_table_names.iter().cloned().collect(),
                 ))
             }
             Unspecified => unreachable!(),
@@ -1257,6 +1259,44 @@ impl Dispatcher for BroadcastDispatcher {
     }
 }
 
+/// The `_rw_table_name` values a downstream `CdcFilter` accepts.
+///
+/// A downstream almost always covers a single table; the planner only emits several names when a
+/// table has an alternate spelling (a quoted Postgres name, say), so the single case is worth
+/// keeping off the hash path.
+#[derive(Debug)]
+pub enum CdcTableNames {
+    /// No predicate: forward every row.
+    Off,
+    One(String),
+    Many(HashSet<String>),
+}
+
+impl CdcTableNames {
+    fn is_off(&self) -> bool {
+        matches!(self, Self::Off)
+    }
+
+    fn accepts(&self, table_name: &str) -> bool {
+        match self {
+            Self::Off => true,
+            Self::One(name) => name == table_name,
+            Self::Many(names) => names.contains(table_name),
+        }
+    }
+}
+
+impl FromIterator<String> for CdcTableNames {
+    fn from_iter<I: IntoIterator<Item = String>>(iter: I) -> Self {
+        let mut names: Vec<_> = iter.into_iter().collect();
+        match names.len() {
+            0 => Self::Off,
+            1 => Self::One(names.pop().unwrap()),
+            _ => Self::Many(names.into_iter().collect()),
+        }
+    }
+}
+
 /// `SimpleDispatcher` dispatches message to a single output.
 #[derive(Debug)]
 pub struct SimpleDispatcher {
@@ -1276,6 +1316,8 @@ pub struct SimpleDispatcher {
     output: SmallVec<[Output; 2]>,
     output_mapping: DispatchOutputMapping,
     dispatcher_id: DispatcherId,
+    /// `_rw_table_name` values the downstream `CdcFilter` accepts.
+    cdc_table_names: CdcTableNames,
 }
 
 impl SimpleDispatcher {
@@ -1283,12 +1325,76 @@ impl SimpleDispatcher {
         output: Output,
         output_mapping: DispatchOutputMapping,
         dispatcher_id: DispatcherId,
+        cdc_table_names: CdcTableNames,
     ) -> Self {
         Self {
             output: smallvec![output],
             output_mapping,
             dispatcher_id,
+            cdc_table_names,
         }
+    }
+
+    /// Mark rows whose `_rw_table_name` is not accepted downstream as invisible.
+    ///
+    /// Returns `None` when nothing remains visible, so the caller can skip the send entirely. The
+    /// downstream `CdcFilter` still evaluates the predicate, so keeping extra rows is always safe;
+    /// any shape we cannot interpret therefore forwards the chunk untouched.
+    fn filter_by_cdc_table_name(&self, chunk: StreamChunk) -> Option<StreamChunk> {
+        if self.cdc_table_names.is_off() {
+            return Some(chunk);
+        }
+
+        let (kept, vis) = {
+            // The predicate is attached to the downstream fragment, so it reaches every edge into
+            // a `CdcFilter`. A chunk without a varchar `_rw_table_name` is not a CDC source chunk
+            // and must be forwarded as-is. Note the chunk is as wide as the source's catalog
+            // columns, which includes hidden ones such as `_row_id`, so its width is not fixed.
+            let Some(column) = chunk.columns().get(RW_TABLE_NAME_COLUMN_IDX as usize) else {
+                return Some(chunk);
+            };
+            let ArrayImpl::Utf8(table_names) = column.as_ref() else {
+                return Some(chunk);
+            };
+
+            // Each CDC message becomes one `Insert`, so there is no `U-`/`U+` pair that routing
+            // could split across chunks. Guard the assumption rather than rely on it silently.
+            debug_assert!(
+                !chunk
+                    .ops()
+                    .iter()
+                    .any(|op| matches!(op, Op::UpdateDelete | Op::UpdateInsert)),
+                "cdc table routing cannot split update pairs"
+            );
+
+            let mut vis = BitmapBuilder::with_capacity(chunk.capacity());
+            let mut kept = 0usize;
+            for (i, visible) in chunk.visibility().iter().enumerate() {
+                let keep = visible
+                    && table_names
+                        .value_at(i)
+                        .is_some_and(|name| self.cdc_table_names.accepts(name));
+                kept += keep as usize;
+                vis.append(keep);
+            }
+            (kept, vis)
+        };
+
+        if kept == 0 {
+            return None;
+        }
+        if kept == chunk.cardinality() {
+            // Every visible row belongs here; reuse the chunk rather than rebuild it.
+            return Some(chunk);
+        }
+
+        // Only the visibility changes, so ops and columns are moved rather than copied.
+        let (data, ops) = chunk.into_parts();
+        let (columns, _) = data.into_parts_v2();
+        Some(StreamChunk::from_parts(
+            ops,
+            DataChunk::from_parts(columns, vis.finish()),
+        ))
     }
 }
 
@@ -1309,6 +1415,17 @@ impl Dispatcher for SimpleDispatcher {
     }
 
     async fn dispatch_data(&mut self, chunk: StreamChunk) -> StreamResult<()> {
+        // Zero-cardinality chunks (e.g. CDC heartbeats) are forwarded untouched, so that filtering
+        // here stays independent of how the downstream treats them.
+        let chunk = if chunk.cardinality() == 0 {
+            chunk
+        } else {
+            match self.filter_by_cdc_table_name(chunk) {
+                Some(chunk) => chunk,
+                None => return Ok(()),
+            }
+        };
+
         let output =
             Itertools::exactly_one(self.output.iter_mut()).expect("expect exactly one output");
 
@@ -1349,7 +1466,10 @@ mod tests {
     use futures::pin_mut;
     use multimap::MultiMap;
     use risingwave_common::array::stream_chunk::StreamChunkTestExt;
-    use risingwave_common::array::{Array, ArrayBuilder, I32ArrayBuilder};
+    use risingwave_common::array::{
+        Array, ArrayBuilder, I32ArrayBuilder, I64ArrayBuilder, Utf8ArrayBuilder,
+    };
+    use risingwave_common::bitmap::Bitmap;
     use risingwave_common::catalog::{Field, Schema};
     use risingwave_common::types::DataType;
     use risingwave_common::util::epoch::test_epoch;
@@ -1970,6 +2090,182 @@ mod tests {
         dispatcher.update_data_suppression(&HashMap::from_iter([(actor_ids[1], true)]));
         dispatcher.remove_outputs(&HashSet::from_iter([actor_ids[1]]));
         assert!(dispatcher.data_suppressed_actors.is_empty());
+    }
+
+    /// A real CDC source chunk carries the source's catalog columns, which include hidden ones:
+    /// `(payload, _rw_offset, _rw_table_name, _row_id)`. Only column 2 is consulted, so the rest
+    /// are placeholders — but the width must match production, or a width-sensitive bug here would
+    /// pass its tests and forward everything in the field.
+    fn cdc_chunk(rows: &[(Op, &str)]) -> StreamChunk {
+        let mut payload = Utf8ArrayBuilder::new(rows.len());
+        let mut offset = Utf8ArrayBuilder::new(rows.len());
+        let mut table_name = Utf8ArrayBuilder::new(rows.len());
+        let mut row_id = I64ArrayBuilder::new(rows.len());
+        for (i, (_, name)) in rows.iter().enumerate() {
+            payload.append(Some("{}"));
+            offset.append(Some("0"));
+            table_name.append(Some(*name));
+            row_id.append(Some(i as i64));
+        }
+        StreamChunk::new(
+            rows.iter().map(|(op, _)| *op).collect_vec(),
+            vec![
+                Arc::new(payload.finish().into()),
+                Arc::new(offset.finish().into()),
+                Arc::new(table_name.finish().into()),
+                Arc::new(row_id.finish().into()),
+            ],
+        )
+    }
+
+    fn table_names_of(chunk: &StreamChunk) -> Vec<String> {
+        let ArrayImpl::Utf8(names) = chunk.columns()[2].as_ref() else {
+            panic!("expected a varchar column")
+        };
+        chunk
+            .visibility()
+            .iter_ones()
+            .map(|i| names.value_at(i).unwrap().to_owned())
+            .collect()
+    }
+
+    /// `columns` is the width of the chunks this dispatcher will be given, so that the output
+    /// mapping matches them.
+    fn simple_dispatcher_with(
+        names: &[&str],
+        columns: usize,
+    ) -> (
+        SimpleDispatcher,
+        crate::executor::exchange::permit::Receiver,
+    ) {
+        let (tx, rx) = channel_for_test();
+        let dispatcher = SimpleDispatcher::new(
+            Output::new(ActorId::new(1), tx),
+            DispatchOutputMapping::Simple((0..columns).collect()),
+            0.into(),
+            names.iter().map(|n| (*n).to_owned()).collect(),
+        );
+        (dispatcher, rx)
+    }
+
+    #[tokio::test]
+    async fn test_simple_dispatcher_routes_by_cdc_table_name() {
+        let (mut dispatcher, mut rx) = simple_dispatcher_with(&["public.orders"], 4);
+
+        dispatcher
+            .dispatch_data(cdc_chunk(&[
+                (Op::Insert, "public.orders"),
+                (Op::Insert, "public.items"),
+                (Op::Delete, "public.orders"),
+            ]))
+            .await
+            .unwrap();
+
+        let msg = rx.try_recv().unwrap();
+        let chunk = msg.as_chunk().unwrap();
+        assert_eq!(
+            table_names_of(&chunk),
+            vec!["public.orders", "public.orders"]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_simple_dispatcher_skips_send_when_nothing_matches() {
+        let (mut dispatcher, mut rx) = simple_dispatcher_with(&["public.orders"], 4);
+
+        dispatcher
+            .dispatch_data(cdc_chunk(&[
+                (Op::Insert, "public.items"),
+                (Op::Insert, "public.users"),
+            ]))
+            .await
+            .unwrap();
+
+        assert!(rx.try_recv().is_err(), "sent a chunk with no matching rows");
+    }
+
+    #[tokio::test]
+    async fn test_simple_dispatcher_accepts_every_name_in_the_set() {
+        // The planner emits an `Or` of equalities for quoted Postgres names, so a downstream can
+        // legitimately accept more than one spelling.
+        let (mut dispatcher, mut rx) =
+            simple_dispatcher_with(&["public.\"Orders\"", "public.Orders"], 4);
+
+        dispatcher
+            .dispatch_data(cdc_chunk(&[
+                (Op::Insert, "public.\"Orders\""),
+                (Op::Insert, "public.items"),
+                (Op::Insert, "public.Orders"),
+            ]))
+            .await
+            .unwrap();
+
+        let msg = rx.try_recv().unwrap();
+        let chunk = msg.as_chunk().unwrap();
+        assert_eq!(
+            table_names_of(&chunk),
+            vec!["public.\"Orders\"", "public.Orders"]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_simple_dispatcher_without_predicate_forwards_everything() {
+        let (mut dispatcher, mut rx) = simple_dispatcher_with(&[], 4);
+
+        dispatcher
+            .dispatch_data(cdc_chunk(&[
+                (Op::Insert, "public.orders"),
+                (Op::Insert, "public.items"),
+            ]))
+            .await
+            .unwrap();
+
+        let msg = rx.try_recv().unwrap();
+        let chunk = msg.as_chunk().unwrap();
+        assert_eq!(
+            table_names_of(&chunk),
+            vec!["public.orders", "public.items"]
+        );
+    }
+
+    /// A non-CDC chunk has no `_rw_table_name` column to inspect. Filtering must not apply, or an
+    /// unrelated `Simple` edge would lose all its data.
+    #[tokio::test]
+    async fn test_simple_dispatcher_forwards_when_column_is_absent() {
+        let (mut dispatcher, mut rx) = simple_dispatcher_with(&["public.orders"], 1);
+
+        dispatcher
+            .dispatch_data(StreamChunk::from_pretty(
+                "  I
+                 + 1
+                 + 2",
+            ))
+            .await
+            .unwrap();
+
+        let msg = rx.try_recv().unwrap();
+        let chunk = msg.as_chunk().unwrap();
+        assert_eq!(chunk.cardinality(), 2);
+    }
+
+    /// Heartbeat chunks carry an advancing offset on an invisible row and must reach every
+    /// downstream untouched, independent of how the downstream treats them.
+    #[tokio::test]
+    async fn test_simple_dispatcher_forwards_zero_cardinality_chunks() {
+        let (mut dispatcher, mut rx) = simple_dispatcher_with(&["public.orders"], 4);
+
+        let chunk = cdc_chunk(&[(Op::Insert, "public.items")]);
+        let chunk = StreamChunk::with_visibility(
+            chunk.ops(),
+            chunk.columns().into(),
+            Bitmap::zeros(chunk.capacity()),
+        );
+        assert_eq!(chunk.cardinality(), 0);
+
+        dispatcher.dispatch_data(chunk).await.unwrap();
+        let msg = rx.try_recv().unwrap();
+        let received = msg.as_chunk().unwrap();
+        assert_eq!(received.cardinality(), 0);
     }
 
     #[test]
