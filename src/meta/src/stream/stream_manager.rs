@@ -234,6 +234,9 @@ pub struct AutoRefreshSchemaSinkContext {
     pub original_sink: PbSink,
     pub original_fragment: Fragment,
     pub new_schema: Vec<PbColumnCatalog>,
+    /// `downstream_pk` remapped onto `new_schema`; the stored indices shift whenever a column
+    /// before a pk column is dropped.
+    pub new_downstream_pk: Vec<i32>,
     pub newly_add_fields: Vec<Field>,
     pub removed_column_names: Vec<String>,
     pub new_fragment: Fragment,

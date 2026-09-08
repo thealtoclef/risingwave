@@ -752,7 +752,7 @@ pub fn rewrite_refresh_schema_sink_fragment(
     upstream_table: &PbTable,
     upstream_table_fragment_id: FragmentId,
     id_generator_manager: &IdGeneratorManager,
-) -> MetaResult<(Fragment, Vec<PbColumnCatalog>, Option<PbTable>)> {
+) -> MetaResult<(Fragment, Vec<PbColumnCatalog>, Option<PbTable>, Vec<i32>)> {
     let removed_column_ids: HashSet<_> =
         removed_columns.iter().map(|col| col.column_id()).collect();
     let removed_log_store_column_names: HashSet<_> = removed_columns
@@ -765,6 +765,36 @@ pub fn rewrite_refresh_schema_sink_fragment(
         .collect();
     let new_sink_columns =
         build_new_sink_columns(sink, &removed_sink_column_names, newly_added_columns);
+
+    // `downstream_pk` indexes into the sink's column list, which `build_new_sink_columns`
+    // compacts when a column is dropped, so the stored indices go stale as soon as anything
+    // before a pk column disappears. Re-resolve them through the sink's own column ids, which
+    // `extend_sink_columns` keeps unique. A pk column that is gone entirely has no new index,
+    // and rekeying the sink silently would corrupt the downstream table, so that fails here.
+    let new_index_of_column_id: HashMap<i32, usize> = new_sink_columns
+        .iter()
+        .enumerate()
+        .map(|(index, col)| (col.column_desc.as_ref().unwrap().column_id, index))
+        .collect();
+    let new_downstream_pk = sink
+        .downstream_pk
+        .iter()
+        .map(|&index| {
+            let column_desc = sink.columns[index as usize].column_desc.as_ref().unwrap();
+            new_index_of_column_id
+                .get(&column_desc.column_id)
+                .map(|&index| index as i32)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "cannot drop column {} of table {}: it is part of the primary key of sink {}",
+                        column_desc.name,
+                        upstream_table.name,
+                        sink.name,
+                    )
+                    .into()
+                })
+        })
+        .collect::<MetaResult<Vec<_>>>()?;
 
     let mut new_sink_fragment = clone_fragment(original_sink_fragment, id_generator_manager);
     let sink_node = &mut new_sink_fragment.nodes;
@@ -821,7 +851,11 @@ pub fn rewrite_refresh_schema_sink_fragment(
     } else {
         None
     };
-    sink_node_body.sink_desc.as_mut().unwrap().column_catalogs = new_sink_columns.clone();
+    let new_sink_desc = sink_node_body.sink_desc.as_mut().unwrap();
+    new_sink_desc.column_catalogs = new_sink_columns.clone();
+    // The executor rebuilds `SinkParam` from `sink_desc`, so the remapped pk has to land here
+    // as well as on the catalog; these are two independent copies of the same indices.
+    new_sink_desc.downstream_pk = new_downstream_pk.iter().map(|&index| index as u32).collect();
 
     let stream_scan_node = if stream_input_is_project {
         let [stream_scan_node] = stream_input_node.input.as_mut_slice() else {
@@ -858,7 +892,12 @@ pub fn rewrite_refresh_schema_sink_fragment(
     } else {
         sink_node.fields = scan_rewrite.output_fields;
     }
-    Ok((new_sink_fragment, new_sink_columns, new_log_store_table))
+    Ok((
+        new_sink_fragment,
+        new_sink_columns,
+        new_log_store_table,
+        new_downstream_pk,
+    ))
 }
 
 /// Adjacency list (G) of backfill orders.
@@ -2444,7 +2483,7 @@ mod tests {
             },
         };
 
-        let (new_fragment, _, _) = rewrite_refresh_schema_sink_fragment(
+        let (new_fragment, _, _, _) = rewrite_refresh_schema_sink_fragment(
             &original_fragment,
             &sink,
             std::slice::from_ref(&new_column),
@@ -2492,6 +2531,136 @@ mod tests {
         assert_eq!(
             stream_scan_node.fields.last().unwrap().name,
             format!("{}.{}", table_name, new_column.column_desc.name)
+        );
+    }
+
+    /// Builds an upsert sink over `columns` whose `downstream_pk` is `pk_indices`, then drops
+    /// `removed`. Returns the sink fragment's remapped `downstream_pk`.
+    async fn rewrite_dropping_column(
+        columns: &[ColumnCatalog],
+        pk_indices: Vec<i32>,
+        removed: &ColumnCatalog,
+    ) -> MetaResult<(Vec<i32>, Vec<u32>)> {
+        let env = MetaSrvEnv::for_test().await;
+        let id_gen_manager = env.id_gen_manager().as_ref();
+        let table_name = "t";
+
+        let surviving = columns
+            .iter()
+            .filter(|col| col.column_id() != removed.column_id())
+            .cloned()
+            .collect_vec();
+        let upstream_table = PbTable {
+            name: table_name.to_owned(),
+            columns: surviving.iter().map(|col| col.to_protobuf()).collect(),
+            ..Default::default()
+        };
+
+        let sink = PbSink {
+            name: "s".to_owned(),
+            columns: columns.iter().map(|col| col.to_protobuf()).collect(),
+            downstream_pk: pk_indices,
+            sink_type: PbSinkType::Upsert as i32,
+            ..Default::default()
+        };
+        let sink_desc = SinkDesc {
+            sink_type: PbSinkType::Upsert as i32,
+            column_catalogs: sink.columns.clone(),
+            downstream_pk: sink.downstream_pk.iter().map(|&i| i as u32).collect(),
+            ..Default::default()
+        };
+
+        let stream_scan_node = make_stream_scan_node(table_name, 1, columns);
+        let project_node = make_project_node(table_name, columns, stream_scan_node);
+        let log_store_table = PbTable {
+            columns: columns
+                .iter()
+                .cloned()
+                .map(|mut col| {
+                    col.column_desc.name = format!("{}_{}", table_name, col.column_desc.name);
+                    col.to_protobuf()
+                })
+                .collect(),
+            value_indices: (0..columns.len()).map(|i| i as i32).collect(),
+            ..Default::default()
+        };
+        let original_fragment = Fragment {
+            fragment_id: 1.into(),
+            fragment_type_mask: FragmentTypeMask::default(),
+            distribution_type: PbFragmentDistributionType::Single,
+            state_table_ids: vec![],
+            maybe_vnode_count: None,
+            nodes: StreamNode {
+                node_body: Some(NodeBody::Sink(Box::new(SinkNode {
+                    sink_desc: Some(sink_desc),
+                    table: Some(log_store_table),
+                    log_store_type: SinkLogStoreType::KvLogStore as i32,
+                    ..Default::default()
+                }))),
+                fields: columns
+                    .iter()
+                    .map(|col| make_field(table_name, col))
+                    .collect(),
+                input: vec![project_node],
+                ..Default::default()
+            },
+        };
+
+        let (new_fragment, _, _, new_downstream_pk) = rewrite_refresh_schema_sink_fragment(
+            &original_fragment,
+            &sink,
+            &[],
+            std::slice::from_ref(removed),
+            &upstream_table,
+            7.into(),
+            id_gen_manager,
+        )?;
+
+        let PbNodeBody::Sink(sink_body) = new_fragment.nodes.node_body.as_ref().unwrap() else {
+            panic!("expect sink node");
+        };
+        let desc_pk = sink_body.sink_desc.as_ref().unwrap().downstream_pk.clone();
+        Ok((new_downstream_pk, desc_pk))
+    }
+
+    /// Dropping a column positioned *before* a pk column shifts every later index down. Without
+    /// remapping, `downstream_pk` keeps pointing at the old positions and the sink silently
+    /// upserts on the wrong columns.
+    #[tokio::test]
+    async fn test_rewrite_refresh_schema_sink_fragment_remaps_downstream_pk_after_drop() {
+        let columns = vec![
+            make_column("a", 1, DataType::Int64),
+            make_column("b", 2, DataType::Int64),
+            make_column("c", 3, DataType::Int64),
+        ];
+        // pk is (b, c) at indices 1 and 2; dropping `a` must move them to 0 and 1.
+        let (new_downstream_pk, desc_pk) =
+            rewrite_dropping_column(&columns, vec![1, 2], &columns[0].clone())
+                .await
+                .unwrap();
+
+        assert_eq!(new_downstream_pk, vec![0, 1]);
+        // The executor reads `sink_desc`, so both copies have to agree.
+        assert_eq!(desc_pk, vec![0, 1]);
+    }
+
+    /// A pk column that is dropped outright has no new index. Rekeying the sink silently would
+    /// corrupt the downstream table, so the schema change has to fail instead.
+    #[tokio::test]
+    async fn test_rewrite_refresh_schema_sink_fragment_rejects_dropping_pk_column() {
+        let columns = vec![
+            make_column("a", 1, DataType::Int64),
+            make_column("b", 2, DataType::Int64),
+            make_column("c", 3, DataType::Int64),
+        ];
+        // pk is (a, b); dropping `b` leaves the sink with no column to key on.
+        let err = rewrite_dropping_column(&columns, vec![0, 1], &columns[1].clone())
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("part of the primary key"),
+            "unexpected error: {err}"
         );
     }
 
@@ -2568,7 +2737,7 @@ mod tests {
             },
         };
 
-        let (new_fragment, new_schema, new_log_store_table) = rewrite_refresh_schema_sink_fragment(
+        let (new_fragment, new_schema, new_log_store_table, _) = rewrite_refresh_schema_sink_fragment(
             &original_fragment,
             &sink,
             &[],

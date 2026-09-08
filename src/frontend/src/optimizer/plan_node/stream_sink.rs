@@ -474,7 +474,14 @@ impl StreamSink {
                 .iter()
                 .map(|&column_index| columns[column_index].name())
                 .collect_vec();
-            if upstream_table_pk_col_names != sink_pk_col_names {
+            // The sink pk only has to *cover* the upstream pk. Those columns cannot be dropped
+            // from the table, so indices derived from them stay resolvable across a schema
+            // change; any extra column the sink keys on is caught when the refresh remaps
+            // `downstream_pk` and finds it gone.
+            let covers_upstream_pk = upstream_table_pk_col_names
+                .iter()
+                .all(|name| sink_pk_col_names.contains(name));
+            if !covers_upstream_pk {
                 let is_iceberg_row_id_alias = properties.is_iceberg_connector()
                     && upstream_table_pk_col_names.len() == 1
                     && upstream_table_pk_col_names[0] == ROW_ID_COLUMN_NAME
@@ -482,7 +489,7 @@ impl StreamSink {
                     && sink_pk_col_names[0] == RISINGWAVE_ICEBERG_ROW_ID;
                 if !is_iceberg_row_id_alias {
                     return Err(ErrorCode::InvalidInputSyntax(format!(
-                        "sink with auto schema change should have same pk as upstream table {:?}, but got {:?}",
+                        "sink with auto schema change must cover the pk of upstream table {:?}, but got {:?}",
                         upstream_table_pk_col_names, sink_pk_col_names
                     ))
                     .into());
