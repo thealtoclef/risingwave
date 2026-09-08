@@ -23,14 +23,12 @@ all-sinks = [
 ]
 all-sources = ["source-adbc_snowflake"]
 source-adbc_snowflake = ["dep:adbc_core", "dep:adbc_snowflake"]
-sink-bigquery = [
-    "dep:gcp-bigquery-client",
-    "dep:google-cloud-bigquery",
-    "dep:google-cloud-googleapis",
-]
+sink-bigquery = ["dep:gcp-bigquery-client", "dep:google-cloud-bigquery"]
 sink-deltalake = ["dep:deltalake"]
 # TODO: pubsub source is not feature-gated, thus `google-cloud-pubsub` cannot be optional.
-sink-google_pubsub = ["dep:google-cloud-googleapis"]
+# google-cloud-googleapis is also unconditional: the pubsub source's native schema fetch
+# (schema/protobuf.rs::fetch_from_pubsub_native) needs it regardless of any sink feature.
+sink-google_pubsub = []
 sink-clickhouse = ["dep:clickhouse"]
 sink-doris = []
 sink-starrocks = []
@@ -41,6 +39,7 @@ adbc_core = { workspace = true, optional = true }
 adbc_snowflake = { workspace = true, optional = true, default-features = false }
 anyhow = "1"
 apache-avro = { workspace = true }
+arrow-58-ipc = { package = "arrow-ipc", version = "58" }
 assert_matches = "1"
 async-compression = { version = "0.4.5", features = ["gzip", "tokio"] }
 async-nats = { version = "0.49", features = ["websockets"] }
@@ -89,7 +88,7 @@ google-cloud-googleapis = { package = "gcloud-googleapis", version = "1", featur
     "pubsub",
     "bigquery",
     "spanner",
-], optional = true }
+] }
 google-cloud-pubsub = { package = "gcloud-pubsub", version = "1.5" }
 google-cloud-spanner = { git = "https://github.com/googleapis/google-cloud-rust", rev = "20b85b29b2b641099096e8a405ccedec3171d345" }
 google-cloud-wkt = { git = "https://github.com/googleapis/google-cloud-rust", rev = "20b85b29b2b641099096e8a405ccedec3171d345" }

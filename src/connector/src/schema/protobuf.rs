@@ -13,8 +13,16 @@
 // limitations under the License.
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use anyhow::Context as _;
+use google_cloud_gax::conn::{ConnectionOptions, Environment};
+use google_cloud_googleapis::pubsub::v1::schema_service_client::SchemaServiceClient;
+use google_cloud_googleapis::pubsub::v1::{GetSchemaRequest, SchemaView};
+use google_cloud_pubsub::apiv1::conn_pool::{self, ConnectionManager};
+use google_cloud_pubsub::client::google_cloud_auth::credentials::CredentialsFile;
+use google_cloud_pubsub::client::google_cloud_auth::project::Config as AuthConfig;
+use google_cloud_pubsub::client::google_cloud_auth::token::DefaultTokenSourceProvider;
 use prost_reflect::{DescriptorPool, FileDescriptor, MessageDescriptor};
 use prost_types::FileDescriptorSet;
 use risingwave_connector_codec::common::protobuf::compile_pb;
@@ -108,6 +116,77 @@ pub async fn fetch_from_registry(
         })?;
 
     Ok((message_descriptor, vid))
+}
+
+/// Matches `sink/big_query.rs`'s `CONNECT_TIMEOUT` for a comparable GCP client.
+const PUBSUB_SCHEMA_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Fetches a schema's raw `.proto` definition directly from GCP Pub/Sub's own Schema resource
+/// (`projects/{project}/schemas/{schema}`), and compiles it the same way the schema-registry
+/// path does. `credentials` is a JSON string containing service account credentials (see
+/// `PubsubProperties::credentials`); without it, Application Default Credentials are used.
+/// `emulator_host` overrides the endpoint for local testing.
+pub async fn fetch_from_pubsub_native(
+    schema_name: &str,
+    emulator_host: Option<&str>,
+    credentials: Option<&str>,
+) -> Result<FileDescriptor, SchemaFetchError> {
+    let to_err = |e: anyhow::Error| SchemaFetchError::PubsubApi(e.into());
+
+    let environment = if let Some(emulator_host) = emulator_host {
+        Environment::Emulator(emulator_host.to_owned())
+    } else {
+        let auth_config = AuthConfig::default()
+            .with_audience(conn_pool::AUDIENCE)
+            .with_scopes(&conn_pool::SCOPES);
+        let provider = match credentials {
+            Some(json) => {
+                let file = CredentialsFile::new_from_str(json)
+                    .await
+                    .map_err(|e| to_err(anyhow::anyhow!(e)))?;
+                DefaultTokenSourceProvider::new_with_credentials(auth_config, Box::new(file))
+                    .await
+                    .map_err(|e| to_err(anyhow::anyhow!(e)))?
+            }
+            None => DefaultTokenSourceProvider::new(auth_config)
+                .await
+                .map_err(|e| to_err(anyhow::anyhow!(e)))?,
+        };
+        Environment::GoogleCloud(Box::new(provider))
+    };
+
+    // A one-off control-plane call, so a single connection is enough.
+    let conn_options = ConnectionOptions {
+        timeout: Some(PUBSUB_SCHEMA_TIMEOUT),
+        connect_timeout: Some(PUBSUB_SCHEMA_TIMEOUT),
+        ..Default::default()
+    };
+    let connection = ConnectionManager::new(1, conn_pool::PUBSUB, &environment, &conn_options)
+        .await
+        .map_err(|e| to_err(anyhow::anyhow!(e)))?;
+    // `gcloud-pubsub`'s `SchemaClient` is `pub(crate)` in the released crate, so call the
+    // generated stub over the connection manager's channel, which attaches auth itself.
+    let schema = SchemaServiceClient::new(connection.conn())
+        .get_schema(GetSchemaRequest {
+            name: schema_name.to_owned(),
+            view: SchemaView::Full as i32,
+        })
+        .await
+        .map_err(|e| to_err(anyhow::anyhow!(e)))?
+        .into_inner();
+
+    let fd_set = compile_pb(
+        (schema_name.to_owned(), schema.definition),
+        std::iter::empty(),
+    )
+    .map_err(|e| SchemaFetchError::SchemaCompile(e.into()))?;
+    DescriptorPool::from_file_descriptor_set(fd_set)
+        .context("failed to convert fd set to descriptor pool")
+        .and_then(|pool| {
+            pool.get_file_by_name(schema_name)
+                .context("file lost after compilation")
+        })
+        .map_err(|e| SchemaFetchError::SchemaCompile(e.into()))
 }
 
 impl LoadedSchema for FileDescriptor {
