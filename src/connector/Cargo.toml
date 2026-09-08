@@ -26,11 +26,12 @@ source-adbc_snowflake = ["dep:adbc_core", "dep:adbc_snowflake"]
 sink-bigquery = [
     "dep:gcp-bigquery-client",
     "dep:google-cloud-bigquery",
-    "dep:google-cloud-googleapis",
 ]
 sink-deltalake = ["dep:deltalake"]
 # TODO: pubsub source is not feature-gated, thus `google-cloud-pubsub` cannot be optional.
-sink-google_pubsub = ["dep:google-cloud-googleapis"]
+# google-cloud-googleapis is also unconditional: the pubsub source's native schema fetch
+# (schema/protobuf.rs::fetch_from_pubsub_native) needs it regardless of any sink feature.
+sink-google_pubsub = []
 sink-clickhouse = ["dep:clickhouse"]
 sink-doris = []
 sink-starrocks = []
@@ -89,8 +90,14 @@ google-cloud-googleapis = { package = "gcloud-googleapis", version = "1", featur
     "pubsub",
     "bigquery",
     "spanner",
-], optional = true }
+] }
 google-cloud-pubsub = { package = "gcloud-pubsub", version = "1.5" }
+# `tonic` above is aliased to `madsim-tonic` for deterministic-simulation testing; the pubsub
+# schema client needs the *real* tonic (matching gcloud-gax's own pin) to build its own gRPC
+# channel, since `gcloud-pubsub`'s ergonomic `SchemaClient` wrapper is `pub(crate)`. Uses the
+# standard webpki-roots bundle, same as `gcloud-gax`'s own default.
+tonic-014 = { package = "tonic", version = "=0.14.6", features = ["tls-webpki-roots"] }
+token-source = "1"
 google-cloud-spanner = { git = "https://github.com/googleapis/google-cloud-rust", rev = "3774eba33c9c6cf017b3939eac18a41c3d7329bc" }
 google-cloud-wkt = { git = "https://github.com/googleapis/google-cloud-rust", rev = "3774eba33c9c6cf017b3939eac18a41c3d7329bc" }
 iceberg = { workspace = true }

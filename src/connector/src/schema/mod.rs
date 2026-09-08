@@ -70,4 +70,10 @@ pub enum SchemaFetchError {
     ),
     #[error("schema registry client error: {0}")]
     Client(#[from] schema_registry::SchemaRegistryClientError),
+    #[error("pubsub schema api error: {0}")]
+    PubsubApi(
+        #[source]
+        #[backtrace]
+        risingwave_common::error::BoxedError,
+    ),
 }

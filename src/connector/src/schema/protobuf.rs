@@ -13,11 +13,18 @@
 // limitations under the License.
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use anyhow::Context as _;
+use google_cloud_googleapis::pubsub::v1::schema_service_client::SchemaServiceClient;
+use google_cloud_googleapis::pubsub::v1::{GetSchemaRequest, SchemaView};
+use google_cloud_pubsub::client::google_cloud_auth::credentials::CredentialsFile;
+use google_cloud_pubsub::client::google_cloud_auth::project::Config as AuthConfig;
+use google_cloud_pubsub::client::google_cloud_auth::token::DefaultTokenSourceProvider;
 use prost_reflect::{DescriptorPool, FileDescriptor, MessageDescriptor};
 use prost_types::FileDescriptorSet;
 use risingwave_connector_codec::common::protobuf::compile_pb;
+use token_source::TokenSourceProvider;
 
 use super::loader::{LoadedSchema, SchemaLoader};
 use super::schema_registry::Subject;
@@ -105,6 +112,107 @@ pub async fn fetch_from_registry(
         .ok_or_else(|| invalid_option_error!("message {message_name} not defined in proto"))?;
 
     Ok((message_descriptor, vid))
+}
+
+/// Fetches a schema's raw `.proto` definition directly from GCP Pub/Sub's own Schema resource
+/// (`projects/{project}/schemas/{schema}`), and compiles it the same way the schema-registry
+/// path does. `credentials` is a JSON string containing service account credentials (see
+/// `PubsubProperties::credentials`); `emulator_host` overrides the endpoint for local testing.
+/// Note: this deliberately builds its own gRPC channel instead of using
+/// `google_cloud_pubsub::apiv1::conn_pool::ConnectionManager` (whose `SchemaClient` wrapper is
+/// `pub(crate)` and thus unreachable from outside that crate). TLS uses the standard
+/// `with_webpki_roots()` bundle, matching `ConnectionManager`'s own default — correct for a real
+/// deployment, where the base image installs `ca-certificates`. For local development behind a
+/// TLS-inspecting corporate proxy, set `RW_PUBSUB_DEV_EXTRA_CA_CERT` to a PEM file containing the
+/// proxy's CA (layered on top of the standard bundle, not replacing it) — analogous to pointing
+/// `SSL_CERT_FILE`/`REQUESTS_CA_BUNDLE`/`GRPC_DEFAULT_SSL_ROOTS_FILE_PATH` at a combined bundle
+/// for Python clients hitting the same proxy. Never read in a way that could affect production:
+/// unset, this is a no-op and behavior is identical to the plain webpki bundle.
+/// Matches `sink/big_query.rs`'s `CONNECT_TIMEOUT` for a comparable GCP client.
+const PUBSUB_SCHEMA_TIMEOUT: Duration = Duration::from_secs(30);
+
+pub async fn fetch_from_pubsub_native(
+    schema_name: &str,
+    emulator_host: Option<&str>,
+    credentials: Option<&str>,
+) -> Result<FileDescriptor, SchemaFetchError> {
+    let to_err = |e: anyhow::Error| SchemaFetchError::PubsubApi(e.into());
+
+    let (channel, token) = if let Some(emulator_host) = emulator_host {
+        let channel = tonic_014::transport::Channel::from_shared(format!("http://{emulator_host}"))
+            .map_err(|e| to_err(anyhow::anyhow!(e)))?
+            .connect_timeout(PUBSUB_SCHEMA_TIMEOUT)
+            .timeout(PUBSUB_SCHEMA_TIMEOUT)
+            .connect()
+            .await
+            .map_err(|e| to_err(anyhow::anyhow!(e)))?;
+        (channel, None)
+    } else {
+        let mut tls_config = tonic_014::transport::ClientTlsConfig::new().with_webpki_roots();
+        if let Ok(extra_ca_path) = std::env::var("RW_PUBSUB_DEV_EXTRA_CA_CERT") {
+            let pem = std::fs::read(&extra_ca_path).map_err(|e| to_err(anyhow::anyhow!(e)))?;
+            tls_config = tls_config.ca_certificate(tonic_014::transport::Certificate::from_pem(pem));
+        }
+        let channel = tonic_014::transport::Endpoint::from_static("https://pubsub.googleapis.com")
+            .tls_config(tls_config)
+            .map_err(|e| to_err(anyhow::anyhow!(e)))?
+            .connect_timeout(PUBSUB_SCHEMA_TIMEOUT)
+            .timeout(PUBSUB_SCHEMA_TIMEOUT)
+            .connect()
+            .await
+            .map_err(|e| to_err(anyhow::anyhow!(e)))?;
+
+        let auth_config = AuthConfig::default()
+            .with_audience("https://pubsub.googleapis.com/")
+            .with_scopes(&["https://www.googleapis.com/auth/cloud-platform"]);
+        let provider = match credentials {
+            Some(json) => {
+                let file = CredentialsFile::new_from_str(json)
+                    .await
+                    .map_err(|e| to_err(anyhow::anyhow!(e)))?;
+                DefaultTokenSourceProvider::new_with_credentials(auth_config, Box::new(file))
+                    .await
+                    .map_err(|e| to_err(anyhow::anyhow!(e)))?
+            }
+            None => DefaultTokenSourceProvider::new(auth_config)
+                .await
+                .map_err(|e| to_err(anyhow::anyhow!(e)))?,
+        };
+        let token = provider
+            .token_source()
+            .token()
+            .await
+            .map_err(|e| to_err(anyhow::anyhow!("{e}")))?;
+        (channel, Some(token))
+    };
+
+    let interceptor = move |mut req: tonic_014::Request<()>| {
+        if let Some(token) = &token {
+            let value = token
+                .parse()
+                .map_err(|e| tonic_014::Status::internal(format!("invalid auth token: {e}")))?;
+            req.metadata_mut().insert("authorization", value);
+        }
+        Ok(req)
+    };
+    let schema = SchemaServiceClient::with_interceptor(channel, interceptor)
+        .get_schema(GetSchemaRequest {
+            name: schema_name.to_owned(),
+            view: SchemaView::Full as i32,
+        })
+        .await
+        .map_err(|e| to_err(anyhow::anyhow!(e)))?
+        .into_inner();
+
+    let fd_set = compile_pb((schema_name.to_owned(), schema.definition), std::iter::empty())
+        .map_err(|e| SchemaFetchError::SchemaCompile(e.into()))?;
+    DescriptorPool::from_file_descriptor_set(fd_set)
+        .context("failed to convert fd set to descriptor pool")
+        .and_then(|pool| {
+            pool.get_file_by_name(schema_name)
+                .context("file lost after compilation")
+        })
+        .map_err(|e| SchemaFetchError::SchemaCompile(e.into()))
 }
 
 impl LoadedSchema for FileDescriptor {

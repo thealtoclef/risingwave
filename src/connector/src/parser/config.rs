@@ -247,6 +247,14 @@ impl SpecificParserConfig {
                             .unwrap(),
                         topic: get_kafka_topic(&options_with_secret)?.clone(),
                     }
+                } else if let Some(schema_name) =
+                    info.row_schema_location.strip_prefix("pubsub://")
+                {
+                    SchemaLocation::PubsubSchema {
+                        schema_name: schema_name.to_owned(),
+                        emulator_host: options_with_secret.get("pubsub.emulator_host").cloned(),
+                        credentials: options_with_secret.get("pubsub.credentials").cloned(),
+                    }
                 } else {
                     SchemaLocation::File {
                         url: info.row_schema_location,
@@ -347,6 +355,13 @@ pub enum SchemaLocation {
         aws_auth_props: AwsAuthProps,
         // When `Some(_)`, ignore AWS and load schemas from provided config
         mock_config: Option<String>,
+    },
+    /// Read schema directly from a GCP Pub/Sub Schema resource, e.g.
+    /// `pubsub://projects/{project}/schemas/{schema_id}`.
+    PubsubSchema {
+        schema_name: String,
+        emulator_host: Option<String>,
+        credentials: Option<String>,
     },
 }
 

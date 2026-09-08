@@ -234,6 +234,9 @@ impl AvroParserConfig {
                     map_handling,
                 })
             }
+            SchemaLocation::PubsubSchema { .. } => {
+                bail!("avro from pubsub native schema not supported yet")
+            }
         }
     }
 

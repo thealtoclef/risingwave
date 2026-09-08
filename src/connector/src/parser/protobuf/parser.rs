@@ -91,6 +91,7 @@ impl TryFrom<&SchemaLocation> for WireType {
     fn try_from(value: &SchemaLocation) -> Result<Self, Self::Error> {
         match value {
             SchemaLocation::File { .. } => Ok(Self::None),
+            SchemaLocation::PubsubSchema { .. } => Ok(Self::None),
             SchemaLocation::Confluent { .. } => Ok(Self::Confluent),
             SchemaLocation::Glue { .. } => bail_invalid_option_error!(
                 "encode protobuf from aws glue schema registry not supported yet"
@@ -151,6 +152,20 @@ impl ProtobufParserConfig {
             SchemaLocation::Glue { .. } => bail_invalid_option_error!(
                 "encode protobuf from aws glue schema registry not supported yet"
             ),
+            SchemaLocation::PubsubSchema {
+                schema_name,
+                emulator_host,
+                credentials,
+            } => {
+                let file_descriptor = crate::schema::protobuf::fetch_from_pubsub_native(
+                    &schema_name,
+                    emulator_host.as_deref(),
+                    credentials.as_deref(),
+                )
+                .await
+                .context("failed to fetch schema from pubsub")?;
+                file_descriptor.parent_pool().clone()
+            }
         };
 
         let message_descriptor = pool
