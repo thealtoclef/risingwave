@@ -786,6 +786,8 @@ async fn execute_query(
         }
     };
 
+    let mut offset_cache = OffsetStringCache::new();
+
     loop {
         let row = match tokio::time::timeout(stall_timeout, result_set.next()).await {
             Ok(Some(Ok(row))) => row,
@@ -828,7 +830,7 @@ async fn execute_query(
                 let wm = offsets
                     .watermark()
                     .expect("partition active, watermark must exist");
-                let offset_str = make_offset_string((wm.unix_timestamp_nanos() / 1000) as i64);
+                let offset_str = offset_cache.get((wm.unix_timestamp_nanos() / 1000) as i64);
 
                 // Schema evolution: emit schema change before data records,
                 // mimicking Debezium's Relation messages that precede DML events.
@@ -885,12 +887,12 @@ async fn execute_query(
                 let wm = offsets
                     .watermark()
                     .expect("partition active, watermark must exist");
-                let offset_str = make_offset_string((wm.unix_timestamp_nanos() / 1000) as i64);
+                let offset_str = offset_cache.get((wm.unix_timestamp_nanos() / 1000) as i64);
 
                 messages.push(SourceMessage {
                     key: None,
                     payload: None,
-                    offset: offset_str,
+                    offset: offset_str.to_owned(),
                     split_id: split_id.clone(),
                     meta: SourceMeta::DebeziumCdc(DebeziumCdcMeta::new(
                         String::new(),
@@ -938,6 +940,34 @@ fn make_offset_string(offset_micros: i64) -> String {
     let spanner_offset = crate::source::cdc::external::spanner::SpannerOffset::new(offset_micros);
     let cdc_offset = crate::source::cdc::external::CdcOffset::Spanner(spanner_offset);
     serde_json::to_string(&cdc_offset).unwrap_or_else(|_| offset_micros.to_string())
+}
+
+/// Memoises the rendered checkpoint offset for one partition reader.
+///
+/// The offset carries the *watermark* — the minimum over all un-finished partitions — not this
+/// partition's own position, so it is unchanged across most consecutive records and heartbeats.
+/// Rendering it means a `serde_json::to_string` of a `CdcOffset`, which the reader otherwise
+/// repeats for every record and every heartbeat.
+struct OffsetStringCache {
+    micros: Option<i64>,
+    rendered: String,
+}
+
+impl OffsetStringCache {
+    fn new() -> Self {
+        Self {
+            micros: None,
+            rendered: String::new(),
+        }
+    }
+
+    fn get(&mut self, offset_micros: i64) -> &str {
+        if self.micros != Some(offset_micros) {
+            self.rendered = make_offset_string(offset_micros);
+            self.micros = Some(offset_micros);
+        }
+        &self.rendered
+    }
 }
 
 fn make_schema_change_msg(
