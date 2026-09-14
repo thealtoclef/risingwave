@@ -146,19 +146,67 @@ pub struct Sstable {
     skip_bloom_filter_in_serde: bool,
 }
 
+/// Borrowing mirror of [`SstableMeta`], serializing to the identical bincode encoding.
+///
+/// `&[T]` and `Vec<T>` share a wire format (both a length followed by the elements), so this
+/// is interchangeable with [`SstableMeta`] on the wire — see
+/// `test_sstable_meta_serde_bytes_is_wire_compatible` and `test_sstable_serialize_borrows`.
+#[derive(Serialize)]
+struct SstableMetaRef<'a> {
+    block_metas: &'a [BlockMeta],
+    #[serde(with = "serde_bytes")]
+    bloom_filter: &'a [u8],
+    estimated_size: u32,
+    key_count: u32,
+    #[serde(with = "serde_bytes")]
+    smallest_key: &'a [u8],
+    #[serde(with = "serde_bytes")]
+    largest_key: &'a [u8],
+    meta_offset: u64,
+    monotonic_tombstone_events: &'a [MonotonicDeleteEvent],
+    version: u32,
+}
+
+/// Borrowing mirror of [`SerdeSstable`], used only for serialization.
+#[derive(Serialize)]
+struct SerdeSstableRef<'a> {
+    id: HummockSstableObjectId,
+    meta: SstableMetaRef<'a>,
+}
+
 impl Serialize for Sstable {
     fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
     {
-        let mut serde_sstable = SerdeSstable {
-            id: self.id,
-            meta: self.meta.clone(),
+        // foyer calls this up to three times per disk-cache insert: twice through
+        // `bincode::serialized_size` (admission check, then entry sizing) and once to write the
+        // entry. Cloning `SstableMeta` here therefore deep-copied every `BlockMeta` on each pass,
+        // so serialize out of borrowed state instead. The filter is still re-encoded from its
+        // parsed form on each pass; that is a plain copy of the fingerprints, not a rebuild.
+        let filter_data;
+        let bloom_filter: &[u8] = if self.skip_bloom_filter_in_serde {
+            // `Sstable::new` moved the filter out of `meta`, so this is empty by construction.
+            &self.meta.bloom_filter
+        } else {
+            filter_data = self.filter_reader.encode_to_bytes();
+            &filter_data
         };
-        if !self.skip_bloom_filter_in_serde {
-            serde_sstable.meta.bloom_filter = self.filter_reader.encode_to_bytes();
-        }
-        serde_sstable.serialize(serializer)
+
+        #[expect(deprecated)]
+        let meta = SstableMetaRef {
+            block_metas: &self.meta.block_metas,
+            bloom_filter,
+            estimated_size: self.meta.estimated_size,
+            key_count: self.meta.key_count,
+            smallest_key: &self.meta.smallest_key,
+            largest_key: &self.meta.largest_key,
+            meta_offset: self.meta.meta_offset,
+            monotonic_tombstone_events: &self.meta.monotonic_tombstone_events,
+            version: self.meta.version,
+        };
+
+        SerdeSstableRef { id: self.id, meta }.serialize(serializer)
     }
 }
 
@@ -230,6 +278,11 @@ impl Sstable {
 
 #[derive(Clone, Default, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BlockMeta {
+    /// Serialized as an opaque byte string rather than a `Vec` of `u8` elements. The derived
+    /// impl walks a `Vec<u8>` one byte at a time, which dominated CPU on the meta disk cache
+    /// path; `serde_bytes` bulk-copies instead. The bincode encoding is byte-for-byte
+    /// identical either way, so this is not a format change.
+    #[serde(with = "serde_bytes")]
     pub smallest_key: Vec<u8>,
     pub offset: u32,
     pub len: u32,
@@ -305,10 +358,15 @@ impl BlockMeta {
 #[derive(Default, Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct SstableMeta {
     pub block_metas: Vec<BlockMeta>,
+    /// See [`BlockMeta::smallest_key`] for why the byte fields below opt out of the derived
+    /// `Vec<u8>` encoding.
+    #[serde(with = "serde_bytes")]
     pub bloom_filter: Vec<u8>,
     pub estimated_size: u32,
     pub key_count: u32,
+    #[serde(with = "serde_bytes")]
     pub smallest_key: Vec<u8>,
+    #[serde(with = "serde_bytes")]
     pub largest_key: Vec<u8>,
     pub meta_offset: u64,
     /// Assume that watermark1 is 5, watermark2 is 7, watermark3 is 11, delete ranges
@@ -592,6 +650,229 @@ mod tests {
         assert_eq!(decoded_meta, meta);
 
         println!("buf: {}", buf.len());
+    }
+
+    /// Mirrors [`BlockMeta`] with the pre-`serde_bytes` field encoding.
+    #[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
+    struct LegacyBlockMeta {
+        smallest_key: Vec<u8>,
+        offset: u32,
+        len: u32,
+        uncompressed_size: u32,
+        total_key_count: u32,
+        stale_key_count: u32,
+    }
+
+    /// Mirrors [`SstableMeta`] with the pre-`serde_bytes` field encoding.
+    #[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
+    struct LegacySstableMeta {
+        block_metas: Vec<LegacyBlockMeta>,
+        bloom_filter: Vec<u8>,
+        estimated_size: u32,
+        key_count: u32,
+        smallest_key: Vec<u8>,
+        largest_key: Vec<u8>,
+        meta_offset: u64,
+        monotonic_tombstone_events: Vec<MonotonicDeleteEvent>,
+        version: u32,
+    }
+
+    /// `serde_bytes` must not change the bincode wire format.
+    ///
+    /// foyer's disk cache encodes `Sstable` with bincode (the blanket `Code` impl in
+    /// `foyer-common`), and the meta file cache outlives a rolling restart: a node on this
+    /// build reads entries written by a node without it, and vice versa. bincode emits
+    /// `serialize_bytes` as a length prefix followed by the raw bytes, which is exactly what
+    /// the derived `Vec<u8>` path emits element by element, so the two are interchangeable.
+    ///
+    /// The structs above pin that equivalence. If a bincode upgrade ever diverges the two
+    /// encodings, this fails here instead of silently corrupting cached SST metadata.
+    #[test]
+    fn test_sstable_meta_serde_bytes_is_wire_compatible() {
+        #[expect(deprecated)]
+        let meta = SstableMeta {
+            block_metas: vec![
+                BlockMeta {
+                    smallest_key: b"0-smallest-key".to_vec(),
+                    len: 100,
+                    ..Default::default()
+                },
+                BlockMeta {
+                    smallest_key: b"5-some-key".to_vec(),
+                    offset: 100,
+                    len: 100,
+                    total_key_count: 7,
+                    stale_key_count: 3,
+                    uncompressed_size: 200,
+                },
+            ],
+            bloom_filter: b"0123456789".to_vec(),
+            estimated_size: 123,
+            key_count: 123,
+            smallest_key: b"0-smallest-key".to_vec(),
+            largest_key: b"9-largest-key".to_vec(),
+            meta_offset: 123,
+            monotonic_tombstone_events: vec![],
+            version: VERSION,
+        };
+
+        let legacy = LegacySstableMeta {
+            block_metas: meta
+                .block_metas
+                .iter()
+                .map(|b| LegacyBlockMeta {
+                    smallest_key: b.smallest_key.clone(),
+                    offset: b.offset,
+                    len: b.len,
+                    uncompressed_size: b.uncompressed_size,
+                    total_key_count: b.total_key_count,
+                    stale_key_count: b.stale_key_count,
+                })
+                .collect(),
+            bloom_filter: meta.bloom_filter.clone(),
+            estimated_size: meta.estimated_size,
+            key_count: meta.key_count,
+            smallest_key: meta.smallest_key.clone(),
+            largest_key: meta.largest_key.clone(),
+            meta_offset: meta.meta_offset,
+            monotonic_tombstone_events: vec![],
+            version: meta.version,
+        };
+
+        // Same entry points foyer's `Code` impl uses.
+        assert_eq!(
+            bincode::serialize(&meta).unwrap(),
+            bincode::serialize(&legacy).unwrap(),
+            "serde_bytes changed the bincode encoding of SstableMeta"
+        );
+        assert_eq!(
+            bincode::serialized_size(&meta).unwrap(),
+            bincode::serialized_size(&legacy).unwrap()
+        );
+
+        // Upgrade direction: bytes written by the legacy encoder decode into the current type.
+        let legacy_bytes = bincode::serialize(&legacy).unwrap();
+        let decoded: SstableMeta = bincode::deserialize(&legacy_bytes).unwrap();
+        assert_eq!(decoded, meta);
+
+        // Rollback direction: bytes written by the current encoder decode into the legacy type.
+        // The meta file cache survives a rolling restart, so a node that is rolled back has to
+        // read entries this build wrote.
+        let current_bytes = bincode::serialize(&meta).unwrap();
+        let decoded_legacy: LegacySstableMeta = bincode::deserialize(&current_bytes).unwrap();
+        assert_eq!(decoded_legacy, legacy);
+    }
+
+    /// Edge cases the generated-SST fixtures never reach: every byte field empty, and a
+    /// non-empty `monotonic_tombstone_events`.
+    ///
+    /// The tombstone vector is the one field the borrowing serializer hands over as `&[T]`
+    /// rather than `Vec<T>`, and the generated fixtures always leave it empty, so without this
+    /// the `&[T]`/`Vec<T>` equivalence would go untested on real data.
+    #[test]
+    fn test_sstable_serialize_borrows_edge_cases() {
+        // `TableKey`'s field is private to the compat module, so build the event through its
+        // own wire format rather than by struct literal.
+        fn tombstone(table_id: u32, key: &[u8], new_epoch: u64) -> MonotonicDeleteEvent {
+            let mut buf = Vec::new();
+            buf.put_u32(table_id);
+            buf.put_u32(key.len() as u32);
+            buf.put_slice(key);
+            buf.put_u8(1); // is_exclude_left_key
+            buf.put_u64_le(new_epoch);
+            MonotonicDeleteEvent::decode(&mut buf.as_slice())
+        }
+
+        #[expect(deprecated)]
+        let meta = SstableMeta {
+            block_metas: vec![
+                BlockMeta {
+                    smallest_key: Vec::new(),
+                    ..Default::default()
+                },
+                BlockMeta {
+                    smallest_key: b"non-empty".to_vec(),
+                    offset: 1,
+                    len: 2,
+                    ..Default::default()
+                },
+            ],
+            bloom_filter: Vec::new(),
+            estimated_size: 0,
+            key_count: 0,
+            smallest_key: Vec::new(),
+            largest_key: Vec::new(),
+            meta_offset: 0,
+            monotonic_tombstone_events: vec![
+                tombstone(7, b"tombstone-key", 42),
+                tombstone(9, b"", u64::MAX),
+            ],
+            version: VERSION,
+        };
+
+        // The filter is empty here, so `skip_bloom_filter_in_serde` does not change the bytes;
+        // both modes must still agree with the cloning path.
+        for skip_bloom_filter_in_serde in [false, true] {
+            let sstable = Sstable::new(7.into(), meta.clone(), skip_bloom_filter_in_serde);
+
+            let mut owned = SerdeSstable {
+                id: sstable.id,
+                meta: sstable.meta.clone(),
+            };
+            if !skip_bloom_filter_in_serde {
+                owned.meta.bloom_filter = sstable.filter_reader.encode_to_bytes();
+            }
+
+            let borrowed_bytes = bincode::serialize(&sstable).unwrap();
+            assert_eq!(
+                borrowed_bytes,
+                bincode::serialize(&owned).unwrap(),
+                "borrowed serialization diverged (skip={skip_bloom_filter_in_serde})"
+            );
+
+            let decoded: Sstable = bincode::deserialize(&borrowed_bytes).unwrap();
+            assert_eq!(decoded.meta, sstable.meta);
+        }
+    }
+
+    /// Serializing out of borrowed state must be indistinguishable from the cloning path it
+    /// replaced, in both `skip_bloom_filter_in_serde` modes.
+    #[tokio::test]
+    async fn test_sstable_serialize_borrows() {
+        let (_, meta) = gen_test_sstable_data(
+            default_builder_opt_for_test(),
+            (0..100).map(|x| {
+                (
+                    iterator_test_key_of(x),
+                    HummockValue::put(format!("overlapped_new_{}", x).as_bytes().to_vec()),
+                )
+            }),
+        )
+        .await;
+
+        for skip_bloom_filter_in_serde in [false, true] {
+            let sstable = Sstable::new(42.into(), meta.clone(), skip_bloom_filter_in_serde);
+
+            // The cloning path this replaced.
+            let mut owned = SerdeSstable {
+                id: sstable.id,
+                meta: sstable.meta.clone(),
+            };
+            if !skip_bloom_filter_in_serde {
+                owned.meta.bloom_filter = sstable.filter_reader.encode_to_bytes();
+            }
+
+            assert_eq!(
+                bincode::serialize(&sstable).unwrap(),
+                bincode::serialize(&owned).unwrap(),
+                "borrowed serialization diverged (skip={skip_bloom_filter_in_serde})"
+            );
+            assert_eq!(
+                bincode::serialized_size(&sstable).unwrap(),
+                bincode::serialized_size(&owned).unwrap(),
+                "borrowed size diverged (skip={skip_bloom_filter_in_serde})"
+            );
+        }
     }
 
     #[tokio::test]
