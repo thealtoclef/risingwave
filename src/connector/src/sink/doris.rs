@@ -1656,8 +1656,12 @@ fn arrow_schema_with_delete_sign(schema: &arrow_schema_58::Schema) -> arrow_sche
     arrow_schema_58::Schema::new(fields)
 }
 
-/// Log a committed stream load from its Doris response. Both write paths emit the same line so a
-/// `load_time_ms` that is dominated by the commit window stands out from Doris's own timings.
+/// Log a committed stream load from its Doris response. Both write paths emit the same line, with
+/// the full phase breakdown Doris reports, so the stage that dominates `load_time_ms` is visible:
+/// `write_data_time_ms` covers the BE write path (tablet routing, memtable flush, segment upload),
+/// which is where a saturated flush pool shows up, while `begin_txn_time_ms` and
+/// `commit_and_publish_time_ms` cover the FE round trips. The phases overlap, so they do not sum to
+/// `load_time_ms`.
 fn log_stream_load_response(sink_id: SinkId, res: &serde_json::Value) {
     let Ok(res) = DorisInsertResultResponse::deserialize(res) else {
         tracing::warn!(
@@ -1675,6 +1679,11 @@ fn log_stream_load_response(sink_id: SinkId, res: &serde_json::Value) {
         number_loaded_rows = res.number_loaded_rows,
         load_bytes = res.load_bytes,
         load_time_ms = res.load_time_ms,
+        begin_txn_time_ms = res.begin_txn_time_ms,
+        stream_load_put_time_ms = res.stream_load_put_time_ms,
+        receive_data_time_ms = res.receive_data_time_ms,
+        read_data_time_ms = res.read_data_time_ms,
+        write_data_time_ms = res.write_data_time_ms,
         commit_and_publish_time_ms = res.commit_and_publish_time_ms,
         "doris stream load committed"
     );
@@ -4183,6 +4192,7 @@ mod tests {
             begin_txn_time_ms: 1,
             stream_load_put_time_ms: 1,
             read_data_time_ms: 1,
+            receive_data_time_ms: Some(1),
             write_data_time_ms: 1,
             commit_and_publish_time_ms: 1,
             err_url: Some("http://be:8040/api/_load_error_log?file=x".to_owned()),
@@ -4285,6 +4295,9 @@ pub struct DorisInsertResultResponse {
     stream_load_put_time_ms: i32,
     #[serde(rename = "ReadDataTimeMs")]
     read_data_time_ms: i32,
+    /// Absent on Doris versions that do not report it, so it must not be required.
+    #[serde(rename = "ReceiveDataTimeMs", default)]
+    receive_data_time_ms: Option<i32>,
     #[serde(rename = "WriteDataTimeMs")]
     write_data_time_ms: i32,
     #[serde(rename = "CommitAndPublishTimeMs")]
