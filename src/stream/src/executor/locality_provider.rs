@@ -16,6 +16,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use futures::future::{Either as FutureEither, select};
+use futures::stream::select_all;
 use futures::{StreamExt, TryStreamExt, pin_mut};
 use futures_async_stream::try_stream;
 use itertools::Itertools;
@@ -223,7 +224,7 @@ impl<S: StateStore> LocalityProviderExecutor<S> {
         reader: FlushedStateTableReader<S>,
         backfill_state: LocalityBackfillState,
     ) {
-        // Read from state table per vnode in locality order
+        let mut iterators = vec![];
         for vnode in reader.vnodes().iter_vnodes() {
             let progress = backfill_state.get_progress(&vnode);
 
@@ -249,7 +250,6 @@ impl<S: StateStore> LocalityProviderExecutor<S> {
                 )
             };
 
-            // Iterate over rows for this vnode
             let iter = reader
                 .iter_with_vnode(
                     vnode,
@@ -257,11 +257,17 @@ impl<S: StateStore> LocalityProviderExecutor<S> {
                     PrefetchOptions::prefetch_for_small_range_scan(),
                 )
                 .await?;
-            pin_mut!(iter);
 
-            while let Some(row) = iter.try_next().await? {
-                yield (vnode, row);
-            }
+            let iter = iter.map_ok(move |row| (vnode, row));
+
+            iterators.push(Box::pin(iter));
+        }
+
+        let vnode_row_iter = select_all(iterators);
+
+        #[for_await]
+        for vnode_and_row in vnode_row_iter {
+            yield vnode_and_row?;
         }
     }
 
