@@ -19,7 +19,7 @@
 //! 1. `SplitReader::new()` spawns a background task that reads from Spanner
 //! 2. The background task sends `Vec<SourceMessage>` through an `mpsc` channel
 //! 3. `into_data_stream()` calls `rx.recv()` and yields messages
-//! 4. `into_stream()` wraps with `into_chunk_stream` (parser)
+//! 4. `into_stream()` parses on a dedicated task and yields the chunks
 //!
 //! ## Partition model
 //!
@@ -48,6 +48,7 @@ use google_cloud_spanner::client::DatabaseClient;
 use google_cloud_spanner::statement::Statement;
 use google_cloud_spanner::types;
 
+use risingwave_common::array::StreamChunk;
 #[allow(unused_imports)]
 use risingwave_common::metrics::GLOBAL_ERROR_METRICS;
 use risingwave_common::{bail, ensure};
@@ -68,6 +69,12 @@ use crate::source::{
 };
 
 const DEFAULT_CHANNEL_SIZE: usize = 16;
+
+/// Depth of the parsed-chunk channel between the parser task and the source actor.
+///
+/// Each element is a whole `StreamChunk`, and this bound is what propagates
+/// backpressure from the actor back to the Spanner readers.
+const PARSED_CHUNK_CHANNEL_SIZE: usize = 8;
 
 /// Spanner CDC split reader — same pattern as Debezium's `CdcSplitReader`.
 pub struct SpannerCdcSplitReader {
@@ -139,11 +146,44 @@ impl SplitReader for SpannerCdcSplitReader {
     fn into_stream(self) -> BoxSourceChunkStream {
         let parser_config = self.parser_config.clone();
         let source_context = self.source_ctx.clone();
-        into_chunk_stream(self.into_data_stream(), parser_config, source_context)
+        let chunk_stream =
+            into_chunk_stream(self.into_data_stream(), parser_config, source_context);
+
+        // Parse on a dedicated task so the actor only forwards and dispatches chunks;
+        // the two then occupy separate runtime workers.
+        //
+        // The channel is bounded, so a slow actor stalls the parser on `send`, which
+        // stops it polling the message stream and parks the Spanner partition readers
+        // once `DEFAULT_CHANNEL_SIZE` fills.
+        let (tx, rx) = mpsc::channel(PARSED_CHUNK_CHANNEL_SIZE);
+        tokio::spawn(async move {
+            let mut chunk_stream = std::pin::pin!(chunk_stream);
+            while let Some(item) = chunk_stream.next().await {
+                let is_err = item.is_err();
+                // Receiver gone: the actor dropped the stream.
+                if tx.send(item).await.is_err() {
+                    break;
+                }
+                // `into_chunk_stream` terminates after an error.
+                if is_err {
+                    break;
+                }
+            }
+        });
+
+        Self::forward_parsed_chunks(rx)
     }
 }
 
 impl SpannerCdcSplitReader {
+    /// Yield chunks parsed by the background parser task.
+    #[try_stream(boxed, ok = StreamChunk, error = ConnectorError)]
+    async fn forward_parsed_chunks(mut rx: mpsc::Receiver<Result<StreamChunk>>) {
+        while let Some(chunk) = rx.recv().await {
+            yield chunk?;
+        }
+    }
+
     /// Identical pattern to `CdcSplitReader::into_data_stream` — just recv from mpsc.
     #[try_stream(ok = Vec<SourceMessage>, error = ConnectorError)]
     async fn into_data_stream(mut self) {
@@ -996,9 +1036,70 @@ fn make_schema_change_msg(
 
 #[cfg(test)]
 mod tests {
+    use risingwave_common::test_prelude::StreamChunkTestExt;
     use time::macros::datetime;
 
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // forward_parsed_chunks: hands parsed chunks from the parser task to the actor.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_forward_parsed_chunks_yields_in_order() {
+        let (tx, rx) = mpsc::channel(PARSED_CHUNK_CHANNEL_SIZE);
+        tx.send(Ok(StreamChunk::from_pretty("I\n + 1")))
+            .await
+            .unwrap();
+        tx.send(Ok(StreamChunk::from_pretty("I\n + 2")))
+            .await
+            .unwrap();
+        drop(tx);
+
+        let chunks: Vec<_> = SpannerCdcSplitReader::forward_parsed_chunks(rx)
+            .collect()
+            .await;
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].as_ref().unwrap().cardinality(), 1);
+        assert_eq!(chunks[1].as_ref().unwrap().cardinality(), 1);
+    }
+
+    /// A parser error surfaces as `Err` rather than a clean end of stream, so the
+    /// source fails loudly instead of going quiet.
+    #[tokio::test]
+    async fn test_forward_parsed_chunks_propagates_error() {
+        let (tx, rx) = mpsc::channel(PARSED_CHUNK_CHANNEL_SIZE);
+        tx.send(Ok(StreamChunk::from_pretty("I\n + 1")))
+            .await
+            .unwrap();
+        tx.send(Err(anyhow::anyhow!("parser blew up").into()))
+            .await
+            .unwrap();
+        drop(tx);
+
+        let chunks: Vec<_> = SpannerCdcSplitReader::forward_parsed_chunks(rx)
+            .collect()
+            .await;
+        assert_eq!(chunks.len(), 2);
+        assert!(chunks[0].is_ok());
+        let err = chunks[1].as_ref().unwrap_err();
+        assert!(
+            err.to_string().contains("parser blew up"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// The stream ends cleanly once the parser task drops its sender.
+    #[tokio::test]
+    async fn test_forward_parsed_chunks_ends_when_sender_dropped() {
+        let (tx, rx) = mpsc::channel::<Result<StreamChunk>>(PARSED_CHUNK_CHANNEL_SIZE);
+        drop(tx);
+
+        let chunks: Vec<_> = SpannerCdcSplitReader::forward_parsed_chunks(rx)
+            .collect()
+            .await;
+        assert!(chunks.is_empty());
+    }
 
     fn make_child(token: &str, parents: Vec<&str>, offset: OffsetDateTime) -> SpannerCdcSplit {
         SpannerCdcSplit::new_child(
