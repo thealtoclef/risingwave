@@ -19,7 +19,7 @@
 //! 1. `SplitReader::new()` spawns a background task that reads from Spanner
 //! 2. The background task sends `Vec<SourceMessage>` through an `mpsc` channel
 //! 3. `into_data_stream()` calls `rx.recv()` and yields messages
-//! 4. `into_stream()` wraps with `into_chunk_stream` (parser)
+//! 4. `into_stream()` parses on a dedicated task and yields the chunks
 //!
 //! ## Partition model
 //!
@@ -48,8 +48,10 @@ use google_cloud_spanner::client::DatabaseClient;
 use google_cloud_spanner::statement::Statement;
 use google_cloud_spanner::types;
 
+use risingwave_common::array::StreamChunk;
 #[allow(unused_imports)]
 use risingwave_common::metrics::GLOBAL_ERROR_METRICS;
+use risingwave_common::metrics::{LabelGuardedIntCounter, LabelGuardedIntGauge};
 use risingwave_common::{bail, ensure};
 use risingwave_pb::connector_service::{SourceType, cdc_message};
 use time::OffsetDateTime;
@@ -61,6 +63,7 @@ use crate::error::{ConnectorError, ConnectorResult as Result};
 use crate::parser::ParserConfig;
 use crate::source::cdc::DebeziumCdcMeta;
 use crate::source::spanner_cdc::schema_track::SchemaTracker;
+use crate::source::monitor::SourceMetrics;
 use crate::source::spanner_cdc::{SpannerCdcProperties, SpannerCdcSplit};
 use crate::source::{
     BoxSourceChunkStream, Column, SourceContextRef, SourceMessage, SourceMeta, SplitId,
@@ -68,6 +71,12 @@ use crate::source::{
 };
 
 const DEFAULT_CHANNEL_SIZE: usize = 16;
+
+/// Depth of the parsed-chunk channel between the parser task and the source actor.
+///
+/// Each element is a whole `StreamChunk`, and this bound is what propagates
+/// backpressure from the actor back to the Spanner readers.
+const PARSED_CHUNK_CHANNEL_SIZE: usize = 8;
 
 /// Spanner CDC split reader — same pattern as Debezium's `CdcSplitReader`.
 pub struct SpannerCdcSplitReader {
@@ -118,6 +127,9 @@ impl SplitReader for SpannerCdcSplitReader {
             stall_timeout: properties.get_stall_timeout(),
             source_id,
             checkpointed_offset,
+            metrics: source_ctx.metrics.clone(),
+            source_name: source_ctx.source_name.clone(),
+            fragment_id: source_ctx.fragment_id.to_string(),
         };
 
         // Spawn background task — like Debezium spawns the JNI thread
@@ -139,11 +151,60 @@ impl SplitReader for SpannerCdcSplitReader {
     fn into_stream(self) -> BoxSourceChunkStream {
         let parser_config = self.parser_config.clone();
         let source_context = self.source_ctx.clone();
-        into_chunk_stream(self.into_data_stream(), parser_config, source_context)
+        let queue_depth = source_context
+            .metrics
+            .spanner_cdc_parsed_chunk_queue_depth
+            .with_guarded_label_values(&[
+                &source_context.source_id.to_string(),
+                &source_context.source_name,
+                &source_context.fragment_id.to_string(),
+            ]);
+        let chunk_stream =
+            into_chunk_stream(self.into_data_stream(), parser_config, source_context);
+
+        // Parse on a dedicated task so the actor only forwards and dispatches chunks;
+        // the two then occupy separate runtime workers.
+        //
+        // The channel is bounded, so a slow actor stalls the parser on `send`, which
+        // stops it polling the message stream and parks the Spanner partition readers
+        // once `DEFAULT_CHANNEL_SIZE` fills.
+        let (tx, rx) = mpsc::channel(PARSED_CHUNK_CHANNEL_SIZE);
+        tokio::spawn(async move {
+            let mut chunk_stream = std::pin::pin!(chunk_stream);
+            while let Some(item) = chunk_stream.next().await {
+                let is_err = item.is_err();
+                // Receiver gone: the actor dropped the stream.
+                if tx.send(item).await.is_err() {
+                    break;
+                }
+                // `into_chunk_stream` terminates after an error.
+                if is_err {
+                    break;
+                }
+            }
+        });
+
+        Self::forward_parsed_chunks(rx, queue_depth)
     }
 }
 
 impl SpannerCdcSplitReader {
+    /// Yield chunks parsed by the background parser task.
+    ///
+    /// The queue depth is sampled on dequeue: a value near
+    /// `PARSED_CHUNK_CHANNEL_SIZE` means the actor is the constraint, near zero
+    /// means the parser is.
+    #[try_stream(boxed, ok = StreamChunk, error = ConnectorError)]
+    async fn forward_parsed_chunks(
+        mut rx: mpsc::Receiver<Result<StreamChunk>>,
+        queue_depth: LabelGuardedIntGauge,
+    ) {
+        while let Some(chunk) = rx.recv().await {
+            queue_depth.set(rx.len() as i64);
+            yield chunk?;
+        }
+    }
+
     /// Identical pattern to `CdcSplitReader::into_data_stream` — just recv from mpsc.
     #[try_stream(ok = Vec<SourceMessage>, error = ConnectorError)]
     async fn into_data_stream(mut self) {
@@ -183,6 +244,70 @@ struct ReaderContext {
     stall_timeout: std::time::Duration,
     source_id: u32,
     checkpointed_offset: Option<OffsetDateTime>,
+    metrics: Arc<SourceMetrics>,
+    source_name: String,
+    fragment_id: String,
+}
+
+/// Guarded metric handles for one Spanner CDC reader.
+///
+/// Held for the lifetime of the reader task so the label guards keep the series
+/// alive. Labels are source-scoped only — partition tokens are unbounded and
+/// must never become label values.
+struct ReaderMetrics {
+    active_partitions: LabelGuardedIntGauge,
+    deferred_partitions: LabelGuardedIntGauge,
+    watermark_lag_ms: LabelGuardedIntGauge,
+    child_partitions_discovered: LabelGuardedIntCounter,
+    partitions_finished: LabelGuardedIntCounter,
+}
+
+impl ReaderMetrics {
+    fn new(metrics: &SourceMetrics, source_id: &str, source_name: &str, fragment_id: &str) -> Self {
+        let labels = [source_id, source_name, fragment_id];
+        Self {
+            active_partitions: metrics
+                .spanner_cdc_active_partitions
+                .with_guarded_label_values(&labels),
+            deferred_partitions: metrics
+                .spanner_cdc_deferred_partitions
+                .with_guarded_label_values(&labels),
+            watermark_lag_ms: metrics
+                .spanner_cdc_watermark_lag_ms
+                .with_guarded_label_values(&labels),
+            child_partitions_discovered: metrics
+                .spanner_cdc_child_partitions_discovered
+                .with_guarded_label_values(&labels),
+            partitions_finished: metrics
+                .spanner_cdc_partitions_finished
+                .with_guarded_label_values(&labels),
+        }
+    }
+
+    /// Publish the partition-lifecycle gauges.
+    ///
+    /// `discovered_total` is monotonic, so the counter advances by its growth
+    /// since the previous observation.
+    fn observe(
+        &self,
+        active: usize,
+        deferred: usize,
+        watermark: Option<OffsetDateTime>,
+        discovered_total: usize,
+        reported_discovered: &mut usize,
+    ) {
+        self.active_partitions.set(active as i64);
+        self.deferred_partitions.set(deferred as i64);
+        if let Some(wm) = watermark {
+            let lag = (OffsetDateTime::now_utc() - wm).whole_milliseconds();
+            self.watermark_lag_ms.set(lag.clamp(0, i64::MAX as i128) as i64);
+        }
+        if discovered_total > *reported_discovered {
+            self.child_partitions_discovered
+                .inc_by((discovered_total - *reported_discovered) as u64);
+            *reported_discovered = discovered_total;
+        }
+    }
 }
 
 /// Result from each partition task.
@@ -368,9 +493,25 @@ async fn run_reader(ctx: ReaderContext, tx: mpsc::Sender<Vec<SourceMessage>>) ->
     );
     active_count += 1;
 
+    let reader_metrics = ReaderMetrics::new(
+        &ctx.metrics,
+        &ctx.source_id.to_string(),
+        &ctx.source_name,
+        &ctx.fragment_id,
+    );
+    let mut reported_discovered = 0usize;
+
     // Main event loop — partition lifecycle management only.
     // Records flow directly from partition tasks → tx.
     loop {
+        reader_metrics.observe(
+            active_count,
+            deferred.len(),
+            offsets.watermark(),
+            discovered.len(),
+            &mut reported_discovered,
+        );
+
         if tx.is_closed() {
             tracing::info!("reader channel closed, stopping");
             break;
@@ -384,6 +525,7 @@ async fn run_reader(ctx: ReaderContext, tx: mpsc::Sender<Vec<SourceMessage>>) ->
                 match result {
                     Some(Ok(Ok(pr))) => {
                         // Partition finished — remove from offsets (excludes from watermark).
+                        reader_metrics.partitions_finished.inc();
                         offsets.remove(&pr.partition_token);
                         if let Some(ref token) = pr.partition_token {
                             discovered.insert(Some(token.clone()), true);
@@ -996,9 +1138,76 @@ fn make_schema_change_msg(
 
 #[cfg(test)]
 mod tests {
+    use risingwave_common::test_prelude::StreamChunkTestExt;
     use time::macros::datetime;
 
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // forward_parsed_chunks: hands parsed chunks from the parser task to the actor.
+    // -----------------------------------------------------------------------
+
+    fn test_queue_depth_gauge() -> LabelGuardedIntGauge {
+        SourceMetrics::default()
+            .spanner_cdc_parsed_chunk_queue_depth
+            .with_guarded_label_values(&["0", "test", "0"])
+    }
+
+    #[tokio::test]
+    async fn test_forward_parsed_chunks_yields_in_order() {
+        let (tx, rx) = mpsc::channel(PARSED_CHUNK_CHANNEL_SIZE);
+        tx.send(Ok(StreamChunk::from_pretty("I\n + 1")))
+            .await
+            .unwrap();
+        tx.send(Ok(StreamChunk::from_pretty("I\n + 2")))
+            .await
+            .unwrap();
+        drop(tx);
+
+        let chunks: Vec<_> = SpannerCdcSplitReader::forward_parsed_chunks(rx, test_queue_depth_gauge())
+            .collect()
+            .await;
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].as_ref().unwrap().cardinality(), 1);
+        assert_eq!(chunks[1].as_ref().unwrap().cardinality(), 1);
+    }
+
+    /// A parser error surfaces as `Err` rather than a clean end of stream, so the
+    /// source fails loudly instead of going quiet.
+    #[tokio::test]
+    async fn test_forward_parsed_chunks_propagates_error() {
+        let (tx, rx) = mpsc::channel(PARSED_CHUNK_CHANNEL_SIZE);
+        tx.send(Ok(StreamChunk::from_pretty("I\n + 1")))
+            .await
+            .unwrap();
+        tx.send(Err(anyhow::anyhow!("parser blew up").into()))
+            .await
+            .unwrap();
+        drop(tx);
+
+        let chunks: Vec<_> = SpannerCdcSplitReader::forward_parsed_chunks(rx, test_queue_depth_gauge())
+            .collect()
+            .await;
+        assert_eq!(chunks.len(), 2);
+        assert!(chunks[0].is_ok());
+        let err = chunks[1].as_ref().unwrap_err();
+        assert!(
+            err.to_string().contains("parser blew up"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// The stream ends cleanly once the parser task drops its sender.
+    #[tokio::test]
+    async fn test_forward_parsed_chunks_ends_when_sender_dropped() {
+        let (tx, rx) = mpsc::channel::<Result<StreamChunk>>(PARSED_CHUNK_CHANNEL_SIZE);
+        drop(tx);
+
+        let chunks: Vec<_> = SpannerCdcSplitReader::forward_parsed_chunks(rx, test_queue_depth_gauge())
+            .collect()
+            .await;
+        assert!(chunks.is_empty());
+    }
 
     fn make_child(token: &str, parents: Vec<&str>, offset: OffsetDateTime) -> SpannerCdcSplit {
         SpannerCdcSplit::new_child(
