@@ -655,6 +655,38 @@ RisingWave exposes operational metrics via Prometheus. Spanner CDC has full metr
 | `spanner_cdc_change_stream_timestamp` | `source_id` | Current change stream position (microseconds since epoch) | `pg_cdc_confirmed_flush_lsn` |
 | `stream_spanner_cdc_state_timestamp` | `source_id` | Checkpointed timestamp in state table (microseconds since epoch) | `stream_pg_cdc_state_table_lsn` |
 
+#### Partition-Lifecycle Metrics
+
+All labelled `source_id`, `source_name`, `fragment_id`. The partition gauges are
+re-sampled by the reader's lifecycle loop every 5 seconds; the counters advance
+on the corresponding event, and the queue depth is sampled by the source actor
+on each dequeue. Partition tokens are never used as label values — they are
+unbounded and churn as Spanner splits and merges.
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `spanner_cdc_active_partitions` | gauge | Partition tasks currently reading the change stream |
+| `spanner_cdc_deferred_partitions` | gauge | Children waiting for their parents to finish |
+| `spanner_cdc_watermark_lag_milliseconds` | gauge | Age of the checkpoint watermark, i.e. `now - min(offset)` over unfinished partitions. Floors at `spanner.heartbeat_milliseconds`, since an idle partition only advances on heartbeats |
+| `spanner_cdc_newest_partition_lag_milliseconds` | gauge | Age of the *newest* offset, i.e. `now - max(offset)` over unfinished partitions — the partition keeping up best |
+| `spanner_cdc_child_partition_discovered_count` | counter | Child partitions discovered through `ChildPartitionsRecord`, excluding the root. Extra label `kind`: `split` (one parent) or `merge` (several) |
+| `spanner_cdc_partition_finished_count` | counter | Partition tasks that ran to completion |
+| `spanner_cdc_partition_query_count` | counter | Change stream queries issued, including retries — the load this source puts on the Spanner instance |
+| `spanner_cdc_partition_query_failure_count` | counter | Failed change stream queries. Extra label `cause`: `establish_timeout`, `stall_timeout`, `query_error`, `row_error`, `decode_error` |
+| `spanner_cdc_parsed_chunk_queue_depth` | gauge | Chunks buffered between the parser task and the source actor, sampled on dequeue. Near `8` means the actor is the constraint, near `0` means the parser is |
+
+##### Reading the lag pair
+
+`spanner_cdc_watermark_lag_milliseconds` is the *worst* partition and is what gets stamped as the
+checkpoint offset, so it is the number that matters for freshness. Comparing it
+with `spanner_cdc_newest_partition_lag_milliseconds` tells you which failure you have:
+
+| `..._watermark_lag_milliseconds` | `..._newest_partition_lag_milliseconds` | Interpretation |
+|---|---|---|
+| high | low | One partition is stuck; it is pinning the checkpoint offset for every other partition. Check `spanner_cdc_partition_query_failure_count` by `cause` |
+| high | high | The reader is uniformly behind — a genuine throughput limit |
+| low | low | Healthy; both floor at `spanner.heartbeat_milliseconds` |
+
 #### General CDC Metrics (framework-level, shared with all CDC sources)
 
 | Metric | Description |
