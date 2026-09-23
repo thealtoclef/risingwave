@@ -202,6 +202,36 @@ pub struct SourceMetrics {
     pub file_source_dirty_split_count: LabelGuardedIntGaugeVec,
     pub file_source_failed_split_count: LabelGuardedIntCounterVec,
 
+    // spanner cdc source
+    /// Partitions currently being streamed by this reader.
+    pub spanner_cdc_active_partitions: LabelGuardedIntGaugeVec,
+    /// Child partitions discovered but still waiting on an unfinished parent.
+    pub spanner_cdc_deferred_partitions: LabelGuardedIntGaugeVec,
+    /// `now - watermark`, where the watermark is the minimum offset across
+    /// un-finished partitions. This is the *worst* partition, so it is what
+    /// pins the checkpoint offset.
+    pub spanner_cdc_watermark_lag_milliseconds: LabelGuardedIntGaugeVec,
+    /// `now - max(offset)` across un-finished partitions, i.e. the *best*
+    /// partition. Paired with `spanner_cdc_watermark_lag_milliseconds` it separates a
+    /// single straggler from the whole reader falling behind.
+    pub spanner_cdc_newest_partition_lag_milliseconds: LabelGuardedIntGaugeVec,
+    /// Child partitions observed, labelled `kind` = `split` (one parent) or
+    /// `merge` (several). The two have opposite operational meanings: a split
+    /// fans out and needs more read concurrency, a merge fans in.
+    pub spanner_cdc_child_partition_discovered_count: LabelGuardedIntCounterVec,
+    /// Partitions whose change stream query ran to completion.
+    pub spanner_cdc_partition_finished_count: LabelGuardedIntCounterVec,
+    /// Change stream queries issued, including retries. This is the load this
+    /// source places on the Spanner instance.
+    pub spanner_cdc_partition_query_count: LabelGuardedIntCounterVec,
+    /// Failed change stream queries by cause. A partition that keeps failing
+    /// stops advancing its offset and pins the watermark for every other
+    /// partition, so this is the leading indicator for a lag incident.
+    pub spanner_cdc_partition_query_failure_count: LabelGuardedIntCounterVec,
+    /// Parsed chunks queued between the parser task and the source actor,
+    /// sampled on dequeue. Near capacity means the actor is the constraint.
+    pub spanner_cdc_parsed_chunk_queue_depth: LabelGuardedIntGaugeVec,
+
     // kinesis source
     pub kinesis_throughput_exceeded_count: LabelGuardedIntCounterVec,
     pub kinesis_timeout_count: LabelGuardedIntCounterVec,
@@ -366,6 +396,80 @@ impl SourceMetrics {
         )
         .unwrap();
 
+        let spanner_cdc_active_partitions = register_guarded_int_gauge_vec_with_registry!(
+            "spanner_cdc_active_partitions",
+            "Number of Spanner change stream partitions currently being streamed",
+            &["source_id", "source_name", "fragment_id"],
+            registry
+        )
+        .unwrap();
+
+        let spanner_cdc_deferred_partitions = register_guarded_int_gauge_vec_with_registry!(
+            "spanner_cdc_deferred_partitions",
+            "Number of discovered Spanner child partitions waiting on an unfinished parent",
+            &["source_id", "source_name", "fragment_id"],
+            registry
+        )
+        .unwrap();
+
+        let spanner_cdc_watermark_lag_milliseconds = register_guarded_int_gauge_vec_with_registry!(
+            "spanner_cdc_watermark_lag_milliseconds",
+            "Milliseconds between now and the minimum offset across un-finished Spanner partitions",
+            &["source_id", "source_name", "fragment_id"],
+            registry
+        )
+        .unwrap();
+
+        let spanner_cdc_newest_partition_lag_milliseconds = register_guarded_int_gauge_vec_with_registry!(
+            "spanner_cdc_newest_partition_lag_milliseconds",
+            "Milliseconds between now and the maximum offset across un-finished Spanner partitions",
+            &["source_id", "source_name", "fragment_id"],
+            registry
+        )
+        .unwrap();
+
+        let spanner_cdc_child_partition_discovered_count =
+            register_guarded_int_counter_vec_with_registry!(
+                "spanner_cdc_child_partition_discovered_count",
+                "Total Spanner child partitions discovered, by lineage kind",
+                &["source_id", "source_name", "fragment_id", "kind"],
+                registry
+            )
+            .unwrap();
+
+        let spanner_cdc_partition_finished_count = register_guarded_int_counter_vec_with_registry!(
+            "spanner_cdc_partition_finished_count",
+            "Total Spanner partitions whose change stream query ran to completion",
+            &["source_id", "source_name", "fragment_id"],
+            registry
+        )
+        .unwrap();
+
+        let spanner_cdc_partition_query_count = register_guarded_int_counter_vec_with_registry!(
+            "spanner_cdc_partition_query_count",
+            "Total Spanner change stream queries issued, including retries",
+            &["source_id", "source_name", "fragment_id"],
+            registry
+        )
+        .unwrap();
+
+        let spanner_cdc_partition_query_failure_count =
+            register_guarded_int_counter_vec_with_registry!(
+                "spanner_cdc_partition_query_failure_count",
+                "Total failed Spanner change stream queries, by cause",
+                &["source_id", "source_name", "fragment_id", "cause"],
+                registry
+            )
+            .unwrap();
+
+        let spanner_cdc_parsed_chunk_queue_depth = register_guarded_int_gauge_vec_with_registry!(
+            "spanner_cdc_parsed_chunk_queue_depth",
+            "Parsed chunks queued between the Spanner parser task and the source actor",
+            &["source_id", "source_name", "fragment_id"],
+            registry
+        )
+        .unwrap();
+
         let connector_ack_failure_count = register_int_counter_vec_with_registry!(
             "source_connector_ack_failure_count",
             "Total number of connector ack failures after checkpoint commit by bounded failure category",
@@ -393,6 +497,16 @@ impl SourceMetrics {
             file_source_input_row_count,
             file_source_dirty_split_count,
             file_source_failed_split_count,
+
+            spanner_cdc_active_partitions,
+            spanner_cdc_deferred_partitions,
+            spanner_cdc_watermark_lag_milliseconds,
+            spanner_cdc_newest_partition_lag_milliseconds,
+            spanner_cdc_child_partition_discovered_count,
+            spanner_cdc_partition_finished_count,
+            spanner_cdc_partition_query_count,
+            spanner_cdc_partition_query_failure_count,
+            spanner_cdc_parsed_chunk_queue_depth,
 
             kinesis_throughput_exceeded_count,
             kinesis_timeout_count,

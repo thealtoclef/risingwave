@@ -51,6 +51,7 @@ use google_cloud_spanner::types;
 use risingwave_common::array::StreamChunk;
 #[allow(unused_imports)]
 use risingwave_common::metrics::GLOBAL_ERROR_METRICS;
+use risingwave_common::metrics::{LabelGuardedIntCounter, LabelGuardedIntGauge};
 use risingwave_common::{bail, ensure};
 use risingwave_pb::connector_service::{SourceType, cdc_message};
 use time::OffsetDateTime;
@@ -61,6 +62,7 @@ use super::{ChangeRecordContext, build_source_message};
 use crate::error::{ConnectorError, ConnectorResult as Result};
 use crate::parser::ParserConfig;
 use crate::source::cdc::DebeziumCdcMeta;
+use crate::source::monitor::SourceMetrics;
 use crate::source::spanner_cdc::schema_track::SchemaTracker;
 use crate::source::spanner_cdc::{SpannerCdcProperties, SpannerCdcSplit};
 use crate::source::{
@@ -69,6 +71,9 @@ use crate::source::{
 };
 
 const DEFAULT_CHANNEL_SIZE: usize = 16;
+
+/// How often the lifecycle loop re-samples the partition gauges.
+const METRICS_SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Depth of the parsed-chunk channel between the parser task and the source actor.
 ///
@@ -125,6 +130,9 @@ impl SplitReader for SpannerCdcSplitReader {
             stall_timeout: properties.get_stall_timeout(),
             source_id,
             checkpointed_offset,
+            metrics: source_ctx.metrics.clone(),
+            source_name: source_ctx.source_name.clone(),
+            fragment_id: source_ctx.fragment_id.to_string(),
         };
 
         // Spawn background task — like Debezium spawns the JNI thread
@@ -146,6 +154,14 @@ impl SplitReader for SpannerCdcSplitReader {
     fn into_stream(self) -> BoxSourceChunkStream {
         let parser_config = self.parser_config.clone();
         let source_context = self.source_ctx.clone();
+        let queue_depth = source_context
+            .metrics
+            .spanner_cdc_parsed_chunk_queue_depth
+            .with_guarded_label_values(&[
+                &source_context.source_id.to_string(),
+                &source_context.source_name,
+                &source_context.fragment_id.to_string(),
+            ]);
         let chunk_stream =
             into_chunk_stream(self.into_data_stream(), parser_config, source_context);
 
@@ -181,15 +197,23 @@ impl SplitReader for SpannerCdcSplitReader {
             }
         });
 
-        Self::forward_parsed_chunks(rx)
+        Self::forward_parsed_chunks(rx, queue_depth)
     }
 }
 
 impl SpannerCdcSplitReader {
     /// Yield chunks parsed by the background parser task.
+    ///
+    /// The queue depth is sampled on dequeue: a value near
+    /// `PARSED_CHUNK_CHANNEL_SIZE` means the actor is the constraint, near zero
+    /// means the parser is.
     #[try_stream(boxed, ok = StreamChunk, error = ConnectorError)]
-    async fn forward_parsed_chunks(mut rx: mpsc::Receiver<Result<StreamChunk>>) {
+    async fn forward_parsed_chunks(
+        mut rx: mpsc::Receiver<Result<StreamChunk>>,
+        queue_depth: LabelGuardedIntGauge,
+    ) {
         while let Some(chunk) = rx.recv().await {
+            queue_depth.set(rx.len() as i64);
             yield chunk?;
         }
     }
@@ -233,6 +257,199 @@ struct ReaderContext {
     stall_timeout: std::time::Duration,
     source_id: u32,
     checkpointed_offset: Option<OffsetDateTime>,
+    metrics: Arc<SourceMetrics>,
+    source_name: String,
+    fragment_id: String,
+}
+
+/// Guarded metric handles for one Spanner CDC reader.
+///
+/// Held for the lifetime of the reader task so the label guards keep the series
+/// alive. Labels are source-scoped only — partition tokens are unbounded and
+/// must never become label values.
+struct ReaderMetrics {
+    active_partitions: LabelGuardedIntGauge,
+    deferred_partitions: LabelGuardedIntGauge,
+    watermark_lag_milliseconds: LabelGuardedIntGauge,
+    newest_partition_lag_milliseconds: LabelGuardedIntGauge,
+    /// One counter per [`ChildKind`], pre-resolved like `query_failures`.
+    child_partitions_discovered: [LabelGuardedIntCounter; ChildKind::ALL.len()],
+    partitions_finished: LabelGuardedIntCounter,
+    queries: LabelGuardedIntCounter,
+    /// One counter per [`QueryFailure`], pre-resolved so the hot path never
+    /// touches the label map.
+    query_failures: [LabelGuardedIntCounter; QueryFailure::ALL.len()],
+}
+
+/// How a child partition came to exist. Spanner reports both through
+/// `ChildPartitionsRecord`; the parent count tells them apart.
+#[derive(Clone, Copy)]
+enum ChildKind {
+    /// One parent fanned out into several children.
+    Split,
+    /// Several parents folded into one child.
+    Merge,
+}
+
+impl ChildKind {
+    const ALL: [Self; 2] = [Self::Split, Self::Merge];
+
+    /// Index into the pre-resolved counter array. See [`QueryFailure::index`].
+    fn index(self) -> usize {
+        match self {
+            Self::Split => 0,
+            Self::Merge => 1,
+        }
+    }
+
+    fn of(parent_tokens: &[String]) -> Self {
+        if parent_tokens.len() > 1 {
+            Self::Merge
+        } else {
+            Self::Split
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Split => "split",
+            Self::Merge => "merge",
+        }
+    }
+}
+
+/// Why a change stream query ended. Kept as a closed set: it becomes a metric
+/// label value, so it must never carry a partition token or an error string.
+#[derive(Clone, Copy)]
+enum QueryFailure {
+    /// The query never returned its first record.
+    Establish,
+    /// The query was established but then went quiet past the stall timeout.
+    Stall,
+    /// Spanner rejected the query outright.
+    Query,
+    /// The established stream produced an error mid-flight.
+    Row,
+    /// A row arrived but its `ChangeRecord` column could not be parsed.
+    Decode,
+}
+
+impl QueryFailure {
+    const ALL: [Self; 5] = [
+        Self::Establish,
+        Self::Stall,
+        Self::Query,
+        Self::Row,
+        Self::Decode,
+    ];
+
+    /// Index into the pre-resolved counter array.
+    ///
+    /// Written out rather than `self as usize` so that reordering or inserting
+    /// a variant cannot silently misroute a label.
+    fn index(self) -> usize {
+        match self {
+            Self::Establish => 0,
+            Self::Stall => 1,
+            Self::Query => 2,
+            Self::Row => 3,
+            Self::Decode => 4,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Establish => "establish_timeout",
+            Self::Stall => "stall_timeout",
+            Self::Query => "query_error",
+            Self::Row => "row_error",
+            Self::Decode => "decode_error",
+        }
+    }
+}
+
+impl ReaderMetrics {
+    fn new(metrics: &SourceMetrics, source_id: &str, source_name: &str, fragment_id: &str) -> Self {
+        let labels = [source_id, source_name, fragment_id];
+        Self {
+            active_partitions: metrics
+                .spanner_cdc_active_partitions
+                .with_guarded_label_values(&labels),
+            deferred_partitions: metrics
+                .spanner_cdc_deferred_partitions
+                .with_guarded_label_values(&labels),
+            watermark_lag_milliseconds: metrics
+                .spanner_cdc_watermark_lag_milliseconds
+                .with_guarded_label_values(&labels),
+            child_partitions_discovered: ChildKind::ALL.map(|kind| {
+                metrics
+                    .spanner_cdc_child_partition_discovered_count
+                    .with_guarded_label_values(&[
+                        source_id,
+                        source_name,
+                        fragment_id,
+                        kind.as_str(),
+                    ])
+            }),
+            newest_partition_lag_milliseconds: metrics
+                .spanner_cdc_newest_partition_lag_milliseconds
+                .with_guarded_label_values(&labels),
+            partitions_finished: metrics
+                .spanner_cdc_partition_finished_count
+                .with_guarded_label_values(&labels),
+            queries: metrics
+                .spanner_cdc_partition_query_count
+                .with_guarded_label_values(&labels),
+            query_failures: QueryFailure::ALL.map(|cause| {
+                metrics
+                    .spanner_cdc_partition_query_failure_count
+                    .with_guarded_label_values(&[
+                        source_id,
+                        source_name,
+                        fragment_id,
+                        cause.as_str(),
+                    ])
+            }),
+        }
+    }
+
+    fn record_child(&self, kind: ChildKind) {
+        self.child_partitions_discovered[kind.index()].inc();
+    }
+
+    fn record_failure(&self, cause: QueryFailure) {
+        self.query_failures[cause.index()].inc();
+    }
+
+    /// Publish the partition-lifecycle gauges.
+    fn observe(
+        &self,
+        active: usize,
+        deferred: usize,
+        watermark: Option<OffsetDateTime>,
+        newest: Option<OffsetDateTime>,
+    ) {
+        self.active_partitions.set(active as i64);
+        self.deferred_partitions.set(deferred as i64);
+        match watermark {
+            Some(wm) => {
+                let lag = (OffsetDateTime::now_utc() - wm).whole_milliseconds();
+                self.watermark_lag_milliseconds
+                    .set(lag.clamp(0, i64::MAX as i128) as i64);
+            }
+            // No registered partition has an offset, so there is no lag to
+            // report. Leaving the previous value would pin a stale reading.
+            None => self.watermark_lag_milliseconds.set(0),
+        }
+        match newest {
+            Some(ts) => {
+                let lag = (OffsetDateTime::now_utc() - ts).whole_milliseconds();
+                self.newest_partition_lag_milliseconds
+                    .set(lag.clamp(0, i64::MAX as i128) as i64);
+            }
+            None => self.newest_partition_lag_milliseconds.set(0),
+        }
+    }
 }
 
 /// Result from each partition task.
@@ -315,6 +532,21 @@ impl PartitionOffsets {
     fn watermark(&self) -> Option<OffsetDateTime> {
         self.inner.lock().unwrap().counts.keys().next().copied()
     }
+
+    /// `(min, max)` offset across all registered (un-finished) partitions, both
+    /// O(1) and read under a single lock so the pair is coherent.
+    ///
+    /// The max is the partition keeping up best; its gap to the min is what
+    /// distinguishes one stuck partition from a reader that is uniformly behind.
+    fn offset_bounds(&self) -> (Option<OffsetDateTime>, Option<OffsetDateTime>) {
+        let inner = self.inner.lock().unwrap();
+        let mut keys = inner.counts.keys();
+        let min = keys.next().copied();
+        // `next_back` after `next` still yields the max unless there is exactly
+        // one key, in which case the iterator is already exhausted.
+        let max = keys.next_back().copied().or(min);
+        (min, max)
+    }
 }
 
 /// Process a single discovered child: dedup, register offset, route to
@@ -326,11 +558,13 @@ fn process_child(
     ready_pool: &mut Vec<SpannerCdcSplit>,
     offsets: &PartitionOffsets,
     split_id: &SplitId,
+    reader_metrics: &ReaderMetrics,
 ) {
     let token = child.partition_token.clone();
     if discovered.contains_key(&token) {
         return;
     }
+    reader_metrics.record_child(ChildKind::of(&child.parent_partition_tokens));
     tracing::debug!(
         %split_id,
         token = ?token,
@@ -362,9 +596,18 @@ fn ingest_children(
     ready_pool: &mut Vec<SpannerCdcSplit>,
     offsets: &PartitionOffsets,
     split_id: &SplitId,
+    reader_metrics: &ReaderMetrics,
 ) {
     while let Ok(child) = rx.try_recv() {
-        process_child(child, discovered, deferred, ready_pool, offsets, split_id);
+        process_child(
+            child,
+            discovered,
+            deferred,
+            ready_pool,
+            offsets,
+            split_id,
+            reader_metrics,
+        );
     }
 }
 
@@ -400,6 +643,13 @@ async fn run_reader(ctx: ReaderContext, tx: mpsc::Sender<Vec<SourceMessage>>) ->
 
     tracing::info!(starting_offset = ?root_offset, "starting Spanner CDC reader");
 
+    let reader_metrics = Arc::new(ReaderMetrics::new(
+        &ctx.metrics,
+        &ctx.source_id.to_string(),
+        &ctx.source_name,
+        &ctx.fragment_id,
+    ));
+
     // Spawn root partition.
     let root_split =
         SpannerCdcSplit::new_root(ctx.change_stream_name.clone(), ctx.source_id, root_offset);
@@ -415,12 +665,23 @@ async fn run_reader(ctx: ReaderContext, tx: mpsc::Sender<Vec<SourceMessage>>) ->
         &tx,
         &mut partition_streams,
         child_discovery_tx.clone(),
+        &reader_metrics,
     );
     active_count += 1;
+
+    // The loop otherwise only wakes on partition completion or child discovery.
+    // A partition that is streaming but falling behind produces neither, so
+    // without this tick the gauges would freeze for exactly the incident they
+    // are meant to show.
+    let mut metrics_tick = tokio::time::interval(METRICS_SAMPLE_INTERVAL);
+    metrics_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     // Main event loop — partition lifecycle management only.
     // Records flow directly from partition tasks → tx.
     loop {
+        let (watermark, newest) = offsets.offset_bounds();
+        reader_metrics.observe(active_count, deferred.len(), watermark, newest);
+
         if tx.is_closed() {
             tracing::info!("reader channel closed, stopping");
             break;
@@ -434,6 +695,7 @@ async fn run_reader(ctx: ReaderContext, tx: mpsc::Sender<Vec<SourceMessage>>) ->
                 match result {
                     Some(Ok(Ok(pr))) => {
                         // Partition finished — remove from offsets (excludes from watermark).
+                        reader_metrics.partitions_finished.inc();
                         offsets.remove(&pr.partition_token);
                         if let Some(ref token) = pr.partition_token {
                             discovered.insert(Some(token.clone()), true);
@@ -459,6 +721,7 @@ async fn run_reader(ctx: ReaderContext, tx: mpsc::Sender<Vec<SourceMessage>>) ->
                             &tx,
                             &mut partition_streams,
                             &child_discovery_tx,
+                            &reader_metrics,
                         );
                     }
                     Some(Ok(Err(e))) => {
@@ -492,6 +755,7 @@ async fn run_reader(ctx: ReaderContext, tx: mpsc::Sender<Vec<SourceMessage>>) ->
                             &mut ready_pool,
                             &offsets,
                             &split_id,
+                            &reader_metrics,
                         );
                         promote_deferred(
                             &mut deferred,
@@ -508,6 +772,7 @@ async fn run_reader(ctx: ReaderContext, tx: mpsc::Sender<Vec<SourceMessage>>) ->
                             &tx,
                             &mut partition_streams,
                             &child_discovery_tx,
+                            &reader_metrics,
                         );
                         // `spawn_from_pool` drains `ready_pool`, so its emptiness
                         // says nothing about in-flight work — tasks may have just
@@ -537,6 +802,7 @@ async fn run_reader(ctx: ReaderContext, tx: mpsc::Sender<Vec<SourceMessage>>) ->
                     &mut ready_pool,
                     &offsets,
                     &split_id,
+                    &reader_metrics,
                 );
                 // Drain any remaining siblings that arrived concurrently.
                 ingest_children(
@@ -546,6 +812,7 @@ async fn run_reader(ctx: ReaderContext, tx: mpsc::Sender<Vec<SourceMessage>>) ->
                     &mut ready_pool,
                     &offsets,
                     &split_id,
+                    &reader_metrics,
                 );
                 spawn_from_pool(
                     &mut ready_pool,
@@ -557,8 +824,13 @@ async fn run_reader(ctx: ReaderContext, tx: mpsc::Sender<Vec<SourceMessage>>) ->
                     &tx,
                     &mut partition_streams,
                     &child_discovery_tx,
+                    &reader_metrics,
                 );
             }
+
+            // Re-sample the gauges. Listed last so `biased` still prioritises
+            // partition progress.
+            _ = metrics_tick.tick() => {}
         }
     }
 
@@ -616,6 +888,7 @@ fn spawn_from_pool(
     tx: &mpsc::Sender<Vec<SourceMessage>>,
     partition_streams: &mut FuturesUnordered<tokio::task::JoinHandle<Result<PartitionResult>>>,
     child_discovery_tx: &tokio::sync::mpsc::UnboundedSender<SpannerCdcSplit>,
+    reader_metrics: &Arc<ReaderMetrics>,
 ) {
     for split in ready_pool.drain(..) {
         spawn_partition_task(
@@ -627,6 +900,7 @@ fn spawn_from_pool(
             tx,
             partition_streams,
             child_discovery_tx.clone(),
+            reader_metrics,
         );
         *active_count += 1;
     }
@@ -645,6 +919,7 @@ fn spawn_partition_task(
     tx: &mpsc::Sender<Vec<SourceMessage>>,
     partition_streams: &mut FuturesUnordered<tokio::task::JoinHandle<Result<PartitionResult>>>,
     child_discovery_tx: tokio::sync::mpsc::UnboundedSender<SpannerCdcSplit>,
+    reader_metrics: &Arc<ReaderMetrics>,
 ) {
     let client = ctx.client.clone();
     let database = ctx.database.clone();
@@ -660,6 +935,7 @@ fn spawn_partition_task(
     let tx = tx.clone();
     let split_id = split_id.clone();
     let partition_token = split.partition_token.clone();
+    let reader_metrics = reader_metrics.clone();
 
     partition_streams.push(tokio::spawn(async move {
         read_partition(
@@ -678,6 +954,7 @@ fn spawn_partition_task(
             shared_schema,
             tx,
             child_discovery_tx,
+            reader_metrics,
         )
         .await
         .map(|()| PartitionResult { partition_token })
@@ -704,6 +981,7 @@ async fn read_partition(
     shared_schema: Arc<std::sync::Mutex<SchemaTracker>>,
     tx: mpsc::Sender<Vec<SourceMessage>>,
     child_discovery_tx: tokio::sync::mpsc::UnboundedSender<SpannerCdcSplit>,
+    reader_metrics: Arc<ReaderMetrics>,
 ) -> Result<()> {
     let start_ts = split.offset.ok_or_else(|| {
         ConnectorError::from(anyhow::anyhow!(
@@ -744,6 +1022,7 @@ async fn read_partition(
             &child_discovery_tx,
             &change_stream_name,
             stall_timeout,
+            &reader_metrics,
         )
         .await;
     }
@@ -780,6 +1059,7 @@ async fn read_partition(
             &child_discovery_tx,
             &change_stream_name,
             stall_timeout,
+            &reader_metrics,
         )
         .await
         {
@@ -819,22 +1099,27 @@ async fn execute_query(
     child_discovery_tx: &tokio::sync::mpsc::UnboundedSender<SpannerCdcSplit>,
     change_stream_name: &str,
     stall_timeout: std::time::Duration,
+    reader_metrics: &ReaderMetrics,
 ) -> Result<()> {
+    reader_metrics.queries.inc();
     let txn = client.single_use().build();
-    let mut result_set = match tokio::time::timeout(stall_timeout, txn.execute_query(stmt.clone()))
-        .await
-    {
-        Ok(Ok(rs)) => rs,
-        Ok(Err(e)) => return Err(anyhow::anyhow!("failed to execute query: {}", e).into()),
-        Err(_) => {
-            return Err(anyhow::anyhow!(
-                "query establishment timed out after {:?} for partition {:?}",
-                stall_timeout,
-                split.partition_token,
-            )
-            .into())
-        }
-    };
+    let mut result_set =
+        match tokio::time::timeout(stall_timeout, txn.execute_query(stmt.clone())).await {
+            Ok(Ok(rs)) => rs,
+            Ok(Err(e)) => {
+                reader_metrics.record_failure(QueryFailure::Query);
+                return Err(anyhow::anyhow!("failed to execute query: {}", e).into());
+            }
+            Err(_) => {
+                reader_metrics.record_failure(QueryFailure::Establish);
+                return Err(anyhow::anyhow!(
+                    "query establishment timed out after {:?} for partition {:?}",
+                    stall_timeout,
+                    split.partition_token,
+                )
+                .into());
+            }
+        };
 
     let mut offset_cache = OffsetStringCache::new();
 
@@ -842,24 +1127,28 @@ async fn execute_query(
         let row = match tokio::time::timeout(stall_timeout, result_set.next()).await {
             Ok(Some(Ok(row))) => row,
             Ok(Some(Err(e))) => {
-                return Err(anyhow::anyhow!("failed to get next row: {}", e).into())
+                reader_metrics.record_failure(QueryFailure::Row);
+                return Err(anyhow::anyhow!("failed to get next row: {}", e).into());
             }
             Ok(None) => break, // result set exhausted
             Err(_) => {
+                reader_metrics.record_failure(QueryFailure::Stall);
                 return Err(anyhow::anyhow!(
                     "stream stalled: no data or heartbeat received within {:?} for partition {:?}",
                     stall_timeout,
                     split.partition_token,
                 )
-                .into())
+                .into());
             }
         };
         if tx.is_closed() {
             return Ok(());
         }
 
-        let change_records =
-            crate::source::spanner_cdc::types::parse_change_record_column(&row, 0)?;
+        let change_records = crate::source::spanner_cdc::types::parse_change_record_column(&row, 0)
+            .inspect_err(|_| {
+                reader_metrics.record_failure(QueryFailure::Decode);
+            })?;
 
         for record in change_records {
             let mut messages = Vec::new();
@@ -1055,6 +1344,16 @@ mod tests {
     // forward_parsed_chunks: hands parsed chunks from the parser task to the actor.
     // -----------------------------------------------------------------------
 
+    fn test_reader_metrics() -> ReaderMetrics {
+        ReaderMetrics::new(&SourceMetrics::default(), "0", "test", "0")
+    }
+
+    fn test_queue_depth_gauge() -> LabelGuardedIntGauge {
+        SourceMetrics::default()
+            .spanner_cdc_parsed_chunk_queue_depth
+            .with_guarded_label_values(&["0", "test", "0"])
+    }
+
     #[tokio::test]
     async fn test_forward_parsed_chunks_yields_in_order() {
         let (tx, rx) = mpsc::channel(PARSED_CHUNK_CHANNEL_SIZE);
@@ -1066,9 +1365,10 @@ mod tests {
             .unwrap();
         drop(tx);
 
-        let chunks: Vec<_> = SpannerCdcSplitReader::forward_parsed_chunks(rx)
-            .collect()
-            .await;
+        let chunks: Vec<_> =
+            SpannerCdcSplitReader::forward_parsed_chunks(rx, test_queue_depth_gauge())
+                .collect()
+                .await;
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0].as_ref().unwrap().cardinality(), 1);
         assert_eq!(chunks[1].as_ref().unwrap().cardinality(), 1);
@@ -1087,9 +1387,10 @@ mod tests {
             .unwrap();
         drop(tx);
 
-        let chunks: Vec<_> = SpannerCdcSplitReader::forward_parsed_chunks(rx)
-            .collect()
-            .await;
+        let chunks: Vec<_> =
+            SpannerCdcSplitReader::forward_parsed_chunks(rx, test_queue_depth_gauge())
+                .collect()
+                .await;
         assert_eq!(chunks.len(), 2);
         assert!(chunks[0].is_ok());
         let err = chunks[1].as_ref().unwrap_err();
@@ -1105,10 +1406,37 @@ mod tests {
         let (tx, rx) = mpsc::channel::<Result<StreamChunk>>(PARSED_CHUNK_CHANNEL_SIZE);
         drop(tx);
 
-        let chunks: Vec<_> = SpannerCdcSplitReader::forward_parsed_chunks(rx)
-            .collect()
-            .await;
+        let chunks: Vec<_> =
+            SpannerCdcSplitReader::forward_parsed_chunks(rx, test_queue_depth_gauge())
+                .collect()
+                .await;
         assert!(chunks.is_empty());
+    }
+
+    /// `offset_bounds` reads both ends of one `BTreeMap` iterator, so the
+    /// single-key case (where `next_back` is already exhausted) needs covering.
+    #[test]
+    fn test_offset_bounds() {
+        let offsets = PartitionOffsets::new();
+        assert_eq!(offsets.offset_bounds(), (None, None));
+
+        let t0 = OffsetDateTime::from_unix_timestamp(1_000).unwrap();
+        offsets.register(Some("a".to_string()), t0);
+        assert_eq!(
+            offsets.offset_bounds(),
+            (Some(t0), Some(t0)),
+            "a single partition is both the min and the max"
+        );
+
+        let t1 = OffsetDateTime::from_unix_timestamp(2_000).unwrap();
+        let t2 = OffsetDateTime::from_unix_timestamp(3_000).unwrap();
+        offsets.register(Some("b".to_string()), t1);
+        offsets.register(Some("c".to_string()), t2);
+        assert_eq!(offsets.offset_bounds(), (Some(t0), Some(t2)));
+
+        // The straggler finishing lifts the watermark to the next oldest.
+        offsets.remove(&Some("a".to_string()));
+        assert_eq!(offsets.offset_bounds(), (Some(t1), Some(t2)));
     }
 
     fn make_child(token: &str, parents: Vec<&str>, offset: OffsetDateTime) -> SpannerCdcSplit {
@@ -1374,6 +1702,7 @@ mod tests {
             &mut ready_pool,
             &offsets,
             &split_id,
+            &test_reader_metrics(),
         );
 
         assert_eq!(deferred.len(), 3, "all 3 children should be in deferred");
@@ -1403,6 +1732,7 @@ mod tests {
             &mut ready_pool,
             &offsets,
             &split_id,
+            &test_reader_metrics(),
         );
 
         assert_eq!(deferred.len(), 2, "duplicate C1 should be deduped");
@@ -1435,6 +1765,7 @@ mod tests {
             &mut ready_pool,
             &offsets,
             &split_id,
+            &test_reader_metrics(),
         );
 
         assert_eq!(ready_pool.len(), 1, "C1 should be in ready_pool");
@@ -1466,6 +1797,7 @@ mod tests {
             &mut ready_pool,
             &offsets,
             &split_id,
+            &test_reader_metrics(),
         );
         assert_eq!(offsets.watermark(), Some(ts), "offset should be registered");
     }
@@ -1498,6 +1830,7 @@ mod tests {
             &mut ready_pool,
             &offsets,
             &split_id,
+            &test_reader_metrics(),
         );
 
         assert_eq!(deferred.len(), 1, "C1 should be in deferred");
@@ -1529,6 +1862,7 @@ mod tests {
             &mut ready_pool,
             &offsets,
             &split_id,
+            &test_reader_metrics(),
         );
 
         assert!(deferred.is_empty());
@@ -1557,6 +1891,7 @@ mod tests {
             &mut ready_pool,
             &offsets,
             &split_id,
+            &test_reader_metrics(),
         );
         assert_eq!(deferred.len(), 1);
 
@@ -1569,6 +1904,7 @@ mod tests {
             &mut ready_pool,
             &offsets,
             &split_id,
+            &test_reader_metrics(),
         );
         assert_eq!(deferred.len(), 1, "duplicate C1 should be deduped");
     }
@@ -1590,6 +1926,7 @@ mod tests {
             &mut ready_pool,
             &offsets,
             &split_id,
+            &test_reader_metrics(),
         );
 
         assert!(deferred.is_empty());
