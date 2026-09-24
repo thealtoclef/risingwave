@@ -254,6 +254,19 @@ PartitionOffsets (shared via Arc<Mutex<HashMap>>):
 
 **Note**: `spanner.databoost.enabled` is a table-level property set automatically by the frontend during `CREATE TABLE FROM source`. It is passed internally and should not be set manually in `CREATE SOURCE`.
 
+#### gRPC Channels (compute node environment)
+
+Every change-stream partition holds one never-ending streaming query, and all partitions of a
+reader share one Spanner client. The client opens `SPANNER_NUM_CHANNELS` gRPC channels (default
+4, or 1 against the emulator), and each channel carries about 100 concurrent streams. Queries
+beyond that wait for a free stream and surface as `establish_timeout` in
+`spanner_cdc_partition_query_failure_count`. When a source can have more concurrent partitions
+than the channels allow, raise it in the compute node environment, e.g. `SPANNER_NUM_CHANNELS=16`.
+The value is process-wide, must be between 1 and 256, and an invalid value makes client creation
+fail.
+
+The Spanner client's built-in Cloud Monitoring metrics are compiled out; use the metrics below.
+
 ---
 
 ## Live Configuration Updates (`ALTER SOURCE`)

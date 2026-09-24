@@ -169,7 +169,7 @@ impl SpannerExternalTable {
              WHERE TABLE_SCHEMA = '' AND TABLE_NAME = @p1 \
              ORDER BY ORDINAL_POSITION",
         )
-        .add_param("p1", &table_name)
+        .add_param("p1", table_name)
         .build();
 
         let mut rows = db_client
@@ -203,7 +203,7 @@ impl SpannerExternalTable {
              WHERE TABLE_SCHEMA = '' AND TABLE_NAME = @p1 AND INDEX_TYPE = 'PRIMARY_KEY' \
              ORDER BY ORDINAL_POSITION",
         )
-        .add_param("p1", &table_name)
+        .add_param("p1", table_name)
         .build();
 
         let mut rows = db_client
@@ -988,14 +988,14 @@ fn add_scalar_param(
     scalar: &ScalarImpl,
 ) -> google_cloud_spanner::statement::StatementBuilder {
     match scalar {
-        ScalarImpl::Int16(v) => stmt.add_param(name, &(*v as i64)),
-        ScalarImpl::Int32(v) => stmt.add_param(name, &(*v as i64)),
+        ScalarImpl::Int16(v) => stmt.add_param(name, *v as i64),
+        ScalarImpl::Int32(v) => stmt.add_param(name, *v as i64),
         ScalarImpl::Int64(v) => stmt.add_param(name, v),
-        ScalarImpl::Float32(v) => stmt.add_param(name, &(v.0 as f64)),
-        ScalarImpl::Float64(v) => stmt.add_param(name, &v.0),
-        ScalarImpl::Utf8(v) => stmt.add_param(name, &v.as_ref().to_owned()),
+        ScalarImpl::Float32(v) => stmt.add_param(name, v.0 as f64),
+        ScalarImpl::Float64(v) => stmt.add_param(name, v.0),
+        ScalarImpl::Utf8(v) => stmt.add_param(name, v.as_ref().to_owned()),
         ScalarImpl::Bool(v) => stmt.add_param(name, v),
-        ScalarImpl::Decimal(v) => stmt.add_param(name, &v.to_string()),
+        ScalarImpl::Decimal(v) => stmt.add_param(name, v.to_string()),
         _ => panic!(
             "unsupported ScalarImpl type for Spanner param binding: {:?}",
             scalar

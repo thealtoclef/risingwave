@@ -1005,16 +1005,16 @@ async fn read_partition(
 
     if retry_attempts == 0 {
         let stmt = Statement::builder(&sql)
-            .add_typed_param("start_timestamp", &start_ts, types::timestamp())
+            .add_typed_param("start_timestamp", start_ts, types::timestamp())
             .add_typed_param(
                 "end_timestamp",
-                &Option::<OffsetDateTime>::None,
+                Option::<OffsetDateTime>::None,
                 types::timestamp(),
             )
             .add_typed_param("partition_token", &split.partition_token, types::string())
             .add_typed_param(
                 "heartbeat_milliseconds",
-                &heartbeat_interval_ms,
+                heartbeat_interval_ms,
                 types::int64(),
             )
             .build();
@@ -1050,16 +1050,16 @@ async fn read_partition(
             .offset
             .expect("offset validated at entry and only advanced by advance_offset");
         let stmt = Statement::builder(&sql)
-            .add_typed_param("start_timestamp", &resume_ts, types::timestamp())
+            .add_typed_param("start_timestamp", resume_ts, types::timestamp())
             .add_typed_param(
                 "end_timestamp",
-                &Option::<OffsetDateTime>::None,
+                Option::<OffsetDateTime>::None,
                 types::timestamp(),
             )
             .add_typed_param("partition_token", &split.partition_token, types::string())
             .add_typed_param(
                 "heartbeat_milliseconds",
-                &heartbeat_interval_ms,
+                heartbeat_interval_ms,
                 types::int64(),
             )
             .build();
