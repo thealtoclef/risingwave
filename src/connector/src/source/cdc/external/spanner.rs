@@ -41,7 +41,7 @@ use chrono::Datelike;
 use futures::stream::BoxStream;
 use futures::{StreamExt, pin_mut};
 use futures_async_stream::try_stream;
-use google_cloud_auth::credentials::{Credentials, service_account};
+use google_cloud_auth::credentials::{Credentials, anonymous, service_account};
 use google_cloud_spanner::client::{DatabaseClient, Spanner};
 use google_cloud_spanner::model::PartitionOptions;
 use google_cloud_spanner::result::Row as SpannerRow;
@@ -72,6 +72,8 @@ use crate::source::cdc::external::{
 /// split. Balanced to keep the split read well-parallelized without
 /// over-fanning out.
 const DEFAULT_MAX_CONCURRENT_PARTITIONS: usize = 16;
+
+const DEFAULT_SPANNER_ENDPOINT: &str = "https://spanner.googleapis.com";
 
 /// A position in the Spanner change stream, used as the CDC offset.
 ///
@@ -1284,6 +1286,46 @@ fn add_pk_params(
 // Spanner client factory
 // ---------------------------------------------------------------------------
 
+/// Resolve endpoint and authentication together so emulator clients never use real credentials.
+fn spanner_client_connection_config(
+    emulator_host: Option<&str>,
+    credentials: Option<&str>,
+    credentials_path: Option<&str>,
+) -> ConnectorResult<(String, Option<Credentials>)> {
+    if let Some(host) = emulator_host {
+        if credentials.is_some() || credentials_path.is_some() {
+            bail!(
+                "spanner.emulator_host cannot be combined with spanner.credentials or spanner.credentials_path"
+            );
+        }
+        if host.trim().is_empty() {
+            bail!("spanner.emulator_host must not be empty");
+        }
+        let endpoint = if url::Url::parse(host).is_ok_and(|url| url.has_host()) {
+            host.to_owned()
+        } else {
+            format!("http://{host}")
+        };
+        // Set anonymous credentials explicitly, including for HTTPS emulators where
+        // the SDK would otherwise fall back to Application Default Credentials.
+        return Ok((endpoint, Some(anonymous::Builder::new().build())));
+    }
+
+    let credentials = if let Some(json) = credentials {
+        Some(build_service_account_credentials(json)?)
+    } else if let Some(path) = credentials_path {
+        let content = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read credentials file: {}", path))?;
+        Some(build_service_account_credentials(&content)?)
+    } else {
+        None
+    };
+
+    // An explicit endpoint prevents the SDK from redirecting production clients
+    // through SPANNER_EMULATOR_HOST inherited from the process environment.
+    Ok((DEFAULT_SPANNER_ENDPOINT.to_owned(), credentials))
+}
+
 /// Create a Spanner `DatabaseClient` from connection parameters.
 ///
 /// Shared by both `SpannerExternalTable` (backfill) and `SpannerCdcProperties` (CDC reader).
@@ -1299,23 +1341,16 @@ pub(crate) async fn create_spanner_client(
         bail!("spanner.project, spanner.instance, and database.name are required");
     }
 
-    if let Some(host) = emulator_host {
-        unsafe { std::env::set_var("SPANNER_EMULATOR_HOST", host) };
-    }
+    let (endpoint, credentials) =
+        spanner_client_connection_config(emulator_host, credentials, credentials_path)?;
 
     let dsn = format!(
         "projects/{}/instances/{}/databases/{}",
         project, instance, database
     );
 
-    let mut builder = Spanner::builder();
-    if let Some(json) = credentials {
-        let creds = build_service_account_credentials(json)?;
-        builder = builder.with_credentials(creds);
-    } else if let Some(path) = credentials_path {
-        let content = std::fs::read_to_string(path)
-            .with_context(|| format!("failed to read credentials file: {}", path))?;
-        let creds = build_service_account_credentials(&content)?;
+    let mut builder = Spanner::builder().with_endpoint(endpoint);
+    if let Some(creds) = credentials {
         builder = builder.with_credentials(creds);
     }
 
@@ -1663,6 +1698,84 @@ fn spanner_row_to_owned_row(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn test_spanner_emulator_endpoint_and_anonymous_credentials() {
+        use google_cloud_auth::credentials::CacheableResource;
+
+        let previous_host = std::env::var_os("SPANNER_EMULATOR_HOST");
+        for (host, expected) in [
+            ("localhost:9010", "http://localhost:9010"),
+            ("http://localhost:9010", "http://localhost:9010"),
+            ("https://emulator.example", "https://emulator.example"),
+        ] {
+            let (endpoint, credentials) =
+                spanner_client_connection_config(Some(host), None, None).unwrap();
+            assert_eq!(endpoint, expected);
+            let headers = credentials
+                .unwrap()
+                .headers(Default::default())
+                .await
+                .unwrap();
+            match headers {
+                CacheableResource::New { data, .. } => assert!(data.is_empty()),
+                CacheableResource::NotModified => panic!("expected fresh anonymous headers"),
+            }
+        }
+        assert_eq!(std::env::var_os("SPANNER_EMULATOR_HOST"), previous_host);
+
+        // Configuring an emulator must not change a subsequent production client.
+        let (endpoint, credentials) = spanner_client_connection_config(None, None, None).unwrap();
+        assert_eq!(endpoint, DEFAULT_SPANNER_ENDPOINT);
+        assert!(credentials.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_spanner_client_passes_endpoint_to_sdk_builder() {
+        // An invalid endpoint must fail while building the SDK client, before
+        // creating a database client. This fails if `with_endpoint` is removed.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            create_spanner_client(
+                "project",
+                "instance",
+                "database",
+                Some(":::invalid-uri"),
+                None,
+                None,
+            ),
+        )
+        .await
+        .expect("SDK client build should reject the invalid endpoint promptly");
+        let error = result.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("failed to create Spanner client"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn test_spanner_emulator_rejects_explicit_credentials_before_loading() {
+        for (credentials, path) in [
+            (Some("invalid JSON"), None),
+            (None, Some("/nonexistent/spanner-service-account.json")),
+            (Some("invalid JSON"), Some("/nonexistent/key.json")),
+        ] {
+            let error = spanner_client_connection_config(Some("localhost:9010"), credentials, path)
+                .unwrap_err();
+            assert!(error.to_string().contains("cannot be combined"));
+        }
+    }
+
+    #[test]
+    fn test_spanner_emulator_rejects_empty_host() {
+        for host in ["", "   "] {
+            let error = spanner_client_connection_config(Some(host), None, None).unwrap_err();
+            assert!(error.to_string().contains("must not be empty"));
+        }
+    }
 
     #[test]
     fn test_spanner_offset() {

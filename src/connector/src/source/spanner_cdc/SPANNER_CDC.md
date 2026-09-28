@@ -236,7 +236,13 @@ PartitionOffsets (shared via Arc<Mutex<HashMap>>):
 | `spanner.credentials_path` | - | Path to service account credentials file |
 | `spanner.emulator_host` | - | Emulator host for testing (e.g., `http://localhost:9010`) |
 
-**Note**: If neither `credentials` nor `credentials_path` is specified, uses Application Default Credentials (ADC).
+**Note**: Production connections use Application Default Credentials (ADC) if neither
+`credentials` nor `credentials_path` is specified. Emulator connections always use
+anonymous authentication, including HTTPS endpoints, and reject either credential
+option. `spanner.emulator_host` applies only to that client's connection and does
+not modify the process environment. Without this option, the connector explicitly
+connects to `https://spanner.googleapis.com`; `SPANNER_EMULATOR_HOST` does not select
+the endpoint. Configure emulator connections with `spanner.emulator_host`.
 
 #### Change Stream Configuration
 
