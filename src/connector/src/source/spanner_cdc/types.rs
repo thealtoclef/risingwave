@@ -696,7 +696,11 @@ impl Mod {
     /// it once per record via [`DataChangeRecord::column_type_map`] rather than per mod.
     ///
     /// Infallible: the cell maps were validated when the `Mod` was parsed.
-    pub fn to_json_map(&self, mod_type: &str, column_types: &HashMap<&str, TypeCode>) -> CellMap {
+    pub fn to_json_map(
+        &self,
+        mod_type: &str,
+        column_types: &HashMap<&str, &SpannerType>,
+    ) -> CellMap {
         let mut result = serde_json::Map::new();
 
         // Spanner change streams encode all values as JSON strings regardless of the
@@ -712,9 +716,9 @@ impl Mod {
                     // Check the actual column type
                     let should_convert = column_types
                         .get(column_name)
-                        .map(|type_code| {
+                        .map(|spanner_type| {
                             matches!(
-                                type_code,
+                                spanner_type.code,
                                 TypeCode::Int64
                                     | TypeCode::Float64
                                     | TypeCode::Float32
@@ -751,6 +755,32 @@ impl Mod {
                     }
                     // Keep as string (either not numeric column, or parsing failed)
                     JsonValue::String(s.clone())
+                }
+                // INT64 is encoded as a JSON string inside arrays too, e.g.
+                // `["1","9007199254740993"]`, and Debezium-format parsing rejects a
+                // string for an integer element, which would null the whole column.
+                // Only INT64 elements are converted: FLOAT elements already arrive as
+                // numbers, and NUMERIC elements parse exactly as strings.
+                JsonValue::Array(items)
+                    if column_types.get(column_name).is_some_and(|spanner_type| {
+                        spanner_type
+                            .array_element_type
+                            .as_deref()
+                            .is_some_and(|elem| elem.code == TypeCode::Int64)
+                    }) =>
+                {
+                    JsonValue::Array(
+                        items
+                            .iter()
+                            .map(|item| match item {
+                                JsonValue::String(s) => s
+                                    .parse::<i64>()
+                                    .map(JsonValue::from)
+                                    .unwrap_or_else(|_| item.clone()),
+                                _ => item.clone(),
+                            })
+                            .collect(),
+                    )
                 }
                 _ => value.clone(),
             }
@@ -830,10 +860,10 @@ impl DataChangeRecord {
     ///
     /// `column_types` is schema metadata shared by every `Mod` in the record, so this
     /// must be built once per record and reused, not rebuilt per mod.
-    pub fn column_type_map(&self) -> HashMap<&str, TypeCode> {
+    pub fn column_type_map(&self) -> HashMap<&str, &SpannerType> {
         self.column_types
             .iter()
-            .map(|ct| (ct.name.as_str(), ct.type_code()))
+            .map(|ct| (ct.name.as_str(), &ct.spanner_type))
             .collect()
     }
 }
@@ -1009,7 +1039,7 @@ mod tests {
         for ct in &record.column_types {
             assert_eq!(
                 map.get(ct.name.as_str()),
-                Some(&ct.type_code()),
+                Some(&&ct.spanner_type),
                 "column {} missing or mistyped",
                 ct.name
             );
@@ -1072,10 +1102,10 @@ mod tests {
         let shared = record.column_type_map();
 
         for m in &record.mods {
-            let fresh: HashMap<&str, TypeCode> = record
+            let fresh: HashMap<&str, &SpannerType> = record
                 .column_types
                 .iter()
-                .map(|ct| (ct.name.as_str(), ct.type_code()))
+                .map(|ct| (ct.name.as_str(), &ct.spanner_type))
                 .collect();
 
             let with_shared = m.to_json_map(&record.mod_type, &shared);
@@ -1246,12 +1276,136 @@ mod tests {
     /// anything, and must not error.
     #[test]
     fn test_to_json_map_without_column_types() {
-        let map: HashMap<&str, TypeCode> = HashMap::new();
+        let map: HashMap<&str, &SpannerType> = HashMap::new();
         let m = insert_mod(1, 100, "02101");
 
         let json = m.to_json_map("INSERT", &map);
         let after = json["after"].as_object().unwrap();
         assert_eq!(after["id"], JsonValue::String("1".to_owned()));
         assert_eq!(after["balance"], JsonValue::String("100".to_owned()));
+    }
+
+    /// Regression test built from a data change record captured from the Spanner
+    /// emulator (2026-09-28, raw `executeStreamingSql` response), for a table
+    /// `f(id INT64, d FLOAT64, r FLOAT32, arr ARRAY<FLOAT64>, i ARRAY<INT64>)` on a
+    /// `NEW_ROW` change stream. The shape is what the SDK hands the reader: STRUCT
+    /// fields named, and the JSON-typed `type` / `keys` / `new_values` cells parsed.
+    ///
+    /// Runs the record through `build_source_message` and the same `DebeziumParser`
+    /// setup the CDC backfill uses, so it covers the full path to table rows.
+    #[tokio::test]
+    async fn test_emulator_record_parses_into_rows() {
+        use risingwave_common::catalog::ColumnId;
+        use risingwave_common::row::Row;
+        use risingwave_common::types::{ScalarImpl, ScalarRefImpl};
+
+        use crate::parser::{
+            DebeziumParser, DebeziumProps, EncodingProperties, JsonProperties, ProtocolProperties,
+            SourceStreamChunkBuilder, SpecificParserConfig,
+        };
+        use crate::source::spanner_cdc::source::{ChangeRecordContext, build_source_message};
+        use crate::source::{SourceColumnDesc, SourceContext, SourceCtrlOpts, SplitId};
+
+        let record = DataChangeRecord::from_json(serde_json::json!({
+            "commit_timestamp": "2026-09-27T17:38:39.216293Z",
+            "record_sequence": "00000000",
+            "server_transaction_id": "1790530703654765",
+            "is_last_record_in_transaction_in_partition": true,
+            "table_name": "f",
+            "column_types": [
+                {"name": "id", "type": {"code": "INT64"}, "is_primary_key": true, "ordinal_position": "1"},
+                {"name": "d", "type": {"code": "FLOAT64"}, "is_primary_key": false, "ordinal_position": "2"},
+                {"name": "r", "type": {"code": "FLOAT32"}, "is_primary_key": false, "ordinal_position": "3"},
+                {"name": "arr", "type": {"array_element_type": {"code": "FLOAT64"}, "code": "ARRAY"}, "is_primary_key": false, "ordinal_position": "4"},
+                {"name": "i", "type": {"array_element_type": {"code": "INT64"}, "code": "ARRAY"}, "is_primary_key": false, "ordinal_position": "5"}
+            ],
+            "mods": [
+                // Inserted as d = NaN, r = NaN, arr = [NaN, 1.5]: Spanner writes NaN as null.
+                {"keys": {"id": "1"}, "new_values": {"arr": [null, 1.5], "d": null, "i": ["1", "9007199254740993"], "r": null}, "old_values": {}},
+                {"keys": {"id": "4"}, "new_values": {"arr": [0.1], "d": 1.25, "i": ["-3"], "r": 2.5}, "old_values": {}}
+            ],
+            "mod_type": "INSERT",
+            "value_capture_type": "NEW_ROW",
+            "number_of_records_in_transaction": "1",
+            "number_of_partitions_in_transaction": "1",
+            "transaction_tag": "",
+            "is_system_transaction": false
+        }))
+        .unwrap();
+
+        let columns = vec![
+            SourceColumnDesc::simple("id", DataType::Int64, ColumnId::from(0)),
+            SourceColumnDesc::simple("d", DataType::Float64, ColumnId::from(1)),
+            SourceColumnDesc::simple("r", DataType::Float32, ColumnId::from(2)),
+            SourceColumnDesc::simple("arr", DataType::Float64.list(), ColumnId::from(3)),
+            SourceColumnDesc::simple("i", DataType::Int64.list(), ColumnId::from(4)),
+        ];
+        let props = SpecificParserConfig {
+            encoding_config: EncodingProperties::Json(JsonProperties {
+                use_schema_registry: false,
+                timestamptz_handling: None,
+                timestamp_handling: None,
+                time_handling: None,
+                bigint_unsigned_handling: None,
+                handle_toast_columns: false,
+            }),
+            protocol_config: ProtocolProperties::Debezium(DebeziumProps::default()),
+        };
+        let mut parser = DebeziumParser::new(props, columns.clone(), SourceContext::dummy().into())
+            .await
+            .unwrap();
+        let mut builder = SourceStreamChunkBuilder::new(columns, SourceCtrlOpts::for_test());
+
+        let split_id: SplitId = "0".into();
+        let column_types = record.column_type_map();
+        let ctx = ChangeRecordContext::new("db", &record, &column_types);
+        for m in &record.mods {
+            let msg = build_source_message(&split_id, &ctx, m, "0");
+            parser
+                .parse_inner(None, msg.payload, builder.row_writer())
+                .await
+                .unwrap();
+        }
+        builder.finish_current_chunk();
+        let chunk = builder.consume_ready_chunks().next().unwrap();
+        let rows: Vec<_> = chunk.rows().map(|(_, row)| row.to_owned_row()).collect();
+        assert_eq!(rows.len(), 2);
+
+        let int_list = |d: &Option<ScalarImpl>| -> Vec<Option<i64>> {
+            let Some(ScalarImpl::List(list)) = d else {
+                panic!("expected a list, got {d:?}");
+            };
+            list.iter()
+                .map(|e| e.map(ScalarRefImpl::into_int64))
+                .collect()
+        };
+        let float_list = |d: &Option<ScalarImpl>| -> Vec<Option<f64>> {
+            let Some(ScalarImpl::List(list)) = d else {
+                panic!("expected a list, got {d:?}");
+            };
+            list.iter()
+                .map(|e| e.map(|s| s.into_float64().into_inner()))
+                .collect()
+        };
+
+        // Row 1: ARRAY<INT64> elements arrive as strings and must not null the column,
+        // including a value above 2^53 that a float would round.
+        assert_eq!(rows[0][0], Some(ScalarImpl::Int64(1)));
+        assert_eq!(
+            int_list(&rows[0][4]),
+            vec![Some(1), Some(9_007_199_254_740_993)]
+        );
+        // NaN is already null on the wire, so it is NULL here: a known Spanner-side
+        // loss, not something the reader can recover.
+        assert_eq!(rows[0][1], None);
+        assert_eq!(rows[0][2], None);
+        assert_eq!(float_list(&rows[0][3]), vec![None, Some(1.5)]);
+
+        // Row 4: finite values.
+        assert_eq!(rows[1][0], Some(ScalarImpl::Int64(4)));
+        assert_eq!(rows[1][1], Some(ScalarImpl::Float64(1.25.into())));
+        assert_eq!(rows[1][2], Some(ScalarImpl::Float32(2.5.into())));
+        assert_eq!(float_list(&rows[1][3]), vec![Some(0.1)]);
+        assert_eq!(int_list(&rows[1][4]), vec![Some(-3)]);
     }
 }

@@ -19,7 +19,7 @@ use time::OffsetDateTime;
 
 use crate::source::base::SourceMessage;
 use crate::source::cdc::DebeziumCdcMeta;
-use crate::source::spanner_cdc::types::{DataChangeRecord, Mod, TypeCode};
+use crate::source::spanner_cdc::types::{DataChangeRecord, Mod, SpannerType};
 use crate::source::{SourceMeta, SplitId};
 
 /// The parts of a `DataChangeRecord` needed to turn each of its `Mod`s into a
@@ -34,14 +34,14 @@ pub struct ChangeRecordContext<'a> {
     pub table_name: &'a str,
     pub mod_type: &'a str,
     pub commit_timestamp: OffsetDateTime,
-    pub column_types: &'a HashMap<&'a str, TypeCode>,
+    pub column_types: &'a HashMap<&'a str, &'a SpannerType>,
 }
 
 impl<'a> ChangeRecordContext<'a> {
     pub fn new(
         database_name: &'a str,
         data_change: &'a DataChangeRecord,
-        column_types: &'a HashMap<&'a str, TypeCode>,
+        column_types: &'a HashMap<&'a str, &'a SpannerType>,
     ) -> Self {
         Self {
             database_name,
