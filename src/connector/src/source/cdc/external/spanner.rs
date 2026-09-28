@@ -55,9 +55,11 @@ use risingwave_common::catalog::{ColumnDesc, ColumnId, Field, Schema};
 use risingwave_common::log::LogSuppressor;
 use risingwave_common::row::{OwnedRow, Row as OwnedRowTrait};
 use risingwave_common::types::{DataType, Datum, F32, F64, ListType, ListValue, ScalarImpl};
+use risingwave_common::util::env_var::env_var_is_true;
 use thiserror_ext::AsReport;
 use time::OffsetDateTime;
 
+use crate::connector_common::DISABLE_DEFAULT_CREDENTIAL;
 use crate::error::{ConnectorError, ConnectorResult};
 use crate::source::CdcTableSnapshotSplit;
 use crate::source::cdc::external::{
@@ -74,6 +76,10 @@ use crate::source::cdc::external::{
 const DEFAULT_MAX_CONCURRENT_PARTITIONS: usize = 16;
 
 const DEFAULT_SPANNER_ENDPOINT: &str = "https://spanner.googleapis.com";
+
+/// Upper bound for a `spanner.credentials_path` file. A service account key is
+/// about 2.4 KB.
+const MAX_CREDENTIALS_FILE_BYTES: u64 = 64 * 1024;
 
 /// A position in the Spanner change stream, used as the CDC offset.
 ///
@@ -1287,10 +1293,15 @@ fn add_pk_params(
 // ---------------------------------------------------------------------------
 
 /// Resolve endpoint and authentication together so emulator clients never use real credentials.
+///
+/// Without explicit credentials a production client falls back to Application Default
+/// Credentials, which authenticate as the RisingWave node. `default_credentials_allowed`
+/// is false when `DISABLE_DEFAULT_CREDENTIAL` forbids that fallback.
 fn spanner_client_connection_config(
     emulator_host: Option<&str>,
     credentials: Option<&str>,
     credentials_path: Option<&str>,
+    default_credentials_allowed: bool,
 ) -> ConnectorResult<(String, Option<Credentials>)> {
     if let Some(host) = emulator_host {
         if credentials.is_some() || credentials_path.is_some() {
@@ -1314,11 +1325,15 @@ fn spanner_client_connection_config(
     let credentials = if let Some(json) = credentials {
         Some(build_service_account_credentials(json)?)
     } else if let Some(path) = credentials_path {
-        let content = std::fs::read_to_string(path)
+        let content = read_credentials_file(path)
             .with_context(|| format!("failed to read credentials file: {}", path))?;
         Some(build_service_account_credentials(&content)?)
-    } else {
+    } else if default_credentials_allowed {
         None
+    } else {
+        bail!(
+            "Google Application Default Credentials are disabled; configure `spanner.credentials` or `spanner.credentials_path`"
+        );
     };
 
     // An explicit endpoint prevents the SDK from redirecting production clients
@@ -1341,8 +1356,12 @@ pub(crate) async fn create_spanner_client(
         bail!("spanner.project, spanner.instance, and database.name are required");
     }
 
-    let (endpoint, credentials) =
-        spanner_client_connection_config(emulator_host, credentials, credentials_path)?;
+    let (endpoint, credentials) = spanner_client_connection_config(
+        emulator_host,
+        credentials,
+        credentials_path,
+        !env_var_is_true(DISABLE_DEFAULT_CREDENTIAL),
+    )?;
 
     let dsn = format!(
         "projects/{}/instances/{}/databases/{}",
@@ -1364,6 +1383,36 @@ pub(crate) async fn create_spanner_client(
         .await
         .context("failed to create Spanner database client")?;
     Ok(db_client)
+}
+
+/// Read a service account key file from a path given in the source options.
+///
+/// The path comes from the user, so only regular files up to
+/// `MAX_CREDENTIALS_FILE_BYTES` are read: a path such as `/dev/zero` must not
+/// exhaust the memory of the frontend, meta or compute node that reads it.
+fn read_credentials_file(path: &str) -> std::io::Result<String> {
+    use std::io::Read;
+
+    let file = std::fs::File::open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::other("not a regular file"));
+    }
+    if metadata.len() > MAX_CREDENTIALS_FILE_BYTES {
+        return Err(std::io::Error::other(format!(
+            "file is larger than {MAX_CREDENTIALS_FILE_BYTES} bytes"
+        )));
+    }
+    // The size can still change after the check, so bound the read itself too.
+    let mut content = String::new();
+    file.take(MAX_CREDENTIALS_FILE_BYTES + 1)
+        .read_to_string(&mut content)?;
+    if content.len() as u64 > MAX_CREDENTIALS_FILE_BYTES {
+        return Err(std::io::Error::other(format!(
+            "file is larger than {MAX_CREDENTIALS_FILE_BYTES} bytes"
+        )));
+    }
+    Ok(content)
 }
 
 fn build_service_account_credentials(json: &str) -> ConnectorResult<Credentials> {
@@ -1710,7 +1759,7 @@ mod tests {
             ("https://emulator.example", "https://emulator.example"),
         ] {
             let (endpoint, credentials) =
-                spanner_client_connection_config(Some(host), None, None).unwrap();
+                spanner_client_connection_config(Some(host), None, None, true).unwrap();
             assert_eq!(endpoint, expected);
             let headers = credentials
                 .unwrap()
@@ -1725,7 +1774,8 @@ mod tests {
         assert_eq!(std::env::var_os("SPANNER_EMULATOR_HOST"), previous_host);
 
         // Configuring an emulator must not change a subsequent production client.
-        let (endpoint, credentials) = spanner_client_connection_config(None, None, None).unwrap();
+        let (endpoint, credentials) =
+            spanner_client_connection_config(None, None, None, true).unwrap();
         assert_eq!(endpoint, DEFAULT_SPANNER_ENDPOINT);
         assert!(credentials.is_none());
     }
@@ -1763,8 +1813,9 @@ mod tests {
             (None, Some("/nonexistent/spanner-service-account.json")),
             (Some("invalid JSON"), Some("/nonexistent/key.json")),
         ] {
-            let error = spanner_client_connection_config(Some("localhost:9010"), credentials, path)
-                .unwrap_err();
+            let error =
+                spanner_client_connection_config(Some("localhost:9010"), credentials, path, true)
+                    .unwrap_err();
             assert!(error.to_string().contains("cannot be combined"));
         }
     }
@@ -1772,9 +1823,45 @@ mod tests {
     #[test]
     fn test_spanner_emulator_rejects_empty_host() {
         for host in ["", "   "] {
-            let error = spanner_client_connection_config(Some(host), None, None).unwrap_err();
+            let error = spanner_client_connection_config(Some(host), None, None, true).unwrap_err();
             assert!(error.to_string().contains("must not be empty"));
         }
+    }
+
+    /// With `DISABLE_DEFAULT_CREDENTIAL` set, a source without credentials must not
+    /// authenticate as the RisingWave node. Emulator clients are unaffected.
+    #[test]
+    fn test_spanner_default_credentials_can_be_disabled() {
+        let error = spanner_client_connection_config(None, None, None, false).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Default Credentials are disabled"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            spanner_client_connection_config(Some("localhost:9010"), None, None, false).is_ok()
+        );
+    }
+
+    #[test]
+    fn test_read_credentials_file_rejects_non_regular_and_oversized_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = read_credentials_file(dir.path().to_str().unwrap()).unwrap_err();
+        assert!(error.to_string().contains("not a regular file"), "{error}");
+
+        let oversized = dir.path().join("oversized.json");
+        std::fs::write(
+            &oversized,
+            vec![b' '; MAX_CREDENTIALS_FILE_BYTES as usize + 1],
+        )
+        .unwrap();
+        let error = read_credentials_file(oversized.to_str().unwrap()).unwrap_err();
+        assert!(error.to_string().contains("larger than"), "{error}");
+
+        let key = dir.path().join("key.json");
+        std::fs::write(&key, "{}").unwrap();
+        assert_eq!(read_credentials_file(key.to_str().unwrap()).unwrap(), "{}");
     }
 
     #[test]
