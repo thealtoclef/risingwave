@@ -62,6 +62,7 @@ use crate::error::{ConnectorError, ConnectorResult as Result};
 use crate::parser::ParserConfig;
 use crate::source::cdc::DebeziumCdcMeta;
 use crate::source::monitor::SourceMetrics;
+use crate::source::spanner_cdc::enumerator::SUPPORTED_VALUE_CAPTURE_TYPES;
 use crate::source::spanner_cdc::schema_track::SchemaTracker;
 use crate::source::spanner_cdc::{SpannerCdcProperties, SpannerCdcSplit};
 use crate::source::{
@@ -331,15 +332,18 @@ enum QueryFailure {
     Row,
     /// A row arrived but its `ChangeRecord` column could not be parsed.
     Decode,
+    /// A record used a value capture type that yields partial rows.
+    UnsupportedValueCaptureType,
 }
 
 impl QueryFailure {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 6] = [
         Self::Establish,
         Self::Stall,
         Self::Query,
         Self::Row,
         Self::Decode,
+        Self::UnsupportedValueCaptureType,
     ];
 
     /// Index into the pre-resolved counter array.
@@ -353,6 +357,7 @@ impl QueryFailure {
             Self::Query => 2,
             Self::Row => 3,
             Self::Decode => 4,
+            Self::UnsupportedValueCaptureType => 5,
         }
     }
 
@@ -363,6 +368,7 @@ impl QueryFailure {
             Self::Query => "query_error",
             Self::Row => "row_error",
             Self::Decode => "decode_error",
+            Self::UnsupportedValueCaptureType => "unsupported_value_capture_type",
         }
     }
 }
@@ -1189,6 +1195,13 @@ async fn execute_query(
                     "received data change"
                 );
 
+                // The enumerator validates the stream at creation, but the capture type
+                // can be changed later with ALTER CHANGE STREAM. Fail rather than write
+                // rows whose unmodified columns are NULL.
+                check_value_capture_type(data_change).inspect_err(|_| {
+                    reader_metrics.record_failure(QueryFailure::UnsupportedValueCaptureType);
+                })?;
+
                 let commit_ts = data_change.commit_time();
                 split.advance_offset(commit_ts);
                 offsets.update(&split.partition_token, commit_ts);
@@ -1302,6 +1315,23 @@ async fn execute_query(
 
     tracing::info!(%split_id, final_offset = ?split.offset, "change stream result set exhausted");
     Ok(())
+}
+
+/// Reject a record whose value capture type omits unmodified columns on UPDATE.
+fn check_value_capture_type(
+    data_change: &crate::source::spanner_cdc::types::DataChangeRecord,
+) -> Result<()> {
+    if SUPPORTED_VALUE_CAPTURE_TYPES.contains(&data_change.value_capture_type.as_str()) {
+        return Ok(());
+    }
+    Err(anyhow::anyhow!(
+        "change stream record for table '{}' uses value_capture_type '{}', which is not \
+         supported; set the change stream to one of {:?}",
+        data_change.table_name,
+        data_change.value_capture_type,
+        SUPPORTED_VALUE_CAPTURE_TYPES,
+    )
+    .into())
 }
 
 // ---------------------------------------------------------------------------

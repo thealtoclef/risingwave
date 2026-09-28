@@ -755,6 +755,17 @@ with `spanner_cdc_newest_partition_lag_milliseconds` tells you which failure you
 
 Set `spanner.credentials` or `spanner.credentials_path`, or set `spanner.emulator_host` for testing.
 
+### Supported change stream options
+
+`CREATE SOURCE` validates the change stream against `INFORMATION_SCHEMA.CHANGE_STREAM_OPTIONS`:
+
+- `value_capture_type` must be `NEW_ROW` or `NEW_ROW_AND_OLD_VALUES`. Spanner's default,
+  `OLD_AND_NEW_VALUES`, and `NEW_VALUES` carry only the modified columns on UPDATE, which
+  would write every unmodified column as NULL. The reader also fails on any record with an
+  unsupported capture type, in case the stream is altered after the source is created.
+- `partition_mode` must be unset or `IMMUTABLE_KEY_RANGE`. `MUTABLE_KEY_RANGE` streams use
+  a different record model (partition start/end/event records) that is not implemented.
+
 ### "change stream does not exist"
 
 Create the change stream in Spanner:

@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -73,6 +74,9 @@ impl SplitEnumerator for SpannerCdcSplitEnumerator {
             );
         }
 
+        let options = fetch_change_stream_options(&client, &properties.change_stream_name).await?;
+        validate_change_stream_options(&properties.change_stream_name, &options)?;
+
         Ok(Self {
             source_id,
             properties,
@@ -127,5 +131,154 @@ impl SplitEnumerator for SpannerCdcSplitEnumerator {
         );
 
         Ok(vec![split])
+    }
+}
+
+/// Value capture types whose records the reader can turn into correct rows.
+///
+/// `NEW_ROW` and `NEW_ROW_AND_OLD_VALUES` carry every watched column in `new_values`.
+/// `OLD_AND_NEW_VALUES` (Spanner's default) and `NEW_VALUES` carry only the modified
+/// columns on UPDATE, so every unmodified column would be written as NULL. Their
+/// `column_types` also lists only the key and modified columns, which the schema
+/// tracker would read as columns being dropped.
+pub(crate) const SUPPORTED_VALUE_CAPTURE_TYPES: [&str; 2] = ["NEW_ROW", "NEW_ROW_AND_OLD_VALUES"];
+
+/// Spanner's value capture type when the option is not set.
+const DEFAULT_VALUE_CAPTURE_TYPE: &str = "OLD_AND_NEW_VALUES";
+
+/// Read the options explicitly set on a change stream, keyed by lower-case option name.
+///
+/// `INFORMATION_SCHEMA.CHANGE_STREAM_OPTIONS` only has rows for options that were set;
+/// an absent option takes Spanner's default.
+async fn fetch_change_stream_options(
+    client: &DatabaseClient,
+    change_stream_name: &str,
+) -> ConnectorResult<HashMap<String, String>> {
+    let stmt = Statement::builder(
+        "SELECT OPTION_NAME, OPTION_VALUE FROM INFORMATION_SCHEMA.CHANGE_STREAM_OPTIONS \
+         WHERE CHANGE_STREAM_NAME = @name",
+    )
+    .add_param("name", change_stream_name)
+    .build();
+    let mut rows = client
+        .single_use()
+        .build()
+        .execute_query(stmt)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to query change stream options: {}", e))?;
+
+    let mut options = HashMap::new();
+    while let Some(row) = rows
+        .next()
+        .await
+        .transpose()
+        .map_err(|e| anyhow::anyhow!("failed to read change stream option: {}", e))?
+    {
+        let name: String = row
+            .try_get(0)
+            .map_err(|e| anyhow::anyhow!("OPTION_NAME: {}", e))?;
+        let value: String = row
+            .try_get(1)
+            .map_err(|e| anyhow::anyhow!("OPTION_VALUE: {}", e))?;
+        options.insert(name.to_ascii_lowercase(), value);
+    }
+    Ok(options)
+}
+
+/// Reject change streams whose records this connector would mishandle.
+fn validate_change_stream_options(
+    change_stream_name: &str,
+    options: &HashMap<String, String>,
+) -> ConnectorResult<()> {
+    let value_capture_type = options
+        .get("value_capture_type")
+        .map(|v| normalize_option_value(v))
+        .unwrap_or_else(|| DEFAULT_VALUE_CAPTURE_TYPE.to_owned());
+    if !SUPPORTED_VALUE_CAPTURE_TYPES.contains(&value_capture_type.as_str()) {
+        bail!(
+            "change stream '{}' uses value_capture_type '{}', which is not supported: it omits \
+             unmodified columns on UPDATE. Use one of {:?}, e.g. \
+             ALTER CHANGE STREAM {} SET OPTIONS (value_capture_type = 'NEW_ROW')",
+            change_stream_name,
+            value_capture_type,
+            SUPPORTED_VALUE_CAPTURE_TYPES,
+            change_stream_name,
+        );
+    }
+
+    // Streams in MUTABLE_KEY_RANGE mode return a different record model
+    // (PartitionStart/End/Event records instead of ChildPartitionsRecord). An absent
+    // option means IMMUTABLE_KEY_RANGE, the model this reader implements.
+    if let Some(partition_mode) = options
+        .get("partition_mode")
+        .map(|v| normalize_option_value(v))
+        && partition_mode != "IMMUTABLE_KEY_RANGE"
+    {
+        bail!(
+            "change stream '{}' uses partition_mode '{}', which is not supported; only \
+             IMMUTABLE_KEY_RANGE change streams can be read",
+            change_stream_name,
+            partition_mode,
+        );
+    }
+    Ok(())
+}
+
+/// Option values are compared case-insensitively, as Beam's `SpannerIO` does, since the
+/// stored spelling is not documented.
+fn normalize_option_value(value: &str) -> String {
+    value.trim().to_ascii_uppercase()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn options(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn test_value_capture_type() {
+        for capture in ["NEW_ROW", "NEW_ROW_AND_OLD_VALUES", "new_row"] {
+            validate_change_stream_options("s", &options(&[("value_capture_type", capture)]))
+                .unwrap_or_else(|e| panic!("{capture} should be accepted: {e}"));
+        }
+        for capture in ["OLD_AND_NEW_VALUES", "NEW_VALUES"] {
+            let err =
+                validate_change_stream_options("s", &options(&[("value_capture_type", capture)]))
+                    .unwrap_err();
+            assert!(err.to_string().contains(capture), "unexpected error: {err}");
+        }
+        // No option row means Spanner's default, `OLD_AND_NEW_VALUES`.
+        let err = validate_change_stream_options("s", &options(&[])).unwrap_err();
+        assert!(
+            err.to_string().contains("OLD_AND_NEW_VALUES"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_partition_mode() {
+        let ok = [("value_capture_type", "NEW_ROW")];
+        validate_change_stream_options("s", &options(&ok)).unwrap();
+        validate_change_stream_options(
+            "s",
+            &options(&[ok[0], ("partition_mode", "IMMUTABLE_KEY_RANGE")]),
+        )
+        .unwrap();
+
+        let err = validate_change_stream_options(
+            "s",
+            &options(&[ok[0], ("partition_mode", "MUTABLE_KEY_RANGE")]),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("MUTABLE_KEY_RANGE"),
+            "unexpected error: {err}"
+        );
     }
 }
