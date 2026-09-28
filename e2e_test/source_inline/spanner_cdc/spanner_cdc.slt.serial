@@ -89,6 +89,33 @@ CREATE SOURCE spanner_source WITH (
     auto.schema.change = 'true'
 );
 
+# A change stream that watches only some columns cannot back a table that has the
+# others: an unwatched column would be overwritten with NULL on every update.
+system ok
+e2e_test/source_inline/spanner_cdc/prepare-data.rs ddl "CREATE CHANGE STREAM partial_columns_stream FOR users(name) OPTIONS (value_capture_type = 'NEW_ROW')"
+
+statement ok
+CREATE SOURCE s WITH (
+    ${RISEDEV_SPANNER_WITH_OPTIONS_COMMON},
+    spanner.change_stream.name = 'partial_columns_stream'
+);
+
+statement error change stream 'partial_columns_stream' does not watch columns
+CREATE TABLE t_users_partial (*) FROM s TABLE 'users';
+
+statement error change stream 'partial_columns_stream' does not watch table 'products'
+CREATE TABLE t_products_partial (*) FROM s TABLE 'products';
+
+# A table with only the watched columns is accepted; the key is always watched.
+statement ok
+CREATE TABLE t_users_partial (id varchar primary key, name varchar) FROM s TABLE 'users';
+
+statement ok
+DROP SOURCE s CASCADE;
+
+system ok
+e2e_test/source_inline/spanner_cdc/prepare-data.rs ddl "DROP CHANGE STREAM partial_columns_stream"
+
 # =============================================================================
 # PART 4: DEFAULT BACKFILL - users table (STRING PK)
 # backfill.parallelism omitted → defaults to 1 (Spanner always uses backfill v2)

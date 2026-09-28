@@ -1519,6 +1519,12 @@ pub(super) async fn handle_create_table_plan(
             // corrupts downstream (UPDATE turns into a fresh INSERT, DELETE no-ops). Plain
             // (non-CDC) tables don't hit this check.
             reject_pk_filtered_by_debezium_column_filter(&pk_names, &cdc_with_options)?;
+            Box::pin(check_cdc_table_change_capture(
+                &cdc_with_options,
+                &columns,
+                &pk_names,
+            ))
+            .await?;
 
             let context: OptimizerContextRef =
                 OptimizerContext::new(handler_args, explain_options).into();
@@ -1703,6 +1709,34 @@ async fn bind_cdc_table_schema_externally(
         pk_names,
         pk_comparisons,
     ))
+}
+
+/// Reject a CDC table whose columns the upstream does not fully capture, and tell the user
+/// about upstream filters that drop some changes. Only Spanner change streams can capture a
+/// subset of tables and columns; for other connectors this is a no-op.
+async fn check_cdc_table_change_capture(
+    cdc_with_options: &WithOptionsSecResolved,
+    columns: &[ColumnCatalog],
+    pk_names: &[String],
+) -> Result<()> {
+    let (options, secret_refs) = cdc_with_options.clone().into_parts();
+    let config = ExternalTableConfig::try_from_btreemap(options, secret_refs)
+        .context("failed to extract external table config")?;
+    let column_names = columns
+        .iter()
+        .filter(|c| !c.is_generated())
+        .map(|c| c.name().to_owned())
+        .collect_vec();
+    let notices = Box::pin(ExternalTableImpl::check_change_capture(
+        &config,
+        &column_names,
+        pk_names,
+    ))
+    .await?;
+    for notice in notices {
+        notice_to_user(notice);
+    }
+    Ok(())
 }
 
 async fn bind_cdc_pk_comparisons_externally(

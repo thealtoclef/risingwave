@@ -396,6 +396,10 @@ pub struct ExternalTableConfig {
     #[serde(default)]
     pub spanner_databoost_enabled: bool,
 
+    /// Change stream the Spanner CDC source reads, used to check that it watches the table
+    #[serde(rename = "spanner.change_stream.name")]
+    pub spanner_change_stream_name: Option<String>,
+
     // Dedicated snapshot endpoint (Postgres CDC only). All optional; falls back to primary.
     #[serde(rename = "snapshot.hostname")]
     pub snapshot_host: Option<String>,
@@ -776,6 +780,28 @@ impl ExternalTableImpl {
     /// modes in the requested `pk_names` order, with case-insensitive name matching and
     /// an error for missing upstream PK names. Other connectors return `Native` for
     /// every requested name without querying upstream.
+    /// Check that the upstream delivers every change to `column_names` of the table.
+    ///
+    /// Returns notices for upstream settings that drop some changes by design. Only Spanner
+    /// CDC can filter what it captures per table and column; other connectors return nothing.
+    pub async fn check_change_capture(
+        config: &ExternalTableConfig,
+        column_names: &[String],
+        pk_names: &[String],
+    ) -> ConnectorResult<Vec<String>> {
+        if config.connector != "spanner-cdc" {
+            return Ok(vec![]);
+        }
+        Box::pin(
+            crate::source::cdc::external::spanner::check_change_stream_capture(
+                config,
+                column_names,
+                pk_names,
+            ),
+        )
+        .await
+    }
+
     pub async fn discover_pk_column_comparisons(
         config: &ExternalTableConfig,
         pk_names: &[String],

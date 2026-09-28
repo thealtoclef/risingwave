@@ -150,7 +150,7 @@ const DEFAULT_VALUE_CAPTURE_TYPE: &str = "OLD_AND_NEW_VALUES";
 ///
 /// `INFORMATION_SCHEMA.CHANGE_STREAM_OPTIONS` only has rows for options that were set;
 /// an absent option takes Spanner's default.
-async fn fetch_change_stream_options(
+pub(crate) async fn fetch_change_stream_options(
     client: &DatabaseClient,
     change_stream_name: &str,
 ) -> ConnectorResult<HashMap<String, String>> {

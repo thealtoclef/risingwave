@@ -33,6 +33,9 @@ fn get_database() -> String {
     get_env_or_default("SPANNER_DATABASE", "test-database")
 }
 const STREAM: &str = "test_stream";
+/// Watches only some columns (`users(name)`), for checking that CREATE TABLE rejects
+/// columns the change stream does not watch.
+const PARTIAL_COLUMNS_STREAM: &str = "partial_columns_stream";
 
 /// Check if we're using emulator (SPANNER_EMULATOR_HOST is set)
 fn is_using_emulator() -> bool {
@@ -171,7 +174,9 @@ async fn main() -> anyhow::Result<()> {
         "cleanup" => {
             println!("Cleaning up Spanner resources...");
             println!("  Dropping change stream if exists...");
-            let _ = execute_ddl(&format!("DROP CHANGE STREAM IF EXISTS {}", STREAM)).await;
+            for stream in [STREAM, PARTIAL_COLUMNS_STREAM] {
+                let _ = execute_ddl(&format!("DROP CHANGE STREAM IF EXISTS {}", stream)).await;
+            }
             println!("  Dropping tables if exist...");
             for table in &["arrays", "orders", "inventory", "products", "users"] {
                 let _ = execute_ddl(&format!("DROP TABLE IF EXISTS {}", table)).await;

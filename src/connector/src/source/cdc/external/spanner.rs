@@ -32,6 +32,7 @@
 //! losing data — and (2) risk exceeding Spanner's `version_retention_period` on
 //! long backfills.
 
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 
 use anyhow::{Context, anyhow};
@@ -233,6 +234,198 @@ impl SpannerExternalTable {
     pub fn table_name(&self) -> &str {
         &self.table_name
     }
+}
+
+// ---------------------------------------------------------------------------
+// Change stream coverage
+// ---------------------------------------------------------------------------
+
+/// The columns of one table a change stream watches. Key columns are always watched.
+enum WatchedColumns {
+    /// The stream watches the whole table, including columns added later.
+    All,
+    /// The stream watches only these non-key columns, compared case-insensitively
+    /// because Spanner identifiers are case-insensitive.
+    Only(HashSet<String>),
+}
+
+/// Check that the source's change stream delivers every change the CDC table needs.
+///
+/// A change stream can watch a subset of tables and columns. A table the stream does not
+/// watch never receives a change after backfill. For a column the stream does not watch, a
+/// `NEW_ROW` record carries no value, so each update overwrites the column with NULL. Both
+/// are rejected. Filter options that drop some changes by design are returned as notices.
+pub(crate) async fn check_change_stream_capture(
+    config: &ExternalTableConfig,
+    column_names: &[String],
+    pk_names: &[String],
+) -> ConnectorResult<Vec<String>> {
+    let Some(stream) = config.spanner_change_stream_name.as_deref() else {
+        return Ok(vec![]);
+    };
+    let client = create_spanner_client(
+        &config.spanner_project,
+        &config.spanner_instance,
+        &config.database,
+        config.emulator_host.as_deref(),
+        config.credentials.as_deref(),
+        config.credentials_path.as_deref(),
+    )
+    .await?;
+
+    let watched = Box::pin(fetch_watched_columns(&client, stream, &config.table)).await?;
+    check_watched_columns(
+        stream,
+        &config.table,
+        watched.as_ref(),
+        column_names,
+        pk_names,
+    )?;
+
+    let options =
+        crate::source::spanner_cdc::enumerator::fetch_change_stream_options(&client, stream)
+            .await?;
+    Ok(change_stream_filter_notices(stream, &options))
+}
+
+/// Read what `stream` watches of `table`, or `None` if it does not watch the table.
+async fn fetch_watched_columns(
+    client: &DatabaseClient,
+    stream: &str,
+    table: &str,
+) -> ConnectorResult<Option<WatchedColumns>> {
+    let stmt = Statement::builder(
+        "SELECT `ALL` FROM INFORMATION_SCHEMA.CHANGE_STREAMS WHERE CHANGE_STREAM_NAME = @s",
+    )
+    .add_param("s", stream)
+    .build();
+    let mut rows = client
+        .single_use()
+        .build()
+        .execute_query(stmt)
+        .await
+        .context("change stream query")?;
+    let Some(row) = rows.next().await.transpose().context("change stream row")? else {
+        bail!("change stream '{}' does not exist", stream);
+    };
+    let watches_all: bool = row.try_get(0).context("ALL")?;
+    if watches_all {
+        return Ok(Some(WatchedColumns::All));
+    }
+
+    let stmt = Statement::builder(
+        "SELECT ALL_COLUMNS FROM INFORMATION_SCHEMA.CHANGE_STREAM_TABLES \
+         WHERE CHANGE_STREAM_NAME = @s AND TABLE_NAME = @t",
+    )
+    .add_param("s", stream)
+    .add_param("t", table)
+    .build();
+    let mut rows = client
+        .single_use()
+        .build()
+        .execute_query(stmt)
+        .await
+        .context("change stream table query")?;
+    let Some(row) = rows
+        .next()
+        .await
+        .transpose()
+        .context("change stream table row")?
+    else {
+        return Ok(None);
+    };
+    let all_columns: bool = row.try_get(0).context("ALL_COLUMNS")?;
+    if all_columns {
+        return Ok(Some(WatchedColumns::All));
+    }
+
+    let stmt = Statement::builder(
+        "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.CHANGE_STREAM_COLUMNS \
+         WHERE CHANGE_STREAM_NAME = @s AND TABLE_NAME = @t",
+    )
+    .add_param("s", stream)
+    .add_param("t", table)
+    .build();
+    let mut rows = client
+        .single_use()
+        .build()
+        .execute_query(stmt)
+        .await
+        .context("change stream column query")?;
+    let mut columns = HashSet::new();
+    while let Some(row) = rows
+        .next()
+        .await
+        .transpose()
+        .context("change stream column row")?
+    {
+        let name: String = row.try_get(0).context("COLUMN_NAME")?;
+        columns.insert(name.to_lowercase());
+    }
+    Ok(Some(WatchedColumns::Only(columns)))
+}
+
+fn check_watched_columns(
+    stream: &str,
+    table: &str,
+    watched: Option<&WatchedColumns>,
+    column_names: &[String],
+    pk_names: &[String],
+) -> ConnectorResult<()> {
+    let Some(watched) = watched else {
+        bail!(
+            "change stream '{}' does not watch table '{}', so the table would never receive \
+             changes after backfill. Add the table to the change stream",
+            stream,
+            table,
+        );
+    };
+    let WatchedColumns::Only(watched) = watched else {
+        return Ok(());
+    };
+    let unwatched: Vec<&str> = column_names
+        .iter()
+        .filter(|c| !pk_names.iter().any(|pk| pk.eq_ignore_ascii_case(c)))
+        .filter(|c| !watched.contains(&c.to_lowercase()))
+        .map(String::as_str)
+        .collect();
+    if !unwatched.is_empty() {
+        bail!(
+            "change stream '{}' does not watch columns {:?} of table '{}': every update would \
+             overwrite them with NULL. Watch the whole table in the change stream, or leave \
+             these columns out of the table definition",
+            stream,
+            unwatched,
+            table,
+        );
+    }
+    Ok(())
+}
+
+/// Notices for change stream options that leave some upstream changes out of the table.
+fn change_stream_filter_notices(stream: &str, options: &HashMap<String, String>) -> Vec<String> {
+    const FILTERS: [(&str, &str); 5] = [
+        ("exclude_insert", "inserts are not applied to the table"),
+        ("exclude_update", "updates are not applied to the table"),
+        ("exclude_delete", "deletes are not applied to the table"),
+        (
+            "exclude_ttl_deletes",
+            "rows deleted by a TTL policy stay in the table",
+        ),
+        (
+            "allow_txn_exclusion",
+            "transactions written with exclude_txn_from_change_streams are not applied to the table",
+        ),
+    ];
+    FILTERS
+        .iter()
+        .filter(|(option, _)| {
+            options
+                .get(*option)
+                .is_some_and(|v| v.trim().eq_ignore_ascii_case("true"))
+        })
+        .map(|(option, effect)| format!("change stream '{stream}' sets {option}: {effect}"))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1478,6 +1671,58 @@ mod tests {
             spanner_type_to_rw_type("ARRAY<INT64>").unwrap(),
             DataType::List(_)
         ));
+    }
+
+    #[test]
+    fn test_check_watched_columns() {
+        let names = |cols: &[&str]| cols.iter().map(|c| (*c).to_owned()).collect::<Vec<_>>();
+        let columns = names(&["id", "name", "Email"]);
+        let pk = names(&["id"]);
+        let check = |watched: Option<&WatchedColumns>, columns: &[String]| {
+            check_watched_columns("s", "users", watched, columns, &pk)
+        };
+
+        check(Some(&WatchedColumns::All), &columns).unwrap();
+        // Key columns are always watched and never listed; names match case-insensitively.
+        let both = WatchedColumns::Only(["name".to_owned(), "email".to_owned()].into());
+        check(Some(&both), &columns).unwrap();
+
+        let err = check(None, &columns).unwrap_err();
+        assert!(
+            err.to_string().contains("does not watch table 'users'"),
+            "{err}"
+        );
+
+        let name_only = WatchedColumns::Only(["name".to_owned()].into());
+        let err = check(Some(&name_only), &columns).unwrap_err();
+        assert!(err.to_string().contains(r#"["Email"]"#), "{err}");
+        // A table defined with only the watched columns is fine.
+        check(Some(&name_only), &names(&["id", "name"])).unwrap();
+    }
+
+    #[test]
+    fn test_change_stream_filter_notices() {
+        let options = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect::<HashMap<_, _>>()
+        };
+        assert!(
+            change_stream_filter_notices("s", &options(&[("value_capture_type", "NEW_ROW")]))
+                .is_empty()
+        );
+        assert!(
+            change_stream_filter_notices("s", &options(&[("exclude_delete", "false")])).is_empty()
+        );
+
+        let notices = change_stream_filter_notices(
+            "s",
+            &options(&[("exclude_delete", "TRUE"), ("exclude_ttl_deletes", "true")]),
+        );
+        assert_eq!(notices.len(), 2, "{notices:?}");
+        assert!(notices[0].contains("exclude_delete"), "{notices:?}");
+        assert!(notices[1].contains("exclude_ttl_deletes"), "{notices:?}");
     }
 
     #[test]
