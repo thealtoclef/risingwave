@@ -53,8 +53,10 @@ use risingwave_common::metrics::GLOBAL_ERROR_METRICS;
 use risingwave_common::metrics::{LabelGuardedIntCounter, LabelGuardedIntGauge};
 use risingwave_common::{bail, ensure};
 use risingwave_pb::connector_service::{SourceType, cdc_message};
+use thiserror_ext::AsReport;
 use time::OffsetDateTime;
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tokio_retry::strategy::{ExponentialBackoff, jitter};
 
 use super::{ChangeRecordContext, build_source_message};
@@ -85,6 +87,8 @@ const PARSED_CHUNK_CHANNEL_SIZE: usize = 8;
 pub struct SpannerCdcSplitReader {
     /// Receives batches of `SourceMessage` from the background reader task.
     rx: mpsc::Receiver<Vec<SourceMessage>>,
+    /// The background reader task, awaited for its error once `rx` closes.
+    reader_task: JoinHandle<Result<()>>,
     parser_config: ParserConfig,
     source_ctx: SourceContextRef,
 }
@@ -136,16 +140,13 @@ impl SplitReader for SpannerCdcSplitReader {
         };
 
         // Spawn background task — like Debezium spawns the JNI thread
-        tokio::spawn(async move {
-            if let Err(e) = run_reader(ctx, tx).await {
-                tracing::error!(error = %e, "Spanner CDC reader task failed");
-            }
-        });
+        let reader_task = tokio::spawn(run_reader(ctx, tx));
 
         tracing::info!(source_id, "Spanner CDC reader started");
 
         Ok(Self {
             rx,
+            reader_task,
             parser_config,
             source_ctx,
         })
@@ -237,7 +238,12 @@ impl SpannerCdcSplitReader {
             self.source_ctx.source_name.clone(),
             self.source_ctx.fragment_id.to_string(),
         ]);
-        bail!("Spanner CDC reader channel closed");
+        // The channel closes once the task drops its senders, so surface why it ended.
+        match self.reader_task.await {
+            Ok(Ok(())) => bail!("Spanner CDC reader channel closed"),
+            Ok(Err(e)) => return Err(e),
+            Err(e) => bail!("Spanner CDC reader task failed: {}", e.as_report()),
+        }
     }
 }
 
@@ -1289,7 +1295,7 @@ async fn execute_query(
 
     // The query has no end timestamp, so it ends only once the partition has named the
     // partitions that take over its key range. Ending without them would leave that range
-    // unread for good; fail instead, as Debezium's Spanner connector does.
+    // unread for good; fail the query so it is retried, as Debezium's Spanner connector does.
     if !saw_child_partitions {
         reader_metrics.record_failure(QueryFailure::NoChildPartitions);
         return Err(anyhow::anyhow!(
@@ -1580,6 +1586,49 @@ mod tests {
                 .collect()
                 .await;
         assert!(chunks.is_empty());
+    }
+
+    fn test_split_reader(reader_task: JoinHandle<Result<()>>) -> SpannerCdcSplitReader {
+        // The sender is dropped at once, as when the reader task has exited.
+        let (_, rx) = mpsc::channel(1);
+        SpannerCdcSplitReader {
+            rx,
+            reader_task,
+            parser_config: ParserConfig::default(),
+            source_ctx: Arc::new(crate::source::SourceContext::dummy()),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_data_stream_returns_reader_task_error() {
+        let reader = test_split_reader(tokio::spawn(async {
+            Err(anyhow::anyhow!("partition query failed").into())
+        }));
+        let err = std::pin::pin!(reader.into_data_stream())
+            .next()
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            err.to_report_string().contains("partition query failed"),
+            "{}",
+            err.as_report()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_data_stream_reports_reader_task_panic() {
+        let reader = test_split_reader(tokio::spawn(async { panic!("reader bug") }));
+        let err = std::pin::pin!(reader.into_data_stream())
+            .next()
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            err.to_report_string().contains("reader bug"),
+            "{}",
+            err.as_report()
+        );
     }
 
     /// `offset_bounds` reads both ends of one `BTreeMap` iterator, so the
