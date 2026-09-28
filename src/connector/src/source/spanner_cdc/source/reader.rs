@@ -1019,49 +1019,14 @@ async fn read_partition(
 
     tracing::info!(%split_id, %start_ts, partition_token = ?split.partition_token, "change stream query starting");
 
-    if retry_attempts == 0 {
-        let stmt = Statement::builder(&sql)
-            .add_typed_param("start_timestamp", start_ts, types::timestamp())
-            .add_typed_param(
-                "end_timestamp",
-                Option::<OffsetDateTime>::None,
-                types::timestamp(),
-            )
-            .add_typed_param("partition_token", &split.partition_token, types::string())
-            .add_typed_param(
-                "heartbeat_milliseconds",
-                heartbeat_interval_ms,
-                types::int64(),
-            )
-            .build();
-        return Box::pin(execute_query(
-            &client,
-            &stmt,
-            &mut split,
-            &split_id,
-            &database,
-            &offsets,
-            &shared_schema,
-            &tx,
-            &child_discovery_tx,
-            &change_stream_name,
-            stall_timeout,
-            &reader_metrics,
-        ))
-        .await;
-    }
+    let mut retry = RetryBudget::new(
+        retry_attempts,
+        retry_backoff,
+        retry_backoff_max_delay_ms,
+        retry_backoff_factor,
+    );
 
-    let retry_strategy = ExponentialBackoff::from_millis(retry_backoff.as_millis() as u64)
-        .max_delay(tokio::time::Duration::from_millis(
-            retry_backoff_max_delay_ms,
-        ))
-        .factor(retry_backoff_factor)
-        .take(retry_attempts as usize)
-        .map(jitter);
-
-    let mut last_error = None;
-
-    for (attempt, delay) in retry_strategy.enumerate() {
+    loop {
         let resume_ts = split
             .offset
             .expect("offset validated at entry and only advanced by advance_offset");
@@ -1079,7 +1044,7 @@ async fn read_partition(
                 types::int64(),
             )
             .build();
-        match Box::pin(execute_query(
+        let Err(e) = Box::pin(execute_query(
             &client,
             &stmt,
             &mut split,
@@ -1094,29 +1059,29 @@ async fn read_partition(
             &reader_metrics,
         ))
         .await
-        {
-            Ok(()) => return Ok(()),
-            Err(e) => {
-                let will_retry = attempt + 1 < retry_attempts as usize;
-                tracing::warn!(
-                    %split_id,
-                    attempt = attempt + 1,
-                    max_attempts = retry_attempts,
-                    ?delay,
-                    error = %e,
-                    resume_ts = ?resume_ts,
-                    will_retry,
-                    "query failed"
-                );
-                last_error = Some(e);
-                if !will_retry {
-                    break;
-                }
-                tokio::time::sleep(delay).await;
-            }
-        }
+        else {
+            return Ok(());
+        };
+
+        // Retention only moves forward, so an expired start timestamp never recovers.
+        let retryable = e.0.downcast_ref::<StartBeforeRetention>().is_none();
+        let delay = retry.on_failure(split.offset > Some(resume_ts), retryable);
+        let will_retry = delay.is_some();
+        tracing::warn!(
+            %split_id,
+            consecutive_failures = retry.failures,
+            max_attempts = retry_attempts,
+            ?delay,
+            error = %e,
+            resume_ts = ?resume_ts,
+            will_retry,
+            "query failed"
+        );
+        let Some(delay) = delay else {
+            return Err(e);
+        };
+        tokio::time::sleep(delay).await;
     }
-    Err(last_error.expect("loop body sets last_error on each failed attempt"))
 }
 
 #[expect(clippy::too_many_arguments)]
@@ -1141,6 +1106,9 @@ async fn execute_query(
             Ok(Ok(rs)) => rs,
             Ok(Err(e)) => {
                 reader_metrics.record_failure(QueryFailure::Query);
+                if let Some(expired) = StartBeforeRetention::from_spanner(&e, split) {
+                    return Err(anyhow::Error::new(expired).into());
+                }
                 return Err(anyhow::anyhow!("failed to execute query: {}", e).into());
             }
             Err(_) => {
@@ -1161,6 +1129,9 @@ async fn execute_query(
             Ok(Some(Ok(row))) => row,
             Ok(Some(Err(e))) => {
                 reader_metrics.record_failure(QueryFailure::Row);
+                if let Some(expired) = StartBeforeRetention::from_spanner(&e, split) {
+                    return Err(anyhow::Error::new(expired).into());
+                }
                 return Err(anyhow::anyhow!("failed to get next row: {}", e).into());
             }
             Ok(None) => break, // result set exhausted
@@ -1315,6 +1286,81 @@ async fn execute_query(
 
     tracing::info!(%split_id, final_offset = ?split.offset, "change stream result set exhausted");
     Ok(())
+}
+
+/// Retry budget for one partition's change stream queries.
+///
+/// `max_attempts` bounds back-to-back failures, not failures over the partition's
+/// lifetime: a query that advanced the offset before failing resets the count and the
+/// backoff, so a long-lived partition is not failed by scattered transient errors.
+/// Values 0 and 1 both mean a single attempt.
+struct RetryBudget {
+    max_attempts: u32,
+    failures: u32,
+    initial_backoff: Backoff,
+    backoff: Backoff,
+}
+
+type Backoff = std::iter::Map<ExponentialBackoff, fn(std::time::Duration) -> std::time::Duration>;
+
+impl RetryBudget {
+    fn new(max_attempts: u32, base: std::time::Duration, max_delay_ms: u64, factor: u64) -> Self {
+        let initial_backoff = ExponentialBackoff::from_millis(base.as_millis() as u64)
+            .max_delay(std::time::Duration::from_millis(max_delay_ms))
+            .factor(factor)
+            .map(jitter as fn(_) -> _);
+        Self {
+            max_attempts,
+            failures: 0,
+            backoff: initial_backoff.clone(),
+            initial_backoff,
+        }
+    }
+
+    /// Count a failed query; returns the delay before the next attempt, or `None` to
+    /// give up.
+    fn on_failure(&mut self, made_progress: bool, retryable: bool) -> Option<std::time::Duration> {
+        if made_progress {
+            self.failures = 0;
+            self.backoff = self.initial_backoff.clone();
+        }
+        self.failures += 1;
+        if !retryable || self.failures >= self.max_attempts {
+            return None;
+        }
+        Some(self.backoff.next().expect("backoff is unbounded"))
+    }
+}
+
+/// Spanner rejected a query because its start timestamp is older than the change
+/// stream's retention period. The emulator reports this as `OUT_OF_RANGE` with
+/// "Specified `start_timestamp` is too far in the past"; any other wording falls back
+/// to the generic, retried query error.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "partition {partition_token:?} cannot resume from {start_ts}, which is older than the \
+     change stream's retention period: changes between that time and the oldest retained \
+     change are lost. Recreate the source and its tables to take a new snapshot. \
+     Spanner: {message}"
+)]
+struct StartBeforeRetention {
+    partition_token: Option<String>,
+    start_ts: OffsetDateTime,
+    message: String,
+}
+
+impl StartBeforeRetention {
+    fn from_spanner(e: &google_cloud_spanner::Error, split: &SpannerCdcSplit) -> Option<Self> {
+        let status = e.status()?;
+        if status.code.name() != "OUT_OF_RANGE" || !status.message.contains("too far in the past") {
+            return None;
+        }
+        Some(Self {
+            partition_token: split.partition_token.clone(),
+            start_ts: split.offset?,
+            message: status.message.clone(),
+        })
+    }
 }
 
 /// Reject a record whose value capture type omits unmodified columns on UPDATE.
@@ -1517,6 +1563,33 @@ mod tests {
 
         offsets.remove(&Some("C".to_owned()));
         assert_eq!(offsets.watermark(), None);
+    }
+
+    #[test]
+    fn test_retry_budget_counts_consecutive_failures() {
+        let new = |max| RetryBudget::new(max, std::time::Duration::from_millis(1), 10, 2);
+
+        let mut retry = new(3);
+        assert!(retry.on_failure(false, true).is_some());
+        assert!(retry.on_failure(false, true).is_some());
+        assert!(retry.on_failure(false, true).is_none());
+
+        // A failure after progress starts a new run of failures.
+        let mut retry = new(3);
+        assert!(retry.on_failure(false, true).is_some());
+        assert!(retry.on_failure(false, true).is_some());
+        assert!(retry.on_failure(true, true).is_some());
+        assert_eq!(retry.failures, 1);
+        assert!(retry.on_failure(false, true).is_some());
+        assert!(retry.on_failure(false, true).is_none());
+
+        // A non-retryable error gives up at once.
+        assert!(new(3).on_failure(false, false).is_none());
+        assert!(new(3).on_failure(true, false).is_none());
+
+        // 0 and 1 both mean a single attempt.
+        assert!(new(0).on_failure(false, true).is_none());
+        assert!(new(1).on_failure(false, true).is_none());
     }
 
     fn make_child(token: &str, parents: Vec<&str>, offset: OffsetDateTime) -> SpannerCdcSplit {

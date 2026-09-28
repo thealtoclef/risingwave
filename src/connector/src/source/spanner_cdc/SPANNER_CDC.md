@@ -245,7 +245,7 @@ PartitionOffsets (shared via Arc<Mutex<HashMap>>):
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `spanner.retry_attempts` | `3` | Number of retry attempts |
+| `spanner.retry_attempts` | `5` | Attempts per run of back-to-back query failures; a query that made progress before failing resets the count. `0` and `1` both mean a single attempt |
 | `spanner.retry_backoff_ms` | `1000` | Base backoff interval in milliseconds |
 | `spanner.retry_backoff_max_delay_ms` | `10000` | Maximum backoff delay in milliseconds |
 | `spanner.retry_backoff_factor` | `2` | Multiplier for each retry (doubles each time) |
@@ -648,15 +648,26 @@ export GOOGLE_APPLICATION_CREDENTIALS="<path-to-service-account.json>"
 
 ### Retry with Exponential Backoff
 
-Configurable retry logic for transient failures:
+Each partition retries failed change stream queries from its own offset:
 
 ```rust
 // Default configuration
-retry_attempts: 3
+retry_attempts: 5
 retry_backoff_ms: 1000         // 1 second base
 retry_backoff_max_delay_ms: 10000  // 10 seconds max
-retry_backoff_factor: 2        // Doubles each retry
+retry_backoff_factor: 2
 ```
+
+- The budget counts back-to-back failures only. When a failed query had advanced the
+  partition's offset (a record or heartbeat arrived), the count and backoff start over, so
+  a long-lived partition is not failed by occasional transient errors spread over days.
+- A start timestamp older than the change stream's retention period is not retried (see
+  "start timestamp older than retention" below).
+- Once the budget runs out the reader fails and the source restarts every partition from
+  the checkpoint watermark.
+- `tokio-retry`'s `ExponentialBackoff` grows by powers of `retry_backoff_ms`, not of
+  `retry_backoff_factor`: with the defaults the delays are 2 s, then the 10 s cap. Each delay
+  is jittered to a random value below it.
 
 ### Log Levels
 
@@ -770,6 +781,16 @@ Set `spanner.credentials` or `spanner.credentials_path`, or set `spanner.emulato
   unsupported capture type, in case the stream is altered after the source is created.
 - `partition_mode` must be unset or `IMMUTABLE_KEY_RANGE`. `MUTABLE_KEY_RANGE` streams use
   a different record model (partition start/end/event records) that is not implemented.
+
+### "cannot resume from ..., which is older than the change stream's retention period"
+
+The source was stopped (or stuck) for longer than the change stream's `retention_period`, so
+its checkpoint is older than the oldest change Spanner still keeps. Spanner rejects the query
+with `OUT_OF_RANGE` ("Specified start_timestamp is too far in the past"), which the reader
+fails on without retrying. Changes between the checkpoint and the oldest retained change are
+lost; recreate the source and its tables to take a new snapshot, and consider a longer
+`retention_period`. This wording was observed on the emulator; if production Spanner words it
+differently, the reader falls back to retrying and failing with Spanner's message.
 
 ### "change stream does not exist"
 
