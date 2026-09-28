@@ -1184,25 +1184,17 @@ async fn execute_query(
 
                 // Schema evolution: emit schema change before data records,
                 // mimicking Debezium's Relation messages that precede DML events.
-                let schema_payload = shared_schema.lock().unwrap().check_and_evolve(
-                    &data_change.table_name,
-                    &data_change.column_types,
-                    commit_ts,
-                );
-                if let Some(schema_payload) = schema_payload {
-                    if !messages.is_empty() && tx.send(std::mem::take(&mut messages)).await.is_err()
-                    {
-                        return Ok(());
-                    }
-                    let schema_msg = make_schema_change_msg(
-                        split_id,
-                        schema_payload.json,
-                        data_change,
-                        offset_str,
-                    );
-                    if tx.send(vec![schema_msg]).await.is_err() {
-                        return Ok(());
-                    }
+                if !send_schema_change_if_evolved(
+                    shared_schema,
+                    tx,
+                    split_id,
+                    data_change,
+                    offset_str,
+                    &mut messages,
+                )
+                .await
+                {
+                    return Ok(());
                 }
 
                 // Column types and the rest of the record header are the same for every
@@ -1416,6 +1408,52 @@ impl OffsetStringCache {
         }
         &self.rendered
     }
+}
+
+/// Sends the schema change message for `data_change` if its columns evolve the table's
+/// schema, after flushing `messages`, which hold this partition's earlier rows.
+///
+/// The tracker records the new schema and the message enters the channel under one lock,
+/// through a channel slot reserved beforehand. A partition that then sees the new schema
+/// and skips emission can only send its rows after this message, so the parser applies
+/// the schema change before reading them.
+///
+/// Returns `false` if the receiver has been dropped.
+async fn send_schema_change_if_evolved(
+    shared_schema: &std::sync::Mutex<SchemaTracker>,
+    tx: &mpsc::Sender<Vec<SourceMessage>>,
+    split_id: &SplitId,
+    data_change: &crate::source::spanner_cdc::types::DataChangeRecord,
+    offset_str: &str,
+    messages: &mut Vec<SourceMessage>,
+) -> bool {
+    let table_name = &data_change.table_name;
+    let column_types = &data_change.column_types;
+    let commit_ts = data_change.commit_time();
+    if !shared_schema
+        .lock()
+        .unwrap()
+        .needs_emit(table_name, column_types, commit_ts)
+    {
+        return true;
+    }
+    if !messages.is_empty() && tx.send(std::mem::take(messages)).await.is_err() {
+        return false;
+    }
+    let Ok(permit) = tx.reserve().await else {
+        return false;
+    };
+    // Re-check under the lock: another partition may have emitted it while we waited.
+    let mut tracker = shared_schema.lock().unwrap();
+    if let Some(schema_payload) = tracker.check_and_evolve(table_name, column_types, commit_ts) {
+        permit.send(vec![make_schema_change_msg(
+            split_id,
+            schema_payload.json,
+            data_change,
+            offset_str,
+        )]);
+    }
+    true
 }
 
 fn make_schema_change_msg(
@@ -2256,5 +2294,87 @@ mod tests {
             closed.is_ok(),
             "channel should close after sibling tasks are aborted"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // send_schema_change_if_evolved: the tracker evolves only once the schema
+    // change is in the channel.
+    // -----------------------------------------------------------------------
+
+    fn test_data_change(
+        column_names: &[&str],
+        commit_ts: OffsetDateTime,
+    ) -> crate::source::spanner_cdc::types::DataChangeRecord {
+        use crate::source::spanner_cdc::types::{ColumnType, SpannerType, TypeCode};
+        crate::source::spanner_cdc::types::DataChangeRecord {
+            commit_timestamp: commit_ts,
+            record_sequence: "00000000".to_owned(),
+            server_transaction_id: "txn".to_owned(),
+            is_last_record_in_transaction_in_partition: true,
+            table_name: "t".to_owned(),
+            value_capture_type: "OLD_AND_NEW_VALUES".to_owned(),
+            column_types: column_names
+                .iter()
+                .map(|name| ColumnType {
+                    name: (*name).to_owned(),
+                    spanner_type: SpannerType::simple(TypeCode::String),
+                    is_primary_key: false,
+                    ordinal_position: 0,
+                })
+                .collect(),
+            mods: vec![],
+            mod_type: "INSERT".to_owned(),
+            number_of_records_in_transaction: 1,
+            number_of_partitions_in_transaction: 1,
+            transaction_tag: String::new(),
+            is_system_transaction: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_schema_change_in_channel_before_tracker_evolves() {
+        let tracker = Arc::new(std::sync::Mutex::new(SchemaTracker::new()));
+        let split_id = SplitId::from("0");
+        let old = test_data_change(&["id"], datetime!(2026-01-01 00:00:01 UTC));
+        let new = test_data_change(&["id", "note"], datetime!(2026-01-01 00:00:02 UTC));
+        tracker.lock().unwrap().check_and_evolve(
+            &old.table_name,
+            &old.column_types,
+            old.commit_time(),
+        );
+
+        // Fill the channel so partition A has to wait for a slot.
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.send(vec![]).await.unwrap();
+        let partition_a = tokio::spawn({
+            let (tracker, tx, split_id, new) =
+                (tracker.clone(), tx.clone(), split_id.clone(), new.clone());
+            async move {
+                send_schema_change_if_evolved(&tracker, &tx, &split_id, &new, "", &mut vec![]).await
+            }
+        });
+        tokio::task::yield_now().await;
+        assert!(!partition_a.is_finished());
+
+        // While A waits, partition B must not skip the schema change, or its rows with
+        // the new column would enter the channel first.
+        assert!(tracker.lock().unwrap().needs_emit(
+            &new.table_name,
+            &new.column_types,
+            new.commit_time(),
+        ));
+
+        assert!(rx.recv().await.unwrap().is_empty());
+        assert!(partition_a.await.unwrap());
+        let msgs = rx.recv().await.unwrap();
+        assert!(matches!(
+            &msgs[0].meta,
+            SourceMeta::DebeziumCdc(meta) if matches!(meta.msg_type, crate::source::cdc::CdcMessageType::SchemaChange)
+        ));
+        assert!(!tracker.lock().unwrap().needs_emit(
+            &new.table_name,
+            &new.column_types,
+            new.commit_time(),
+        ));
     }
 }

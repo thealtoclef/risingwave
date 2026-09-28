@@ -25,6 +25,10 @@
 //! used to distinguish real DDL evolution (newer timestamp → emit) from a stale partition
 //! seeing an older schema (older or equal timestamp → skip, adopt stored schema).
 //!
+//! The tracker must not record a new schema before its message is in the reader's channel,
+//! or another partition could skip emission and send rows with the new column first. The
+//! reader checks `needs_emit`, reserves a channel slot, then evolves and sends under the lock.
+//!
 //! Edge case: if two partitions see different schemas at the exact same commit timestamp,
 //! the first one to acquire the lock wins (`<=` check). This is safe because Spanner DDL
 //! produces records with the old schema at timestamps < `T_DDL` and the new schema at ≥ `T_DDL`,
@@ -76,54 +80,54 @@ impl SchemaTracker {
         }
     }
 
-    /// Check a data change record for schema changes.
+    /// Whether a record with `column_types` would make `check_and_evolve` emit a schema
+    /// change, without changing the tracker.
     ///
-    /// Returns `Some(SchemaChangePayload)` if a schema change should be emitted before
-    /// the data records, `None` otherwise.
+    /// The caller uses this to reserve a channel slot before the tracker changes, so the
+    /// emitted message is in the channel before any other partition sees the new schema.
     ///
     /// Comparison is done directly against `column_types` (no allocation on hot path).
     /// When the stored schema differs, the commit timestamp determines the action:
-    /// - Incoming timestamp > stored → real DDL evolution → emit + update.
+    /// - Incoming timestamp > stored → real DDL evolution → emit.
     /// - Incoming timestamp <= stored → stale partition → skip, adopt stored schema.
+    pub fn needs_emit(
+        &self,
+        table_name: &str,
+        column_types: &[ColumnType],
+        commit_timestamp: OffsetDateTime,
+    ) -> bool {
+        match self.schemas.get(table_name) {
+            // First encounter: emit and register.
+            None => true,
+            Some((stored, stored_ts)) => {
+                !schemas_equal_from_column_types(stored, column_types)
+                    && commit_timestamp > *stored_ts
+            }
+        }
+    }
+
+    /// Check a data change record for schema changes, and record the new schema if so.
+    ///
+    /// Returns `Some(SchemaChangePayload)` if a schema change should be emitted before
+    /// the data records, `None` otherwise. See `needs_emit` for the rules.
     pub fn check_and_evolve(
         &mut self,
         table_name: &str,
         column_types: &[ColumnType],
         commit_timestamp: OffsetDateTime,
     ) -> Option<SchemaChangePayload> {
-        match self.schemas.get(table_name) {
-            None => {
-                // First encounter: emit and register.
-                let columns: Vec<ColumnSchema> = column_types
-                    .iter()
-                    .map(ColumnSchema::from_column_type)
-                    .collect();
-                let payload = Self::make_payload(table_name, &columns, true);
-                self.schemas
-                    .insert(table_name.to_owned(), (columns, commit_timestamp));
-                Some(payload)
-            }
-            Some((stored, stored_ts)) => {
-                // Hot path: same schema → skip (no allocation).
-                if schemas_equal_from_column_types(stored, column_types) {
-                    return None;
-                }
-                // Schema differs. Check timestamp to distinguish DDL from stale partition.
-                if commit_timestamp <= *stored_ts {
-                    // Stale partition seeing an older schema. Skip emission.
-                    return None;
-                }
-                // Real schema evolution at a newer timestamp. Emit and update.
-                let columns: Vec<ColumnSchema> = column_types
-                    .iter()
-                    .map(ColumnSchema::from_column_type)
-                    .collect();
-                let payload = Self::make_payload(table_name, &columns, false);
-                self.schemas
-                    .insert(table_name.to_owned(), (columns, commit_timestamp));
-                Some(payload)
-            }
+        if !self.needs_emit(table_name, column_types, commit_timestamp) {
+            return None;
         }
+        let is_first = !self.schemas.contains_key(table_name);
+        let columns: Vec<ColumnSchema> = column_types
+            .iter()
+            .map(ColumnSchema::from_column_type)
+            .collect();
+        let payload = Self::make_payload(table_name, &columns, is_first);
+        self.schemas
+            .insert(table_name.to_owned(), (columns, commit_timestamp));
+        Some(payload)
     }
 
     /// Build a Debezium-compatible schema change JSON payload.
