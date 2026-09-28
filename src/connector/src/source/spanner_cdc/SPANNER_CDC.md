@@ -505,7 +505,7 @@ Spanner embeds `column_types` metadata in every `DataChangeRecord`. A shared `Sc
 DataChangeRecord arrives (contains column_types + commit_timestamp)
   │
   ├── Table not yet in registry (first encounter)?
-  │     → Emit schema change event (type: "CREATE")
+  │     → Emit schema change event (type: "ALTER")
   │     → Register schema + commit timestamp
   │
   └── Table already in registry?
@@ -531,9 +531,9 @@ The `mpsc` channel's backpressure ensures the data messages wait until the parse
 
 **First Encounter After Restart**
 
-The `SchemaTracker` is in-memory and resets on every restart. This means the first `DataChangeRecord` for each table after any startup or recovery triggers a schema change event (type: `"CREATE"`). The downstream parser skips `"CREATE"` events — the initial schema is established by the user's `CREATE TABLE` DDL. The registry is then populated, and subsequent records with the same schema are skipped without emission.
+The `SchemaTracker` is in-memory and resets on every restart, so the first `DataChangeRecord` for each table after any startup or recovery triggers a schema change event. It is emitted as `"ALTER"`, never `"CREATE"`: the downstream parser drops `"CREATE"` events, and the first record may already carry a column the RW table lacks — added while the reader was down, or while it was running but before the table's next write. Meta compares the full column list with the table, adds any new columns, and skips the change when there are none. The registry is then populated, and subsequent records with the same schema are skipped without emission.
 
-This design closes the **recovery gap**: if a schema change happened while the reader was down, the first record after restart will carry the new `column_types`, the registry will see it as a new schema, and the table will be updated automatically.
+The cost is one `auto_schema_change` round trip to meta per table after each restart, during which parsing pauses.
 
 ### Enabling Schema Evolution
 

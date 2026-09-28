@@ -119,12 +119,11 @@ impl SchemaTracker {
         if !self.needs_emit(table_name, column_types, commit_timestamp) {
             return None;
         }
-        let is_first = !self.schemas.contains_key(table_name);
         let columns: Vec<ColumnSchema> = column_types
             .iter()
             .map(ColumnSchema::from_column_type)
             .collect();
-        let payload = Self::make_payload(table_name, &columns, is_first);
+        let payload = Self::make_payload(table_name, &columns);
         self.schemas
             .insert(table_name.to_owned(), (columns, commit_timestamp));
         Some(payload)
@@ -132,12 +131,11 @@ impl SchemaTracker {
 
     /// Build a Debezium-compatible schema change JSON payload.
     ///
-    /// `is_first` distinguishes first-encounter registration from real schema evolution.
-    fn make_payload(
-        table_name: &str,
-        columns: &[ColumnSchema],
-        is_first: bool,
-    ) -> SchemaChangePayload {
+    /// The type is always `ALTER`, including on first encounter. The tracker starts empty
+    /// on every restart, so a first encounter may already carry columns the RW table lacks,
+    /// and the parser drops `CREATE` events. Meta diffs the full column list against the
+    /// table and skips the change when nothing is new.
+    fn make_payload(table_name: &str, columns: &[ColumnSchema]) -> SchemaChangePayload {
         let cols: Vec<serde_json::Value> = columns
             .iter()
             .map(|col| {
@@ -152,7 +150,7 @@ impl SchemaTracker {
             "ddl": "UNKNOWN_DDL",
             "tableChanges": [{
                 "id": table_name,
-                "type": if is_first { "CREATE" } else { "ALTER" },
+                "type": "ALTER",
                 "table": { "columns": cols },
             }],
         });
@@ -205,10 +203,14 @@ mod tests {
     }
 
     #[test]
-    fn first_encounter_emits() {
+    fn first_encounter_emits_alter() {
         let mut tracker = SchemaTracker::new();
         let cols = vec![col("id", TypeCode::Int64)];
-        assert!(tracker.check_and_evolve("t", &cols, ts(100)).is_some());
+        let payload = tracker.check_and_evolve("t", &cols, ts(100)).unwrap();
+        // The parser drops CREATE, so a first encounter must be an ALTER for meta to add
+        // columns the table gained before the reader started.
+        let json: serde_json::Value = serde_json::from_slice(&payload.json).unwrap();
+        assert_eq!(json["tableChanges"][0]["type"], "ALTER");
     }
 
     #[test]
