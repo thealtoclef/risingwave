@@ -487,9 +487,19 @@ impl PartitionOffsets {
         }
     }
 
-    /// Register a partition with its start offset.
+    /// Register a partition with its start offset. A no-op if the partition is
+    /// already registered: a child is registered first by the parent task that
+    /// reported it, then again by the lifecycle loop, and a merged child is
+    /// reported by every parent.
+    ///
+    /// Relies on a partition never being reported again after it finished and was
+    /// removed. That holds because a child starts only after all of its parents
+    /// finished, and a finished parent reports nothing more.
     fn register(&self, token: Option<String>, start_ts: OffsetDateTime) {
         let mut inner = self.inner.lock().unwrap();
+        if inner.offsets.contains_key(&token) {
+            return;
+        }
         inner.offsets.insert(token, start_ts);
         *inner.counts.entry(start_ts).or_insert(0) += 1;
     }
@@ -1270,6 +1280,13 @@ async fn execute_query(
             for cpr in &record.child_partitions_record {
                 let start_time = cpr.start_time();
                 for cp in &cpr.child_partitions {
+                    // Register the child's offset here, before this task can finish.
+                    // The lifecycle loop removes this partition's offset as soon as
+                    // the task completes, which may be before it drains the discovery
+                    // channel. Without this, the watermark would briefly exclude the
+                    // child and could jump past its start, and a checkpoint taken in
+                    // that window would skip the child's first records on recovery.
+                    offsets.register(Some(cp.token.clone()), start_time);
                     let child_split = SpannerCdcSplit::new_child(
                         cp.token.clone(),
                         cp.parent_partition_tokens.clone(),
@@ -1453,6 +1470,23 @@ mod tests {
         // The straggler finishing lifts the watermark to the next oldest.
         offsets.remove(&Some("a".to_owned()));
         assert_eq!(offsets.offset_bounds(), (Some(t1), Some(t2)));
+    }
+
+    /// Registering a partition twice must not double-count it, or removing it once
+    /// would leave a phantom entry pinning the watermark.
+    #[test]
+    fn test_register_is_idempotent() {
+        let offsets = PartitionOffsets::new();
+        let t1 = datetime!(2025-01-01 0:00 UTC);
+        let t2 = datetime!(2025-01-02 0:00 UTC);
+
+        offsets.register(Some("C".to_owned()), t1);
+        // A later registration neither double-counts nor moves the offset.
+        offsets.register(Some("C".to_owned()), t2);
+        assert_eq!(offsets.watermark(), Some(t1));
+
+        offsets.remove(&Some("C".to_owned()));
+        assert_eq!(offsets.watermark(), None);
     }
 
     fn make_child(token: &str, parents: Vec<&str>, offset: OffsetDateTime) -> SpannerCdcSplit {

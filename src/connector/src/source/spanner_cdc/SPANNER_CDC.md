@@ -201,6 +201,11 @@ PartitionOffsets (shared via Arc<Mutex<HashMap>>):
 - An unbounded mpsc channel (`child_discovery_tx`) sends discovered child partitions to the main loop
 - `HashMap<Option<String>, bool` tracks which partitions have finished
 - Children whose parents haven't finished wait in `deferred_children` until promoted
+- The parent task registers each child's offset (its `start_timestamp`) as soon as it
+  reads the `ChildPartitionsRecord`, before the parent can finish. Otherwise the
+  watermark could jump past the child's start between the parent's removal and the
+  main loop draining the discovery channel, and a checkpoint taken then would skip the
+  child's first records on recovery.
 
 ---
 
