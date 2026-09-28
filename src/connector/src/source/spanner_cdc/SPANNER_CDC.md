@@ -374,14 +374,15 @@ CREATE TABLE large_table FROM spanner_cdc_source TABLE 'large_table' WITH (
 
 ### Type Mapping Table
 
-All Spanner types are mapped to RisingWave types with **NO data loss**.
+All Spanner types are mapped to RisingWave types without data loss, except the non-finite
+float values described under [Limitations](#other-considerations).
 
 | Spanner Type | RisingWave Type | Notes |
 |--------------|-----------------|-------|
 | **BOOL** | `BOOLEAN` | Direct mapping |
 | **INT64** | `BIGINT` | Direct mapping |
-| **FLOAT64** | `DOUBLE PRECISION` | Direct mapping |
-| **FLOAT32** | `REAL` | Direct mapping |
+| **FLOAT64** | `DOUBLE PRECISION` | Direct mapping; NaN and ±Infinity become NULL in change events |
+| **FLOAT32** | `REAL` | Direct mapping; NaN and ±Infinity become NULL in change events |
 | **STRING** | `VARCHAR` | Direct mapping |
 | **BYTES** | `BYTEA` | Direct mapping |
 | **TIMESTAMP** | `TIMESTAMPTZ` | Direct mapping |
@@ -769,6 +770,12 @@ with `spanner_cdc_newest_partition_lag_milliseconds` tells you which failure you
 - Requires Spanner change streams to be created beforehand
 - At-least-once delivery (may have duplicates on failures)
 - Emulator has limited functionality compared to production Spanner
+- NaN, Infinity and -Infinity in FLOAT64/FLOAT32 columns and array elements are kept by the
+  snapshot but become NULL in change events. Spanner sends them as the JSON strings `"NaN"`,
+  `"Infinity"` and `"-Infinity"`, which the Debezium parser does not accept for a float
+  column; a scalar column is set to NULL with a `failed to parse non-pk column` warning, and
+  an array column containing one becomes NULL as a whole. A NaN key fails the row. The
+  emulator differs: it sends these values as JSON `null`.
 - DataBoost requires IAM permission `spanner.databases.useDataBoost`
 
 ---

@@ -1365,7 +1365,8 @@ mod tests {
                 {"name": "i", "type": {"array_element_type": {"code": "INT64"}, "code": "ARRAY"}, "is_primary_key": false, "ordinal_position": "5"}
             ],
             "mods": [
-                // Inserted as d = NaN, r = NaN, arr = [NaN, 1.5]: Spanner writes NaN as null.
+                // Inserted as d = NaN, r = NaN, arr = [NaN, 1.5]: the emulator writes NaN as
+                // null. Real Spanner sends the string "NaN" instead (see SPANNER_CDC.md).
                 {"keys": {"id": "1"}, "new_values": {"arr": [null, 1.5], "d": null, "i": ["1", "9007199254740993"], "r": null}, "old_values": {}},
                 {"keys": {"id": "4"}, "new_values": {"arr": [0.1], "d": 1.25, "i": ["-3"], "r": 2.5}, "old_values": {}}
             ],
@@ -1440,8 +1441,8 @@ mod tests {
             int_list(&rows[0][4]),
             vec![Some(1), Some(9_007_199_254_740_993)]
         );
-        // NaN is already null on the wire, so it is NULL here: a known Spanner-side
-        // loss, not something the reader can recover.
+        // The emulator sends NaN as null, so it is NULL here. Real Spanner sends "NaN",
+        // which the parser also reads as NULL (see SPANNER_CDC.md).
         assert_eq!(rows[0][1], None);
         assert_eq!(rows[0][2], None);
         assert_eq!(float_list(&rows[0][3]), vec![None, Some(1.5)]);

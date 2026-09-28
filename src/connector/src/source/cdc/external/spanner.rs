@@ -34,6 +34,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
+use std::sync::LazyLock;
 
 use anyhow::{Context, anyhow};
 use chrono::Datelike;
@@ -51,8 +52,10 @@ use google_cloud_spanner::transaction::{
 use google_cloud_spanner::value::{FromValue, Value};
 use risingwave_common::bail;
 use risingwave_common::catalog::{ColumnDesc, ColumnId, Field, Schema};
+use risingwave_common::log::LogSuppressor;
 use risingwave_common::row::{OwnedRow, Row as OwnedRowTrait};
 use risingwave_common::types::{DataType, Datum, F32, F64, ListType, ListValue, ScalarImpl};
+use thiserror_ext::AsReport;
 use time::OffsetDateTime;
 
 use crate::error::{ConnectorError, ConnectorResult};
@@ -648,8 +651,8 @@ impl SpannerExternalTableReader {
             .transpose()
             .context("PK range row failed")?
         {
-            let min_val = spanner_cell_to_scalar_impl(&row, &split_column.data_type, 0);
-            let max_val = spanner_cell_to_scalar_impl(&row, &split_column.data_type, 1);
+            let min_val = spanner_cell_to_datum(&row, &split_column.data_type, 0)?;
+            let max_val = spanner_cell_to_datum(&row, &split_column.data_type, 1)?;
             match (min_val, max_val) {
                 (Some(min), Some(max)) => Ok(Some((min, max))),
                 _ => Ok(None),
@@ -695,7 +698,7 @@ impl SpannerExternalTableReader {
             .transpose()
             .context("boundary row fetch failed")?
         {
-            let datum = spanner_cell_to_scalar_impl(&row, &split_column.data_type, 0);
+            let datum = spanner_cell_to_datum(&row, &split_column.data_type, 0)?;
             Ok(Some(datum))
         } else {
             Ok(None)
@@ -731,7 +734,7 @@ impl SpannerExternalTableReader {
             .transpose()
             .context("next_greater_bound row fetch failed")?
         {
-            let datum = spanner_cell_to_scalar_impl(&row, &split_column.data_type, 0);
+            let datum = spanner_cell_to_datum(&row, &split_column.data_type, 0)?;
             Ok(Some(datum))
         } else {
             Ok(None)
@@ -954,6 +957,7 @@ impl SpannerExternalTableReader {
         scan_limit: u32,
     ) {
         let fields = self.rw_schema.fields();
+        let pk_names = &self.pk_names;
         let order_key = Self::get_order_key(&primary_keys);
 
         let stmt = if let Some(ref pk_row) = start_pk_row {
@@ -1000,7 +1004,7 @@ impl SpannerExternalTableReader {
             .context("snapshot query failed")?;
 
         while let Some(row) = rows.next().await.transpose().context("row read failed")? {
-            yield spanner_row_to_owned_row(&row, fields)?;
+            yield spanner_row_to_owned_row(&row, fields, pk_names)?;
         }
     }
 
@@ -1024,6 +1028,7 @@ impl SpannerExternalTableReader {
         split_columns: Vec<Field>,
     ) {
         let fields = self.rw_schema.fields();
+        let pk_names = &self.pk_names;
 
         // Use the split column from parameters (follows Postgres CDC pattern)
         // The split column is determined by backfill_split_pk_column_index
@@ -1109,7 +1114,7 @@ impl SpannerExternalTableReader {
                 let mut rs = p.execute(&db).await?;
                 let mut out: Vec<OwnedRow> = Vec::new();
                 while let Some(row) = rs.next().await.transpose()? {
-                    out.push(spanner_row_to_owned_row(&row, fields)?);
+                    out.push(spanner_row_to_owned_row(&row, fields, pk_names)?);
                 }
                 Ok::<_, anyhow::Error>(out)
             }
@@ -1475,110 +1480,71 @@ pub(crate) fn spanner_type_to_rw_type(spanner_type: &str) -> ConnectorResult<Dat
 // Row / value helpers
 // ---------------------------------------------------------------------------
 
-/// Extracts a single typed cell from a Spanner row as a `ScalarImpl`.
+/// Decodes a single typed cell from a Spanner row.
 ///
-/// Follows the same pattern as `postgres_cell_to_scalar_impl` in the Postgres CDC parser.
-fn spanner_cell_to_scalar_impl(
+/// Returns `Ok(None)` for a SQL NULL and an error for a value that does not decode or
+/// convert, so a bad value is never mistaken for NULL.
+fn spanner_cell_to_datum(
     row: &SpannerRow,
     data_type: &DataType,
     idx: usize,
-) -> Option<ScalarImpl> {
-    match data_type {
-        DataType::Boolean => {
-            let v: Option<bool> = row.try_get(idx).ok();
-            v.map(ScalarImpl::Bool)
-        }
-
-        DataType::Int64 => {
-            let v: Option<i64> = row.try_get(idx).ok();
-            v.map(ScalarImpl::Int64)
-        }
-
-        DataType::Int32 => {
-            let v: Option<i64> = row.try_get(idx).ok();
-            v.map(|v| ScalarImpl::Int32(v as i32))
-        }
-
-        DataType::Int16 => {
-            let v: Option<i64> = row.try_get(idx).ok();
-            v.map(|v| ScalarImpl::Int16(v as i16))
-        }
-
-        DataType::Float64 => {
-            let v: Option<f64> = row.try_get(idx).ok();
-            v.map(|v| ScalarImpl::Float64(F64::from(v)))
-        }
-
-        DataType::Float32 => {
-            let v: Option<f64> = row.try_get(idx).ok();
-            v.map(|v| ScalarImpl::Float32(F32::from(v as f32)))
-        }
-
-        DataType::Varchar => {
-            // Handle VARCHAR, ENUM (stored as string), TIME, INTERVAL
-            let s: Option<String> = row.try_get(idx).ok();
-            s.map(|s| ScalarImpl::Utf8(s.into()))
-        }
-
-        DataType::Bytea => {
-            // Handle BYTEA and PROTO types (stored as bytes)
-            // Try reading as Vec<u8> first (for PROTO)
-            if let Ok(v) = row.try_get::<Vec<u8>, _>(idx) {
-                Some(ScalarImpl::Bytea(v.into()))
+) -> anyhow::Result<Datum> {
+    let datum = match data_type {
+        DataType::Boolean => row.try_get::<Option<bool>, _>(idx)?.map(ScalarImpl::Bool),
+        DataType::Int64 => row.try_get::<Option<i64>, _>(idx)?.map(ScalarImpl::Int64),
+        DataType::Int32 => row
+            .try_get::<Option<i64>, _>(idx)?
+            .map(|v| i32::try_from(v).map(ScalarImpl::Int32))
+            .transpose()?,
+        DataType::Int16 => row
+            .try_get::<Option<i64>, _>(idx)?
+            .map(|v| i16::try_from(v).map(ScalarImpl::Int16))
+            .transpose()?,
+        DataType::Float64 => row
+            .try_get::<Option<f64>, _>(idx)?
+            .map(|v| ScalarImpl::Float64(F64::from(v))),
+        DataType::Float32 => row
+            .try_get::<Option<f32>, _>(idx)?
+            .map(|v| ScalarImpl::Float32(F32::from(v))),
+        // STRING, and ENUM, which is sent as a string.
+        DataType::Varchar => row
+            .try_get::<Option<String>, _>(idx)?
+            .map(|s| ScalarImpl::Utf8(s.into())),
+        // BYTES and PROTO, both base64 on the wire and decoded by the SDK.
+        DataType::Bytea => row
+            .try_get::<Option<Vec<u8>>, _>(idx)?
+            .map(|v| ScalarImpl::Bytea(v.into())),
+        DataType::Timestamptz => row
+            .try_get::<Option<OffsetDateTime>, _>(idx)?
+            .map(offset_datetime_to_timestamptz)
+            .transpose()?,
+        DataType::Timestamp => row
+            .try_get::<Option<OffsetDateTime>, _>(idx)?
+            .map(|v| {
+                let micros = (v.unix_timestamp_nanos() / 1000) as i64;
+                risingwave_common::types::Timestamp::with_micros(micros).map(ScalarImpl::Timestamp)
+            })
+            .transpose()?,
+        DataType::Date => row
+            .try_get::<Option<time::Date>, _>(idx)?
+            .map(spanner_date_to_scalar)
+            .transpose()?,
+        // Spanner sends NUMERIC as a decimal string.
+        DataType::Decimal => row
+            .try_get::<Option<String>, _>(idx)?
+            .map(|s| parse_spanner_numeric(&s))
+            .transpose()?,
+        DataType::Jsonb => row.try_get::<Option<String>, _>(idx)?.map(|s| {
+            // Try to parse as JSON first
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&s) {
+                ScalarImpl::Jsonb(json.into())
             } else {
-                // Fallback: read as string (for BYTES stored as base64 string)
-                let s: Option<String> = row.try_get(idx).ok();
-                s.map(|s| ScalarImpl::Bytea(s.into_bytes().into()))
+                // If not valid JSON, wrap as string
+                ScalarImpl::Jsonb(serde_json::json!(s).into())
             }
-        }
-
-        DataType::Timestamptz => {
-            use risingwave_common::types::Timestamptz;
-            let v: Option<time::OffsetDateTime> = row.try_get(idx).ok();
-            v.and_then(|v| {
-                let micros = (v.unix_timestamp_nanos() / 1000) as i64;
-                Timestamptz::from_micros(micros).map(ScalarImpl::Timestamptz)
-            })
-        }
-
-        DataType::Timestamp => {
-            use risingwave_common::types::Timestamp;
-            let v: Option<time::OffsetDateTime> = row.try_get(idx).ok();
-            v.map(|v| {
-                let micros = (v.unix_timestamp_nanos() / 1000) as i64;
-                ScalarImpl::Timestamp(Timestamp::with_micros(micros).unwrap())
-            })
-        }
-
-        DataType::Date => {
-            let v: Option<time::Date> = row.try_get(idx).ok();
-            v.and_then(spanner_date_to_scalar)
-        }
-
-        DataType::Decimal => {
-            use risingwave_common::types::Decimal;
-            // Spanner stores NUMERIC as string on the wire; read as String and parse.
-            let s: Option<String> = row.try_get(idx).ok();
-            s.and_then(|s| Decimal::from_str(&s).ok())
-                .map(ScalarImpl::Decimal)
-        }
-
-        DataType::Jsonb => {
-            // Handle JSON and STRUCT types (stored as JSON string)
-            let s: Option<String> = row.try_get(idx).ok();
-            s.map(|s| {
-                // Try to parse as JSON first
-                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&s) {
-                    ScalarImpl::Jsonb(json.into())
-                } else {
-                    // If not valid JSON, wrap as string
-                    ScalarImpl::Jsonb(serde_json::json!(s).into())
-                }
-            })
-        }
-
+        }),
         DataType::List(list_type) => {
-            spanner_array_to_list(row, list_type.elem(), idx).map(ScalarImpl::List)
+            spanner_array_to_list(row, list_type.elem(), idx)?.map(ScalarImpl::List)
         }
 
         // Unknown or unsupported types - try to read as string as fallback
@@ -1588,87 +1554,125 @@ fn spanner_cell_to_scalar_impl(
                 idx,
                 data_type
             );
-            let s: Option<String> = row.try_get(idx).ok();
-            s.map(|s| ScalarImpl::Utf8(s.into()))
+            row.try_get::<Option<String>, _>(idx)?
+                .map(|s| ScalarImpl::Utf8(s.into()))
         }
-    }
+    };
+    Ok(datum)
+}
+
+fn offset_datetime_to_timestamptz(v: OffsetDateTime) -> anyhow::Result<ScalarImpl> {
+    let micros = (v.unix_timestamp_nanos() / 1000) as i64;
+    risingwave_common::types::Timestamptz::from_micros(micros)
+        .map(ScalarImpl::Timestamptz)
+        .ok_or_else(|| anyhow!("timestamp {v} is out of range"))
 }
 
 /// Converts a Spanner DATE to a RisingWave `Date`.
 ///
 /// Built from the numeric year, month and day: `time::Month` displays as its name, so
 /// formatting it into a `YYYY-MM-DD` string does not round-trip.
-fn spanner_date_to_scalar(v: time::Date) -> Option<ScalarImpl> {
+fn spanner_date_to_scalar(v: time::Date) -> anyhow::Result<ScalarImpl> {
     chrono::NaiveDate::from_ymd_opt(v.year(), v.month() as u32, v.day() as u32)
         .map(|d| ScalarImpl::Date(risingwave_common::types::Date::new(d)))
+        .ok_or_else(|| anyhow!("date {v} is out of range"))
+}
+
+fn parse_spanner_numeric(s: &str) -> anyhow::Result<ScalarImpl> {
+    risingwave_common::types::Decimal::from_str(s)
+        .map(ScalarImpl::Decimal)
+        .map_err(|e| anyhow!("NUMERIC {s} does not fit DECIMAL: {e}"))
 }
 
 /// Reads an ARRAY cell as a `ListValue` of `elem_type`.
 ///
 /// Spanner sends an ARRAY as a list value, not a string, so each element is decoded by the
-/// SDK with the same `FromValue` impls the scalar branches of `spanner_cell_to_scalar_impl`
-/// use. Returns `None` for a NULL array or a cell that does not decode.
-fn spanner_array_to_list(row: &SpannerRow, elem_type: &DataType, idx: usize) -> Option<ListValue> {
+/// SDK with the same `FromValue` impls the scalar branches of `spanner_cell_to_datum`
+/// use. Returns `Ok(None)` for a NULL array.
+fn spanner_array_to_list(
+    row: &SpannerRow,
+    elem_type: &DataType,
+    idx: usize,
+) -> anyhow::Result<Option<ListValue>> {
     fn collect<T: FromValue>(
         row: &SpannerRow,
         idx: usize,
         elem_type: &DataType,
-        convert: impl Fn(T) -> Option<ScalarImpl>,
-    ) -> Option<ListValue> {
-        let items: Vec<Option<T>> = row.try_get(idx).ok()?;
-        Some(ListValue::from_datum_iter(
-            elem_type,
-            items.into_iter().map(|item| item.and_then(&convert)),
-        ))
+        convert: impl Fn(T) -> anyhow::Result<ScalarImpl>,
+    ) -> anyhow::Result<Option<ListValue>> {
+        let Some(items) = row.try_get::<Option<Vec<Option<T>>>, _>(idx)? else {
+            return Ok(None);
+        };
+        let datums = items
+            .into_iter()
+            .map(|item| item.map(&convert).transpose())
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        Ok(Some(ListValue::from_datum_iter(elem_type, datums)))
     }
 
     match elem_type {
-        DataType::Boolean => collect(row, idx, elem_type, |v: bool| Some(ScalarImpl::Bool(v))),
-        DataType::Int64 => collect(row, idx, elem_type, |v: i64| Some(ScalarImpl::Int64(v))),
+        DataType::Boolean => collect(row, idx, elem_type, |v: bool| Ok(ScalarImpl::Bool(v))),
+        DataType::Int64 => collect(row, idx, elem_type, |v: i64| Ok(ScalarImpl::Int64(v))),
         DataType::Float64 => collect(row, idx, elem_type, |v: f64| {
-            Some(ScalarImpl::Float64(F64::from(v)))
+            Ok(ScalarImpl::Float64(F64::from(v)))
         }),
-        DataType::Float32 => collect(row, idx, elem_type, |v: f64| {
-            Some(ScalarImpl::Float32(F32::from(v as f32)))
+        DataType::Float32 => collect(row, idx, elem_type, |v: f32| {
+            Ok(ScalarImpl::Float32(F32::from(v)))
         }),
         DataType::Varchar => collect(row, idx, elem_type, |v: String| {
-            Some(ScalarImpl::Utf8(v.into()))
+            Ok(ScalarImpl::Utf8(v.into()))
         }),
         DataType::Bytea => collect(row, idx, elem_type, |v: Vec<u8>| {
-            Some(ScalarImpl::Bytea(v.into()))
+            Ok(ScalarImpl::Bytea(v.into()))
         }),
-        DataType::Timestamptz => collect(row, idx, elem_type, |v: OffsetDateTime| {
-            let micros = (v.unix_timestamp_nanos() / 1000) as i64;
-            risingwave_common::types::Timestamptz::from_micros(micros).map(ScalarImpl::Timestamptz)
-        }),
+        DataType::Timestamptz => collect(row, idx, elem_type, offset_datetime_to_timestamptz),
         DataType::Date => collect(row, idx, elem_type, spanner_date_to_scalar),
         // NUMERIC is a decimal string on the wire, as in the scalar branch.
-        DataType::Decimal => collect(row, idx, elem_type, |v: String| {
-            risingwave_common::types::Decimal::from_str(&v)
-                .ok()
-                .map(ScalarImpl::Decimal)
-        }),
+        DataType::Decimal => collect(row, idx, elem_type, |v: String| parse_spanner_numeric(&v)),
         DataType::Jsonb => collect(row, idx, elem_type, |v: serde_json::Value| {
-            Some(ScalarImpl::Jsonb(v.into()))
+            Ok(ScalarImpl::Jsonb(v.into()))
         }),
-        _ => {
-            tracing::warn!(
-                "column at index {} is an array of unsupported element type {:?}",
-                idx,
-                elem_type
-            );
-            None
-        }
+        _ => bail!("array of unsupported element type {elem_type:?}"),
     }
 }
 
-fn spanner_row_to_owned_row(row: &SpannerRow, fields: &[Field]) -> ConnectorResult<OwnedRow> {
-    let values = fields
-        .iter()
-        .enumerate()
-        .map(|(idx, f)| spanner_cell_to_scalar_impl(row, &f.data_type, idx))
-        .collect();
-    Ok(OwnedRow::new(values))
+/// Decodes a snapshot row. A primary-key value that does not decode fails the read, as in
+/// the other CDC snapshot readers; any other column is logged and read as NULL. Unlike
+/// those readers, a NULL key is valid, since Spanner allows NULL key columns.
+fn spanner_row_to_owned_row(
+    row: &SpannerRow,
+    fields: &[Field],
+    pk_names: &[String],
+) -> ConnectorResult<OwnedRow> {
+    static LOG_SUPPRESSOR: LazyLock<LogSuppressor> = LazyLock::new(LogSuppressor::default);
+
+    let mut datums = Vec::with_capacity(fields.len());
+    for (idx, field) in fields.iter().enumerate() {
+        let datum = match spanner_cell_to_datum(row, &field.data_type, idx) {
+            Ok(datum) => datum,
+            Err(err) if pk_names.contains(&field.name) => {
+                return Err(err
+                    .context(format!(
+                        "failed to decode Spanner snapshot primary key `{}`",
+                        field.name
+                    ))
+                    .into());
+            }
+            Err(err) => {
+                if let Ok(suppressed_count) = LOG_SUPPRESSOR.check() {
+                    tracing::error!(
+                        column = %field.name,
+                        error = %err.as_report(),
+                        suppressed_count,
+                        "parse column failed"
+                    );
+                }
+                None
+            }
+        };
+        datums.push(datum);
+    }
+    Ok(OwnedRow::new(datums))
 }
 
 #[cfg(test)]
