@@ -567,8 +567,13 @@ When you create a table FROM a Spanner CDC source, RisingWave performs:
 - The CDC offset is the read timestamp resolved by a strong read-only transaction
   (`current_cdc_offset()`), the Spanner analogue of Postgres's current WAL LSN.
 - CDC streaming starts from `spanner.start_timestamp` (user-provided or auto-generated at source creation time)
-- `CdcBackfillExecutor` coordinates the two phases automatically, bracketing the
-  change-log against each snapshot read via the CDC offset (matches Postgres/MySQL).
+- Spanner CDC tables always use the parallelized backfill (`backfill.parallelism`
+  defaults to 1 instead of 0). The non-parallel `CdcBackfillExecutor` drops change-log
+  events whose offset is below a low offset that it advances to each consumed event,
+  which assumes a totally ordered log. A change stream interleaves partitions out of
+  commit order and each event carries the cross-partition watermark, so that filter
+  would drop events the snapshot never saw. The parallelized backfill routes events by
+  PK range instead of filtering by offset.
 
 ### Rate Limiting
 

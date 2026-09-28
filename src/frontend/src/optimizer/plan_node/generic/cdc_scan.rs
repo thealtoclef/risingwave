@@ -122,6 +122,29 @@ pub fn build_cdc_scan_options_with_options(
         }
     }
 
+    // Spanner CDC must always use the parallelized backfill (v2).
+    //
+    // The v1 backfill drops change-log events whose offset is below a single low
+    // offset that it advances to each consumed event, which assumes offsets arrive
+    // in a total order (binlog position, LSN). A Spanner change stream merges many
+    // partitions whose records interleave out of commit order, and each event
+    // carries the cross-partition watermark rather than its commit timestamp, so v1
+    // would drop events that the snapshot never saw. v2 routes events by PK range
+    // and does not filter by offset.
+    if *cdc_table_type == ExternalCdcTableType::Spanner && !scan_options.disable_backfill {
+        if scan_options.backfill_num_rows_per_split == 0 {
+            return Err(anyhow!(
+                "{} must be greater than 0 for Spanner CDC tables",
+                CDC_BACKFILL_NUM_ROWS_PER_SPLIT
+            )
+            .into());
+        }
+        if scan_options.backfill_parallelism == 0 {
+            // Same footprint as the single-actor v1 backfill.
+            scan_options.backfill_parallelism = 1;
+        }
+    }
+
     Ok(scan_options)
 }
 
@@ -257,5 +280,48 @@ impl CdcScan {
             .iter()
             .map(|&i| self.get_table_columns()[i].clone())
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::*;
+
+    fn options(pairs: &[(&str, &str)]) -> WithOptions {
+        WithOptions::new_with_options(
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect::<BTreeMap<_, _>>(),
+        )
+    }
+
+    #[test]
+    fn test_spanner_defaults_to_parallelized_backfill() {
+        let scan_options =
+            build_cdc_scan_options_with_options(&options(&[]), &ExternalCdcTableType::Spanner)
+                .unwrap();
+        assert_eq!(scan_options.backfill_parallelism, 1);
+        assert!(scan_options.is_parallelized_backfill());
+    }
+
+    #[test]
+    fn test_spanner_rejects_zero_rows_per_split() {
+        let result = build_cdc_scan_options_with_options(
+            &options(&[(CDC_BACKFILL_NUM_ROWS_PER_SPLIT, "0")]),
+            &ExternalCdcTableType::Spanner,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_postgres_keeps_v1_default() {
+        let scan_options =
+            build_cdc_scan_options_with_options(&options(&[]), &ExternalCdcTableType::Postgres)
+                .unwrap();
+        assert_eq!(scan_options.backfill_parallelism, 0);
+        assert!(!scan_options.is_parallelized_backfill());
     }
 }

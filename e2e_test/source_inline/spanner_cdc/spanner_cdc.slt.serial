@@ -27,7 +27,7 @@ system ok
 e2e_test/source_inline/spanner_cdc/prepare-data.rs setup
 
 # Create tables before the change stream:
-# - users: STRING PK (for non-parallel backfill V1)
+# - users: STRING PK (default backfill options)
 # - products: STRING PK (for parallel backfill, uneven splits)
 # - inventory: INT64 PK (for parallel backfill, even splits)
 system ok
@@ -90,8 +90,8 @@ CREATE SOURCE spanner_source WITH (
 );
 
 # =============================================================================
-# PART 4: NON-PARALLEL BACKFILL (V1) - users table (STRING PK)
-# backfill.parallelism omitted (default 0) → uses legacy single-actor snapshot_read
+# PART 4: DEFAULT BACKFILL - users table (STRING PK)
+# backfill.parallelism omitted → defaults to 1 (Spanner always uses backfill v2)
 # =============================================================================
 
 statement ok
@@ -206,8 +206,7 @@ quantity
 # =============================================================================
 
 # --- Verify parallel tables generated splits via rw_cdc_progress ---
-# Parallel tables (t_products, t_inventory) should have split_total_count > 0.
-# Non-parallel table (t_users) should have split_total_count = 0 or no entry.
+# All Spanner tables use backfill v2, so each should have split_total_count > 0.
 
 # t_products (parallel, uneven): must have splits
 query B
@@ -221,11 +220,11 @@ SELECT p.split_total_count > 0 FROM rw_catalog.rw_cdc_progress p JOIN rw_catalog
 ----
 t
 
-# t_users (non-parallel V1): should have 0 splits or no entry in rw_cdc_progress
-query I
-SELECT count(*) FROM rw_catalog.rw_cdc_progress p JOIN rw_catalog.rw_tables t ON p.job_id = t.id WHERE t.name = 't_users' AND p.split_total_count > 0;
+# t_users (default options): must also have splits
+query B
+SELECT p.split_total_count > 0 FROM rw_catalog.rw_cdc_progress p JOIN rw_catalog.rw_tables t ON p.job_id = t.id WHERE t.name = 't_users';
 ----
-0
+t
 
 # --- Verify even vs uneven split mode via logs ---
 # The split mode is logged by get_parallel_cdc_splits.
@@ -245,7 +244,7 @@ grep -q "databoost=false" .risingwave/log/*.log
 
 # =============================================================================
 # PART 8: CDC STREAMING - INSERT/UPDATE/DELETE on users
-# Test CDC phase on users (non-parallel V1 table).
+# Test CDC phase on users (default backfill options).
 # =============================================================================
 
 system ok
@@ -520,7 +519,7 @@ recover;
 
 sleep 20s
 
-# --- users (V1): verify CDC routing is restored, including schema-evolved columns ---
+# --- users (default options): verify CDC routing is restored, including schema-evolved columns ---
 system ok
 e2e_test/source_inline/spanner_cdc/prepare-data.rs dml "UPDATE users SET age = 99 WHERE id = '3'"
 
