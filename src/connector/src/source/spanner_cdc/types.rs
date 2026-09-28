@@ -72,6 +72,13 @@ pub enum TypeCode {
     Proto,
     #[display("ENUM")]
     Enum,
+    #[display("UUID")]
+    Uuid,
+    /// A type code this connector does not know yet. Unknown types fall back to VARCHAR,
+    /// matching how schema discovery maps them.
+    #[serde(other)]
+    #[display("STRING")]
+    Unknown,
 }
 
 /// `TypeAnnotationCode` disambiguates SQL types for Spanner values.
@@ -84,6 +91,9 @@ pub enum TypeAnnotationCode {
     PgNumeric,
     PgJsonb,
     PgOid,
+    /// An annotation this connector does not know yet; see [`TypeCode::Unknown`].
+    #[serde(other)]
+    Unknown,
 }
 
 /// Spanner Type represents the type of a Cloud Spanner value.
@@ -180,6 +190,8 @@ impl SpannerType {
             }
             TypeCode::Struct => DataType::Jsonb,
             TypeCode::Proto | TypeCode::Enum => DataType::Varchar,
+            // Schema discovery stores UUID and unknown types as VARCHAR.
+            TypeCode::Uuid | TypeCode::Unknown => DataType::Varchar,
         }
     }
 }
@@ -204,6 +216,8 @@ pub fn spanner_type_name_to_rw_type(type_name: &str) -> Option<DataType> {
         "BYTES" => Some(DataType::Bytea),
         "NUMERIC" => Some(DataType::Decimal),
         "JSON" => Some(DataType::Jsonb),
+        // Matches schema discovery, which stores UUID as VARCHAR.
+        "UUID" => Some(DataType::Varchar),
         _ => None,
     }
 }
@@ -1000,6 +1014,49 @@ mod tests {
                 ct.name
             );
         }
+    }
+
+    /// Newer and unknown type codes must decode instead of failing the record. Their
+    /// type names feed schema-change messages, so pin those too.
+    #[test]
+    fn test_column_type_accepts_new_and_unknown_type_codes() {
+        for (code, expected, type_name) in [
+            ("UUID", TypeCode::Uuid, "UUID"),
+            // Unknown types are named STRING, which schema changes map to VARCHAR,
+            // the same fallback schema discovery uses.
+            ("SOME_FUTURE_TYPE", TypeCode::Unknown, "STRING"),
+        ] {
+            let json = serde_json::json!({
+                "name": "c",
+                "type": { "code": code },
+                "is_primary_key": false,
+                "ordinal_position": 2,
+            });
+            let ct = ColumnType::from_json(&json).unwrap();
+            assert_eq!(ct.type_code(), expected, "code {code}");
+            assert_eq!(ct.spanner_type.to_type_string(), type_name, "code {code}");
+        }
+
+        let array_of_uuid = serde_json::json!({
+            "name": "ids",
+            "type": { "code": "ARRAY", "array_element_type": { "code": "UUID" } },
+            "is_primary_key": false,
+            "ordinal_position": 3,
+        });
+        let ct = ColumnType::from_json(&array_of_uuid).unwrap();
+        assert_eq!(ct.spanner_type.to_type_string(), "ARRAY<UUID>");
+
+        let unknown_annotation = serde_json::json!({
+            "name": "n",
+            "type": { "code": "NUMERIC", "type_annotation": "PG_SOMETHING_NEW" },
+            "is_primary_key": false,
+            "ordinal_position": 4,
+        });
+        let ct = ColumnType::from_json(&unknown_annotation).unwrap();
+        assert_eq!(
+            ct.spanner_type.type_annotation,
+            Some(TypeAnnotationCode::Unknown)
+        );
     }
 
     /// Guards the refactor that hoisted the column-type map out of `to_json_map`:

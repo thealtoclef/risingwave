@@ -387,7 +387,9 @@ All Spanner types are mapped to RisingWave types with **NO data loss**.
 | **PROTO\<...\>** | `BYTEA` | Raw bytes preserved (can deserialize later) |
 | **ENUM\<...\>** | `VARCHAR` | Enum name preserved as string |
 | **INTERVAL** | `VARCHAR` | Text representation preserved |
+| **UUID** | `VARCHAR` | Text representation preserved |
 | **TIME** | `VARCHAR` | Text representation preserved |
+| *any other type* | `VARCHAR` | Unknown type codes decode as `VARCHAR` instead of failing the record |
 
 ### Type Mapping Strategy
 
