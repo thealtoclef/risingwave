@@ -964,7 +964,7 @@ impl SpannerExternalTableReader {
             let primary_keys: Vec<String> = self.pk_names.clone();
             let order_key = Self::get_order_key(&primary_keys);
             // Build filter: `pk0` > @pk0 OR (`pk0` = @pk0 AND `pk1` > @pk1) ...
-            let filter = build_pk_filter_sql(&primary_keys, pk_row);
+            let filter = build_pk_filter_sql(&primary_keys);
             let sql = format!(
                 "SELECT {} FROM {} WHERE {} ORDER BY {} LIMIT {}",
                 self.field_names,
@@ -1221,34 +1221,21 @@ fn split_table_name(name: &str) -> (&str, &str) {
 /// For a single PK column: `` `pk0` > @pk0 ``
 /// For composite (pk0, pk1, pk2):
 ///   `` (`pk0` > @pk0) OR (`pk0` = @pk0 AND `pk1` > @pk1) OR (`pk0` = @pk0 AND `pk1` = @pk1 AND `pk2` > @pk2) ``
-///
-/// Spanner key columns can be NULL and sort NULL first, so a NULL value in `pk_row` is
-/// compared with `IS NULL` for equality and `IS NOT NULL` for greater, and is not bound
-/// as a parameter (see [`add_pk_params`]).
-fn build_pk_filter_sql(pk_names: &[String], pk_row: &OwnedRow) -> String {
+fn build_pk_filter_sql(pk_names: &[String]) -> String {
     let cols: Vec<String> = pk_names
         .iter()
         .map(|n| SpannerExternalTableReader::quote_column(n))
         .collect();
-    let is_null = |i: usize| pk_row.datum_at(i).is_none();
 
     let mut clauses = Vec::with_capacity(pk_names.len());
     for i in 0..pk_names.len() {
         let mut parts = Vec::with_capacity(i + 1);
         // All preceding columns must be equal
         for (j, col) in cols.iter().enumerate().take(i) {
-            if is_null(j) {
-                parts.push(format!("{} IS NULL", col));
-            } else {
-                parts.push(format!("{} = @pk{}", col, j));
-            }
+            parts.push(format!("{} = @pk{}", col, j));
         }
         // The i-th column must be strictly greater
-        if is_null(i) {
-            parts.push(format!("{} IS NOT NULL", cols[i]));
-        } else {
-            parts.push(format!("{} > @pk{}", cols[i], i));
-        }
+        parts.push(format!("{} > @pk{}", cols[i], i));
         clauses.push(format!("({})", parts.join(" AND ")));
     }
     clauses.join(" OR ")
@@ -1280,8 +1267,6 @@ fn build_split_filter_sql(
 }
 
 /// Adds PK row values as named parameters (@pk0, @pk1, ...) to a Spanner `StatementBuilder`.
-///
-/// NULL values are left unbound, since [`build_pk_filter_sql`] does not reference them.
 fn add_pk_params(
     mut stmt: google_cloud_spanner::statement::StatementBuilder,
     pk_row: &OwnedRow,
@@ -1784,31 +1769,20 @@ mod tests {
 
     #[test]
     fn test_build_pk_filter_sql() {
-        let pk_row = |datums: &[Option<i64>]| {
-            OwnedRow::new(datums.iter().map(|d| d.map(ScalarImpl::Int64)).collect())
-        };
-
         let cols = vec!["v1".to_owned()];
-        let expr = build_pk_filter_sql(&cols, &pk_row(&[Some(1)]));
+        let expr = build_pk_filter_sql(&cols);
         assert_eq!(expr, "(`v1` > @pk0)");
 
         let cols = vec!["v1".to_owned(), "v2".to_owned()];
-        let expr = build_pk_filter_sql(&cols, &pk_row(&[Some(1), Some(1)]));
+        let expr = build_pk_filter_sql(&cols);
         assert_eq!(expr, "(`v1` > @pk0) OR (`v1` = @pk0 AND `v2` > @pk1)");
 
         let cols = vec!["v1".to_owned(), "v2".to_owned(), "v3".to_owned()];
-        let expr = build_pk_filter_sql(&cols, &pk_row(&[Some(1), Some(1), Some(1)]));
+        let expr = build_pk_filter_sql(&cols);
         assert_eq!(
             expr,
             "(`v1` > @pk0) OR (`v1` = @pk0 AND `v2` > @pk1) OR (`v1` = @pk0 AND `v2` = @pk1 AND `v3` > @pk2)"
         );
-
-        // NULL sorts first in Spanner: every non-NULL value is greater than it.
-        let cols = vec!["v1".to_owned(), "v2".to_owned()];
-        let expr = build_pk_filter_sql(&cols, &pk_row(&[None, Some(1)]));
-        assert_eq!(expr, "(`v1` IS NOT NULL) OR (`v1` IS NULL AND `v2` > @pk1)");
-        let expr = build_pk_filter_sql(&cols, &pk_row(&[Some(1), None]));
-        assert_eq!(expr, "(`v1` > @pk0) OR (`v1` = @pk0 AND `v2` IS NOT NULL)");
     }
 
     #[test]
