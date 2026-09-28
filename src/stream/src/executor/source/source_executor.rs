@@ -947,6 +947,14 @@ impl<S: StateStore> SourceExecutor<S> {
                                                         sqlserver_split.inner.start_offset = None;
                                                     }
                                                 }
+                                                SplitImpl::SpannerCdc(spanner_split) => {
+                                                    tracing::info!(
+                                                        split_id = spanner_split.index,
+                                                        old_offset = ?spanner_split.offset,
+                                                        "Clearing Spanner CDC offset"
+                                                    );
+                                                    spanner_split.offset = None;
+                                                }
                                                 _ => {
                                                     tracing::warn!(
                                                         "RESET SOURCE called on non-CDC split type"
