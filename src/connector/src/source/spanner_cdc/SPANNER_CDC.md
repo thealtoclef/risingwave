@@ -69,7 +69,7 @@ The Spanner CDC reader follows the **exact same pattern** as RisingWave's Debezi
 
 1. `SplitReader::new()` spawns a **background task** that reads from the Spanner change stream
 2. The background task sends `Vec<SourceMessage>` through an **`mpsc` channel** (buffer size 16, same as Debezium)
-3. `into_data_stream()` calls `rx.recv()` and yields messages
+3. `into_data_stream()` calls `rx.recv()` and yields messages. Partition tasks send one batch per change record, so batches already queued behind the current one are merged, up to the source chunk size, before the parser sees them. Schema-change and heartbeat batches are never merged
 4. `into_stream()` wraps with `into_chunk_stream` (parser)
 
 **Key Design Decision**: Each CDC source has exactly one split with `split_id = source_id.as_raw_id()`. The source executor reads from one `SpannerCdcSplitReader` via a single `mpsc` channel — identical to how it reads from Debezium's JNI channel.
@@ -81,7 +81,7 @@ Background task:    JNI thread (std::thread)         tokio::spawn(run_reader)
 Channel:            mpsc::channel(16)                mpsc::channel(16)
 Send:               tx.blocking_send(events)         tx.send(messages).await
 Reader struct:      { rx, parser_config, source_ctx } { rx, parser_config, source_ctx }
-into_data_stream:   rx.recv() → yield msgs           rx.recv() → yield msgs
+into_data_stream:   rx.recv() → yield msgs           rx.recv() + merge queued → yield
 into_stream:        into_chunk_stream(...)            into_chunk_stream(...)
 ```
 

@@ -219,12 +219,40 @@ impl SpannerCdcSplitReader {
         }
     }
 
-    /// Identical pattern to `CdcSplitReader::into_data_stream` — just recv from mpsc.
+    /// Receive message batches from the reader task, like `CdcSplitReader::into_data_stream`.
+    ///
+    /// Partition tasks send one batch per change record, and the parser ends a chunk at
+    /// every batch. Batches already queued behind the current one are merged, up to the
+    /// chunk size, so a burst becomes full chunks instead of one chunk per record. An
+    /// idle stream never waits: only batches that have already arrived are merged.
     #[try_stream(ok = Vec<SourceMessage>, error = ConnectorError)]
     async fn into_data_stream(mut self) {
         let source_id = self.source_ctx.source_id.to_string();
+        let max_batch_len = self.source_ctx.source_ctrl_opts.chunk_size;
 
-        while let Some(messages) = self.rx.recv().await {
+        // A batch received while merging that must not be merged, yielded next.
+        let mut pending: Option<Vec<SourceMessage>> = None;
+        loop {
+            let mut messages = match pending.take() {
+                Some(messages) => messages,
+                None => match self.rx.recv().await {
+                    Some(messages) => messages,
+                    None => break,
+                },
+            };
+            if is_mergeable_batch(&messages) {
+                while messages.len() < max_batch_len {
+                    match self.rx.try_recv() {
+                        Ok(next) if is_mergeable_batch(&next) => messages.extend(next),
+                        Ok(next) => {
+                            pending = Some(next);
+                            break;
+                        }
+                        // Empty, or disconnected: the next `recv` reports the close.
+                        Err(_) => break,
+                    }
+                }
+            }
             if !messages.is_empty() {
                 yield messages;
             }
@@ -245,6 +273,23 @@ impl SpannerCdcSplitReader {
             Err(e) => bail!("Spanner CDC reader task failed: {}", e.as_report()),
         }
     }
+}
+
+/// Whether a batch holds only data rows and may be merged with its neighbours.
+///
+/// Schema changes stay alone in their batch: the parser applies one before parsing the
+/// messages after it, and rows before it in the same batch would be held back until the
+/// change is applied. Heartbeats stay alone too, since the parser emits only the first
+/// heartbeat of a batch, and merging would drop the offset progress of the later ones.
+fn is_mergeable_batch(messages: &[SourceMessage]) -> bool {
+    messages.iter().all(|msg| {
+        !msg.is_cdc_heartbeat()
+            && !matches!(
+                &msg.meta,
+                SourceMeta::DebeziumCdc(meta)
+                    if matches!(meta.msg_type, crate::source::cdc::CdcMessageType::SchemaChange)
+            )
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1613,6 +1658,111 @@ mod tests {
             err.to_report_string().contains("partition query failed"),
             "{}",
             err.as_report()
+        );
+    }
+
+    fn test_message(msg_type: cdc_message::CdcMessageType, offset: &str) -> SourceMessage {
+        let is_heartbeat = matches!(msg_type, cdc_message::CdcMessageType::Heartbeat);
+        SourceMessage {
+            key: None,
+            payload: (!is_heartbeat).then(|| b"{}".to_vec()),
+            offset: offset.to_owned(),
+            split_id: "0".into(),
+            meta: SourceMeta::DebeziumCdc(DebeziumCdcMeta::new(
+                "db.t".to_owned(),
+                0,
+                msg_type,
+                SourceType::Unspecified,
+            )),
+        }
+    }
+
+    fn data(offset: &str) -> SourceMessage {
+        test_message(cdc_message::CdcMessageType::Data, offset)
+    }
+
+    /// Queue `batches` behind a finished reader task and collect the merged batches,
+    /// as offsets, until the stream reports the closed channel.
+    async fn collect_data_stream(
+        batches: Vec<Vec<SourceMessage>>,
+        chunk_size: usize,
+    ) -> Vec<Vec<String>> {
+        let (tx, rx) = mpsc::channel(batches.len().max(1));
+        for batch in batches {
+            tx.send(batch).await.unwrap();
+        }
+        drop(tx);
+        let mut source_ctx = crate::source::SourceContext::dummy();
+        source_ctx.source_ctrl_opts.chunk_size = chunk_size;
+        let reader = SpannerCdcSplitReader {
+            rx,
+            reader_task: tokio::spawn(async { Ok(()) }),
+            parser_config: ParserConfig::default(),
+            source_ctx: Arc::new(source_ctx),
+        };
+        let mut stream = std::pin::pin!(reader.into_data_stream());
+        let mut merged = vec![];
+        while let Some(Ok(batch)) = stream.next().await {
+            merged.push(batch.into_iter().map(|msg| msg.offset).collect());
+        }
+        merged
+    }
+
+    #[tokio::test]
+    async fn test_data_stream_merges_queued_data_batches() {
+        let merged = collect_data_stream(
+            vec![vec![data("1")], vec![data("2"), data("3")], vec![data("4")]],
+            1024,
+        )
+        .await;
+        assert_eq!(merged, vec![vec!["1", "2", "3", "4"]]);
+    }
+
+    /// Merging stops once a batch reaches the chunk size; a batch is never split.
+    #[tokio::test]
+    async fn test_data_stream_merge_stops_at_chunk_size() {
+        let merged = collect_data_stream(
+            vec![
+                vec![data("1")],
+                vec![data("2"), data("3")],
+                vec![data("4")],
+                vec![data("5")],
+            ],
+            3,
+        )
+        .await;
+        assert_eq!(merged, vec![vec!["1", "2", "3"], vec!["4", "5"]]);
+    }
+
+    /// Schema changes and heartbeats keep their own batch, and order is preserved.
+    #[tokio::test]
+    async fn test_data_stream_never_merges_schema_change_or_heartbeat() {
+        let schema_change = test_message(cdc_message::CdcMessageType::SchemaChange, "s");
+        let heartbeat = |offset| test_message(cdc_message::CdcMessageType::Heartbeat, offset);
+        let merged = collect_data_stream(
+            vec![
+                vec![data("1")],
+                vec![data("2")],
+                vec![schema_change],
+                vec![data("3")],
+                vec![heartbeat("h1")],
+                vec![heartbeat("h2")],
+                vec![data("4")],
+                vec![data("5")],
+            ],
+            1024,
+        )
+        .await;
+        assert_eq!(
+            merged,
+            vec![
+                vec!["1", "2"],
+                vec!["s"],
+                vec!["3"],
+                vec!["h1"],
+                vec!["h2"],
+                vec!["4", "5"],
+            ]
         );
     }
 
