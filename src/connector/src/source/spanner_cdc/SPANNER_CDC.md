@@ -34,11 +34,11 @@ CREATE SOURCE spanner_source WITH (
 ) FORMAT PLAIN ENCODE JSON;
 
 -- Create tables from the source (specify upstream table name)
-CREATE TABLE users FROM spanner_source TABLE 'users';
-CREATE TABLE orders FROM spanner_source TABLE 'orders';
+CREATE TABLE users (*) FROM spanner_source TABLE 'users';
+CREATE TABLE orders (*) FROM spanner_source TABLE 'orders';
 
 -- A table in a named schema is referenced as 'schema.table'
-CREATE TABLE sales_orders FROM spanner_source TABLE 'sales.orders';
+CREATE TABLE sales_orders (*) FROM spanner_source TABLE 'sales.orders';
 ```
 
 Only GoogleSQL-dialect databases are supported; `CREATE SOURCE` rejects a
@@ -56,7 +56,7 @@ CREATE SOURCE spanner_test WITH (
     spanner.emulator_host = 'http://localhost:9010'
 ) FORMAT PLAIN ENCODE JSON;
 
-CREATE TABLE test_table FROM spanner_test TABLE 'test_table';
+CREATE TABLE test_table (*) FROM spanner_test TABLE 'test_table';
 ```
 
 ---
@@ -244,6 +244,14 @@ not modify the process environment. Without this option, the connector explicitl
 connects to `https://spanner.googleapis.com`; `SPANNER_EMULATOR_HOST` does not select
 the endpoint. Configure emulator connections with `spanner.emulator_host`.
 
+ADC authenticates as the RisingWave node, so any user who can create a source can read
+every Spanner database the node's service account can reach. Set the
+`DISABLE_DEFAULT_CREDENTIAL=true` environment variable on the frontend, meta and compute
+nodes to reject sources without explicit credentials, as the Pub/Sub, S3 and Iceberg
+connectors do. `spanner.credentials_path` is read by the frontend, meta and compute nodes
+from their own file systems and must name a regular file of at most 64 KiB. Prefer
+`spanner.credentials = secret ...` over an inline key or a path.
+
 #### Change Stream Configuration
 
 | Parameter | Default | Description |
@@ -307,7 +315,7 @@ ALTER SOURCE spanner_cdc_source SET (
 );
 ```
 
-Under the hood, `ALTER SOURCE ... SET (...)` updates the source catalog and issues a `ConnectorPropsChange` barrier mutation; the running source executor rebuilds its `SpannerCdcSplitReader` with the new properties in place — no restart or backfill re-run required. Only properties registered as `#[with_option(allow_alter_on_fly)]` on `SpannerCdcProperties` (see `mod.rs`) are accepted; anything else is rejected by `check_source_allow_alter_on_fly_fields`.
+Under the hood, `ALTER SOURCE ... SET (...)` updates the source catalog and issues a `ConnectorPropsChange` barrier mutation; the running source executor then rebuilds its `SpannerCdcSplitReader` with the new properties. No backfill re-runs, but the new reader restarts every partition query from the saved offset, which is the position of the slowest partition. Changes since that position are read again (at-least-once), so on a source with a lagging partition an ALTER can cause a long catch-up. Changing `SOURCE_RATE_LIMIT` rebuilds the reader the same way. Only properties registered as `#[with_option(allow_alter_on_fly)]` on `SpannerCdcProperties` (see `mod.rs`) are accepted; anything else is rejected by `check_source_allow_alter_on_fly_fields`.
 
 `spanner.databoost.enabled` cannot be altered this way: it's injected into `CdcTableDesc.connect_properties` at `CREATE TABLE` time and read once by the backfill's external table reader, which doesn't subscribe to `ConnectorPropsChange`.
 
@@ -328,8 +336,8 @@ CREATE SOURCE spanner_cdc_source WITH (
     spanner.heartbeat_milliseconds = 5000
 ) FORMAT PLAIN ENCODE JSON;
 
-CREATE TABLE users FROM spanner_cdc_source TABLE 'users';
-CREATE TABLE orders FROM spanner_cdc_source TABLE 'orders';
+CREATE TABLE users (*) FROM spanner_cdc_source TABLE 'users';
+CREATE TABLE orders (*) FROM spanner_cdc_source TABLE 'orders';
 ```
 
 ### Using Secrets Manager (Recommended)
@@ -364,7 +372,7 @@ CREATE SOURCE spanner_cdc_source WITH (
 ) FORMAT PLAIN ENCODE JSON;
 
 -- Enable databoost at table level
-CREATE TABLE large_table FROM spanner_cdc_source TABLE 'large_table' WITH (
+CREATE TABLE large_table (*) FROM spanner_cdc_source TABLE 'large_table' WITH (
     spanner.databoost.enabled = 'true'         -- Enable DataBoost for backfill
 );
 ```
@@ -600,7 +608,7 @@ Control backfill throughput to avoid overwhelming downstream systems:
 SET backfill_rate_limit = 1000;
 
 -- Per-table (when creating table)
-CREATE TABLE my_table FROM spanner_source TABLE 'users'
+CREATE TABLE my_table (*) FROM spanner_source TABLE 'users'
 WITH (backfill_rate_limit = '1000');
 
 -- Dynamic adjustment (no restart required)
@@ -680,6 +688,9 @@ retry_backoff_factor: 2
   "start timestamp older than retention" below).
 - Once the budget runs out the reader fails and the source restarts every partition from
   the checkpoint watermark.
+- This budget is the only retry layer. The Spanner SDK's own retry is turned off for change
+  stream queries: it would retry inside a single call, hidden from the stall timeout and
+  from the `spanner_cdc_partition_query_failure_count` metric.
 - `tokio-retry`'s `ExponentialBackoff` grows by powers of `retry_backoff_ms`, not of
   `retry_backoff_factor`: with the defaults the delays are 2 s, then the 10 s cap. Each delay
   is jittered to a random value below it.
@@ -788,9 +799,11 @@ with `spanner_cdc_newest_partition_lag_milliseconds` tells you which failure you
 
 ## Troubleshooting
 
-### "credentials must be set"
+### "Google Application Default Credentials are disabled"
 
-Set `spanner.credentials` or `spanner.credentials_path`, or set `spanner.emulator_host` for testing.
+`DISABLE_DEFAULT_CREDENTIAL` is set on the node, so a source must name its own credentials.
+Set `spanner.credentials` or `spanner.credentials_path`, or set `spanner.emulator_host` for
+testing.
 
 ### Supported change stream options
 
@@ -810,7 +823,10 @@ its checkpoint is older than the oldest change Spanner still keeps. Spanner reje
 with `OUT_OF_RANGE` ("Specified start_timestamp is too far in the past"), which the reader
 fails on without retrying. Changes between the checkpoint and the oldest retained change are
 lost; recreate the source and its tables to take a new snapshot, and consider a longer
-`retention_period`. This wording was observed on the emulator; if production Spanner words it
+`retention_period`. To keep the tables and accept the gap instead, run
+`RESET SOURCE <source>` on the shared source: it clears the saved offset, and the reader
+rebuilt after the next failure starts from the current time. `RESET SOURCE` is not
+available for a table created directly with the connector. This wording was observed on the emulator; if production Spanner words it
 differently, the reader falls back to retrying and failing with Spanner's message.
 
 ### "change stream does not exist"

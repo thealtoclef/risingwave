@@ -4,6 +4,12 @@ End-to-end tests for the Spanner CDC source connector.
 
 The test can run with **either** the Spanner emulator or real Spanner.
 
+## Prerequisites
+
+- The `gcloud` CLI with the Spanner emulator component (`gcloud components install cloud-spanner-emulator`).
+  The `spanner-emulator` risedev profile checks for both before starting the emulator.
+- A nightly Rust toolchain: `prepare-data.rs` is a `cargo -Zscript` script.
+
 ## Running Tests
 
 ### Option 1: With Emulator (via risedev)
@@ -12,7 +18,7 @@ This is the easiest way for local development - risedev handles all setup.
 
 ```bash
 # Start RisingWave with Spanner emulator
-./risedev d spanner-only
+./risedev d spanner-emulator
 
 # Run Spanner CDC test
 ./risedev slt 'e2e_test/source_inline/spanner_cdc/spanner_cdc.slt.serial'
@@ -51,27 +57,10 @@ gcloud auth login
 - `prepare-data.rs` will verify the instance exists and create the database/table/change stream
 - No `SPANNER_EMULATOR_HOST` env var should be set
 
-### Option 3: Remote Build (K8s)
+### CI
 
-For building and testing on a remote K8s cluster:
-
-```bash
-# With emulator
-make -C scripts/remote run profile=spanner-only
-
-# With real Spanner (default, no profile)
-make -C scripts/remote run
-
-# Individual commands
-make -C scripts/remote sync      # Sync code
-make -C scripts/remote deploy profile=spanner-only  # Deploy with emulator
-make -C scripts/remote deploy                       # Deploy with real Spanner
-make -C scripts/remote test       # Run tests
-```
-
-### CI (Automatic)
-
-Tests run automatically in CI with the emulator.
+This test is not run in CI. Run it locally with the `spanner-emulator` profile before
+changing the Spanner CDC connector.
 
 ## Test Structure
 
@@ -124,14 +113,14 @@ error: ...
 **Emulator not running:**
 ```bash
 ./risedev k
-./risedev d spanner-only
+./risedev d spanner-emulator
 ```
 
 **Clean start:**
 ```bash
 ./risedev k
 ./risedev clean-data
-./risedev d spanner-only
+./risedev d spanner-emulator
 ```
 
 **Test hangs:**
