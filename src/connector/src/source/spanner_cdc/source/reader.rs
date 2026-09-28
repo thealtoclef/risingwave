@@ -42,7 +42,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::StreamExt;
-use futures::stream::FuturesUnordered;
+use futures::stream::{BoxStream, FuturesUnordered};
 use futures_async_stream::try_stream;
 use google_cloud_spanner::client::DatabaseClient;
 use google_cloud_spanner::statement::Statement;
@@ -55,6 +55,7 @@ use risingwave_common::metrics::GLOBAL_ERROR_METRICS;
 use risingwave_common::metrics::{LabelGuardedIntCounter, LabelGuardedIntGauge};
 use risingwave_common::{bail, ensure};
 use risingwave_pb::connector_service::{SourceType, cdc_message};
+use serde_json::Value as JsonValue;
 use thiserror_ext::AsReport;
 use time::OffsetDateTime;
 use tokio::sync::mpsc;
@@ -125,7 +126,10 @@ impl SplitReader for SpannerCdcSplitReader {
         let heartbeat_interval_ms = properties.heartbeat_milliseconds;
 
         let ctx = ReaderContext {
-            client,
+            querier: Arc::new(SpannerChangeStreamQuerier::new(
+                client,
+                &properties.change_stream_name,
+            )),
             database: properties.database.clone(),
             change_stream_name: properties.change_stream_name.clone(),
             heartbeat_interval_ms,
@@ -295,11 +299,109 @@ fn is_mergeable_batch(messages: &[SourceMessage]) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Change stream queries
+// ---------------------------------------------------------------------------
+
+/// One change stream query for one partition.
+#[derive(Clone, Debug)]
+struct PartitionQuery {
+    /// `None` for the root partition.
+    partition_token: Option<String>,
+    start_timestamp: OffsetDateTime,
+    heartbeat_milliseconds: i64,
+}
+
+/// Why reading the next row of a change stream query failed.
+enum RowError {
+    /// Spanner returned an error mid-stream.
+    Spanner(google_cloud_spanner::Error),
+    /// The row's `ChangeRecord` column could not be read as JSON.
+    Decode(anyhow::Error),
+}
+
+/// The rows of one change stream query, each the JSON of its `ChangeRecord` column.
+type ChangeRecordRows = BoxStream<'static, std::result::Result<JsonValue, RowError>>;
+
+/// Runs change stream queries: the only part of the reader that talks to Spanner.
+///
+/// Partition lifecycle, retries, timeouts and record handling all sit above this
+/// trait, so tests drive them through a scripted implementation instead of Spanner.
+#[async_trait]
+trait ChangeStreamQuerier: Send + Sync {
+    /// Start `query`, returning its rows once Spanner has accepted it.
+    async fn query(
+        &self,
+        query: PartitionQuery,
+    ) -> std::result::Result<ChangeRecordRows, google_cloud_spanner::Error>;
+}
+
+/// [`ChangeStreamQuerier`] backed by a Spanner database client.
+struct SpannerChangeStreamQuerier {
+    client: DatabaseClient,
+    sql: String,
+}
+
+impl SpannerChangeStreamQuerier {
+    fn new(client: DatabaseClient, change_stream_name: &str) -> Self {
+        // Workaround: the googleapis SDK's `OffsetDateTime::to_value()` formats
+        // timestamps with 9-digit subsecond precision (nanoseconds, padded with
+        // zeros for microsecond-precision values). Spanner's TIMESTAMP literal
+        // parser rejects that, so we format the timestamp ourselves with
+        // microsecond precision and bind it as a string.
+        let sql = format!(
+            "SELECT ChangeRecord FROM READ_{}(start_timestamp => @start_timestamp, end_timestamp => @end_timestamp, partition_token => @partition_token, heartbeat_milliseconds => @heartbeat_milliseconds)",
+            change_stream_name
+        );
+        Self { client, sql }
+    }
+}
+
+#[async_trait]
+impl ChangeStreamQuerier for SpannerChangeStreamQuerier {
+    async fn query(
+        &self,
+        query: PartitionQuery,
+    ) -> std::result::Result<ChangeRecordRows, google_cloud_spanner::Error> {
+        // The SDK retries a failed query or stream by default, with up to 10 attempts and
+        // backoff of up to a minute, all inside a single `execute_query` or `next` call.
+        // That is invisible to the stall timeout around those calls, which then fires and
+        // reports a timeout for what was really a retried error. `RetryBudget` is the only
+        // retry layer: it counts failures, resets on progress and resumes from the
+        // advanced offset.
+        let stmt = Statement::builder(&self.sql)
+            .with_retry_policy(NeverRetry)
+            .add_typed_param("start_timestamp", query.start_timestamp, types::timestamp())
+            .add_typed_param(
+                "end_timestamp",
+                Option::<OffsetDateTime>::None,
+                types::timestamp(),
+            )
+            .add_typed_param("partition_token", &query.partition_token, types::string())
+            .add_typed_param(
+                "heartbeat_milliseconds",
+                query.heartbeat_milliseconds,
+                types::int64(),
+            )
+            .build();
+        let result_set = self.client.single_use().build().execute_query(stmt).await?;
+        let rows = futures::stream::unfold(result_set, |mut result_set| async move {
+            let row = match result_set.next().await? {
+                Ok(row) => crate::source::spanner_cdc::types::change_record_column(&row, 0)
+                    .map_err(RowError::Decode),
+                Err(e) => Err(RowError::Spanner(e)),
+            };
+            Some((row, result_set))
+        });
+        Ok(rows.boxed())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Background reader task (equivalent to Debezium's JNI thread)
 // ---------------------------------------------------------------------------
 
 struct ReaderContext {
-    client: DatabaseClient,
+    querier: Arc<dyn ChangeStreamQuerier>,
     database: String,
     change_stream_name: String,
     heartbeat_interval_ms: i64,
@@ -994,7 +1096,7 @@ fn spawn_partition_task(
     child_discovery_tx: tokio::sync::mpsc::UnboundedSender<SpannerCdcSplit>,
     reader_metrics: &Arc<ReaderMetrics>,
 ) {
-    let client = ctx.client.clone();
+    let querier = ctx.querier.clone();
     let database = ctx.database.clone();
     let change_stream_name = ctx.change_stream_name.clone();
     let heartbeat_interval_ms = ctx.heartbeat_interval_ms;
@@ -1012,7 +1114,7 @@ fn spawn_partition_task(
 
     partition_streams.push(tokio::spawn(async move {
         Box::pin(read_partition(
-            client,
+            querier,
             database,
             split,
             change_stream_name,
@@ -1040,7 +1142,7 @@ fn spawn_partition_task(
 
 #[expect(clippy::too_many_arguments)]
 async fn read_partition(
-    client: DatabaseClient,
+    querier: Arc<dyn ChangeStreamQuerier>,
     database: String,
     mut split: SpannerCdcSplit,
     change_stream_name: String,
@@ -1065,16 +1167,6 @@ async fn read_partition(
         ))
     })?;
 
-    // Workaround: the googleapis SDK's `OffsetDateTime::to_value()` formats
-    // timestamps with 9-digit subsecond precision (nanoseconds, padded with
-    // zeros for microsecond-precision values). Spanner's TIMESTAMP literal
-    // parser rejects that, so we format the timestamp ourselves with
-    // microsecond precision and bind it as a string.
-    let sql = format!(
-        "SELECT ChangeRecord FROM READ_{}(start_timestamp => @start_timestamp, end_timestamp => @end_timestamp, partition_token => @partition_token, heartbeat_milliseconds => @heartbeat_milliseconds)",
-        change_stream_name
-    );
-
     tracing::info!(%split_id, %start_ts, partition_token = ?split.partition_token, "change stream query starting");
 
     let mut retry = RetryBudget::new(
@@ -1088,30 +1180,14 @@ async fn read_partition(
         let resume_ts = split
             .offset
             .expect("offset validated at entry and only advanced by advance_offset");
-        // The SDK retries a failed query or stream by default, with up to 10 attempts and
-        // backoff of up to a minute, all inside a single `execute_query` or `next` call.
-        // That is invisible to the stall timeout around those calls, which then fires and
-        // reports a timeout for what was really a retried error. `RetryBudget` below is the
-        // only retry layer: it counts failures, resets on progress and resumes from the
-        // advanced offset.
-        let stmt = Statement::builder(&sql)
-            .with_retry_policy(NeverRetry)
-            .add_typed_param("start_timestamp", resume_ts, types::timestamp())
-            .add_typed_param(
-                "end_timestamp",
-                Option::<OffsetDateTime>::None,
-                types::timestamp(),
-            )
-            .add_typed_param("partition_token", &split.partition_token, types::string())
-            .add_typed_param(
-                "heartbeat_milliseconds",
-                heartbeat_interval_ms,
-                types::int64(),
-            )
-            .build();
+        let query = PartitionQuery {
+            partition_token: split.partition_token.clone(),
+            start_timestamp: resume_ts,
+            heartbeat_milliseconds: heartbeat_interval_ms,
+        };
         let Err(e) = Box::pin(execute_query(
-            &client,
-            &stmt,
+            &*querier,
+            query,
             &mut split,
             &split_id,
             &database,
@@ -1151,8 +1227,8 @@ async fn read_partition(
 
 #[expect(clippy::too_many_arguments)]
 async fn execute_query(
-    client: &DatabaseClient,
-    stmt: &Statement,
+    querier: &dyn ChangeStreamQuerier,
+    query: PartitionQuery,
     split: &mut SpannerCdcSplit,
     split_id: &SplitId,
     database: &str,
@@ -1165,35 +1241,37 @@ async fn execute_query(
     reader_metrics: &ReaderMetrics,
 ) -> Result<()> {
     reader_metrics.queries.inc();
-    let txn = client.single_use().build();
-    let mut result_set =
-        match tokio::time::timeout(stall_timeout, txn.execute_query(stmt.clone())).await {
-            Ok(Ok(rs)) => rs,
-            Ok(Err(e)) => {
-                reader_metrics.record_failure(QueryFailure::Query);
-                if let Some(expired) = StartBeforeRetention::from_spanner(&e, split) {
-                    return Err(anyhow::Error::new(expired).into());
-                }
-                return Err(anyhow::anyhow!("failed to execute query: {}", e).into());
+    let mut rows = match tokio::time::timeout(stall_timeout, querier.query(query)).await {
+        Ok(Ok(rows)) => rows,
+        Ok(Err(e)) => {
+            reader_metrics.record_failure(QueryFailure::Query);
+            if let Some(expired) = StartBeforeRetention::from_spanner(&e, split) {
+                return Err(anyhow::Error::new(expired).into());
             }
-            Err(_) => {
-                reader_metrics.record_failure(QueryFailure::Establish);
-                return Err(anyhow::anyhow!(
-                    "query establishment timed out after {:?} for partition {:?}",
-                    stall_timeout,
-                    split.partition_token,
-                )
-                .into());
-            }
-        };
+            return Err(anyhow::anyhow!("failed to execute query: {}", e).into());
+        }
+        Err(_) => {
+            reader_metrics.record_failure(QueryFailure::Establish);
+            return Err(anyhow::anyhow!(
+                "query establishment timed out after {:?} for partition {:?}",
+                stall_timeout,
+                split.partition_token,
+            )
+            .into());
+        }
+    };
 
     let mut offset_cache = OffsetStringCache::new();
     let mut saw_child_partitions = false;
 
     loop {
-        let row = match tokio::time::timeout(stall_timeout, result_set.next()).await {
-            Ok(Some(Ok(row))) => row,
-            Ok(Some(Err(e))) => {
+        let json = match tokio::time::timeout(stall_timeout, rows.next()).await {
+            Ok(Some(Ok(json))) => json,
+            Ok(Some(Err(RowError::Decode(e)))) => {
+                reader_metrics.record_failure(QueryFailure::Decode);
+                return Err(e.into());
+            }
+            Ok(Some(Err(RowError::Spanner(e)))) => {
                 reader_metrics.record_failure(QueryFailure::Row);
                 if let Some(expired) = StartBeforeRetention::from_spanner(&e, split) {
                     return Err(anyhow::Error::new(expired).into());
@@ -1215,7 +1293,7 @@ async fn execute_query(
             return Ok(());
         }
 
-        let change_records = crate::source::spanner_cdc::types::parse_change_record_column(&row, 0)
+        let change_records = crate::source::spanner_cdc::types::parse_change_record_json(json)
             .inspect_err(|_| {
                 reader_metrics.record_failure(QueryFailure::Decode);
             })?;
@@ -1564,6 +1642,8 @@ fn make_schema_change_msg(
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use risingwave_common::test_prelude::StreamChunkTestExt;
     use time::macros::datetime;
 
@@ -2355,175 +2435,342 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Abort sibling tasks on failure: run_reader must fail-fast.
+    // run_reader: the partition lifecycle, driven by a scripted querier.
     // -----------------------------------------------------------------------
 
-    #[tokio::test]
-    async fn test_run_reader_aborts_siblings_on_failure() {
-        use std::time::Duration;
+    /// One scripted query result for [`FakeQuerier`].
+    enum FakeQuery {
+        /// Spanner rejects the query.
+        Fail(google_cloud_spanner::Error),
+        /// The query never starts.
+        Hang,
+        /// The partition task panics.
+        Panic,
+        /// The query yields `rows`, then ends, or stays open when `then_hang` is set.
+        Rows {
+            rows: Vec<std::result::Result<JsonValue, google_cloud_spanner::Error>>,
+            then_hang: bool,
+        },
+    }
 
-        // Verify that when one partition task fails, sibling tasks are aborted
-        // promptly rather than left running (holding channel open).
-        //
-        // Setup: tasks that hold cloned senders — one fails immediately, one
-        // sleeps for an hour.  Without the abort fix the test would hang for
-        // 3600s; with the fix the sleeping task is aborted and the whole thing
-        // completes in <5s.
+    /// Answers each partition's queries from a script, in order, and records every
+    /// query. A partition with no script left stays open without sending anything.
+    #[derive(Default)]
+    struct FakeQuerier {
+        scripts: std::sync::Mutex<HashMap<Option<String>, Vec<FakeQuery>>>,
+        calls: std::sync::Mutex<Vec<PartitionQuery>>,
+    }
 
-        let (tx, rx) = mpsc::channel::<Vec<SourceMessage>>(16);
-
-        let test_result = tokio::time::timeout(Duration::from_secs(5), async {
-            let mut partition_streams: FuturesUnordered<
-                tokio::task::JoinHandle<std::result::Result<PartitionResult, anyhow::Error>>,
-            > = FuturesUnordered::new();
-
-            // Task that holds a tx clone and fails immediately.
-            let tx_clone = tx.clone();
-            partition_streams.push(tokio::spawn(async move {
-                let _sender = tx_clone; // held until task is dropped
-                Err(anyhow::anyhow!("simulated partition failure"))
-            }));
-
-            // Task that holds a tx clone and would take forever.
-            let tx_clone = tx.clone();
-            partition_streams.push(tokio::spawn(async move {
-                let _sender = tx_clone; // held until task is dropped
-                tokio::time::sleep(Duration::from_secs(3600)).await;
-                Ok(PartitionResult {
-                    partition_token: None,
-                })
-            }));
-
-            // Simulate the fixed error handling path: abort siblings on error.
-            let mut error = None;
-            while let Some(result) = partition_streams.next().await {
-                match result {
-                    Ok(Ok(_)) => continue,
-                    Ok(Err(e)) => {
-                        for handle in &partition_streams {
-                            handle.abort();
-                        }
-                        error = Some(e);
-                        break;
-                    }
-                    Err(e) => {
-                        for handle in &partition_streams {
-                            handle.abort();
-                        }
-                        error = Some(anyhow::anyhow!("task panicked: {}", e));
-                        break;
-                    }
-                }
-            }
-            error
-        })
-        .await;
-
-        // Should complete within timeout (not wait 3600s for the slow task).
-        assert!(
-            test_result.is_ok(),
-            "run_reader should complete within timeout, not wait for orphaned tasks"
-        );
-        let inner_error = test_result.unwrap();
-        assert!(inner_error.is_some(), "should have captured the error");
-        assert!(
-            inner_error
+    impl FakeQuerier {
+        fn script(self, token: Option<&str>, mut queries: Vec<FakeQuery>) -> Self {
+            // Stored reversed so `pop` returns them in order.
+            queries.reverse();
+            self.scripts
+                .lock()
                 .unwrap()
-                .to_string()
-                .contains("simulated partition failure"),
-            "error should be from the failing partition"
-        );
+                .insert(token.map(str::to_owned), queries);
+            self
+        }
 
-        // Channel must close once the original tx is dropped — abort freed
-        // the cloned senders held by the tasks.
-        drop(tx);
-        let closed = tokio::time::timeout(Duration::from_secs(1), async {
-            while !rx.is_closed() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
+        fn calls(&self) -> Vec<PartitionQuery> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl ChangeStreamQuerier for FakeQuerier {
+        async fn query(
+            &self,
+            query: PartitionQuery,
+        ) -> std::result::Result<ChangeRecordRows, google_cloud_spanner::Error> {
+            self.calls.lock().unwrap().push(query.clone());
+            let next = self
+                .scripts
+                .lock()
+                .unwrap()
+                .get_mut(&query.partition_token)
+                .and_then(Vec::pop);
+            match next {
+                Some(FakeQuery::Fail(e)) => Err(e),
+                Some(FakeQuery::Hang) => futures::future::pending().await,
+                Some(FakeQuery::Panic) => panic!("simulated partition panic"),
+                Some(FakeQuery::Rows { rows, then_hang }) => {
+                    let rows = futures::stream::iter(
+                        rows.into_iter().map(|row| row.map_err(RowError::Spanner)),
+                    );
+                    Ok(if then_hang {
+                        rows.chain(futures::stream::pending()).boxed()
+                    } else {
+                        rows.boxed()
+                    })
+                }
+                None => Ok(futures::stream::pending().boxed()),
             }
-        })
-        .await;
+        }
+    }
+
+    const T0: OffsetDateTime = datetime!(2026-01-01 00:00:00 UTC);
+
+    fn rfc3339(ts: OffsetDateTime) -> String {
+        ts.format(&time::format_description::well_known::Rfc3339)
+            .unwrap()
+    }
+
+    fn heartbeat_row(ts: OffsetDateTime) -> JsonValue {
+        serde_json::json!([{ "heartbeat_record": [{ "timestamp": rfc3339(ts) }] }])
+    }
+
+    fn children_row(start: OffsetDateTime, children: &[(&str, &[&str])]) -> JsonValue {
+        let children: Vec<_> = children
+            .iter()
+            .map(|(token, parents)| {
+                serde_json::json!({ "token": token, "parent_partition_tokens": parents })
+            })
+            .collect();
+        serde_json::json!([{ "child_partitions_record": [{
+            "start_timestamp": rfc3339(start),
+            "record_sequence": "00000001",
+            "child_partitions": children,
+        }] }])
+    }
+
+    fn spanner_error(code: Code, message: &str) -> google_cloud_spanner::Error {
+        google_cloud_spanner::Error::service(
+            googleapis_gax::error::rpc::Status::default()
+                .set_code(code)
+                .set_message(message),
+        )
+    }
+
+    fn rows(rows: Vec<JsonValue>) -> FakeQuery {
+        FakeQuery::Rows {
+            rows: rows.into_iter().map(Ok).collect(),
+            then_hang: false,
+        }
+    }
+
+    fn test_reader_context(querier: Arc<FakeQuerier>, retry_attempts: u32) -> ReaderContext {
+        ReaderContext {
+            querier,
+            database: "db".to_owned(),
+            change_stream_name: "stream".to_owned(),
+            heartbeat_interval_ms: 1000,
+            retry_attempts,
+            retry_backoff: Duration::from_millis(1),
+            retry_backoff_max_delay_ms: 10,
+            retry_backoff_factor: 2,
+            stall_timeout: Duration::from_secs(60),
+            source_id: 1,
+            checkpointed_offset: Some(T0),
+            metrics: Arc::new(SourceMetrics::default()),
+            source_name: "test".to_owned(),
+            fragment_id: "0".to_owned(),
+        }
+    }
+
+    /// Receive messages until a heartbeat at `ts` arrives.
+    async fn recv_heartbeat_at(rx: &mut mpsc::Receiver<Vec<SourceMessage>>, ts: OffsetDateTime) {
+        let ts_ms = (ts.unix_timestamp_nanos() / 1_000_000) as i64;
+        while let Some(batch) = rx.recv().await {
+            if batch.iter().any(|msg| {
+                msg.is_cdc_heartbeat()
+                    && matches!(&msg.meta, SourceMeta::DebeziumCdc(meta) if meta.source_ts_ms == ts_ms)
+            }) {
+                return;
+            }
+        }
+        panic!("channel closed before the heartbeat at {ts}");
+    }
+
+    /// A merged child starts once, after every parent finished, from the start
+    /// timestamp its parents reported.
+    #[tokio::test(start_paused = true)]
+    async fn test_run_reader_starts_merged_child_once_after_all_parents() {
+        let t1 = T0 + Duration::from_secs(1);
+        let t2 = T0 + Duration::from_secs(2);
+        let querier = Arc::new(
+            FakeQuerier::default()
+                .script(
+                    None,
+                    vec![rows(vec![children_row(t1, &[("a", &[]), ("b", &[])])])],
+                )
+                .script(
+                    Some("a"),
+                    vec![rows(vec![children_row(t2, &[("c", &["a", "b"])])])],
+                )
+                // `b` fails once, so `c` must wait for its retry to finish.
+                .script(
+                    Some("b"),
+                    vec![
+                        FakeQuery::Fail(spanner_error(Code::Unavailable, "try again")),
+                        rows(vec![children_row(t2, &[("c", &["a", "b"])])]),
+                    ],
+                )
+                .script(
+                    Some("c"),
+                    vec![FakeQuery::Rows {
+                        rows: vec![Ok(heartbeat_row(t2 + Duration::from_secs(1)))],
+                        then_hang: true,
+                    }],
+                ),
+        );
+        let (tx, mut rx) = mpsc::channel(16);
+        let reader = tokio::spawn(run_reader(test_reader_context(querier.clone(), 3), tx));
+
+        recv_heartbeat_at(&mut rx, t2 + Duration::from_secs(1)).await;
+        drop(rx);
+        reader.await.unwrap().unwrap();
+
+        let calls = querier.calls();
+        let tokens: Vec<_> = calls.iter().map(|q| q.partition_token.as_deref()).collect();
+        assert_eq!(tokens.iter().filter(|t| **t == Some("c")).count(), 1);
+        assert_eq!(tokens.last(), Some(&Some("c")), "{tokens:?}");
+        assert_eq!(calls.last().unwrap().start_timestamp, t2);
+    }
+
+    /// A query that fails after making progress resumes from the advanced offset.
+    #[tokio::test(start_paused = true)]
+    async fn test_run_reader_resumes_from_advanced_offset() {
+        let t1 = T0 + Duration::from_secs(1);
+        let t2 = T0 + Duration::from_secs(2);
+        let querier = Arc::new(FakeQuerier::default().script(
+            None,
+            vec![
+                FakeQuery::Rows {
+                    rows: vec![
+                        Ok(heartbeat_row(t1)),
+                        Err(spanner_error(Code::Unavailable, "connection reset")),
+                    ],
+                    then_hang: false,
+                },
+                FakeQuery::Rows {
+                    rows: vec![Ok(heartbeat_row(t2))],
+                    then_hang: true,
+                },
+            ],
+        ));
+        let (tx, mut rx) = mpsc::channel(16);
+        let reader = tokio::spawn(run_reader(test_reader_context(querier.clone(), 2), tx));
+
+        recv_heartbeat_at(&mut rx, t2).await;
+        drop(rx);
+        reader.await.unwrap().unwrap();
+
+        let starts: Vec<_> = querier.calls().iter().map(|q| q.start_timestamp).collect();
+        assert_eq!(starts, vec![T0, t1]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_run_reader_fails_query_ending_without_child_partitions() {
+        let querier =
+            Arc::new(FakeQuerier::default().script(None, vec![rows(vec![heartbeat_row(T0)])]));
+        let (tx, _rx) = mpsc::channel(16);
+        let err = run_reader(test_reader_context(querier, 1), tx)
+            .await
+            .unwrap_err();
         assert!(
-            closed.is_ok(),
-            "channel should close after sibling tasks are aborted"
+            err.to_report_string()
+                .contains("ended without child partitions"),
+            "{}",
+            err.as_report()
         );
     }
 
-    #[tokio::test]
-    async fn test_run_reader_aborts_siblings_on_panic() {
-        use std::time::Duration;
-
-        let (tx, rx) = mpsc::channel::<Vec<SourceMessage>>(16);
-
-        let test_result = tokio::time::timeout(Duration::from_secs(5), async {
-            let mut partition_streams: FuturesUnordered<
-                tokio::task::JoinHandle<std::result::Result<PartitionResult, anyhow::Error>>,
-            > = FuturesUnordered::new();
-
-            // Task that panics.
-            let tx_clone = tx.clone();
-            partition_streams.push(tokio::spawn(async move {
-                let _sender = tx_clone;
-                panic!("simulated partition panic");
-            }));
-
-            // Task that holds a tx clone and sleeps forever.
-            let tx_clone = tx.clone();
-            partition_streams.push(tokio::spawn(async move {
-                let _sender = tx_clone;
-                tokio::time::sleep(Duration::from_secs(3600)).await;
-                Ok(PartitionResult {
-                    partition_token: None,
-                })
-            }));
-
-            // Simulate the fixed panic handling path.
-            let mut error = None;
-            while let Some(result) = partition_streams.next().await {
-                match result {
-                    Ok(Ok(_)) => continue,
-                    Ok(Err(e)) => {
-                        for handle in &partition_streams {
-                            handle.abort();
-                        }
-                        error = Some(e);
-                        break;
-                    }
-                    Err(e) => {
-                        for handle in &partition_streams {
-                            handle.abort();
-                        }
-                        error = Some(anyhow::anyhow!("task panicked: {}", e));
-                        break;
-                    }
-                }
-            }
-            error
-        })
-        .await;
-
-        assert!(test_result.is_ok(), "should complete within timeout");
-        let inner_error = test_result
-            .unwrap()
-            .expect("should have captured the panic error");
+    #[tokio::test(start_paused = true)]
+    async fn test_run_reader_does_not_retry_start_before_retention() {
+        let querier = Arc::new(FakeQuerier::default().script(
+            None,
+            vec![FakeQuery::Fail(spanner_error(
+                Code::OutOfRange,
+                "Specified start_timestamp is too far in the past",
+            ))],
+        ));
+        let (tx, _rx) = mpsc::channel(16);
+        let err = run_reader(test_reader_context(querier.clone(), 5), tx)
+            .await
+            .unwrap_err();
         assert!(
-            inner_error.to_string().contains("task panicked"),
-            "error should indicate a panic, got: {}",
-            inner_error
+            err.to_report_string().contains("retention period"),
+            "{}",
+            err.as_report()
         );
+        assert_eq!(querier.calls().len(), 1);
+    }
 
-        // Channel must close after abort.
-        drop(tx);
-        let closed = tokio::time::timeout(Duration::from_secs(1), async {
-            while !rx.is_closed() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await;
-        assert!(
-            closed.is_ok(),
-            "channel should close after sibling tasks are aborted"
-        );
+    /// Queries that never start, or go quiet, fail after the stall timeout and are retried.
+    #[tokio::test(start_paused = true)]
+    async fn test_run_reader_times_out_stuck_queries() {
+        let stalled = || FakeQuery::Rows {
+            rows: vec![],
+            then_hang: true,
+        };
+        for (queries, expected) in [
+            (
+                vec![FakeQuery::Hang, FakeQuery::Hang],
+                "query establishment timed out",
+            ),
+            (vec![stalled(), stalled()], "stream stalled"),
+        ] {
+            let querier = Arc::new(FakeQuerier::default().script(None, queries));
+            let (tx, _rx) = mpsc::channel(16);
+            let err = run_reader(test_reader_context(querier.clone(), 2), tx)
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_report_string().contains(expected),
+                "{}",
+                err.as_report()
+            );
+            assert_eq!(querier.calls().len(), 2);
+        }
+    }
+
+    /// One partition failing, or panicking, aborts its siblings, so their senders
+    /// are dropped and the channel closes.
+    #[tokio::test(start_paused = true)]
+    async fn test_run_reader_aborts_siblings_when_a_partition_fails() {
+        let t1 = T0 + Duration::from_secs(1);
+        for (failure, expected) in [
+            (
+                FakeQuery::Fail(spanner_error(
+                    Code::OutOfRange,
+                    "Specified start_timestamp is too far in the past",
+                )),
+                "retention period",
+            ),
+            (FakeQuery::Panic, "partition task panicked"),
+        ] {
+            let querier = Arc::new(
+                FakeQuerier::default()
+                    .script(
+                        None,
+                        vec![rows(vec![children_row(t1, &[("a", &[]), ("b", &[])])])],
+                    )
+                    .script(Some("a"), vec![failure])
+                    .script(
+                        Some("b"),
+                        vec![FakeQuery::Rows {
+                            rows: vec![],
+                            then_hang: true,
+                        }],
+                    ),
+            );
+            let (tx, mut rx) = mpsc::channel(16);
+            let err = run_reader(test_reader_context(querier, 1), tx)
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_report_string().contains(expected),
+                "{}",
+                err.as_report()
+            );
+            // `b` would stay open for the whole stall timeout if it were not aborted.
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while rx.recv().await.is_some() {}
+            })
+            .await
+            .expect("channel should close once the sibling task is aborted");
+        }
     }
 
     // -----------------------------------------------------------------------

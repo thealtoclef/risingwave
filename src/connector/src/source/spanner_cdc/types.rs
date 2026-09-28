@@ -359,18 +359,22 @@ pub struct ChildPartition {
 // Parsing
 // ============================================================================
 
-/// Parse the `ChangeRecord` column of a change-stream result row.
+/// Read the `ChangeRecord` column of a change-stream result row as JSON.
 ///
-/// The SDK returns `ARRAY<STRUCT<...>>` as a `JsonValue::Array` of objects. Spanner documents
-/// that this array always holds a single element per row, but every element is parsed anyway
-/// so a future multi-element row cannot be silently truncated.
-pub fn parse_change_record_column(
+/// The SDK returns `ARRAY<STRUCT<...>>` as a `JsonValue::Array` of objects.
+pub fn change_record_column(
     row: &google_cloud_spanner::result::Row,
     idx: usize,
-) -> anyhow::Result<Vec<ChangeStreamRecord>> {
-    let json: JsonValue = row
-        .try_get(idx)
-        .map_err(|e| anyhow::anyhow!("failed to get ChangeRecord column: {}", e))?;
+) -> anyhow::Result<JsonValue> {
+    row.try_get(idx)
+        .map_err(|e| anyhow::anyhow!("failed to get ChangeRecord column: {}", e))
+}
+
+/// Parse the JSON of a `ChangeRecord` column, as read by [`change_record_column`].
+///
+/// Spanner documents that the array always holds a single element per row, but every
+/// element is parsed anyway so a future multi-element row cannot be silently truncated.
+pub fn parse_change_record_json(json: JsonValue) -> anyhow::Result<Vec<ChangeStreamRecord>> {
     let elements = match json {
         JsonValue::Array(arr) if !arr.is_empty() => arr,
         JsonValue::Object(_) => vec![json],
