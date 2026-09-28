@@ -334,16 +334,19 @@ enum QueryFailure {
     Decode,
     /// A record used a value capture type that yields partial rows.
     UnsupportedValueCaptureType,
+    /// The query ended without naming the partitions that take over its key range.
+    NoChildPartitions,
 }
 
 impl QueryFailure {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 7] = [
         Self::Establish,
         Self::Stall,
         Self::Query,
         Self::Row,
         Self::Decode,
         Self::UnsupportedValueCaptureType,
+        Self::NoChildPartitions,
     ];
 
     /// Index into the pre-resolved counter array.
@@ -358,6 +361,7 @@ impl QueryFailure {
             Self::Row => 3,
             Self::Decode => 4,
             Self::UnsupportedValueCaptureType => 5,
+            Self::NoChildPartitions => 6,
         }
     }
 
@@ -369,6 +373,7 @@ impl QueryFailure {
             Self::Row => "row_error",
             Self::Decode => "decode_error",
             Self::UnsupportedValueCaptureType => "unsupported_value_capture_type",
+            Self::NoChildPartitions => "no_child_partitions",
         }
     }
 }
@@ -1123,6 +1128,7 @@ async fn execute_query(
         };
 
     let mut offset_cache = OffsetStringCache::new();
+    let mut saw_child_partitions = false;
 
     loop {
         let row = match tokio::time::timeout(stall_timeout, result_set.next()).await {
@@ -1254,6 +1260,7 @@ async fn execute_query(
 
             // Child partition discovery
             for cpr in &record.child_partitions_record {
+                saw_child_partitions = true;
                 let start_time = cpr.start_time();
                 for cp in &cpr.child_partitions {
                     // Register the child's offset here, before this task can finish.
@@ -1276,6 +1283,17 @@ async fn execute_query(
         }
     }
 
+    // The query has no end timestamp, so it ends only once the partition has named the
+    // partitions that take over its key range. Ending without them would leave that range
+    // unread for good; fail instead, as Debezium's Spanner connector does.
+    if !saw_child_partitions {
+        reader_metrics.record_failure(QueryFailure::NoChildPartitions);
+        return Err(anyhow::anyhow!(
+            "change stream query for partition {:?} ended without child partitions",
+            split.partition_token,
+        )
+        .into());
+    }
     tracing::info!(%split_id, final_offset = ?split.offset, "change stream result set exhausted");
     Ok(())
 }

@@ -715,7 +715,7 @@ unbounded and churn as Spanner splits and merges.
 | `spanner_cdc_child_partition_discovered_count` | counter | Child partitions discovered through `ChildPartitionsRecord`, excluding the root. Extra label `kind`: `split` (one parent) or `merge` (several) |
 | `spanner_cdc_partition_finished_count` | counter | Partition tasks that ran to completion |
 | `spanner_cdc_partition_query_count` | counter | Change stream queries issued, including retries — the load this source puts on the Spanner instance |
-| `spanner_cdc_partition_query_failure_count` | counter | Failed change stream queries. Extra label `cause`: `establish_timeout`, `stall_timeout`, `query_error`, `row_error`, `decode_error` |
+| `spanner_cdc_partition_query_failure_count` | counter | Failed change stream queries. Extra label `cause`: `establish_timeout`, `stall_timeout`, `query_error`, `row_error`, `decode_error`, `unsupported_value_capture_type`, `no_child_partitions` |
 | `spanner_cdc_parsed_chunk_queue_depth` | gauge | Chunks buffered between the parser task and the source actor, sampled on dequeue. Near `8` means the actor is the constraint, near `0` means the parser is |
 
 ##### Reading the lag pair
