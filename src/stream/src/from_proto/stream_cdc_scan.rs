@@ -40,11 +40,16 @@ fn decode_table_pk(
     table_desc: &ExternalTableDesc,
     table_type: &ExternalCdcTableType,
 ) -> StreamResult<DecodedTablePk> {
+    // The backfill compares keys against its snapshot position, so it must order NULL keys
+    // where the snapshot reads them.
+    let nulls_first_order = table_type
+        .pk_nulls_first()
+        .then(OrderType::ascending_nulls_first);
     if let Some(table_pk) = &table_desc.pk_ordering {
         let order_types = table_pk
             .columns
             .iter()
-            .map(|_| OrderType::ascending())
+            .map(|_| nulls_first_order.unwrap_or_else(OrderType::ascending))
             .collect_vec();
         let comparisons = table_pk
             .columns
@@ -61,7 +66,10 @@ fn decode_table_pk(
         let order_types = table_desc
             .pk
             .iter()
-            .map(|column| OrderType::from_protobuf(column.get_order_type().unwrap()))
+            .map(|column| {
+                nulls_first_order
+                    .unwrap_or_else(|| OrderType::from_protobuf(column.get_order_type().unwrap()))
+            })
             .collect_vec();
         let indices = table_desc
             .pk
@@ -274,8 +282,12 @@ mod tests {
             ExternalCdcTableType::SqlServer,
             ExternalCdcTableType::Mock,
         ] {
-            let (_, comparisons, _) =
+            let (order_types, comparisons, _) =
                 decode_table_pk(&legacy_desc(DataType::Int64), &table_type).unwrap();
+            assert_eq!(
+                order_types,
+                vec![OrderType::descending(), OrderType::ascending()]
+            );
             assert_eq!(
                 comparisons,
                 Some(vec![CdcKeyComparison::Native, CdcKeyComparison::Native])
@@ -315,5 +327,33 @@ mod tests {
             ])
         );
         assert_eq!(indices, vec![3, 1]);
+    }
+
+    #[test]
+    fn test_decode_spanner_pk_order_nulls_first() {
+        let desc = ExternalTableDesc {
+            pk_ordering: Some(CdcKeyOrdering {
+                columns: vec![Column {
+                    pk_col_idx: 1,
+                    comparison: Comparison::Native as i32,
+                }],
+            }),
+            ..Default::default()
+        };
+        let (order_types, _, _) = decode_table_pk(&desc, &ExternalCdcTableType::Spanner).unwrap();
+        assert_eq!(order_types, vec![OrderType::ascending_nulls_first()]);
+
+        let (order_types, _, _) = decode_table_pk(
+            &legacy_desc(DataType::Int64),
+            &ExternalCdcTableType::Spanner,
+        )
+        .unwrap();
+        assert_eq!(
+            order_types,
+            vec![
+                OrderType::ascending_nulls_first(),
+                OrderType::ascending_nulls_first()
+            ]
+        );
     }
 }

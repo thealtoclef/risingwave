@@ -36,6 +36,7 @@ use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 
 use anyhow::{Context, anyhow};
+use chrono::Datelike;
 use futures::stream::BoxStream;
 use futures::{StreamExt, pin_mut};
 use futures_async_stream::try_stream;
@@ -47,7 +48,7 @@ use google_cloud_spanner::statement::Statement;
 use google_cloud_spanner::transaction::{
     BeginTransactionOption, MultiUseReadOnlyTransaction, TimestampBound,
 };
-use google_cloud_spanner::value::FromValue;
+use google_cloud_spanner::value::{FromValue, Value};
 use risingwave_common::bail;
 use risingwave_common::catalog::{ColumnDesc, ColumnId, Field, Schema};
 use risingwave_common::row::{OwnedRow, Row as OwnedRowTrait};
@@ -659,8 +660,8 @@ impl SpannerExternalTableReader {
         );
 
         let stmt = Statement::builder(&sql);
-        let stmt = add_scalar_param(stmt, "left", left_value);
-        let stmt = add_scalar_param(stmt, "max", max_value);
+        let stmt = add_scalar_param(stmt, "left", left_value)?;
+        let stmt = add_scalar_param(stmt, "max", max_value)?;
         let stmt = stmt.build();
 
         let mut rows = txn
@@ -695,8 +696,8 @@ impl SpannerExternalTableReader {
             format!("SELECT MIN({col}) AS val FROM {tbl} WHERE {col} > @start AND {col} < @max",);
 
         let stmt = Statement::builder(&sql);
-        let stmt = add_scalar_param(stmt, "start", start_offset);
-        let stmt = add_scalar_param(stmt, "max", max_value);
+        let stmt = add_scalar_param(stmt, "start", start_offset)?;
+        let stmt = add_scalar_param(stmt, "max", max_value)?;
         let stmt = stmt.build();
 
         let mut rows = txn
@@ -939,7 +940,7 @@ impl SpannerExternalTableReader {
             let primary_keys: Vec<String> = self.pk_names.clone();
             let order_key = Self::get_order_key(&primary_keys);
             // Build filter: `pk0` > @pk0 OR (`pk0` = @pk0 AND `pk1` > @pk1) ...
-            let filter = build_pk_filter_sql(&primary_keys);
+            let filter = build_pk_filter_sql(&primary_keys, pk_row);
             let sql = format!(
                 "SELECT {} FROM {} WHERE {} ORDER BY {} LIMIT {}",
                 self.field_names,
@@ -949,7 +950,7 @@ impl SpannerExternalTableReader {
                 scan_limit
             );
             let stmt = Statement::builder(&sql);
-            add_pk_params(stmt, pk_row).build()
+            add_pk_params(stmt, pk_row)?.build()
         } else {
             let sql = format!(
                 "SELECT {} FROM {} ORDER BY {} LIMIT {}",
@@ -1017,7 +1018,6 @@ impl SpannerExternalTableReader {
             1,
             "multiple split columns is not supported yet"
         );
-        let split_column_name = &split_columns[0].name;
 
         let is_first_split = left[0].is_none();
         let is_last_split = right[0].is_none();
@@ -1042,53 +1042,21 @@ impl SpannerExternalTableReader {
 
         // Build query with PK range WHERE clause using parameter binding
         // Follows Postgres CDC pattern: split on single column specified by backfill_split_pk_column_index
-        let col = Self::quote_column(split_column_name);
-        let tbl = Self::quote_column(&self.table_name);
-
-        let (where_clause, stmt) = if is_first_split && is_last_split {
-            // No bounds - full table scan
-            let sql = format!("SELECT {} FROM {}", self.field_names, tbl);
-            (String::new(), Statement::builder(&sql).build())
-        } else if is_first_split {
-            // Unbounded left side: WHERE pk < @pk_end
-            let sql = format!(
-                "SELECT {} FROM {} WHERE {} < @pk_end",
-                self.field_names, tbl, col
-            );
-            let mut b = Statement::builder(&sql);
-            if let Some(ref scalar) = right[0] {
-                b = add_scalar_param(b, "pk_end", scalar);
-            }
-            (format!("WHERE {} < @pk_end", col), b.build())
-        } else if is_last_split {
-            // Unbounded right side: WHERE pk >= @pk_start
-            let sql = format!(
-                "SELECT {} FROM {} WHERE {} >= @pk_start",
-                self.field_names, tbl, col
-            );
-            let mut b = Statement::builder(&sql);
-            if let Some(ref scalar) = left[0] {
-                b = add_scalar_param(b, "pk_start", scalar);
-            }
-            (format!("WHERE {} >= @pk_start", col), b.build())
-        } else {
-            // Bounded range: WHERE pk >= @pk_start AND pk < @pk_end
-            let sql = format!(
-                "SELECT {} FROM {} WHERE {} >= @pk_start AND {} < @pk_end",
-                self.field_names, tbl, col, col
-            );
-            let mut b = Statement::builder(&sql);
-            if let Some(ref scalar) = left[0] {
-                b = add_scalar_param(b, "pk_start", scalar);
-            }
-            if let Some(ref scalar) = right[0] {
-                b = add_scalar_param(b, "pk_end", scalar);
-            }
-            (
-                format!("WHERE {} >= @pk_start AND {} < @pk_end", col, col),
-                b.build(),
-            )
-        };
+        let where_clause = build_split_filter_sql(&split_columns[0], is_first_split, is_last_split);
+        let sql = format!(
+            "SELECT {} FROM {} {}",
+            self.field_names,
+            Self::quote_column(&self.table_name),
+            where_clause
+        );
+        let mut stmt = Statement::builder(&sql);
+        if let Some(ref scalar) = left[0] {
+            stmt = add_scalar_param(stmt, "pk_start", scalar)?;
+        }
+        if let Some(ref scalar) = right[0] {
+            stmt = add_scalar_param(stmt, "pk_end", scalar)?;
+        }
+        let stmt = stmt.build();
 
         tracing::info!(
             "split_snapshot_read: executing partition_query with databoost={}, where={}",
@@ -1174,27 +1142,44 @@ fn try_increase_split_id(split_id: &mut i64) -> ConnectorResult<()> {
 }
 
 /// Adds a `ScalarImpl` value as a named parameter to a Spanner `StatementBuilder`.
-///
-/// Converts RisingWave scalar types to the corresponding Spanner parameter types.
 fn add_scalar_param(
     stmt: google_cloud_spanner::statement::StatementBuilder,
     name: &str,
     scalar: &ScalarImpl,
-) -> google_cloud_spanner::statement::StatementBuilder {
-    match scalar {
-        ScalarImpl::Int16(v) => stmt.add_param(name, *v as i64),
-        ScalarImpl::Int32(v) => stmt.add_param(name, *v as i64),
-        ScalarImpl::Int64(v) => stmt.add_param(name, v),
-        ScalarImpl::Float32(v) => stmt.add_param(name, v.0 as f64),
-        ScalarImpl::Float64(v) => stmt.add_param(name, v.0),
-        ScalarImpl::Utf8(v) => stmt.add_param(name, v.as_ref().to_owned()),
-        ScalarImpl::Bool(v) => stmt.add_param(name, v),
-        ScalarImpl::Decimal(v) => stmt.add_param(name, v.to_string()),
-        _ => panic!(
+) -> ConnectorResult<google_cloud_spanner::statement::StatementBuilder> {
+    Ok(stmt.add_param(name, scalar_to_spanner_value(scalar)?))
+}
+
+/// Converts a RisingWave scalar to a Spanner parameter value, covering every type a
+/// Spanner primary-key column maps to.
+///
+/// The value is bound untyped, so Spanner infers its type from the SQL: a NUMERIC is sent
+/// as its decimal string, like the SDK encodes one.
+fn scalar_to_spanner_value(scalar: &ScalarImpl) -> ConnectorResult<Value> {
+    let value = match scalar {
+        ScalarImpl::Int16(v) => Value::from(*v as i64),
+        ScalarImpl::Int32(v) => Value::from(*v as i64),
+        ScalarImpl::Int64(v) => Value::from(*v),
+        ScalarImpl::Float32(v) => Value::from(v.0 as f64),
+        ScalarImpl::Float64(v) => Value::from(v.0),
+        ScalarImpl::Utf8(v) => Value::from(v.as_ref().to_owned()),
+        ScalarImpl::Bool(v) => Value::from(*v),
+        ScalarImpl::Decimal(v) => Value::from(v.to_string()),
+        ScalarImpl::Bytea(v) => Value::from(v.to_vec()),
+        ScalarImpl::Timestamptz(v) => Value::from(micros_to_offset_datetime(v.timestamp_micros())?),
+        ScalarImpl::Date(v) => {
+            let month = time::Month::try_from(v.0.month() as u8)
+                .map_err(|e| anyhow!("invalid date {}: {}", v, e))?;
+            let date = time::Date::from_calendar_date(v.0.year(), month, v.0.day() as u8)
+                .map_err(|e| anyhow!("invalid date {}: {}", v, e))?;
+            Value::from(date)
+        }
+        _ => bail!(
             "unsupported ScalarImpl type for Spanner param binding: {:?}",
             scalar
         ),
-    }
+    };
+    Ok(value)
 }
 
 /// Builds a lexicographic `>` filter for composite PKs, expanded for Spanner
@@ -1203,38 +1188,78 @@ fn add_scalar_param(
 /// For a single PK column: `` `pk0` > @pk0 ``
 /// For composite (pk0, pk1, pk2):
 ///   `` (`pk0` > @pk0) OR (`pk0` = @pk0 AND `pk1` > @pk1) OR (`pk0` = @pk0 AND `pk1` = @pk1 AND `pk2` > @pk2) ``
-fn build_pk_filter_sql(pk_names: &[String]) -> String {
+///
+/// Spanner key columns can be NULL and sort NULL first, so a NULL value in `pk_row` is
+/// compared with `IS NULL` for equality and `IS NOT NULL` for greater, and is not bound
+/// as a parameter (see [`add_pk_params`]).
+fn build_pk_filter_sql(pk_names: &[String], pk_row: &OwnedRow) -> String {
     let cols: Vec<String> = pk_names
         .iter()
         .map(|n| SpannerExternalTableReader::quote_column(n))
         .collect();
+    let is_null = |i: usize| pk_row.datum_at(i).is_none();
 
     let mut clauses = Vec::with_capacity(pk_names.len());
     for i in 0..pk_names.len() {
         let mut parts = Vec::with_capacity(i + 1);
         // All preceding columns must be equal
         for (j, col) in cols.iter().enumerate().take(i) {
-            parts.push(format!("{} = @pk{}", col, j));
+            if is_null(j) {
+                parts.push(format!("{} IS NULL", col));
+            } else {
+                parts.push(format!("{} = @pk{}", col, j));
+            }
         }
         // The i-th column must be strictly greater
-        parts.push(format!("{} > @pk{}", cols[i], i));
+        if is_null(i) {
+            parts.push(format!("{} IS NOT NULL", cols[i]));
+        } else {
+            parts.push(format!("{} > @pk{}", cols[i], i));
+        }
         clauses.push(format!("({})", parts.join(" AND ")));
     }
     clauses.join(" OR ")
 }
 
+/// Builds the `WHERE` clause that reads one snapshot split, `[@pk_start, @pk_end)` on the
+/// split column. The first split has no lower bound and the last no upper bound.
+///
+/// The edge splits also read the keys that fail every range comparison in Spanner, so that
+/// each row is read by the split that `filter_stream_chunk` routes its changes to:
+/// - NULL sorts first there, so the first split reads NULL keys.
+/// - `NaN` sorts last there, so the last split reads `NaN` keys of a FLOAT64 column (Spanner
+///   does not allow FLOAT32 key columns).
+fn build_split_filter_sql(
+    split_column: &Field,
+    is_first_split: bool,
+    is_last_split: bool,
+) -> String {
+    let col = SpannerExternalTableReader::quote_column(&split_column.name);
+    match (is_first_split, is_last_split) {
+        (true, true) => String::new(),
+        (true, false) => format!("WHERE ({col} < @pk_end OR {col} IS NULL)"),
+        (false, true) if split_column.data_type == DataType::Float64 => {
+            format!("WHERE ({col} >= @pk_start OR IS_NAN({col}))")
+        }
+        (false, true) => format!("WHERE {col} >= @pk_start"),
+        (false, false) => format!("WHERE {col} >= @pk_start AND {col} < @pk_end"),
+    }
+}
+
 /// Adds PK row values as named parameters (@pk0, @pk1, ...) to a Spanner `StatementBuilder`.
+///
+/// NULL values are left unbound, since [`build_pk_filter_sql`] does not reference them.
 fn add_pk_params(
     mut stmt: google_cloud_spanner::statement::StatementBuilder,
     pk_row: &OwnedRow,
-) -> google_cloud_spanner::statement::StatementBuilder {
+) -> ConnectorResult<google_cloud_spanner::statement::StatementBuilder> {
     for (i, datum_ref) in pk_row.iter().enumerate() {
         if let Some(scalar_ref) = datum_ref {
             let scalar = scalar_ref.into_scalar_impl();
-            stmt = add_scalar_param(stmt, &format!("pk{}", i), &scalar);
+            stmt = add_scalar_param(stmt, &format!("pk{}", i), &scalar)?;
         }
     }
-    stmt
+    Ok(stmt)
 }
 
 // ---------------------------------------------------------------------------
@@ -1727,19 +1752,84 @@ mod tests {
 
     #[test]
     fn test_build_pk_filter_sql() {
+        let pk_row = |datums: &[Option<i64>]| {
+            OwnedRow::new(datums.iter().map(|d| d.map(ScalarImpl::Int64)).collect())
+        };
+
         let cols = vec!["v1".to_owned()];
-        let expr = build_pk_filter_sql(&cols);
+        let expr = build_pk_filter_sql(&cols, &pk_row(&[Some(1)]));
         assert_eq!(expr, "(`v1` > @pk0)");
 
         let cols = vec!["v1".to_owned(), "v2".to_owned()];
-        let expr = build_pk_filter_sql(&cols);
+        let expr = build_pk_filter_sql(&cols, &pk_row(&[Some(1), Some(1)]));
         assert_eq!(expr, "(`v1` > @pk0) OR (`v1` = @pk0 AND `v2` > @pk1)");
 
         let cols = vec!["v1".to_owned(), "v2".to_owned(), "v3".to_owned()];
-        let expr = build_pk_filter_sql(&cols);
+        let expr = build_pk_filter_sql(&cols, &pk_row(&[Some(1), Some(1), Some(1)]));
         assert_eq!(
             expr,
             "(`v1` > @pk0) OR (`v1` = @pk0 AND `v2` > @pk1) OR (`v1` = @pk0 AND `v2` = @pk1 AND `v3` > @pk2)"
         );
+
+        // NULL sorts first in Spanner: every non-NULL value is greater than it.
+        let cols = vec!["v1".to_owned(), "v2".to_owned()];
+        let expr = build_pk_filter_sql(&cols, &pk_row(&[None, Some(1)]));
+        assert_eq!(expr, "(`v1` IS NOT NULL) OR (`v1` IS NULL AND `v2` > @pk1)");
+        let expr = build_pk_filter_sql(&cols, &pk_row(&[Some(1), None]));
+        assert_eq!(expr, "(`v1` > @pk0) OR (`v1` = @pk0 AND `v2` IS NOT NULL)");
+    }
+
+    #[test]
+    fn test_build_split_filter_sql() {
+        let key = Field::new("k", DataType::Int64);
+        assert_eq!(build_split_filter_sql(&key, true, true), "");
+        assert_eq!(
+            build_split_filter_sql(&key, true, false),
+            "WHERE (`k` < @pk_end OR `k` IS NULL)"
+        );
+        assert_eq!(
+            build_split_filter_sql(&key, false, false),
+            "WHERE `k` >= @pk_start AND `k` < @pk_end"
+        );
+        assert_eq!(
+            build_split_filter_sql(&key, false, true),
+            "WHERE `k` >= @pk_start"
+        );
+
+        let key = Field::new("k", DataType::Float64);
+        assert_eq!(
+            build_split_filter_sql(&key, false, true),
+            "WHERE (`k` >= @pk_start OR IS_NAN(`k`))"
+        );
+    }
+
+    #[test]
+    fn test_scalar_to_spanner_value() {
+        use risingwave_common::types::{Date, Decimal, Timestamptz};
+
+        let to_string = |scalar: ScalarImpl| {
+            scalar_to_spanner_value(&scalar)
+                .unwrap()
+                .as_string()
+                .to_owned()
+        };
+        assert_eq!(to_string(ScalarImpl::Bytea(vec![1, 2, 255].into())), "AQL/");
+        assert_eq!(
+            to_string(ScalarImpl::Timestamptz(
+                Timestamptz::from_micros(1_704_067_200_123_456).unwrap()
+            )),
+            "2024-01-01T00:00:00.123456000Z"
+        );
+        assert_eq!(
+            to_string(ScalarImpl::Date(Date::from_ymd_uncheck(2024, 2, 29))),
+            "2024-02-29"
+        );
+        assert_eq!(
+            to_string(ScalarImpl::Decimal(
+                Decimal::from_str("12345678901234567.8").unwrap()
+            )),
+            "12345678901234567.8"
+        );
+        assert!(scalar_to_spanner_value(&ScalarImpl::Jsonb(serde_json::json!(1).into())).is_err());
     }
 }

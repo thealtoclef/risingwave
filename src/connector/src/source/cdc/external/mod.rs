@@ -105,6 +105,13 @@ impl ExternalCdcTableType {
         matches!(self, Self::Spanner)
     }
 
+    /// Whether primary-key columns can hold NULL, which the snapshot then reads first.
+    ///
+    /// Only Spanner allows NULL key columns; the keys of the other upstreams are never NULL.
+    pub fn pk_nulls_first(&self) -> bool {
+        matches!(self, Self::Spanner)
+    }
+
     pub async fn create_table_reader(
         &self,
         config: ExternalTableConfig,
