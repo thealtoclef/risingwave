@@ -173,7 +173,7 @@ async fn main() -> anyhow::Result<()> {
             println!("  Dropping change stream if exists...");
             let _ = execute_ddl(&format!("DROP CHANGE STREAM IF EXISTS {}", STREAM)).await;
             println!("  Dropping tables if exist...");
-            for table in &["orders", "inventory", "products", "users"] {
+            for table in &["arrays", "orders", "inventory", "products", "users"] {
                 let _ = execute_ddl(&format!("DROP TABLE IF EXISTS {}", table)).await;
             }
             println!("Spanner resources cleaned up");

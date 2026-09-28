@@ -46,10 +46,11 @@ use google_cloud_spanner::statement::Statement;
 use google_cloud_spanner::transaction::{
     BeginTransactionOption, MultiUseReadOnlyTransaction, TimestampBound,
 };
+use google_cloud_spanner::value::FromValue;
 use risingwave_common::bail;
 use risingwave_common::catalog::{ColumnDesc, ColumnId, Field, Schema};
 use risingwave_common::row::{OwnedRow, Row as OwnedRowTrait};
-use risingwave_common::types::{DataType, Datum, F32, F64, ListType, ScalarImpl};
+use risingwave_common::types::{DataType, Datum, F32, F64, ListType, ListValue, ScalarImpl};
 use time::OffsetDateTime;
 
 use crate::error::{ConnectorError, ConnectorResult};
@@ -1304,13 +1305,8 @@ fn spanner_cell_to_scalar_impl(
         }
 
         DataType::Date => {
-            use risingwave_common::types::Date;
             let v: Option<time::Date> = row.try_get(idx).ok();
-            v.and_then(|v| {
-                let s = format!("{:04}-{:02}-{:02}", v.year(), v.month(), v.day());
-                Date::from_str(&s).ok()
-            })
-            .map(ScalarImpl::Date)
+            v.and_then(spanner_date_to_scalar)
         }
 
         DataType::Decimal => {
@@ -1335,19 +1331,8 @@ fn spanner_cell_to_scalar_impl(
             })
         }
 
-        DataType::List(_) => {
-            // Handle ARRAY types - read as JSON array and convert
-            // The spanner library returns arrays as JSON strings
-            let s: Option<String> = row.try_get(idx).ok();
-            s.and_then(|s| {
-                // Parse the JSON array string
-                if let Ok(json_arr) = serde_json::from_str::<serde_json::Value>(&s) {
-                    // Return as JSONB for now (preserves all data)
-                    Some(ScalarImpl::Jsonb(json_arr.into()))
-                } else {
-                    None
-                }
-            })
+        DataType::List(list_type) => {
+            spanner_array_to_list(row, list_type.elem(), idx).map(ScalarImpl::List)
         }
 
         // Unknown or unsupported types - try to read as string as fallback
@@ -1359,6 +1344,74 @@ fn spanner_cell_to_scalar_impl(
             );
             let s: Option<String> = row.try_get(idx).ok();
             s.map(|s| ScalarImpl::Utf8(s.into()))
+        }
+    }
+}
+
+/// Converts a Spanner DATE to a RisingWave `Date`.
+///
+/// Built from the numeric year, month and day: `time::Month` displays as its name, so
+/// formatting it into a `YYYY-MM-DD` string does not round-trip.
+fn spanner_date_to_scalar(v: time::Date) -> Option<ScalarImpl> {
+    chrono::NaiveDate::from_ymd_opt(v.year(), v.month() as u32, v.day() as u32)
+        .map(|d| ScalarImpl::Date(risingwave_common::types::Date::new(d)))
+}
+
+/// Reads an ARRAY cell as a `ListValue` of `elem_type`.
+///
+/// Spanner sends an ARRAY as a list value, not a string, so each element is decoded by the
+/// SDK with the same `FromValue` impls the scalar branches of `spanner_cell_to_scalar_impl`
+/// use. Returns `None` for a NULL array or a cell that does not decode.
+fn spanner_array_to_list(row: &SpannerRow, elem_type: &DataType, idx: usize) -> Option<ListValue> {
+    fn collect<T: FromValue>(
+        row: &SpannerRow,
+        idx: usize,
+        elem_type: &DataType,
+        convert: impl Fn(T) -> Option<ScalarImpl>,
+    ) -> Option<ListValue> {
+        let items: Vec<Option<T>> = row.try_get(idx).ok()?;
+        Some(ListValue::from_datum_iter(
+            elem_type,
+            items.into_iter().map(|item| item.and_then(&convert)),
+        ))
+    }
+
+    match elem_type {
+        DataType::Boolean => collect(row, idx, elem_type, |v: bool| Some(ScalarImpl::Bool(v))),
+        DataType::Int64 => collect(row, idx, elem_type, |v: i64| Some(ScalarImpl::Int64(v))),
+        DataType::Float64 => collect(row, idx, elem_type, |v: f64| {
+            Some(ScalarImpl::Float64(F64::from(v)))
+        }),
+        DataType::Float32 => collect(row, idx, elem_type, |v: f64| {
+            Some(ScalarImpl::Float32(F32::from(v as f32)))
+        }),
+        DataType::Varchar => collect(row, idx, elem_type, |v: String| {
+            Some(ScalarImpl::Utf8(v.into()))
+        }),
+        DataType::Bytea => collect(row, idx, elem_type, |v: Vec<u8>| {
+            Some(ScalarImpl::Bytea(v.into()))
+        }),
+        DataType::Timestamptz => collect(row, idx, elem_type, |v: OffsetDateTime| {
+            let micros = (v.unix_timestamp_nanos() / 1000) as i64;
+            risingwave_common::types::Timestamptz::from_micros(micros).map(ScalarImpl::Timestamptz)
+        }),
+        DataType::Date => collect(row, idx, elem_type, spanner_date_to_scalar),
+        // NUMERIC is a decimal string on the wire, as in the scalar branch.
+        DataType::Decimal => collect(row, idx, elem_type, |v: String| {
+            risingwave_common::types::Decimal::from_str(&v)
+                .ok()
+                .map(ScalarImpl::Decimal)
+        }),
+        DataType::Jsonb => collect(row, idx, elem_type, |v: serde_json::Value| {
+            Some(ScalarImpl::Jsonb(v.into()))
+        }),
+        _ => {
+            tracing::warn!(
+                "column at index {} is an array of unsupported element type {:?}",
+                idx,
+                elem_type
+            );
+            None
         }
     }
 }

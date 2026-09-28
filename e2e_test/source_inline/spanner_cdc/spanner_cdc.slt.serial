@@ -390,6 +390,61 @@ product_id
 quantity
 status
 
+# =============================================================================
+# PART 10A: ARRAY AND DATE COLUMNS IN THE SNAPSHOT
+# Spanner returns ARRAY cells as list values; the backfill must read them as
+# typed lists, including NULL elements, NULL arrays and empty arrays.
+# DATE is checked both as a column and as an array element.
+# =============================================================================
+
+system ok
+e2e_test/source_inline/spanner_cdc/prepare-data.rs ddl "CREATE TABLE IF NOT EXISTS arrays (id INT64 NOT NULL, a_i ARRAY<INT64>, a_f ARRAY<FLOAT64>, a_s ARRAY<STRING(MAX)>, a_b ARRAY<BYTES(MAX)>, a_ts ARRAY<TIMESTAMP>, a_d ARRAY<DATE>, a_n ARRAY<NUMERIC>, a_j ARRAY<JSON>, a_bool ARRAY<BOOL>, d DATE) PRIMARY KEY (id)"
+
+system ok
+e2e_test/source_inline/spanner_cdc/prepare-data.rs dml "DELETE FROM arrays WHERE true"
+
+system ok
+e2e_test/source_inline/spanner_cdc/prepare-data.rs dml "INSERT INTO arrays (id, a_i, a_f, a_s, a_b, a_ts, a_d, a_n, a_j, a_bool, d) VALUES (1, [1, 9007199254740993, NULL], [1.5, NULL], ['x', NULL], [b'\x01\x02'], [TIMESTAMP '2024-03-04T05:06:07.123456Z'], [DATE '2024-02-29', NULL], [NUMERIC '12345678901234567.8'], [JSON '{\"k\":1}'], [true, NULL], DATE '2024-02-29'), (2, NULL, [], NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)"
+
+statement ok
+CREATE TABLE t_arrays (*) WITH (
+    spanner.databoost.enabled = 'false',
+)
+FROM spanner_source
+TABLE 'arrays';
+
+sleep 30s
+
+# INT64 elements beyond 2^53 must keep full precision.
+query III
+select a_i[1], a_i[2], a_i[3] from t_arrays where id = 1;
+----
+1 9007199254740993 NULL
+
+query RRTTT
+select a_f[1], a_f[2], a_s[1], a_s[2], a_b[1] from t_arrays where id = 1;
+----
+1.5 NULL x NULL \x0102
+
+query TTTTTBB
+select a_ts[1], a_d[1], a_d[2], a_n[1], a_j[1], a_bool[1], a_bool[2] from t_arrays where id = 1;
+----
+2024-03-04 05:06:07.123456+00:00 2024-02-29 NULL 12345678901234567.8 {"k": 1} t NULL
+
+query T
+select d from t_arrays where id = 1;
+----
+2024-02-29
+
+# A NULL array stays NULL; an empty array is not NULL.
+query BI
+select a_i is null, cardinality(a_f) from t_arrays where id = 2;
+----
+t 0
+
+statement ok
+DROP TABLE t_arrays;
+
 # Test CDC streaming on the new table
 system ok
 e2e_test/source_inline/spanner_cdc/prepare-data.rs dml "INSERT INTO orders (id, product_id, quantity, status) VALUES ('o3', 'p2', 5, 'pending')"
