@@ -380,7 +380,7 @@ All Spanner types are mapped to RisingWave types with **NO data loss**.
 | **BYTES** | `BYTEA` | Direct mapping |
 | **TIMESTAMP** | `TIMESTAMPTZ` | Direct mapping |
 | **DATE** | `DATE` | Direct mapping |
-| **NUMERIC** | `DECIMAL` | Direct mapping |
+| **NUMERIC** | `DECIMAL` | Passed to the parser as the exact decimal string (never through `f64`) |
 | **JSON** | `JSONB` | Direct mapping |
 | **ARRAY\<T\>** | `LIST` | Element-wise mapping; e.g., `ARRAY<INT64>` → `LIST<BIGINT>` |
 | **STRUCT\<...\>** | `JSONB` | Serialized structure preserved |

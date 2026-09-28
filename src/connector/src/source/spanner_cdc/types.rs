@@ -713,16 +713,15 @@ impl Mod {
         let convert_value = |column_name: &str, value: &JsonValue| -> JsonValue {
             match value {
                 JsonValue::String(s) => {
-                    // Check the actual column type
+                    // Check the actual column type. NUMERIC is left as a string: the
+                    // parser reads a decimal string exactly, while an f64 keeps only
+                    // ~16 of NUMERIC's 38 significant digits.
                     let should_convert = column_types
                         .get(column_name)
                         .map(|spanner_type| {
                             matches!(
                                 spanner_type.code,
-                                TypeCode::Int64
-                                    | TypeCode::Float64
-                                    | TypeCode::Float32
-                                    | TypeCode::Numeric
+                                TypeCode::Int64 | TypeCode::Float64 | TypeCode::Float32
                             )
                         })
                         .unwrap_or(false);
@@ -1407,5 +1406,42 @@ mod tests {
         assert_eq!(rows[1][2], Some(ScalarImpl::Float32(2.5.into())));
         assert_eq!(float_list(&rows[1][3]), vec![Some(0.1)]);
         assert_eq!(int_list(&rows[1][4]), vec![Some(-3)]);
+    }
+
+    /// NUMERIC arrives as a string (captured from the Spanner emulator, 2026-09-28, table
+    /// `t(id INT64, n NUMERIC, na ARRAY<NUMERIC>)`) and must be passed on unchanged: the
+    /// parser reads a decimal string exactly, while an f64 keeps only ~16 of NUMERIC's
+    /// 38 significant digits (`12345678901234567.8` became `12345678901234568`).
+    #[test]
+    fn test_numeric_stays_string() {
+        let record = DataChangeRecord::from_json(serde_json::json!({
+            "commit_timestamp": "2026-09-28T03:06:45.00871Z",
+            "record_sequence": "00000000",
+            "server_transaction_id": "1790564800365101",
+            "is_last_record_in_transaction_in_partition": true,
+            "table_name": "t",
+            "column_types": [
+                {"name": "id", "type": {"code": "INT64"}, "is_primary_key": true, "ordinal_position": "1"},
+                {"name": "n", "type": {"code": "NUMERIC"}, "is_primary_key": false, "ordinal_position": "2"},
+                {"name": "na", "type": {"array_element_type": {"code": "NUMERIC"}, "code": "ARRAY"}, "is_primary_key": false, "ordinal_position": "3"}
+            ],
+            "mods": [
+                {"keys": {"id": "3"}, "new_values": {"n": "12345678901234567.8", "na": ["0.1", "1234567.123456789"]}, "old_values": {}}
+            ],
+            "mod_type": "INSERT",
+            "value_capture_type": "NEW_ROW",
+            "number_of_records_in_transaction": "1",
+            "number_of_partitions_in_transaction": "1",
+            "transaction_tag": "",
+            "is_system_transaction": false
+        }))
+        .unwrap();
+
+        let map = record.column_type_map();
+        let json = record.mods[0].to_json_map("INSERT", &map);
+        let after = json["after"].as_object().unwrap();
+        assert_eq!(after["id"], serde_json::json!(3));
+        assert_eq!(after["n"], serde_json::json!("12345678901234567.8"));
+        assert_eq!(after["na"], serde_json::json!(["0.1", "1234567.123456789"]));
     }
 }
