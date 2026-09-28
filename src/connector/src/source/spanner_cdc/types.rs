@@ -189,7 +189,8 @@ impl SpannerType {
                 }
             }
             TypeCode::Struct => DataType::Jsonb,
-            TypeCode::Proto | TypeCode::Enum => DataType::Varchar,
+            TypeCode::Proto => DataType::Bytea,
+            TypeCode::Enum => DataType::Varchar,
             // Schema discovery stores UUID and unknown types as VARCHAR.
             TypeCode::Uuid | TypeCode::Unknown => DataType::Varchar,
         }
@@ -216,8 +217,9 @@ pub fn spanner_type_name_to_rw_type(type_name: &str) -> Option<DataType> {
         "BYTES" => Some(DataType::Bytea),
         "NUMERIC" => Some(DataType::Decimal),
         "JSON" => Some(DataType::Jsonb),
-        // Matches schema discovery, which stores UUID as VARCHAR.
-        "UUID" => Some(DataType::Varchar),
+        // Matches schema discovery, which stores these as VARCHAR, and PROTO as BYTEA.
+        "UUID" | "ENUM" => Some(DataType::Varchar),
+        "PROTO" => Some(DataType::Bytea),
         _ => None,
     }
 }
@@ -1086,6 +1088,50 @@ mod tests {
             ct.spanner_type.type_annotation,
             Some(TypeAnnotationCode::Unknown)
         );
+    }
+
+    /// A schema change lists every column of the table, so a type name that the
+    /// schema-change parser cannot map fails the whole change. Every name the reader
+    /// can emit must map to the type schema discovery gave the column.
+    #[test]
+    fn test_schema_change_type_names_match_schema_discovery() {
+        use crate::source::cdc::external::spanner::spanner_type_to_rw_type;
+
+        let proto: SpannerType = serde_json::from_value(serde_json::json!(
+            {"code": "PROTO", "proto_type_fqn": "examples.Singer"}
+        ))
+        .unwrap();
+        let enum_type: SpannerType = serde_json::from_value(serde_json::json!(
+            {"code": "ENUM", "proto_type_fqn": "examples.Genre"}
+        ))
+        .unwrap();
+        assert_eq!(proto.to_type_string(), "PROTO");
+        assert_eq!(enum_type.to_type_string(), "ENUM");
+
+        for name in [
+            "BOOL",
+            "INT64",
+            "FLOAT64",
+            "FLOAT32",
+            "TIMESTAMP",
+            "DATE",
+            "STRING",
+            "BYTES",
+            "NUMERIC",
+            "JSON",
+            "UUID",
+            "PROTO",
+            "ENUM",
+            "ARRAY<PROTO>",
+            "ARRAY<ENUM>",
+            "ARRAY<UUID>",
+        ] {
+            assert_eq!(
+                spanner_type_name_to_rw_type(name),
+                Some(spanner_type_to_rw_type(name).unwrap()),
+                "{name}"
+            );
+        }
     }
 
     /// Guards the refactor that hoisted the column-type map out of `to_json_map`:
