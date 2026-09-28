@@ -47,6 +47,8 @@ use futures_async_stream::try_stream;
 use google_cloud_spanner::client::DatabaseClient;
 use google_cloud_spanner::statement::Statement;
 use google_cloud_spanner::types;
+use googleapis_gax::error::rpc::Code;
+use googleapis_gax::retry_policy::NeverRetry;
 use risingwave_common::array::StreamChunk;
 #[allow(unused_imports)]
 use risingwave_common::metrics::GLOBAL_ERROR_METRICS;
@@ -1086,7 +1088,14 @@ async fn read_partition(
         let resume_ts = split
             .offset
             .expect("offset validated at entry and only advanced by advance_offset");
+        // The SDK retries a failed query or stream by default, with up to 10 attempts and
+        // backoff of up to a minute, all inside a single `execute_query` or `next` call.
+        // That is invisible to the stall timeout around those calls, which then fires and
+        // reports a timeout for what was really a retried error. `RetryBudget` below is the
+        // only retry layer: it counts failures, resets on progress and resumes from the
+        // advanced offset.
         let stmt = Statement::builder(&sql)
+            .with_retry_policy(NeverRetry)
             .add_typed_param("start_timestamp", resume_ts, types::timestamp())
             .add_typed_param(
                 "end_timestamp",
@@ -1417,7 +1426,7 @@ struct StartBeforeRetention {
 impl StartBeforeRetention {
     fn from_spanner(e: &google_cloud_spanner::Error, split: &SpannerCdcSplit) -> Option<Self> {
         let status = e.status()?;
-        if status.code.name() != "OUT_OF_RANGE" || !status.message.contains("too far in the past") {
+        if status.code != Code::OutOfRange || !status.message.contains("too far in the past") {
             return None;
         }
         Some(Self {

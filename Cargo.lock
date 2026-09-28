@@ -12436,6 +12436,7 @@ dependencies = [
  "gcp-bigquery-client",
  "glob",
  "google-cloud-auth",
+ "google-cloud-gax",
  "google-cloud-spanner",
  "google-cloud-wkt",
  "iceberg",

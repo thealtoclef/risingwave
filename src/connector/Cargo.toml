@@ -96,6 +96,9 @@ google-cloud-spanner = { git = "https://github.com/googleapis/google-cloud-rust"
     "default-rustls-provider",
 ] }
 google-cloud-wkt = { git = "https://github.com/googleapis/google-cloud-rust", rev = "4855fdd8be0e9c6063d3eac9f7d80bcb71782732" }
+# The gax crate that `google-cloud-spanner` uses. The `google-cloud-gax` key above is the
+# unrelated `gcloud-gax` crate used by Pub/Sub and BigQuery.
+googleapis-gax = { package = "google-cloud-gax", git = "https://github.com/googleapis/google-cloud-rust", rev = "4855fdd8be0e9c6063d3eac9f7d80bcb71782732" }
 iceberg = { workspace = true }
 iceberg-catalog-glue = { workspace = true }
 iceberg-catalog-rest = { workspace = true }
