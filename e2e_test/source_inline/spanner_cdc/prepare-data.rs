@@ -37,6 +37,9 @@ const STREAM: &str = "test_stream";
 /// columns the change stream does not watch.
 const PARTIAL_COLUMNS_STREAM: &str = "partial_columns_stream";
 
+/// A PostgreSQL-dialect database, for checking that CREATE SOURCE rejects it.
+const POSTGRESQL_DIALECT_DATABASE: &str = "test-postgresql-database";
+
 /// Check if we're using emulator (SPANNER_EMULATOR_HOST is set)
 fn is_using_emulator() -> bool {
     env::var("SPANNER_EMULATOR_HOST").is_ok()
@@ -178,9 +181,17 @@ async fn main() -> anyhow::Result<()> {
                 let _ = execute_ddl(&format!("DROP CHANGE STREAM IF EXISTS {}", stream)).await;
             }
             println!("  Dropping tables if exist...");
-            for table in &["arrays", "orders", "inventory", "products", "users"] {
+            for table in &[
+                "sch.items",
+                "arrays",
+                "orders",
+                "inventory",
+                "products",
+                "users",
+            ] {
                 let _ = execute_ddl(&format!("DROP TABLE IF EXISTS {}", table)).await;
             }
+            let _ = execute_ddl("DROP SCHEMA IF EXISTS sch").await;
             println!("Spanner resources cleaned up");
         }
         "setup" => {
@@ -233,6 +244,29 @@ async fn main() -> anyhow::Result<()> {
             }
             tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
             println!("Spanner resources setup complete!");
+        }
+        "create-postgresql-database" => {
+            if !using_emulator {
+                anyhow::bail!("create-postgresql-database is only supported on the emulator");
+            }
+            println!("Creating database {}...", POSTGRESQL_DIALECT_DATABASE);
+            let output = emulator_gcloud_command()
+                .args([
+                    "spanner",
+                    "databases",
+                    "create",
+                    POSTGRESQL_DIALECT_DATABASE,
+                    &format!("--instance={}", instance),
+                    "--database-dialect=POSTGRESQL",
+                ])
+                .output()?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                if !stderr.contains("already exists") {
+                    anyhow::bail!("Failed to create database: {}", stderr);
+                }
+                println!("  Database already exists");
+            }
         }
         "create-table" => {
             println!("Creating table users...");
@@ -289,6 +323,7 @@ async fn main() -> anyhow::Result<()> {
             eprintln!("Setup commands:");
             eprintln!("  cleanup              Drop table and change stream");
             eprintln!("  setup                Create instance and database (emulator only)");
+            eprintln!("  create-postgresql-database  Create a PostgreSQL-dialect database (emulator only)");
             eprintln!("  create-table         Create the users table");
             eprintln!("  create-change-stream Create the test_stream change stream");
             eprintln!("  insert-data          Insert initial test data");

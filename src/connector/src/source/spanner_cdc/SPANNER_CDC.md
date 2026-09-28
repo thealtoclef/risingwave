@@ -36,7 +36,13 @@ CREATE SOURCE spanner_source WITH (
 -- Create tables from the source (specify upstream table name)
 CREATE TABLE users FROM spanner_source TABLE 'users';
 CREATE TABLE orders FROM spanner_source TABLE 'orders';
+
+-- A table in a named schema is referenced as 'schema.table'
+CREATE TABLE sales_orders FROM spanner_source TABLE 'sales.orders';
 ```
+
+Only GoogleSQL-dialect databases are supported; `CREATE SOURCE` rejects a
+PostgreSQL-dialect database.
 
 ### Testing with Emulator
 
@@ -237,9 +243,9 @@ PartitionOffsets (shared via Arc<Mutex<HashMap>>):
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `spanner.heartbeat_milliseconds` | `2000` | Heartbeat interval in milliseconds for partition health monitoring. Maps to the `heartbeat_milliseconds` TVF argument. Valid range: 1,000–300,000. |
-| `spanner.max_missed_heartbeats` | `100` | Maximum consecutive missed heartbeats before a partition stream is considered stalled and restarted. Stall timeout = `spanner.heartbeat_milliseconds` × `spanner.max_missed_heartbeats`. |
+| `spanner.max_missed_heartbeats` | `10` | Maximum consecutive missed heartbeats before a partition stream is considered stalled and restarted. Stall timeout = `spanner.heartbeat_milliseconds` × `spanner.max_missed_heartbeats`. |
 | `spanner.start_timestamp` | current time | Start timestamp for the change stream query (RFC3339 format) |
-| `table.name` | - | Filter by upstream table (set via `TABLE 'name'` in CREATE TABLE) |
+| `table.name` | - | Filter by upstream table (set via `TABLE 'name'` in CREATE TABLE; `'schema.name'` for a table in a named schema) |
 
 #### Retry Configuration
 

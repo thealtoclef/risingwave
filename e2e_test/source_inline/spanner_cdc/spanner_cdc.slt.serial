@@ -76,6 +76,21 @@ CREATE SOURCE s WITH (
     spanner.change_stream.name = 'nonexistent_stream'
 );
 
+# A PostgreSQL-dialect database is rejected up front, before any GoogleSQL query
+# fails on it with a syntax error. Emulator only: the script creates the database.
+system ok
+e2e_test/source_inline/spanner_cdc/prepare-data.rs create-postgresql-database
+
+statement error uses the POSTGRESQL dialect, which is not supported
+CREATE SOURCE s WITH (
+    connector = 'spanner-cdc',
+    spanner.emulator_host = '${SPANNER_EMULATOR_HOST}',
+    spanner.project = '${SPANNER_PROJECT}',
+    spanner.instance = '${SPANNER_INSTANCE}',
+    database.name = 'test-postgresql-database',
+    spanner.change_stream.name = 'test_stream'
+);
+
 # =============================================================================
 # PART 3: SHARED SOURCE
 # =============================================================================
@@ -471,6 +486,63 @@ t 0
 
 statement ok
 DROP TABLE t_arrays;
+
+# =============================================================================
+# PART 10B: TABLE IN A NAMED SCHEMA
+# A table in a named schema is referenced as 'schema.table', the name change
+# records carry. Both the snapshot and later changes must reach the table.
+# =============================================================================
+
+system ok
+e2e_test/source_inline/spanner_cdc/prepare-data.rs ddl "CREATE SCHEMA IF NOT EXISTS sch"
+
+system ok
+e2e_test/source_inline/spanner_cdc/prepare-data.rs ddl "CREATE TABLE IF NOT EXISTS sch.items (id INT64 NOT NULL, name STRING(MAX)) PRIMARY KEY (id)"
+
+system ok
+e2e_test/source_inline/spanner_cdc/prepare-data.rs dml "DELETE FROM sch.items WHERE true"
+
+system ok
+e2e_test/source_inline/spanner_cdc/prepare-data.rs dml "INSERT INTO sch.items (id, name) VALUES (1, 'snapshot')"
+
+statement ok
+CREATE TABLE t_sch_items (*) WITH (
+    spanner.databoost.enabled = 'false',
+)
+FROM spanner_source
+TABLE 'sch.items';
+
+sleep 30s
+
+system ok
+e2e_test/source_inline/spanner_cdc/prepare-data.rs dml "INSERT INTO sch.items (id, name) VALUES (2, 'change')"
+
+sleep 10s
+
+query IT
+select id, name from t_sch_items order by id;
+----
+1 snapshot
+2 change
+
+# Auto schema change finds the table by its 'schema.table' name too.
+system ok
+e2e_test/source_inline/spanner_cdc/prepare-data.rs ddl "ALTER TABLE sch.items ADD COLUMN note STRING(MAX)"
+
+system ok
+e2e_test/source_inline/spanner_cdc/prepare-data.rs dml "INSERT INTO sch.items (id, name, note) VALUES (3, 'evolved', 'n')"
+
+sleep 10s
+
+query ITT
+select id, name, note from t_sch_items order by id;
+----
+1 snapshot NULL
+2 change NULL
+3 evolved n
+
+statement ok
+DROP TABLE t_sch_items;
 
 # Test CDC streaming on the new table
 system ok

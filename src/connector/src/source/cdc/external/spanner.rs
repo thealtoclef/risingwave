@@ -166,13 +166,15 @@ impl SpannerExternalTable {
         db_client: &DatabaseClient,
         table_name: &str,
     ) -> ConnectorResult<Vec<ColumnDesc>> {
+        let (schema, table) = split_table_name(table_name);
         let stmt = Statement::builder(
             "SELECT COLUMN_NAME, SPANNER_TYPE \
              FROM INFORMATION_SCHEMA.COLUMNS \
-             WHERE TABLE_SCHEMA = '' AND TABLE_NAME = @p1 \
+             WHERE TABLE_SCHEMA = @schema AND TABLE_NAME = @table \
              ORDER BY ORDINAL_POSITION",
         )
-        .add_param("p1", table_name)
+        .add_param("schema", schema)
+        .add_param("table", table)
         .build();
 
         let mut rows = db_client
@@ -200,13 +202,15 @@ impl SpannerExternalTable {
         db_client: &DatabaseClient,
         table_name: &str,
     ) -> ConnectorResult<Vec<String>> {
+        let (schema, table) = split_table_name(table_name);
         let stmt = Statement::builder(
             "SELECT COLUMN_NAME \
              FROM INFORMATION_SCHEMA.INDEX_COLUMNS \
-             WHERE TABLE_SCHEMA = '' AND TABLE_NAME = @p1 AND INDEX_TYPE = 'PRIMARY_KEY' \
+             WHERE TABLE_SCHEMA = @schema AND TABLE_NAME = @table AND INDEX_TYPE = 'PRIMARY_KEY' \
              ORDER BY ORDINAL_POSITION",
         )
-        .add_param("p1", table_name)
+        .add_param("schema", schema)
+        .add_param("table", table)
         .build();
 
         let mut rows = db_client
@@ -295,6 +299,7 @@ async fn fetch_watched_columns(
     stream: &str,
     table: &str,
 ) -> ConnectorResult<Option<WatchedColumns>> {
+    let (schema, table) = split_table_name(table);
     let stmt = Statement::builder(
         "SELECT `ALL` FROM INFORMATION_SCHEMA.CHANGE_STREAMS WHERE CHANGE_STREAM_NAME = @s",
     )
@@ -316,9 +321,10 @@ async fn fetch_watched_columns(
 
     let stmt = Statement::builder(
         "SELECT ALL_COLUMNS FROM INFORMATION_SCHEMA.CHANGE_STREAM_TABLES \
-         WHERE CHANGE_STREAM_NAME = @s AND TABLE_NAME = @t",
+         WHERE CHANGE_STREAM_NAME = @s AND TABLE_SCHEMA = @schema AND TABLE_NAME = @t",
     )
     .add_param("s", stream)
+    .add_param("schema", schema)
     .add_param("t", table)
     .build();
     let mut rows = client
@@ -342,9 +348,10 @@ async fn fetch_watched_columns(
 
     let stmt = Statement::builder(
         "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.CHANGE_STREAM_COLUMNS \
-         WHERE CHANGE_STREAM_NAME = @s AND TABLE_NAME = @t",
+         WHERE CHANGE_STREAM_NAME = @s AND TABLE_SCHEMA = @schema AND TABLE_NAME = @t",
     )
     .add_param("s", stream)
+    .add_param("schema", schema)
     .add_param("t", table)
     .build();
     let mut rows = client
@@ -460,6 +467,19 @@ impl SpannerExternalTableReader {
     /// prevent reserved-word conflicts.
     fn quote_column(name: &str) -> String {
         format!("`{}`", name)
+    }
+
+    /// Quotes a table name, quoting the schema and table separately for a table in a
+    /// named schema (`` `sch`.`t` ``): `` `sch.t` `` would name a table called `sch.t`.
+    fn quote_table(name: &str) -> String {
+        match split_table_name(name) {
+            ("", table) => Self::quote_column(table),
+            (schema, table) => format!(
+                "{}.{}",
+                Self::quote_column(schema),
+                Self::quote_column(table)
+            ),
+        }
     }
 
     pub async fn new(config: ExternalTableConfig, schema: Schema) -> ConnectorResult<Self> {
@@ -612,7 +632,7 @@ impl SpannerExternalTableReader {
         split_column: &Field,
     ) -> ConnectorResult<Option<(ScalarImpl, ScalarImpl)>> {
         let col = Self::quote_column(&split_column.name);
-        let tbl = Self::quote_column(&self.table_name);
+        let tbl = Self::quote_table(&self.table_name);
         let minmax_query =
             format!("SELECT MIN({col}) as min_val, MAX({col}) as max_val FROM {tbl}",);
 
@@ -653,7 +673,7 @@ impl SpannerExternalTableReader {
         split_column: &Field,
     ) -> ConnectorResult<Option<Datum>> {
         let col = Self::quote_column(&split_column.name);
-        let tbl = Self::quote_column(&self.table_name);
+        let tbl = Self::quote_table(&self.table_name);
         let sql = format!(
             "WITH t AS (SELECT {col} FROM {tbl} WHERE {col} >= @left ORDER BY {col} ASC LIMIT {max_split_size}) \
              SELECT CASE WHEN MAX({col}) < @max THEN MAX({col}) ELSE NULL END AS val FROM t",
@@ -691,7 +711,7 @@ impl SpannerExternalTableReader {
         split_column: &Field,
     ) -> ConnectorResult<Option<Datum>> {
         let col = Self::quote_column(&split_column.name);
-        let tbl = Self::quote_column(&self.table_name);
+        let tbl = Self::quote_table(&self.table_name);
         let sql =
             format!("SELECT MIN({col}) AS val FROM {tbl} WHERE {col} > @start AND {col} < @max",);
 
@@ -944,7 +964,7 @@ impl SpannerExternalTableReader {
             let sql = format!(
                 "SELECT {} FROM {} WHERE {} ORDER BY {} LIMIT {}",
                 self.field_names,
-                Self::quote_column(&self.table_name),
+                Self::quote_table(&self.table_name),
                 filter,
                 order_key,
                 scan_limit
@@ -955,7 +975,7 @@ impl SpannerExternalTableReader {
             let sql = format!(
                 "SELECT {} FROM {} ORDER BY {} LIMIT {}",
                 self.field_names,
-                Self::quote_column(&self.table_name),
+                Self::quote_table(&self.table_name),
                 order_key,
                 scan_limit
             );
@@ -1046,7 +1066,7 @@ impl SpannerExternalTableReader {
         let sql = format!(
             "SELECT {} FROM {} {}",
             self.field_names,
-            Self::quote_column(&self.table_name),
+            Self::quote_table(&self.table_name),
             where_clause
         );
         let mut stmt = Statement::builder(&sql);
@@ -1180,6 +1200,14 @@ fn scalar_to_spanner_value(scalar: &ScalarImpl) -> ConnectorResult<Value> {
         ),
     };
     Ok(value)
+}
+
+/// Splits a table name into its schema and table, the way change records name a table:
+/// `sch.t` for table `t` in the named schema `sch`, and `t` for a table in the default
+/// schema, whose `INFORMATION_SCHEMA.TABLE_SCHEMA` is `''`. Spanner identifiers cannot
+/// contain `.`, so the first `.` separates the two.
+fn split_table_name(name: &str) -> (&str, &str) {
+    name.split_once('.').unwrap_or(("", name))
 }
 
 /// Builds a lexicographic `>` filter for composite PKs, expanded for Spanner
@@ -1777,6 +1805,17 @@ mod tests {
         assert_eq!(expr, "(`v1` IS NOT NULL) OR (`v1` IS NULL AND `v2` > @pk1)");
         let expr = build_pk_filter_sql(&cols, &pk_row(&[Some(1), None]));
         assert_eq!(expr, "(`v1` > @pk0) OR (`v1` = @pk0 AND `v2` IS NOT NULL)");
+    }
+
+    #[test]
+    fn test_named_schema_table() {
+        assert_eq!(split_table_name("t"), ("", "t"));
+        assert_eq!(split_table_name("sch.t"), ("sch", "t"));
+        assert_eq!(SpannerExternalTableReader::quote_table("t"), "`t`");
+        assert_eq!(
+            SpannerExternalTableReader::quote_table("sch.t"),
+            "`sch`.`t`"
+        );
     }
 
     #[test]

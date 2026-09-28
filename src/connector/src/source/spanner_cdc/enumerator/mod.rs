@@ -47,6 +47,39 @@ impl SplitEnumerator for SpannerCdcSplitEnumerator {
         let source_id = context.info.source_id;
         let client = properties.create_client().await?;
 
+        // Reject PostgreSQL-dialect databases before any GoogleSQL query fails on them with
+        // a confusing syntax error: the connector only speaks GoogleSQL (backtick quoting,
+        // `@` parameters, the `READ_<stream>` function). This query is valid in both dialects.
+        let stmt = Statement::builder(
+            "SELECT OPTION_VALUE FROM INFORMATION_SCHEMA.DATABASE_OPTIONS \
+             WHERE OPTION_NAME = 'database_dialect'",
+        )
+        .build();
+        let mut rows = client
+            .single_use()
+            .build()
+            .execute_query(stmt)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to query database dialect: {}", e))?;
+        if let Some(row) = rows
+            .next()
+            .await
+            .transpose()
+            .map_err(|e| anyhow::anyhow!("failed to read row: {}", e))?
+        {
+            let dialect: String = row
+                .try_get(0)
+                .map_err(|e| anyhow::anyhow!("OPTION_VALUE: {}", e))?;
+            if dialect != "GOOGLE_STANDARD_SQL" {
+                bail!(
+                    "database '{}' uses the {} dialect, which is not supported; only \
+                     GoogleSQL-dialect Spanner databases can be read",
+                    properties.database,
+                    dialect
+                );
+            }
+        }
+
         // Validate that the change stream exists.
         let stmt = Statement::builder(
             "SELECT 1 FROM INFORMATION_SCHEMA.CHANGE_STREAMS WHERE CHANGE_STREAM_NAME = @name",
