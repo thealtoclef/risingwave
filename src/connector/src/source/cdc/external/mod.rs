@@ -297,30 +297,6 @@ pub trait ExternalTableReader: Sized {
         right: OwnedRow,
         split_columns: Vec<Field>,
     ) -> BoxStream<'_, ConnectorResult<OwnedRow>>;
-
-    /// Enumerate partitions and read from all of them in a single stream.
-    /// This is only supported by Spanner CDC, which uses session-bound partition tokens.
-    /// For other connectors, this returns an error.
-    ///
-    /// This method keeps the transaction alive throughout the entire read process,
-    /// ensuring partition tokens remain valid for Spanner.
-    ///
-    /// # Arguments
-    /// * `batch_size` - Number of rows to fetch per batch (currently unused)
-    /// * `max_concurrent_reads` - Maximum number of partitions to read concurrently
-    fn enumerate_and_read_partitions(
-        &self,
-        _batch_size: u32,
-        _max_concurrent_reads: usize,
-    ) -> BoxStream<'_, ConnectorResult<OwnedRow>> {
-        use futures::stream;
-        Box::pin(stream::once(async {
-            Err(
-                anyhow::anyhow!("enumerate_and_read_partitions is only supported for Spanner CDC")
-                    .into(),
-            )
-        }))
-    }
 }
 
 pub struct CdcTableSnapshotSplitOption {
@@ -528,14 +504,6 @@ impl ExternalTableReader for ExternalTableReaderImpl {
     ) -> BoxStream<'_, ConnectorResult<OwnedRow>> {
         self.split_snapshot_read_inner(table_name, left, right, split_columns)
     }
-
-    fn enumerate_and_read_partitions(
-        &self,
-        batch_size: u32,
-        max_concurrent_reads: usize,
-    ) -> BoxStream<'_, ConnectorResult<OwnedRow>> {
-        self.enumerate_and_read_partitions_inner(batch_size, max_concurrent_reads)
-    }
 }
 
 impl ExternalTableReaderImpl {
@@ -657,29 +625,6 @@ impl ExternalTableReaderImpl {
         for row in stream {
             let row = row?;
             yield row;
-        }
-    }
-
-    /// Inner method for `enumerate_and_read_partitions`. Only Spanner implements this;
-    /// other connectors return an error.
-    fn enumerate_and_read_partitions_inner(
-        &self,
-        batch_size: u32,
-        max_concurrent_reads: usize,
-    ) -> BoxStream<'_, ConnectorResult<OwnedRow>> {
-        match self {
-            ExternalTableReaderImpl::Spanner(spanner) => {
-                spanner.enumerate_and_read_partitions(batch_size, max_concurrent_reads)
-            }
-            _ => {
-                use futures::stream;
-                Box::pin(stream::once(async {
-                    Err(anyhow::anyhow!(
-                        "enumerate_and_read_partitions is only supported for Spanner CDC"
-                    )
-                    .into())
-                }))
-            }
         }
     }
 }
