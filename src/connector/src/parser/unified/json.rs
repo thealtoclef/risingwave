@@ -39,6 +39,13 @@ use super::{Access, AccessError, AccessResult};
 use crate::parser::DatumCow;
 use crate::schema::{InvalidOptionError, bail_invalid_option_error};
 
+/// Whether `value` is `NaN` or ±`Infinity` spelled as a string. JSON has no literal for them, so
+/// producers such as Spanner change streams send these strings. They are accepted for float
+/// columns even when string parsing is off: they cannot be sent as JSON numbers.
+fn is_non_finite_float_str(value: &BorrowedValue<'_>) -> bool {
+    matches!(value.as_str(), Some("NaN" | "Infinity" | "-Infinity"))
+}
+
 /// Try to parse Debezium `PostGIS` `geometry` object.
 ///
 /// Debezium represents `PostGIS` `geometry` as an object: `{"srid": <int>, "wkb": <base64_string>}`.
@@ -399,6 +406,9 @@ impl JsonParseOptions {
             ) if matches!(self.numeric_handling, NumericHandling::Relax { .. }) => {
                 (value.try_as_i64().map_err(|_| create_error())? as f32).into()
             }
+            (DataType::Float32, ValueType::String) if is_non_finite_float_str(value) => {
+                value.as_str().unwrap().parse::<f32>().unwrap().into()
+            }
             (DataType::Float32, ValueType::String)
                 if matches!(
                     self.numeric_handling,
@@ -423,6 +433,9 @@ impl JsonParseOptions {
                 ValueType::I64 | ValueType::I128 | ValueType::U64 | ValueType::U128,
             ) if matches!(self.numeric_handling, NumericHandling::Relax { .. }) => {
                 (value.try_as_i64().map_err(|_| create_error())? as f64).into()
+            }
+            (DataType::Float64, ValueType::String) if is_non_finite_float_str(value) => {
+                value.as_str().unwrap().parse::<f64>().unwrap().into()
             }
             (DataType::Float64, ValueType::String)
                 if matches!(

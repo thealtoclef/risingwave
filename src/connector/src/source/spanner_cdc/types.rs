@@ -478,6 +478,14 @@ impl DataChangeRecord {
             _ => vec![],
         };
         let mod_type = get_str("mod_type")?;
+        // These are the only types Spanner documents. Reading any other as an insert
+        // would write rows the database never had.
+        if !matches!(mod_type.as_str(), "INSERT" | "UPDATE" | "DELETE") {
+            return Err(anyhow::anyhow!(
+                "DataChangeRecord.mod_type: unsupported value '{}'",
+                mod_type
+            ));
+        }
         let mods = match mods_json {
             Some(JsonValue::Array(a)) => a
                 .into_iter()
@@ -589,10 +597,11 @@ impl Mod {
             }
         }
 
-        // Mirrors the per-`mod_type` reads in `to_json_map`; unknown types are read as INSERT.
+        // Mirrors the per-`mod_type` reads in `to_json_map`.
         let (uses_new, uses_old) = match mod_type {
             "UPDATE" => (true, true),
             "DELETE" => (false, true),
+            // INSERT; other types are rejected by `DataChangeRecord::from_json`.
             _ => (true, false),
         };
         let mut take = |k: &str| cell(k, obj.remove(k));
@@ -808,11 +817,6 @@ impl Mod {
 
         // Parse before and after values based on operation type
         let (before, after, op) = match mod_type {
-            "INSERT" => {
-                // INSERT: before is null, after has keys + new_values
-                let after_data = merge_keys_and_values(&self.keys, &self.new_values);
-                (JsonValue::Null, JsonValue::Object(after_data), "c")
-            }
             "UPDATE" => {
                 // UPDATE: before has keys + old_values (if available), after has keys + new_values
                 let after_data = merge_keys_and_values(&self.keys, &self.new_values);
@@ -837,10 +841,11 @@ impl Mod {
                 let before_data = merge_keys_and_values(&self.keys, &self.old_values);
                 (JsonValue::Object(before_data), JsonValue::Null, "d")
             }
+            // INSERT: before is null, after has keys + new_values. Other types are rejected
+            // by `DataChangeRecord::from_json`.
             _ => {
-                // Unknown operation type - treat as INSERT
-                let data = merge_keys_and_values(&self.keys, &self.new_values);
-                (JsonValue::Null, JsonValue::Object(data), "c")
+                let after_data = merge_keys_and_values(&self.keys, &self.new_values);
+                (JsonValue::Null, JsonValue::Object(after_data), "c")
             }
         };
 
@@ -1321,6 +1326,19 @@ mod tests {
         );
     }
 
+    /// A `mod_type` Spanner does not document fails the record instead of being written
+    /// as an insert.
+    #[test]
+    fn test_data_change_record_rejects_unknown_mod_type() {
+        let mut record = data_change_json();
+        record["mod_type"] = serde_json::json!("TRUNCATE");
+        let err = DataChangeRecord::from_json(record).unwrap_err();
+        assert!(
+            err.to_string().contains("TRUNCATE"),
+            "unexpected error: {err}"
+        );
+    }
+
     /// An empty type map (record carried no `column_types`) must not coerce
     /// anything, and must not error.
     #[test]
@@ -1370,8 +1388,10 @@ mod tests {
             ],
             "mods": [
                 // Inserted as d = NaN, r = NaN, arr = [NaN, 1.5]: the emulator writes NaN as
-                // null. Real Spanner sends the string "NaN" instead (see SPANNER_CDC.md).
+                // null.
                 {"keys": {"id": "1"}, "new_values": {"arr": [null, 1.5], "d": null, "i": ["1", "9007199254740993"], "r": null}, "old_values": {}},
+                // Real Spanner writes NaN and ±Infinity as strings.
+                {"keys": {"id": "2"}, "new_values": {"arr": ["NaN", "Infinity", 1.5], "d": "-Infinity", "i": [], "r": "NaN"}, "old_values": {}},
                 {"keys": {"id": "4"}, "new_values": {"arr": [0.1], "d": 1.25, "i": ["-3"], "r": 2.5}, "old_values": {}}
             ],
             "mod_type": "INSERT",
@@ -1419,7 +1439,7 @@ mod tests {
         builder.finish_current_chunk();
         let chunk = builder.consume_ready_chunks().next().unwrap();
         let rows: Vec<_> = chunk.rows().map(|(_, row)| row.to_owned_row()).collect();
-        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.len(), 3);
 
         let int_list = |d: &Option<ScalarImpl>| -> Vec<Option<i64>> {
             let Some(ScalarImpl::List(list)) = d else {
@@ -1445,18 +1465,28 @@ mod tests {
             int_list(&rows[0][4]),
             vec![Some(1), Some(9_007_199_254_740_993)]
         );
-        // The emulator sends NaN as null, so it is NULL here. Real Spanner sends "NaN",
-        // which the parser also reads as NULL (see SPANNER_CDC.md).
+        // The emulator sends NaN as null, so it is NULL here.
         assert_eq!(rows[0][1], None);
         assert_eq!(rows[0][2], None);
         assert_eq!(float_list(&rows[0][3]), vec![None, Some(1.5)]);
 
+        // Row 2: the strings real Spanner sends keep their values.
+        assert_eq!(
+            rows[1][1],
+            Some(ScalarImpl::Float64(f64::NEG_INFINITY.into()))
+        );
+        // RisingWave's float types compare NaN equal to NaN.
+        assert_eq!(rows[1][2], Some(ScalarImpl::Float32(f32::NAN.into())));
+        let arr = float_list(&rows[1][3]);
+        assert!(arr[0].unwrap().is_nan());
+        assert_eq!(arr[1..], [Some(f64::INFINITY), Some(1.5)]);
+
         // Row 4: finite values.
-        assert_eq!(rows[1][0], Some(ScalarImpl::Int64(4)));
-        assert_eq!(rows[1][1], Some(ScalarImpl::Float64(1.25.into())));
-        assert_eq!(rows[1][2], Some(ScalarImpl::Float32(2.5.into())));
-        assert_eq!(float_list(&rows[1][3]), vec![Some(0.1)]);
-        assert_eq!(int_list(&rows[1][4]), vec![Some(-3)]);
+        assert_eq!(rows[2][0], Some(ScalarImpl::Int64(4)));
+        assert_eq!(rows[2][1], Some(ScalarImpl::Float64(1.25.into())));
+        assert_eq!(rows[2][2], Some(ScalarImpl::Float32(2.5.into())));
+        assert_eq!(float_list(&rows[2][3]), vec![Some(0.1)]);
+        assert_eq!(int_list(&rows[2][4]), vec![Some(-3)]);
     }
 
     /// NUMERIC arrives as a string (captured from the Spanner emulator, 2026-09-28, table

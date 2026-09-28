@@ -395,8 +395,8 @@ float values described under [Limitations](#other-considerations).
 |--------------|-----------------|-------|
 | **BOOL** | `BOOLEAN` | Direct mapping |
 | **INT64** | `BIGINT` | Direct mapping |
-| **FLOAT64** | `DOUBLE PRECISION` | Direct mapping; NaN and ±Infinity become NULL in change events |
-| **FLOAT32** | `REAL` | Direct mapping; NaN and ±Infinity become NULL in change events |
+| **FLOAT64** | `DOUBLE PRECISION` | Direct mapping, including NaN and ±Infinity |
+| **FLOAT32** | `REAL` | Direct mapping, including NaN and ±Infinity |
 | **STRING** | `VARCHAR` | Direct mapping |
 | **BYTES** | `BYTEA` | Direct mapping |
 | **TIMESTAMP** | `TIMESTAMPTZ` | Direct mapping |
@@ -787,12 +787,11 @@ with `spanner_cdc_newest_partition_lag_milliseconds` tells you which failure you
 - Requires Spanner change streams to be created beforehand
 - At-least-once delivery (may have duplicates on failures)
 - Emulator has limited functionality compared to production Spanner
-- NaN, Infinity and -Infinity in FLOAT64/FLOAT32 columns and array elements are kept by the
-  snapshot but become NULL in change events. Spanner sends them as the JSON strings `"NaN"`,
-  `"Infinity"` and `"-Infinity"`, which the Debezium parser does not accept for a float
-  column; a scalar column is set to NULL with a `failed to parse non-pk column` warning, and
-  an array column containing one becomes NULL as a whole. A NaN key fails the row. The
-  emulator differs: it sends these values as JSON `null`.
+- The emulator sends NaN, Infinity and -Infinity in FLOAT64/FLOAT32 change events as JSON
+  `null`, so they become NULL there. Production Spanner sends the strings `"NaN"`,
+  `"Infinity"` and `"-Infinity"`, which are read as the float values.
+- A change record whose `mod_type` is not `INSERT`, `UPDATE` or `DELETE` fails the reader
+  instead of being written as an insert.
 - DataBoost requires IAM permission `spanner.databases.useDataBoost`
 
 ---

@@ -273,6 +273,35 @@ mod tests {
             }
         }
 
+        /// JSON has no number for NaN or ±Infinity, so they arrive as strings. Those three
+        /// spellings are read as floats; any other string still fails, as string parsing
+        /// is off for Debezium.
+        #[tokio::test]
+        async fn test1_debezium_json_parser_non_finite_float_strings() {
+            let columns = get_test1_columns();
+            for (weight, expected) in [
+                (r#""NaN""#, Some(f64::NAN)),
+                (r#""Infinity""#, Some(f64::INFINITY)),
+                (r#""-Infinity""#, Some(f64::NEG_INFINITY)),
+                (r#""nan""#, None),
+                (r#""1.5""#, None),
+            ] {
+                let data = format!(
+                    r#"{{"before":null,"after":{{"id":1,"name":"a","description":"b","weight":{weight}}},"op":"c","ts_ms":0}}"#
+                );
+                let parser = build_parser(columns.clone()).await;
+                let [(_op, row)]: [_; 1] = parse_one(parser, columns.clone(), data.into_bytes())
+                    .await
+                    .try_into()
+                    .unwrap();
+                assert_eq!(
+                    row[3],
+                    expected.map(|f| ScalarImpl::Float64(f.into())),
+                    "weight = {weight}"
+                );
+            }
+        }
+
         #[tokio::test]
         async fn test1_debezium_json_parser_delete() {
             //     "before": {
