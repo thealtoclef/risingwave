@@ -77,7 +77,7 @@ pub struct EnumeratorMetrics {
     pub sqlserver_cdc_upstream_min_lsn: LabelGuardedIntGaugeVec,
     /// SQL Server CDC upstream maximum LSN
     pub sqlserver_cdc_upstream_max_lsn: LabelGuardedIntGaugeVec,
-    /// Spanner CDC change stream timestamp (microseconds since epoch)
+    /// Spanner CDC upstream current timestamp (microseconds since epoch)
     pub spanner_cdc_change_stream_timestamp: LabelGuardedIntGaugeVec,
 }
 
@@ -152,7 +152,7 @@ impl EnumeratorMetrics {
 
         let spanner_cdc_change_stream_timestamp = register_guarded_int_gauge_vec_with_registry!(
             "spanner_cdc_change_stream_timestamp",
-            "Spanner CDC change stream position (microseconds since epoch)",
+            "Spanner CDC upstream current timestamp (microseconds since epoch)",
             &["source_id"],
             registry,
         )

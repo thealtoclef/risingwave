@@ -1270,6 +1270,10 @@ async fn execute_query(
                     // child and could jump past its start, and a checkpoint taken in
                     // that window would skip the child's first records on recovery.
                     offsets.register(Some(cp.token.clone()), start_time);
+                    // Index 0 is a placeholder, so `id()` is the same for every child.
+                    // Children live only inside this reader and are tracked by token; all
+                    // their messages carry the root's `split_id`. Give each child a unique
+                    // id before ever persisting or assigning children as separate splits.
                     let child_split = SpannerCdcSplit::new_child(
                         cp.token.clone(),
                         cp.parent_partition_tokens.clone(),

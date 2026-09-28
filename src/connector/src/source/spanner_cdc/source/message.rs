@@ -145,7 +145,7 @@ mod tests {
             server_transaction_id: "txn-1".to_owned(),
             is_last_record_in_transaction_in_partition: true,
             table_name: TABLE.to_owned(),
-            value_capture_type: "OLD_AND_NEW_VALUES".to_owned(),
+            value_capture_type: "NEW_ROW".to_owned(),
             column_types: vec![
                 column("id", TypeCode::Int64, 1),
                 column("owner", TypeCode::String, 2),

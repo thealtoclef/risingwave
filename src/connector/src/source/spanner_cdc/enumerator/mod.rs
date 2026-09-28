@@ -131,9 +131,9 @@ impl SplitEnumerator for SpannerCdcSplitEnumerator {
             offset,
         );
 
-        // Report the current Spanner timestamp as the source position metric.
-        // This queries Spanner's CURRENT_TIMESTAMP() to reflect how far along the
-        // change stream source is, assuming the reader always catches up by design.
+        // Report Spanner's current time as the upstream head, like
+        // `pg_cdc_upstream_max_lsn`. It is not the source's read position: that is
+        // `stream_spanner_cdc_state_timestamp`, and the difference is the checkpoint lag.
         let mut rows = self
             .client
             .single_use()

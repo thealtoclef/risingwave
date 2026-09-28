@@ -695,7 +695,7 @@ RisingWave exposes operational metrics via Prometheus. Spanner CDC has full metr
 
 | Metric | Labels | Description | Equivalent to |
 |--------|--------|-------------|---------------|
-| `spanner_cdc_change_stream_timestamp` | `source_id` | Current change stream position (microseconds since epoch) | `pg_cdc_confirmed_flush_lsn` |
+| `spanner_cdc_change_stream_timestamp` | `source_id` | Spanner's current time (`CURRENT_TIMESTAMP()`, microseconds since epoch), sampled on each source-worker tick. This is the upstream head, not how far the source has read: subtract `stream_spanner_cdc_state_timestamp` for the checkpoint lag | `pg_cdc_upstream_max_lsn` |
 | `stream_spanner_cdc_state_timestamp` | `source_id` | Checkpointed timestamp in state table (microseconds since epoch) | `stream_pg_cdc_state_table_lsn` |
 
 #### Partition-Lifecycle Metrics
