@@ -1,8 +1,6 @@
 # Spanner CDC E2E Tests
 
-End-to-end tests for the Spanner CDC source connector.
-
-The test can run with **either** the Spanner emulator or real Spanner.
+End-to-end tests for the Spanner CDC source connector, run against the Spanner emulator.
 
 ## Prerequisites
 
@@ -10,153 +8,51 @@ The test can run with **either** the Spanner emulator or real Spanner.
   The `spanner-emulator` risedev profile checks for both before starting the emulator.
 - A nightly Rust toolchain: `prepare-data.rs` is a `cargo -Zscript` script.
 
-## Running Tests
-
-### Option 1: With Emulator (via risedev)
-
-This is the easiest way for local development - risedev handles all setup.
+## Running
 
 ```bash
-# Start RisingWave with Spanner emulator
 ./risedev d spanner-emulator
-
-# Run Spanner CDC test
 ./risedev slt 'e2e_test/source_inline/spanner_cdc/spanner_cdc.slt.serial'
-
-# Stop when done
 ./risedev k
 ```
 
-When using risedev, the following environment variables are set automatically:
-- `SPANNER_EMULATOR_HOST` - Points to emulator
-- `SPANNER_PROJECT`, `SPANNER_INSTANCE`, `SPANNER_DATABASE` - Set to test values
-- `RISEDEV_SPANNER_WITH_OPTIONS_COMMON` - Pre-configured connection options
+The `spanner-emulator` profile sets:
+- `SPANNER_EMULATOR_HOST`: the emulator's gRPC address
+- `SPANNER_PROJECT`, `SPANNER_INSTANCE`, `SPANNER_DATABASE`: the test resources
+- `RISEDEV_SPANNER_WITH_OPTIONS_COMMON`: the connection options for `CREATE SOURCE`
 
-### Option 2: With Real Spanner
+This test is not run in CI. Run it locally before changing the Spanner CDC connector.
 
-Run tests against your real Spanner instance for production validation.
+## Files
 
-```bash
-# 1. Set environment variables for your Spanner resources
-export SPANNER_PROJECT="your-project-id"
-export SPANNER_INSTANCE="your-instance-name"
-export SPANNER_DATABASE="your-database-name"
-
-# 2. Ensure gcloud is authenticated
-gcloud auth login
-
-# 3. Start RisingWave (default profile, no emulator)
-./risedev d
-
-# 4. In another terminal, run the test
-./risedev slt 'e2e_test/source_inline/spanner_cdc/spanner_cdc.slt.serial'
-```
-
-**Important for real Spanner:**
-- The instance must exist before running the test
-- `prepare-data.rs` will verify the instance exists and create the database/table/change stream
-- No `SPANNER_EMULATOR_HOST` env var should be set
-
-### CI
-
-This test is not run in CI. Run it locally with the `spanner-emulator` profile before
-changing the Spanner CDC connector.
-
-## Test Structure
-
-### Files
-- `spanner_cdc.slt.serial` - Main test file
-- `prepare-data.rs` - Resource setup script (works with both emulator and real Spanner)
-
-### How It Works
-
-The test script (`prepare-data.rs`) automatically detects the environment:
-
-1. **If `SPANNER_EMULATOR_HOST` is set** → Uses emulator (risedev mode)
-   - Configures gcloud with no auth
-   - Creates instance, database, table, change stream
-
-2. **If `SPANNER_EMULATOR_HOST` is NOT set** → Uses real Spanner
-   - Verifies instance exists (you must create it first)
-   - Creates database, table, change stream
-   - Uses your existing gcloud authentication
-
-### Environment Variables
-
-| Variable | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `SPANNER_EMULATOR_HOST` | No* | - | Set by risedev when using emulator |
-| `SPANNER_PROJECT` | No | `test-project` | Your GCP project (for real Spanner) |
-| `SPANNER_INSTANCE` | No | `test-instance` | Spanner instance name |
-| `SPANNER_DATABASE` | No | `test-database` | Database name |
-
-*Required when using emulator
-
-## Expected Output
-
-### Successful Test
-```
-e2e_test/source_inline/spanner_cdc/spanner_cdc.slt.serial    .. [PASSED]
-```
-
-### Failed Test
-```
-e2e_test/source_inline/spanner_cdc/spanner_cdc.slt.serial    .. [FAILED]
-error: ...
-  --> e2e_test/source_inline/spanner_cdc/spanner_cdc.slt.serial:XX:X
-```
+- `spanner_cdc.slt.serial`: the test. One shared source reads a `FOR ALL` change stream,
+  and each part checks one behaviour:
+  1. Spanner fixtures
+  2. `CREATE SOURCE` / `CREATE TABLE` validation (options, value capture type, dialect, watched columns)
+  3. Backfill with default, even and uneven splits, an empty table, and backfill completion
+  4. Insert, update and delete through the change stream, including successive updates to one row
+  5. A table created after the source
+  6. Column types (scalars read by snapshot vs stream, arrays) and a named schema
+  7. Parallel backfill with changes issued while it runs
+  8. Schema evolution
+  9. `ALTER SOURCE`
+  10. Changes committed during recovery
+  11. Cleanup
+- `prepare-data.rs`: emulator fixtures, used as `system` commands by the test:
+  - `setup`: create the instance if needed and recreate the test database empty, so every
+    run starts clean
+  - `create-postgresql-database`: recreate a PostgreSQL-dialect database
+  - `ddl <SQL>` / `dml <SQL>`: run one statement
 
 ## Troubleshooting
 
-### Emulator Issues
-
-**Emulator not running:**
-```bash
-./risedev k
-./risedev d spanner-emulator
-```
-
-**Clean start:**
+**Emulator not running, or a clean start:**
 ```bash
 ./risedev k
 ./risedev clean-data
 ./risedev d spanner-emulator
 ```
 
-**Test hangs:**
-The test may take 10-20 seconds to create Spanner resources. If it hangs longer:
-```bash
-# Check if emulator is running
-docker ps | grep spanner
-
-# Check RisingWave logs
-./risedev l
-```
-
-### Real Spanner Issues
-
-**Instance not found:**
-```bash
-# List your instances
-gcloud spanner instances list --project=your-project
-
-# Create if needed
-gcloud spanner instances create test-instance \
-  --project=your-project \
-  --description="Test" \
-  --nodes=1
-```
-
-**Authentication issues:**
-```bash
-# Re-authenticate
-gcloud auth login
-
-# Check current account
-gcloud auth list
-```
-
-**Test fails with connection error:**
-- Ensure `SPANNER_EMULATOR_HOST` is NOT set
-- Verify environment variables are correct
-- Check gcloud can access your Spanner: `gcloud spanner databases list --instance=your-instance`
+**Test hangs:** each `prepare-data.rs` call compiles and runs a cargo script, and the checks
+retry for up to two minutes while data arrives. If it hangs longer, check the RisingWave logs
+with `./risedev l`.

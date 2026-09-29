@@ -333,13 +333,13 @@ The following properties can be changed on a running source without dropping and
 | `spanner.databoost.enabled` | No — table-level, set once at `CREATE TABLE FROM ... TABLE '...'` time; consumed only by the one-shot snapshot backfill reader, which has no live-reload path |
 
 ```sql
-ALTER SOURCE spanner_cdc_source SET (
+ALTER SOURCE spanner_cdc_source CONNECTOR WITH (
     spanner.heartbeat_milliseconds = 5000,
     spanner.max_missed_heartbeats = 200
 );
 ```
 
-Under the hood, `ALTER SOURCE ... SET (...)` updates the source catalog and issues a `ConnectorPropsChange` barrier mutation; the running source executor then rebuilds its `SpannerCdcSplitReader` with the new properties. No backfill re-runs, but the new reader restarts every partition query from that partition's last reported progress (see Watermark & Checkpoint), so a few seconds of each partition are read again (at-least-once). Changing `SOURCE_RATE_LIMIT` rebuilds the reader the same way. Only properties registered as `#[with_option(allow_alter_on_fly)]` on `SpannerCdcProperties` (see `mod.rs`) are accepted; anything else is rejected by `check_source_allow_alter_on_fly_fields`.
+Under the hood, `ALTER SOURCE ... CONNECTOR WITH (...)` updates the source catalog and issues a `ConnectorPropsChange` barrier mutation; the running source executor then rebuilds its `SpannerCdcSplitReader` with the new properties. No backfill re-runs, but the new reader restarts every partition query from that partition's last reported progress (see Watermark & Checkpoint), so a few seconds of each partition are read again (at-least-once). Changing `SOURCE_RATE_LIMIT` rebuilds the reader the same way. Only properties registered as `#[with_option(allow_alter_on_fly)]` on `SpannerCdcProperties` (see `mod.rs`) are accepted; anything else is rejected by `check_source_allow_alter_on_fly_fields`.
 
 `spanner.databoost.enabled` cannot be altered this way: it's injected into `CdcTableDesc.connect_properties` at `CREATE TABLE` time and read once by the backfill's external table reader, which doesn't subscribe to `ConnectorPropsChange`.
 
