@@ -42,6 +42,7 @@ use futures::stream::BoxStream;
 use futures::{StreamExt, pin_mut};
 use futures_async_stream::try_stream;
 use google_cloud_auth::credentials::{Credentials, anonymous, service_account};
+use google_cloud_spanner::batch::Partition;
 use google_cloud_spanner::client::{DatabaseClient, Spanner};
 use google_cloud_spanner::model::PartitionOptions;
 use google_cloud_spanner::result::Row as SpannerRow;
@@ -69,10 +70,9 @@ use crate::source::cdc::external::{
 
 /// Cap on concurrent partition executions per split during CDC backfill.
 ///
-/// Each partition runs as an independent read and buffers its full result set
-/// before yielding, so this bounds both in-flight reads and peak memory per
-/// split. Balanced to keep the split read well-parallelized without
-/// over-fanning out.
+/// Each partition runs as an independent read, which counts against the Data
+/// Boost concurrency limit when Data Boost is enabled. Balanced to keep the
+/// split read well-parallelized without over-fanning out.
 const DEFAULT_MAX_CONCURRENT_PARTITIONS: usize = 16;
 
 const DEFAULT_SPANNER_ENDPOINT: &str = "https://spanner.googleapis.com";
@@ -1109,31 +1109,26 @@ impl SpannerExternalTableReader {
         let partition_count = partitions.len();
         tracing::info!(partition_count, "split_snapshot_read: fanning out");
 
-        // Fan out partitions and stream completed batches. Each partition
-        // future materializes its full result set into a `Vec<OwnedRow>` before
-        // yielding, so `buffer_unordered` holds completed batches rather than
-        // row-yielding streams. In-flight reads and peak memory per split are
-        // bounded by `DEFAULT_MAX_CONCURRENT_PARTITIONS`.
-        let mut stream = futures::stream::iter(partitions.into_iter().map(|p| {
-            let p = p.set_data_boost(data_boost);
-            let db = db_client.clone();
-            let fields = &fields;
-            async move {
-                let mut rs = p.execute(&db).await?;
-                let mut out: Vec<OwnedRow> = Vec::new();
-                while let Some(row) = rs.next().await.transpose()? {
-                    out.push(spanner_row_to_owned_row(&row, fields, pk_names)?);
-                }
-                Ok::<_, anyhow::Error>(out)
-            }
-        }))
-        .buffer_unordered(DEFAULT_MAX_CONCURRENT_PARTITIONS);
+        // Fan out partitions and interleave their rows as they arrive. At most
+        // `DEFAULT_MAX_CONCURRENT_PARTITIONS` partitions are read at once, and a
+        // partition's rows are yielded while it is still being read.
+        let rows = futures::stream::iter(partitions)
+            .map(|p| read_partition(p.set_data_boost(data_boost), db_client.clone()))
+            .flatten_unordered(DEFAULT_MAX_CONCURRENT_PARTITIONS);
 
-        while let Some(batch) = stream.next().await {
-            for row in batch? {
-                yield row;
-            }
+        #[for_await]
+        for row in rows {
+            yield spanner_row_to_owned_row(&row?, fields, pk_names)?;
         }
+    }
+}
+
+/// Streams the rows of one snapshot partition.
+#[try_stream(boxed, ok = SpannerRow, error = anyhow::Error)]
+async fn read_partition(partition: Partition, db_client: DatabaseClient) {
+    let mut rs = partition.execute(&db_client).await?;
+    while let Some(row) = rs.next().await.transpose()? {
+        yield row;
     }
 }
 
