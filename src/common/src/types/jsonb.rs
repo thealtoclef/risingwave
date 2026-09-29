@@ -342,6 +342,11 @@ impl<'a> JsonbRef<'a> {
             .ok_or_else(|| "jsonb number out of range".into())
     }
 
+    /// If the JSON is an integer that fits in `i64`, returns it exactly.
+    pub fn as_i64(&self) -> Option<i64> {
+        self.0.as_i64()
+    }
+
     /// This is part of the `->>` or `#>>` syntax to access a child as string.
     ///
     /// * It is not `as_str`, because there is no runtime error when the jsonb type is not string.

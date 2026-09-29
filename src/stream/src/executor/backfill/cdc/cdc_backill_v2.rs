@@ -22,9 +22,10 @@ use itertools::Itertools;
 use risingwave_common::bitmap::BitmapBuilder;
 use risingwave_common::catalog::{CdcKeyComparison, ColumnDesc, Field};
 use risingwave_common::row::RowDeserializer;
-use risingwave_common::types::DatumRef;
+use risingwave_common::types::{DatumRef, JsonbRef, ScalarRefImpl};
 use risingwave_common::util::iter_util::ZipEqFast;
 use risingwave_common::util::sort_util::OrderType;
+use risingwave_connector::parser::DebeziumParser;
 use risingwave_connector::source::cdc::CdcScanOptions;
 use risingwave_connector::source::cdc::external::{
     CdcOffset, ExternalCdcTableType, ExternalTableConfig, ExternalTableReaderImpl,
@@ -36,7 +37,8 @@ use thiserror_ext::AsReport;
 use tracing::Instrument;
 
 use crate::executor::backfill::cdc::cdc_backfill::{
-    build_reader_and_poll_upstream, get_cdc_json_parse_handling_from_properties, transform_upstream,
+    build_debezium_parser, build_reader_and_poll_upstream,
+    get_cdc_json_parse_handling_from_properties, parse_debezium_chunk,
 };
 use crate::executor::backfill::cdc::state_v2::ParallelizedCdcBackfillState;
 use crate::executor::backfill::cdc::upstream_table::external::ExternalStorageTable;
@@ -143,7 +145,6 @@ impl<S: StateStore> ParallelizedCdcBackfillExecutor<S> {
         let mut upstream = self.upstream.execute();
         // Poll the upstream to get the first barrier.
         let first_barrier = expect_first_barrier(&mut upstream).await?;
-        // Make sure to use mapping_message after transform_upstream.
 
         // If user sets debezium.time.precision.mode to "connect", it means the user can guarantee
         // that the upstream data precision is MilliSecond. In this case, we don't use GuessNumberUnit
@@ -153,16 +154,24 @@ impl<S: StateStore> ParallelizedCdcBackfillExecutor<S> {
         // Only postgres-cdc connector may trigger TOAST.
         let handle_toast_columns: bool =
             self.external_table.table_type() == &ExternalCdcTableType::Postgres;
-        let mut upstream = transform_upstream(
-            upstream,
-            self.output_columns.clone(),
+        // Upstream chunks are parsed here rather than by `transform_upstream`, so that rows outside
+        // this actor's splits skip the parse. Make sure to map a chunk only after parsing it.
+        let parser = build_debezium_parser(
+            &self.output_columns,
             timestamp_handling,
             timestamptz_handling,
             time_handling,
             bigint_unsigned_handling,
             handle_toast_columns,
         )
-        .boxed();
+        .await?;
+        let split_key_column =
+            &self.output_columns[self.output_indices[snapshot_split_column_index]];
+        let mut upstream_parser = UpstreamChunkParser {
+            parser,
+            split_key_name: split_key_column.name.clone(),
+            split_key_type: split_key_column.data_type.clone(),
+        };
         let mut next_reset_barrier = Some(first_barrier);
         let mut is_reset = false;
         let mut state_impl = ParallelizedCdcBackfillState::new(self.state_table);
@@ -300,6 +309,22 @@ impl<S: StateStore> ParallelizedCdcBackfillExecutor<S> {
                     build_reader_and_poll_upstream(&mut upstream, &mut table_reader, &mut future)
                         .await?
                 {
+                    let msg = match msg {
+                        Message::Chunk(chunk) => {
+                            let Some(chunk) = upstream_parser
+                                .parse(
+                                    chunk,
+                                    &current_actor_bounds,
+                                    split_key_needs_unsigned_i64_compare.unwrap_or_default(),
+                                )
+                                .await?
+                            else {
+                                continue;
+                            };
+                            Message::Chunk(chunk)
+                        }
+                        msg => msg,
+                    };
                     if let Some(msg) = mapping_message(msg, &self.output_indices) {
                         match msg {
                             Message::Barrier(barrier) => {
@@ -511,6 +536,13 @@ impl<S: StateStore> ParallelizedCdcBackfillExecutor<S> {
                                     //     continue;
                                     // }
 
+                                    // `current_actor_bounds` already covers the current split.
+                                    let Some(chunk) = upstream_parser
+                                        .parse(chunk, &current_actor_bounds, split_key_unsigned)
+                                        .await?
+                                    else {
+                                        continue;
+                                    };
                                     let chunk = mapping_chunk(chunk, &self.output_indices);
                                     let (finished_chunk, current_chunk) =
                                         split_finished_and_current_chunk(
@@ -680,6 +712,12 @@ impl<S: StateStore> ParallelizedCdcBackfillExecutor<S> {
                         if actor_snapshot_splits.is_empty() {
                             continue;
                         }
+                        let Some(chunk) = upstream_parser
+                            .parse(chunk, &current_actor_bounds, split_key_unsigned)
+                            .await?
+                        else {
+                            continue;
+                        };
                         if chunk.cardinality() == 0 {
                             continue;
                         }
@@ -787,11 +825,7 @@ fn filter_stream_chunk(
         1,
         "multiple split columns is not supported yet"
     );
-    let left_split_key = left.datum_at(0);
-    let right_split_key = right.datum_at(0);
-    let is_leftmost_bound = is_leftmost_bound(left);
-    let is_rightmost_bound = is_rightmost_bound(right);
-    if is_leftmost_bound && is_rightmost_bound {
+    if is_leftmost_bound(left) && is_rightmost_bound(right) {
         return Some(chunk);
     }
     let mut new_bitmap = BitmapBuilder::with_capacity(chunk.capacity());
@@ -804,27 +838,9 @@ fn filter_stream_chunk(
             new_bitmap.append(false);
             continue;
         }
-        let mut is_in_range = true;
-        if !is_leftmost_bound {
-            is_in_range = cmp_split_key(
-                row_split_key,
-                left_split_key,
-                OrderType::ascending_nulls_first(),
-                split_key_unsigned,
-            )
-            .is_ge();
-        }
-        if is_in_range && !is_rightmost_bound {
-            is_in_range = cmp_split_key(
-                row_split_key,
-                right_split_key,
-                OrderType::ascending_nulls_first(),
-                split_key_unsigned,
-            )
-            .is_lt();
-        }
+        let is_in_range = is_in_split_range(row_split_key, left, right, split_key_unsigned);
         if !is_in_range {
-            tracing::trace!(?row_split_key, ?left_split_key, ?right_split_key, snapshot_split_column_index, data_type = ?columns[snapshot_split_column_index].data_type(), "filter out row")
+            tracing::trace!(?row_split_key, ?left, ?right, snapshot_split_column_index, data_type = ?columns[snapshot_split_column_index].data_type(), "filter out row")
         }
         new_bitmap.append(is_in_range);
     }
@@ -833,6 +849,129 @@ fn filter_stream_chunk(
         columns,
         new_bitmap.finish(),
     ))
+}
+
+/// Returns whether `split_key` is in `[left, right)`, where an all-NULL bound is unbounded.
+fn is_in_split_range(
+    split_key: DatumRef<'_>,
+    left: &OwnedRow,
+    right: &OwnedRow,
+    split_key_unsigned: bool,
+) -> bool {
+    let order = OrderType::ascending_nulls_first();
+    (is_leftmost_bound(left)
+        || cmp_split_key(split_key, left.datum_at(0), order, split_key_unsigned).is_ge())
+        && (is_rightmost_bound(right)
+            || cmp_split_key(split_key, right.datum_at(0), order, split_key_unsigned).is_lt())
+}
+
+/// Parses upstream chunks, skipping the Debezium parse of rows outside the actor's splits.
+///
+/// Upstream rows are broadcast to every backfill actor that has splits, and each actor keeps
+/// only the rows in its own splits. Reading the split key straight from the JSON payload lets
+/// an actor drop the other rows before the parse, which costs far more than the lookup. The
+/// filter after the parse still decides which rows are kept.
+struct UpstreamChunkParser {
+    parser: DebeziumParser,
+    split_key_name: String,
+    split_key_type: DataType,
+}
+
+impl UpstreamChunkParser {
+    /// Returns `None` when no row of `chunk` can be in `bounds`.
+    async fn parse(
+        &mut self,
+        chunk: StreamChunk,
+        bounds: &Option<(OwnedRow, OwnedRow)>,
+        split_key_unsigned: bool,
+    ) -> StreamExecutorResult<Option<StreamChunk>> {
+        // The parser expects one visible payload per row, and callers drop empty chunks anyway.
+        if chunk.cardinality() == 0 {
+            return Ok(None);
+        }
+        let Some(chunk) = self.drop_rows_out_of_bounds(chunk, bounds, split_key_unsigned) else {
+            return Ok(None);
+        };
+        parse_debezium_chunk(&mut self.parser, &chunk)
+            .await
+            .map(Some)
+    }
+
+    fn drop_rows_out_of_bounds(
+        &self,
+        chunk: StreamChunk,
+        bounds: &Option<(OwnedRow, OwnedRow)>,
+        split_key_unsigned: bool,
+    ) -> Option<StreamChunk> {
+        // No bound means no splits, and `filter_stream_chunk` drops everything.
+        let (left, right) = bounds.as_ref()?;
+        // A `BIGINT UNSIGNED` key is encoded according to `bigint_unsigned_handling`, which
+        // this lookup does not replicate.
+        if split_key_unsigned || (is_leftmost_bound(left) && is_rightmost_bound(right)) {
+            return Some(chunk);
+        }
+        let mut visibility = BitmapBuilder::with_capacity(chunk.capacity());
+        let mut dropped_any = false;
+        for (payload, visible) in chunk.columns()[0]
+            .iter()
+            .zip_eq_fast(chunk.visibility().iter())
+        {
+            let keep = visible && self.may_be_in_range(payload, left, right).unwrap_or(true);
+            dropped_any |= visible && !keep;
+            visibility.append(keep);
+        }
+        if !dropped_any {
+            return Some(chunk);
+        }
+        let chunk = chunk.clone_with_vis(visibility.finish());
+        // The parser expects one visible payload per row.
+        (chunk.cardinality() > 0).then(|| chunk.compact_vis())
+    }
+
+    /// Returns `None` when the split key cannot be read exactly as the parser would read it.
+    fn may_be_in_range(
+        &self,
+        payload: DatumRef<'_>,
+        left: &OwnedRow,
+        right: &OwnedRow,
+    ) -> Option<bool> {
+        let Some(ScalarRefImpl::Jsonb(event)) = payload else {
+            return None;
+        };
+        // Like `DebeziumJsonAccessBuilder`, read the event inside an optional `payload` envelope.
+        let payload = event.access_object_field("payload").unwrap_or(event);
+        // The parser reads `after` for an insert, update or snapshot read, and `before` for a
+        // delete.
+        let row = match get_json_field(payload, "op")?.as_str().ok()? {
+            "r" | "c" | "u" => "after",
+            "d" => "before",
+            _ => return None,
+        };
+        let value = get_json_field(get_json_field(payload, row)?, &self.split_key_name)?;
+        let split_key = match self.split_key_type {
+            DataType::Int16 => ScalarRefImpl::Int16(value.as_i64()?.try_into().ok()?),
+            DataType::Int32 => ScalarRefImpl::Int32(value.as_i64()?.try_into().ok()?),
+            DataType::Int64 => ScalarRefImpl::Int64(value.as_i64()?),
+            DataType::Varchar => ScalarRefImpl::Utf8(value.as_str().ok()?),
+            _ => return None,
+        };
+        Some(is_in_split_range(Some(split_key), left, right, false))
+    }
+}
+
+/// Gets a field the way the Debezium parser does: exact name first, then ignoring ASCII case.
+/// Returns `None` if several fields match ignoring case, since the parser's pick among them
+/// depends on its map's iteration order.
+fn get_json_field<'a>(object: JsonbRef<'a>, name: &str) -> Option<JsonbRef<'a>> {
+    if let Some(value) = object.access_object_field(name) {
+        return Some(value);
+    }
+    let mut matches = object
+        .object_key_values()
+        .ok()?
+        .filter(|(key, _)| key.eq_ignore_ascii_case(name));
+    let (_, value) = matches.next()?;
+    matches.next().is_none().then_some(value)
 }
 
 fn is_leftmost_bound(row: &OwnedRow) -> bool {
@@ -925,18 +1064,186 @@ fn assert_consecutive_splits(
 
 #[cfg(test)]
 mod tests {
+    use std::str::FromStr;
+
     use risingwave_common::array::{Op, StreamChunk};
-    use risingwave_common::row::OwnedRow;
-    use risingwave_common::types::{DataType, ScalarImpl};
+    use risingwave_common::catalog::{ColumnDesc, ColumnId};
+    use risingwave_common::row::{OwnedRow, Row};
+    use risingwave_common::types::{DataType, JsonbVal, ScalarImpl};
     use risingwave_connector::source::CdcTableSnapshotSplit;
 
+    use crate::executor::backfill::cdc::cdc_backfill::{
+        build_debezium_parser, parse_debezium_chunk,
+    };
     use crate::executor::backfill::cdc::cdc_backill_v2::{
-        assert_consecutive_splits, filter_stream_chunk, split_finished_and_current_chunk,
+        UpstreamChunkParser, assert_consecutive_splits, filter_stream_chunk,
+        split_finished_and_current_chunk,
     };
 
     /// A MySQL `BIGINT UNSIGNED` value as RisingWave stores it in an `Int64` column.
     fn unsigned_i64(v: u64) -> ScalarImpl {
         ScalarImpl::Int64(v as i64)
+    }
+
+    /// An upstream chunk of `(payload, _rw_offset)` rows.
+    fn upstream_chunk(payloads: &[&str]) -> StreamChunk {
+        let rows = payloads
+            .iter()
+            .enumerate()
+            .map(|(i, payload)| {
+                (
+                    Op::Insert,
+                    OwnedRow::new(vec![
+                        Some(JsonbVal::from_str(payload).unwrap().into()),
+                        Some(ScalarImpl::Utf8(format!("offset {i}").into())),
+                    ]),
+                )
+            })
+            .collect::<Vec<_>>();
+        StreamChunk::from_rows(&rows, &[DataType::Jsonb, DataType::Varchar])
+    }
+
+    /// A parser of `(id bigint, name varchar)` rows, split on `split_key`.
+    async fn new_upstream_parser(split_key: &str) -> UpstreamChunkParser {
+        let columns = [
+            ColumnDesc::named("id", ColumnId::new(1), DataType::Int64),
+            ColumnDesc::named("name", ColumnId::new(2), DataType::Varchar),
+        ];
+        let split_key_type = columns
+            .iter()
+            .find(|c| c.name == split_key)
+            .unwrap()
+            .data_type
+            .clone();
+        UpstreamChunkParser {
+            parser: build_debezium_parser(&columns, None, None, None, None, false)
+                .await
+                .unwrap(),
+            split_key_name: split_key.to_owned(),
+            split_key_type,
+        }
+    }
+
+    fn split_bounds(
+        left: Option<ScalarImpl>,
+        right: Option<ScalarImpl>,
+    ) -> Option<(OwnedRow, OwnedRow)> {
+        Some((OwnedRow::new(vec![left]), OwnedRow::new(vec![right])))
+    }
+
+    #[tokio::test]
+    async fn test_upstream_chunk_parser_keeps_the_rows_of_a_full_parse() {
+        let chunk = upstream_chunk(&[
+            r#"{"op": "c", "before": null, "after": {"id": 1, "name": "a"}}"#,
+            r#"{"op": "c", "before": null, "after": {"id": 3, "name": "b"}}"#,
+            r#"{"payload": {"op": "r", "before": null, "after": {"id": 7, "name": "c"}}}"#,
+            r#"{"op": "d", "before": {"id": 4, "name": "d"}, "after": null}"#,
+            r#"{"op": "d", "before": {"id": 9, "name": "e"}, "after": null}"#,
+            r#"{"op": "u", "before": {"id": 2, "name": "f"}, "after": {"id": 2, "name": "g"}}"#,
+            r#"{"op": "c", "before": null, "after": {"ID": 8, "name": "h"}}"#,
+            // The exact name wins over a name that differs only in case.
+            r#"{"op": "c", "before": null, "after": {"id": 3, "ID": 9, "name": "i"}}"#,
+            // Not readable as the parser reads a `bigint`, so it is left to the parser.
+            r#"{"op": "c", "before": null, "after": {"id": "3", "name": "j"}}"#,
+        ]);
+        let int = |v| Some(ScalarImpl::Int64(v));
+        for (bounds, parsed_rows) in [
+            (split_bounds(int(2), int(5)), 5),
+            (split_bounds(None, int(5)), 6),
+            (split_bounds(int(5), None), 4),
+        ] {
+            let mut upstream_parser = new_upstream_parser("id").await;
+            let parsed = upstream_parser
+                .parse(chunk.clone(), &bounds, false)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(parsed.capacity(), parsed_rows);
+
+            let fully_parsed = parse_debezium_chunk(&mut upstream_parser.parser, &chunk)
+                .await
+                .unwrap();
+            let filter = |chunk| {
+                filter_stream_chunk(chunk, &bounds, 0, false)
+                    .unwrap()
+                    .compact_vis()
+            };
+            assert_eq!(filter(parsed), filter(fully_parsed));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_upstream_chunk_parser_drops_rows_by_varchar_split_key() {
+        let chunk = upstream_chunk(&[
+            r#"{"op": "c", "after": {"id": 1, "name": "a"}}"#,
+            r#"{"op": "c", "after": {"id": 2, "name": "c"}}"#,
+            r#"{"op": "c", "after": {"id": 3, "name": "e"}}"#,
+        ]);
+        let upstream_parser = new_upstream_parser("name").await;
+        let varchar = |v: &str| Some(ScalarImpl::Utf8(v.into()));
+
+        let kept = upstream_parser
+            .drop_rows_out_of_bounds(
+                chunk.clone(),
+                &split_bounds(varchar("b"), varchar("d")),
+                false,
+            )
+            .unwrap();
+        assert_eq!(kept.capacity(), 1);
+        assert_eq!(chunk_payload(&kept, 0), chunk_payload(&chunk, 1));
+
+        // An actor without splits keeps nothing.
+        assert!(
+            upstream_parser
+                .drop_rows_out_of_bounds(chunk.clone(), &None, false)
+                .is_none()
+        );
+        // Every row out of bounds.
+        assert!(
+            upstream_parser
+                .drop_rows_out_of_bounds(chunk, &split_bounds(varchar("x"), varchar("y")), false)
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_upstream_chunk_parser_keeps_rows_it_cannot_read() {
+        let chunk = upstream_chunk(&[
+            // The parser's pick between these depends on its map's iteration order.
+            r#"{"op": "c", "after": {"Id": 1, "ID": 9, "name": "a"}}"#,
+            r#"{"op": "x", "after": {"id": 9, "name": "a"}}"#,
+            r#"{"op": "c", "after": {"id": 9.5, "name": "a"}}"#,
+            r#"{"op": "c", "after": {"id": null, "name": "a"}}"#,
+            r#"{"op": "c", "after": {"name": "a"}}"#,
+            r#"{"op": "c", "after": null}"#,
+        ]);
+        let upstream_parser = new_upstream_parser("id").await;
+        let bounds = split_bounds(Some(ScalarImpl::Int64(0)), Some(ScalarImpl::Int64(5)));
+        assert_eq!(
+            upstream_parser
+                .drop_rows_out_of_bounds(chunk.clone(), &bounds, false)
+                .unwrap(),
+            chunk
+        );
+
+        // `BIGINT UNSIGNED` keys are left to the filter after the parse.
+        let chunk = upstream_chunk(&[r#"{"op": "c", "after": {"id": 9, "name": "a"}}"#]);
+        assert_eq!(
+            upstream_parser
+                .drop_rows_out_of_bounds(chunk.clone(), &bounds, true)
+                .unwrap(),
+            chunk
+        );
+    }
+
+    fn chunk_payload(chunk: &StreamChunk, row: usize) -> String {
+        chunk
+            .row_at(row)
+            .1
+            .datum_at(0)
+            .unwrap()
+            .into_jsonb()
+            .to_string()
     }
 
     #[test]

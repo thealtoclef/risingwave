@@ -1107,6 +1107,37 @@ pub async fn transform_upstream(
     bigint_unsigned_handling: Option<BigintUnsignedHandlingMode>,
     handle_toast_columns: bool,
 ) {
+    let mut parser = build_debezium_parser(
+        &output_columns,
+        timestamp_handling,
+        timestamptz_handling,
+        time_handling,
+        bigint_unsigned_handling,
+        handle_toast_columns,
+    )
+    .await?;
+
+    pin_mut!(upstream);
+    #[for_await]
+    for msg in upstream {
+        let mut msg = msg?;
+        if let Message::Chunk(chunk) = &mut msg {
+            let parsed_chunk = parse_debezium_chunk(&mut parser, chunk).await?;
+            let _ = std::mem::replace(chunk, parsed_chunk);
+        }
+        yield msg;
+    }
+}
+
+/// Builds the parser that turns upstream CDC events into rows of `output_columns`.
+pub(crate) async fn build_debezium_parser(
+    output_columns: &[ColumnDesc],
+    timestamp_handling: Option<TimestampHandling>,
+    timestamptz_handling: Option<TimestamptzHandling>,
+    time_handling: Option<TimeHandling>,
+    bigint_unsigned_handling: Option<BigintUnsignedHandlingMode>,
+    handle_toast_columns: bool,
+) -> StreamExecutorResult<DebeziumParser> {
     let props = SpecificParserConfig {
         encoding_config: EncodingProperties::Json(JsonProperties {
             use_schema_registry: false,
@@ -1125,27 +1156,12 @@ pub async fn transform_upstream(
         .iter()
         .map(SourceColumnDesc::from)
         .collect_vec();
-    let mut parser = DebeziumParser::new(
-        props,
-        columns_with_meta.clone(),
-        Arc::new(SourceContext::dummy()),
-    )
-    .await
-    .map_err(StreamExecutorError::connector_error)?;
-
-    pin_mut!(upstream);
-    #[for_await]
-    for msg in upstream {
-        let mut msg = msg?;
-        if let Message::Chunk(chunk) = &mut msg {
-            let parsed_chunk = parse_debezium_chunk(&mut parser, chunk).await?;
-            let _ = std::mem::replace(chunk, parsed_chunk);
-        }
-        yield msg;
-    }
+    DebeziumParser::new(props, columns_with_meta, Arc::new(SourceContext::dummy()))
+        .await
+        .map_err(StreamExecutorError::connector_error)
 }
 
-async fn parse_debezium_chunk(
+pub(crate) async fn parse_debezium_chunk(
     parser: &mut DebeziumParser,
     chunk: &StreamChunk,
 ) -> StreamExecutorResult<StreamChunk> {
