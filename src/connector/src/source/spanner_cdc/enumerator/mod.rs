@@ -20,6 +20,7 @@ use google_cloud_spanner::client::DatabaseClient;
 use google_cloud_spanner::statement::Statement;
 use risingwave_common::bail;
 use risingwave_common::id::SourceId;
+use risingwave_common::metrics::LabelGuardedIntGauge;
 use time::OffsetDateTime;
 
 use crate::error::ConnectorResult;
@@ -33,6 +34,7 @@ pub struct SpannerCdcSplitEnumerator {
     properties: SpannerCdcProperties,
     metrics: Arc<EnumeratorMetrics>,
     client: DatabaseClient,
+    change_stream_timestamp: Option<LabelGuardedIntGauge>,
 }
 
 #[async_trait]
@@ -115,6 +117,7 @@ impl SplitEnumerator for SpannerCdcSplitEnumerator {
             properties,
             metrics: context.metrics.clone(),
             client,
+            change_stream_timestamp: None,
         })
     }
 
@@ -131,6 +134,16 @@ impl SplitEnumerator for SpannerCdcSplitEnumerator {
             offset,
         );
 
+        tracing::debug!(
+            ?offset,
+            change_stream = %self.properties.change_stream_name,
+            "created root CDC split"
+        );
+
+        Ok(vec![split])
+    }
+
+    async fn on_tick(&mut self) -> ConnectorResult<()> {
         // Report Spanner's current time as the upstream head, like
         // `pg_cdc_upstream_max_lsn`. It is not the source's read position: that is
         // `stream_spanner_cdc_state_timestamp`, and the difference is the checkpoint lag.
@@ -151,19 +164,15 @@ impl SplitEnumerator for SpannerCdcSplitEnumerator {
                 .try_get(0)
                 .map_err(|e| anyhow::anyhow!("timestamp column: {}", e))?;
             let ts_micros = (now.unix_timestamp_nanos() / 1_000) as i64;
-            self.metrics
-                .spanner_cdc_change_stream_timestamp
-                .with_guarded_label_values(&[&self.source_id.to_string()])
+            self.change_stream_timestamp
+                .get_or_insert_with(|| {
+                    self.metrics
+                        .spanner_cdc_change_stream_timestamp
+                        .with_guarded_label_values(&[&self.source_id.to_string()])
+                })
                 .set(ts_micros);
         }
-
-        tracing::debug!(
-            ?offset,
-            change_stream = %self.properties.change_stream_name,
-            "created root CDC split"
-        );
-
-        Ok(vec![split])
+        Ok(())
     }
 }
 
