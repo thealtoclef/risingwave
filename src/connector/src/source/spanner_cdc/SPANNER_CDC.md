@@ -823,8 +823,10 @@ with `OUT_OF_RANGE` ("Specified start_timestamp is too far in the past"), which 
 fails on without retrying. Changes between the checkpoint and the oldest retained change are
 lost; recreate the source and its tables to take a new snapshot, and consider a longer
 `retention_period`. To keep the tables and accept the gap instead, run
-`RESET SOURCE <source>` on the shared source: it clears the saved offset, and the reader
-rebuilt after the next failure starts from the current time. `RESET SOURCE` is not
+`RESET SOURCE <source>` on the shared source, then trigger a recovery (for example `RECOVER;`
+as a superuser, which restarts every streaming job). The reset clears the saved offset, but the
+running reader keeps its own copy and does not use the cleared one; after the recovery the
+reader starts from the current time. `RESET SOURCE` is not
 available for a table created directly with the connector. This wording was observed on the emulator; if production Spanner words it
 differently, the reader falls back to retrying and failing with Spanner's message.
 
