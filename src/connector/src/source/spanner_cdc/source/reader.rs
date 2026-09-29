@@ -34,22 +34,26 @@
 //! ## Watermark & checkpoint
 //!
 //! The watermark = min(offset) across all registered, un-finished partitions.
-//! It is the safe recovery point. On restart, the root query restarts from
-//! the watermark — all partitions are re-discovered from scratch.
+//! Every message carries it as its offset, and it becomes the split's `offset`.
+//!
+//! Every [`PROGRESS_INTERVAL`] the reader also reports each unfinished partition's
+//! offset and parents, in band after the messages it covers, as the split's
+//! `partitions`. On restart each saved partition resumes from its own offset. A split
+//! without saved partitions restarts the root query from the watermark, and all
+//! partitions are re-discovered from scratch.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use futures::StreamExt;
 use futures::stream::{BoxStream, FuturesUnordered};
+use futures::{StreamExt, TryStreamExt};
 use futures_async_stream::try_stream;
 use google_cloud_spanner::client::DatabaseClient;
 use google_cloud_spanner::statement::Statement;
 use google_cloud_spanner::types;
 use googleapis_gax::error::rpc::Code;
 use googleapis_gax::retry_policy::NeverRetry;
-use risingwave_common::array::StreamChunk;
 #[allow(unused_imports)]
 use risingwave_common::metrics::GLOBAL_ERROR_METRICS;
 use risingwave_common::metrics::{LabelGuardedIntCounter, LabelGuardedIntGauge};
@@ -69,16 +73,19 @@ use crate::source::cdc::DebeziumCdcMeta;
 use crate::source::monitor::SourceMetrics;
 use crate::source::spanner_cdc::enumerator::SUPPORTED_VALUE_CAPTURE_TYPES;
 use crate::source::spanner_cdc::schema_track::SchemaTracker;
-use crate::source::spanner_cdc::{SpannerCdcProperties, SpannerCdcSplit};
+use crate::source::spanner_cdc::{PartitionProgress, SpannerCdcProperties, SpannerCdcSplit};
 use crate::source::{
-    BoxSourceChunkStream, Column, SourceContextRef, SourceMessage, SourceMeta, SplitId,
-    SplitReader, into_chunk_stream,
+    BoxSourceChunkStream, BoxSourceReaderEventStream, Column, SourceContextRef, SourceMessage,
+    SourceMessageEvent, SourceMeta, SourceReaderEvent, SplitId, SplitReader,
+    into_chunk_event_stream,
 };
 
 const DEFAULT_CHANNEL_SIZE: usize = 16;
 
-/// How often the lifecycle loop re-samples the partition gauges.
-const METRICS_SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+/// How often the lifecycle loop re-samples the partition gauges and reports each
+/// partition's progress. A restart replays at most about this much of every partition,
+/// on top of the time since the last checkpoint.
+const PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Depth of the parsed-chunk channel between the parser task and the source actor.
 ///
@@ -88,8 +95,8 @@ const PARSED_CHUNK_CHANNEL_SIZE: usize = 8;
 
 /// Spanner CDC split reader — same pattern as Debezium's `CdcSplitReader`.
 pub struct SpannerCdcSplitReader {
-    /// Receives batches of `SourceMessage` from the background reader task.
-    rx: mpsc::Receiver<Vec<SourceMessage>>,
+    /// Receives message batches and progress reports from the background reader task.
+    rx: mpsc::Receiver<SourceMessageEvent>,
     /// The background reader task, awaited for its error once `rx` closes.
     reader_task: JoinHandle<Result<()>>,
     parser_config: ParserConfig,
@@ -117,10 +124,11 @@ impl SplitReader for SpannerCdcSplitReader {
         let source_id = source_ctx.source_id.as_raw_id();
         let (tx, rx) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
 
-        let checkpointed_offset = splits
-            .iter()
-            .find(|s| s.index == source_id)
-            .and_then(|s| s.offset);
+        let checkpointed = splits.iter().find(|s| s.index == source_id);
+        let checkpointed_offset = checkpointed.and_then(|s| s.offset);
+        let saved_partitions = checkpointed
+            .map(|s| s.partitions.clone())
+            .unwrap_or_default();
 
         let client = properties.create_client().await?;
         let heartbeat_interval_ms = properties.heartbeat_milliseconds;
@@ -140,6 +148,7 @@ impl SplitReader for SpannerCdcSplitReader {
             stall_timeout: properties.get_stall_timeout(),
             source_id,
             checkpointed_offset,
+            saved_partitions,
             metrics: source_ctx.metrics.clone(),
             source_name: source_ctx.source_name.clone(),
             fragment_id: source_ctx.fragment_id.to_string(),
@@ -159,6 +168,17 @@ impl SplitReader for SpannerCdcSplitReader {
     }
 
     fn into_stream(self) -> BoxSourceChunkStream {
+        self.into_event_stream()
+            .try_filter_map(|event| async move {
+                Ok(match event {
+                    SourceReaderEvent::DataChunk(chunk) => Some(chunk),
+                    SourceReaderEvent::SplitProgress(_) => None,
+                })
+            })
+            .boxed()
+    }
+
+    fn into_event_stream(self) -> BoxSourceReaderEventStream {
         let parser_config = self.parser_config.clone();
         let source_context = self.source_ctx.clone();
         let queue_depth = source_context
@@ -169,8 +189,8 @@ impl SplitReader for SpannerCdcSplitReader {
                 &source_context.source_name,
                 &source_context.fragment_id.to_string(),
             ]);
-        let chunk_stream =
-            into_chunk_stream(self.into_data_stream(), parser_config, source_context);
+        let event_stream =
+            into_chunk_event_stream(self.into_data_stream(), parser_config, source_context);
 
         // Parse on a dedicated task so the actor only forwards and dispatches chunks;
         // the two then occupy separate runtime workers.
@@ -180,7 +200,7 @@ impl SplitReader for SpannerCdcSplitReader {
         // once `DEFAULT_CHANNEL_SIZE` fills.
         let (tx, rx) = mpsc::channel(PARSED_CHUNK_CHANNEL_SIZE);
         tokio::spawn(async move {
-            let mut chunk_stream = std::pin::pin!(chunk_stream);
+            let mut event_stream = std::pin::pin!(event_stream);
             loop {
                 let item = tokio::select! {
                     biased;
@@ -188,7 +208,7 @@ impl SplitReader for SpannerCdcSplitReader {
                     // would stay parked on `next()` until the partition readers
                     // produce their next record or heartbeat.
                     _ = tx.closed() => break,
-                    item = chunk_stream.next() => match item {
+                    item = event_stream.next() => match item {
                         Some(item) => item,
                         None => break,
                     },
@@ -197,59 +217,67 @@ impl SplitReader for SpannerCdcSplitReader {
                 if tx.send(item).await.is_err() {
                     break;
                 }
-                // `into_chunk_stream` terminates after an error.
+                // `into_chunk_event_stream` terminates after an error.
                 if is_err {
                     break;
                 }
             }
         });
 
-        Self::forward_parsed_chunks(rx, queue_depth)
+        Self::forward_parsed_events(rx, queue_depth)
     }
 }
 
 impl SpannerCdcSplitReader {
-    /// Yield chunks parsed by the background parser task.
+    /// Yield chunks and progress reports from the background parser task, in order.
     ///
     /// The queue depth is sampled on dequeue: a value near
     /// `PARSED_CHUNK_CHANNEL_SIZE` means the actor is the constraint, near zero
     /// means the parser is.
-    #[try_stream(boxed, ok = StreamChunk, error = ConnectorError)]
-    async fn forward_parsed_chunks(
-        mut rx: mpsc::Receiver<Result<StreamChunk>>,
+    #[try_stream(boxed, ok = SourceReaderEvent, error = ConnectorError)]
+    async fn forward_parsed_events(
+        mut rx: mpsc::Receiver<Result<SourceReaderEvent>>,
         queue_depth: LabelGuardedIntGauge,
     ) {
-        while let Some(chunk) = rx.recv().await {
+        while let Some(event) = rx.recv().await {
             queue_depth.set(rx.len() as i64);
-            yield chunk?;
+            yield event?;
         }
     }
 
-    /// Receive message batches from the reader task, like `CdcSplitReader::into_data_stream`.
+    /// Receive message batches and progress reports from the reader task, like
+    /// `CdcSplitReader::into_data_stream`.
     ///
     /// Partition tasks send one batch per change record, and the parser ends a chunk at
     /// every batch. Batches already queued behind the current one are merged, up to the
     /// chunk size, so a burst becomes full chunks instead of one chunk per record. An
     /// idle stream never waits: only batches that have already arrived are merged.
-    #[try_stream(ok = Vec<SourceMessage>, error = ConnectorError)]
+    /// A progress report is never merged, so it stays after the messages it covers.
+    #[try_stream(ok = SourceMessageEvent, error = ConnectorError)]
     async fn into_data_stream(mut self) {
         let source_id = self.source_ctx.source_id.to_string();
         let max_batch_len = self.source_ctx.source_ctrl_opts.chunk_size;
 
-        // A batch received while merging that must not be merged, yielded next.
-        let mut pending: Option<Vec<SourceMessage>> = None;
+        // An event received while merging that must not be merged, yielded next.
+        let mut pending: Option<SourceMessageEvent> = None;
         loop {
-            let mut messages = match pending.take() {
-                Some(messages) => messages,
+            let event = match pending.take() {
+                Some(event) => event,
                 None => match self.rx.recv().await {
-                    Some(messages) => messages,
+                    Some(event) => event,
                     None => break,
                 },
+            };
+            let SourceMessageEvent::Data(mut messages) = event else {
+                yield event;
+                continue;
             };
             if is_mergeable_batch(&messages) {
                 while messages.len() < max_batch_len {
                     match self.rx.try_recv() {
-                        Ok(next) if is_mergeable_batch(&next) => messages.extend(next),
+                        Ok(SourceMessageEvent::Data(next)) if is_mergeable_batch(&next) => {
+                            messages.extend(next)
+                        }
                         Ok(next) => {
                             pending = Some(next);
                             break;
@@ -260,7 +288,7 @@ impl SpannerCdcSplitReader {
                 }
             }
             if !messages.is_empty() {
-                yield messages;
+                yield SourceMessageEvent::Data(messages);
             }
         }
 
@@ -412,6 +440,9 @@ struct ReaderContext {
     stall_timeout: std::time::Duration,
     source_id: u32,
     checkpointed_offset: Option<OffsetDateTime>,
+    /// Unfinished partitions saved in the split; when present they are resumed
+    /// instead of the root query from `checkpointed_offset`.
+    saved_partitions: Arc<[PartitionProgress]>,
     metrics: Arc<SourceMetrics>,
     source_name: String,
     fragment_id: String,
@@ -625,12 +656,12 @@ struct PartitionResult {
 /// Partition offset tracking with O(1) watermark.
 ///
 /// Uses two maps behind a single lock:
-/// - `offsets`: token → current offset (O(1) lookup)
+/// - `offsets`: token → current offset and parents (O(1) lookup)
 /// - `counts`: offset → count of partitions at that offset (O(1) watermark via first key)
 ///
 /// Shared between the main loop and partition tasks via `Arc`.
-/// Partition tasks update their offset as they process records.
-/// The main loop computes the watermark from this map.
+/// Partition tasks update their offset once they have sent the records up to it.
+/// The main loop computes the watermark from this map, and saves it as progress.
 ///
 /// A partition's entry is removed when it finishes, so the watermark
 /// only reflects un-finished partitions.
@@ -639,8 +670,13 @@ struct PartitionOffsets {
 }
 
 struct PartitionOffsetsInner {
-    offsets: HashMap<Option<String>, OffsetDateTime>,
+    offsets: HashMap<Option<String>, PartitionEntry>,
     counts: BTreeMap<OffsetDateTime, usize>,
+}
+
+struct PartitionEntry {
+    offset: OffsetDateTime,
+    parents: Vec<String>,
 }
 
 impl PartitionOffsets {
@@ -661,12 +697,18 @@ impl PartitionOffsets {
     /// Relies on a partition never being reported again after it finished and was
     /// removed. That holds because a child starts only after all of its parents
     /// finished, and a finished parent reports nothing more.
-    fn register(&self, token: Option<String>, start_ts: OffsetDateTime) {
+    fn register(&self, token: Option<String>, start_ts: OffsetDateTime, parents: &[String]) {
         let mut inner = self.inner.lock().unwrap();
         if inner.offsets.contains_key(&token) {
             return;
         }
-        inner.offsets.insert(token, start_ts);
+        inner.offsets.insert(
+            token,
+            PartitionEntry {
+                offset: start_ts,
+                parents: parents.to_vec(),
+            },
+        );
         *inner.counts.entry(start_ts).or_insert(0) += 1;
     }
 
@@ -674,10 +716,10 @@ impl PartitionOffsets {
     fn update(&self, token: &Option<String>, offset: OffsetDateTime) {
         let mut inner = self.inner.lock().unwrap();
         if let Some(entry) = inner.offsets.get_mut(token)
-            && offset > *entry
+            && offset > entry.offset
         {
-            let old = *entry;
-            *entry = offset;
+            let old = entry.offset;
+            entry.offset = offset;
 
             // Update counts: decrement old, increment new.
             if let Some(count) = inner.counts.get_mut(&old) {
@@ -693,12 +735,12 @@ impl PartitionOffsets {
     /// Remove a finished partition.
     fn remove(&self, token: &Option<String>) {
         let mut inner = self.inner.lock().unwrap();
-        if let Some(offset) = inner.offsets.remove(token)
-            && let Some(count) = inner.counts.get_mut(&offset)
+        if let Some(entry) = inner.offsets.remove(token)
+            && let Some(count) = inner.counts.get_mut(&entry.offset)
         {
             *count -= 1;
             if *count == 0 {
-                inner.counts.remove(&offset);
+                inner.counts.remove(&entry.offset);
             }
         }
     }
@@ -721,6 +763,26 @@ impl PartitionOffsets {
         // one key, in which case the iterator is already exhausted.
         let max = keys.next_back().copied().or(min);
         (min, max)
+    }
+
+    /// Every registered partition, read under one lock, sorted by token.
+    ///
+    /// A valid restore point at any moment: a child is registered before its parent
+    /// can finish and be removed, so every partition missing from it has finished and
+    /// its children are in it.
+    fn snapshot(&self) -> Vec<PartitionProgress> {
+        let inner = self.inner.lock().unwrap();
+        let mut partitions: Vec<_> = inner
+            .offsets
+            .iter()
+            .map(|(token, entry)| PartitionProgress {
+                token: token.clone(),
+                parents: entry.parents.clone(),
+                offset: entry.offset,
+            })
+            .collect();
+        partitions.sort_unstable_by(|a, b| a.token.cmp(&b.token));
+        partitions
     }
 }
 
@@ -749,6 +811,7 @@ fn process_child(
     offsets.register(
         token.clone(),
         child.offset.expect("new_child always sets offset"),
+        &child.parent_partition_tokens,
     );
     discovered.insert(token, false);
 
@@ -787,7 +850,7 @@ fn ingest_children(
 }
 
 /// Main reader loop — equivalent to Debezium's JNI thread that reads from the WAL.
-async fn run_reader(ctx: ReaderContext, tx: mpsc::Sender<Vec<SourceMessage>>) -> Result<()> {
+async fn run_reader(ctx: ReaderContext, tx: mpsc::Sender<SourceMessageEvent>) -> Result<()> {
     let mut partition_streams: FuturesUnordered<tokio::task::JoinHandle<Result<PartitionResult>>> =
         FuturesUnordered::new();
 
@@ -812,11 +875,6 @@ async fn run_reader(ctx: ReaderContext, tx: mpsc::Sender<Vec<SourceMessage>>) ->
     let shared_schema = Arc::new(std::sync::Mutex::new(SchemaTracker::new()));
 
     let split_id = SplitId::from(ctx.source_id.to_string());
-    let root_offset = ctx
-        .checkpointed_offset
-        .unwrap_or_else(OffsetDateTime::now_utc);
-
-    tracing::info!(starting_offset = ?root_offset, "starting Spanner CDC reader");
 
     let reader_metrics = Arc::new(ReaderMetrics::new(
         &ctx.metrics,
@@ -825,31 +883,63 @@ async fn run_reader(ctx: ReaderContext, tx: mpsc::Sender<Vec<SourceMessage>>) ->
         &ctx.fragment_id,
     ));
 
-    // Spawn root partition.
-    let root_split =
-        SpannerCdcSplit::new_root(ctx.change_stream_name.clone(), ctx.source_id, root_offset);
-    let root_token = root_split.partition_token.clone();
-    offsets.register(root_token.clone(), root_offset);
-    discovered.insert(root_token, false);
-    spawn_partition_task(
-        &ctx,
-        root_split,
-        &split_id,
-        &offsets,
-        &shared_schema,
-        &tx,
-        &mut partition_streams,
-        child_discovery_tx.clone(),
-        &reader_metrics,
-    );
-    active_count += 1;
+    if ctx.saved_partitions.is_empty() {
+        let root_offset = ctx
+            .checkpointed_offset
+            .unwrap_or_else(OffsetDateTime::now_utc);
+        tracing::info!(starting_offset = ?root_offset, "starting Spanner CDC reader");
+
+        // Spawn root partition.
+        let root_split =
+            SpannerCdcSplit::new_root(ctx.change_stream_name.clone(), ctx.source_id, root_offset);
+        let root_token = root_split.partition_token.clone();
+        offsets.register(root_token.clone(), root_offset, &[]);
+        discovered.insert(root_token, false);
+        spawn_partition_task(
+            &ctx,
+            root_split,
+            &split_id,
+            &offsets,
+            &shared_schema,
+            &tx,
+            &mut partition_streams,
+            child_discovery_tx.clone(),
+            &reader_metrics,
+        );
+        active_count += 1;
+    } else {
+        tracing::info!(
+            partitions = ctx.saved_partitions.len(),
+            watermark = ?ctx.saved_partitions.iter().map(|p| p.offset).min(),
+            "resuming Spanner CDC reader from saved partitions"
+        );
+        restore_partitions(
+            &ctx,
+            &offsets,
+            &mut discovered,
+            &mut deferred,
+            &mut ready_pool,
+        );
+        spawn_from_pool(
+            &mut ready_pool,
+            &mut active_count,
+            &ctx,
+            &split_id,
+            &offsets,
+            &shared_schema,
+            &tx,
+            &mut partition_streams,
+            &child_discovery_tx,
+            &reader_metrics,
+        );
+    }
 
     // The loop otherwise only wakes on partition completion or child discovery.
     // A partition that is streaming but falling behind produces neither, so
     // without this tick the gauges would freeze for exactly the incident they
-    // are meant to show.
-    let mut metrics_tick = tokio::time::interval(METRICS_SAMPLE_INTERVAL);
-    metrics_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // are meant to show, and progress would be reported only when the tree changes.
+    let mut progress_tick = tokio::time::interval(PROGRESS_INTERVAL);
+    progress_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     // Main event loop — partition lifecycle management only.
     // Records flow directly from partition tasks → tx.
@@ -1003,9 +1093,18 @@ async fn run_reader(ctx: ReaderContext, tx: mpsc::Sender<Vec<SourceMessage>>) ->
                 );
             }
 
-            // Re-sample the gauges. Listed last so `biased` still prioritises
-            // partition progress.
-            _ = metrics_tick.tick() => {}
+            // Re-sample the gauges (at the top of the loop) and report progress. Listed
+            // last so `biased` still prioritises partition progress.
+            _ = progress_tick.tick() => {
+                // Sent through the data channel, so it follows every batch the partitions
+                // sent before their offsets advanced. Skipped while the channel is full,
+                // so backpressure never stalls the lifecycle loop; the next tick retries.
+                let progress = SpannerCdcSplit::encode_partition_progress(offsets.snapshot());
+                let _ = tx.try_send(SourceMessageEvent::SplitProgress(HashMap::from([(
+                    split_id.clone(),
+                    progress,
+                )])));
+            }
         }
     }
 
@@ -1038,6 +1137,50 @@ fn parents_all_finished(
         .all(|p| discovered.get(&Some(p.clone())).copied().unwrap_or(false))
 }
 
+/// Register the saved partitions and route each to `ready_pool` or `deferred`.
+///
+/// Only unfinished partitions are saved, so every partition the saved ones name as a
+/// parent but that is not saved itself has finished, and so has the root unless it is
+/// saved. Marking them finished lets their children start; otherwise
+/// `parents_all_finished` would treat them as unknown and hold the children forever.
+fn restore_partitions(
+    ctx: &ReaderContext,
+    offsets: &PartitionOffsets,
+    discovered: &mut HashMap<Option<String>, bool>,
+    deferred: &mut Vec<SpannerCdcSplit>,
+    ready_pool: &mut Vec<SpannerCdcSplit>,
+) {
+    for p in ctx.saved_partitions.iter() {
+        offsets.register(p.token.clone(), p.offset, &p.parents);
+        discovered.insert(p.token.clone(), false);
+    }
+    discovered.entry(None).or_insert(true);
+    for parent in ctx.saved_partitions.iter().flat_map(|p| &p.parents) {
+        discovered.entry(Some(parent.clone())).or_insert(true);
+    }
+
+    for p in ctx.saved_partitions.iter() {
+        let split = match &p.token {
+            None => {
+                SpannerCdcSplit::new_root(ctx.change_stream_name.clone(), ctx.source_id, p.offset)
+            }
+            // Index 0, as for children discovered while reading; see `execute_query`.
+            Some(token) => SpannerCdcSplit::new_child(
+                token.clone(),
+                p.parents.clone(),
+                p.offset,
+                ctx.change_stream_name.clone(),
+                0,
+            ),
+        };
+        if split.is_root() || parents_all_finished(&split.parent_partition_tokens, discovered) {
+            ready_pool.push(split);
+        } else {
+            deferred.push(split);
+        }
+    }
+}
+
 fn promote_deferred(
     deferred: &mut Vec<SpannerCdcSplit>,
     ready_pool: &mut Vec<SpannerCdcSplit>,
@@ -1060,7 +1203,7 @@ fn spawn_from_pool(
     split_id: &SplitId,
     offsets: &Arc<PartitionOffsets>,
     shared_schema: &Arc<std::sync::Mutex<SchemaTracker>>,
-    tx: &mpsc::Sender<Vec<SourceMessage>>,
+    tx: &mpsc::Sender<SourceMessageEvent>,
     partition_streams: &mut FuturesUnordered<tokio::task::JoinHandle<Result<PartitionResult>>>,
     child_discovery_tx: &tokio::sync::mpsc::UnboundedSender<SpannerCdcSplit>,
     reader_metrics: &Arc<ReaderMetrics>,
@@ -1091,7 +1234,7 @@ fn spawn_partition_task(
     split_id: &SplitId,
     offsets: &Arc<PartitionOffsets>,
     shared_schema: &Arc<std::sync::Mutex<SchemaTracker>>,
-    tx: &mpsc::Sender<Vec<SourceMessage>>,
+    tx: &mpsc::Sender<SourceMessageEvent>,
     partition_streams: &mut FuturesUnordered<tokio::task::JoinHandle<Result<PartitionResult>>>,
     child_discovery_tx: tokio::sync::mpsc::UnboundedSender<SpannerCdcSplit>,
     reader_metrics: &Arc<ReaderMetrics>,
@@ -1155,7 +1298,7 @@ async fn read_partition(
     stall_timeout: std::time::Duration,
     offsets: Arc<PartitionOffsets>,
     shared_schema: Arc<std::sync::Mutex<SchemaTracker>>,
-    tx: mpsc::Sender<Vec<SourceMessage>>,
+    tx: mpsc::Sender<SourceMessageEvent>,
     child_discovery_tx: tokio::sync::mpsc::UnboundedSender<SpannerCdcSplit>,
     reader_metrics: Arc<ReaderMetrics>,
 ) -> Result<()> {
@@ -1234,7 +1377,7 @@ async fn execute_query(
     database: &str,
     offsets: &PartitionOffsets,
     shared_schema: &std::sync::Mutex<SchemaTracker>,
-    tx: &mpsc::Sender<Vec<SourceMessage>>,
+    tx: &mpsc::Sender<SourceMessageEvent>,
     child_discovery_tx: &tokio::sync::mpsc::UnboundedSender<SpannerCdcSplit>,
     change_stream_name: &str,
     stall_timeout: std::time::Duration,
@@ -1317,9 +1460,7 @@ async fn execute_query(
                     reader_metrics.record_failure(QueryFailure::UnsupportedValueCaptureType);
                 })?;
 
-                let commit_ts = data_change.commit_time();
-                split.advance_offset(commit_ts);
-                offsets.update(&split.partition_token, commit_ts);
+                split.advance_offset(data_change.commit_time());
                 // Use watermark (min of all un-finished partitions) for checkpoint offset.
                 let wm = offsets
                     .watermark()
@@ -1367,7 +1508,6 @@ async fn execute_query(
                 );
                 let hb_ts = heartbeat.heartbeat_time();
                 split.advance_offset(hb_ts);
-                offsets.update(&split.partition_token, hb_ts);
                 // Use watermark (min of all un-finished partitions) for checkpoint offset.
                 let wm = offsets
                     .watermark()
@@ -1391,9 +1531,16 @@ async fn execute_query(
             // Send batch
             if !messages.is_empty() {
                 tracing::debug!(%split_id, count = messages.len(), "sending CDC messages");
-                if tx.send(messages).await.is_err() {
+                if tx.send(SourceMessageEvent::Data(messages)).await.is_err() {
                     return Ok(());
                 }
+                // Only now, with the records up to it in the channel: saved progress must
+                // never claim records that were not sent. The watermark stamped on this
+                // batch is therefore at most the previous offset, which is only lower.
+                offsets.update(
+                    &split.partition_token,
+                    split.offset.expect("advanced above"),
+                );
             }
 
             // Child partition discovery
@@ -1407,7 +1554,11 @@ async fn execute_query(
                     // channel. Without this, the watermark would briefly exclude the
                     // child and could jump past its start, and a checkpoint taken in
                     // that window would skip the child's first records on recovery.
-                    offsets.register(Some(cp.token.clone()), start_time);
+                    offsets.register(
+                        Some(cp.token.clone()),
+                        start_time,
+                        &cp.parent_partition_tokens,
+                    );
                     // Index 0 is a placeholder, so `id()` is the same for every child.
                     // Children live only inside this reader and are tracked by token; all
                     // their messages carry the root's `split_id`. Give each child a unique
@@ -1581,7 +1732,7 @@ impl OffsetStringCache {
 /// Returns `false` if the receiver has been dropped.
 async fn send_schema_change_if_evolved(
     shared_schema: &std::sync::Mutex<SchemaTracker>,
-    tx: &mpsc::Sender<Vec<SourceMessage>>,
+    tx: &mpsc::Sender<SourceMessageEvent>,
     split_id: &SplitId,
     data_change: &crate::source::spanner_cdc::types::DataChangeRecord,
     offset_str: &str,
@@ -1597,7 +1748,12 @@ async fn send_schema_change_if_evolved(
     {
         return true;
     }
-    if !messages.is_empty() && tx.send(std::mem::take(messages)).await.is_err() {
+    if !messages.is_empty()
+        && tx
+            .send(SourceMessageEvent::Data(std::mem::take(messages)))
+            .await
+            .is_err()
+    {
         return false;
     }
     let Ok(permit) = tx.reserve().await else {
@@ -1606,12 +1762,12 @@ async fn send_schema_change_if_evolved(
     // Re-check under the lock: another partition may have emitted it while we waited.
     let mut tracker = shared_schema.lock().unwrap();
     if let Some(schema_payload) = tracker.check_and_evolve(table_name, column_types, commit_ts) {
-        permit.send(vec![make_schema_change_msg(
+        permit.send(SourceMessageEvent::Data(vec![make_schema_change_msg(
             split_id,
             schema_payload.json,
             data_change,
             offset_str,
-        )]);
+        )]));
     }
     true
 }
@@ -1644,10 +1800,12 @@ fn make_schema_change_msg(
 mod tests {
     use std::time::Duration;
 
+    use risingwave_common::array::StreamChunk;
     use risingwave_common::test_prelude::StreamChunkTestExt;
     use time::macros::datetime;
 
     use super::*;
+    use crate::source::SplitMetaData;
 
     // -----------------------------------------------------------------------
     // forward_parsed_chunks: hands parsed chunks from the parser task to the actor.
@@ -1663,41 +1821,48 @@ mod tests {
             .with_guarded_label_values(&["0", "test", "0"])
     }
 
+    fn chunk_event(pretty: &str) -> Result<SourceReaderEvent> {
+        Ok(SourceReaderEvent::DataChunk(StreamChunk::from_pretty(
+            pretty,
+        )))
+    }
+
     #[tokio::test]
-    async fn test_forward_parsed_chunks_yields_in_order() {
+    async fn test_forward_parsed_events_yields_in_order() {
         let (tx, rx) = mpsc::channel(PARSED_CHUNK_CHANNEL_SIZE);
-        tx.send(Ok(StreamChunk::from_pretty("I\n + 1")))
+        tx.send(chunk_event("I\n + 1")).await.unwrap();
+        tx.send(Ok(SourceReaderEvent::SplitProgress(HashMap::new())))
             .await
             .unwrap();
-        tx.send(Ok(StreamChunk::from_pretty("I\n + 2")))
-            .await
-            .unwrap();
+        tx.send(chunk_event("I\n + 2")).await.unwrap();
         drop(tx);
 
-        let chunks: Vec<_> =
-            SpannerCdcSplitReader::forward_parsed_chunks(rx, test_queue_depth_gauge())
+        let events: Vec<_> =
+            SpannerCdcSplitReader::forward_parsed_events(rx, test_queue_depth_gauge())
                 .collect()
                 .await;
-        assert_eq!(chunks.len(), 2);
-        assert_eq!(chunks[0].as_ref().unwrap().cardinality(), 1);
-        assert_eq!(chunks[1].as_ref().unwrap().cardinality(), 1);
+        assert_eq!(events.len(), 3);
+        assert!(matches!(&events[0], Ok(SourceReaderEvent::DataChunk(c)) if c.cardinality() == 1));
+        assert!(matches!(
+            &events[1],
+            Ok(SourceReaderEvent::SplitProgress(_))
+        ));
+        assert!(matches!(&events[2], Ok(SourceReaderEvent::DataChunk(c)) if c.cardinality() == 1));
     }
 
     /// A parser error surfaces as `Err` rather than a clean end of stream, so the
     /// source fails loudly instead of going quiet.
     #[tokio::test]
-    async fn test_forward_parsed_chunks_propagates_error() {
+    async fn test_forward_parsed_events_propagates_error() {
         let (tx, rx) = mpsc::channel(PARSED_CHUNK_CHANNEL_SIZE);
-        tx.send(Ok(StreamChunk::from_pretty("I\n + 1")))
-            .await
-            .unwrap();
+        tx.send(chunk_event("I\n + 1")).await.unwrap();
         tx.send(Err(anyhow::anyhow!("parser blew up").into()))
             .await
             .unwrap();
         drop(tx);
 
         let chunks: Vec<_> =
-            SpannerCdcSplitReader::forward_parsed_chunks(rx, test_queue_depth_gauge())
+            SpannerCdcSplitReader::forward_parsed_events(rx, test_queue_depth_gauge())
                 .collect()
                 .await;
         assert_eq!(chunks.len(), 2);
@@ -1711,12 +1876,12 @@ mod tests {
 
     /// The stream ends cleanly once the parser task drops its sender.
     #[tokio::test]
-    async fn test_forward_parsed_chunks_ends_when_sender_dropped() {
-        let (tx, rx) = mpsc::channel::<Result<StreamChunk>>(PARSED_CHUNK_CHANNEL_SIZE);
+    async fn test_forward_parsed_events_ends_when_sender_dropped() {
+        let (tx, rx) = mpsc::channel::<Result<SourceReaderEvent>>(PARSED_CHUNK_CHANNEL_SIZE);
         drop(tx);
 
         let chunks: Vec<_> =
-            SpannerCdcSplitReader::forward_parsed_chunks(rx, test_queue_depth_gauge())
+            SpannerCdcSplitReader::forward_parsed_events(rx, test_queue_depth_gauge())
                 .collect()
                 .await;
         assert!(chunks.is_empty());
@@ -1770,15 +1935,16 @@ mod tests {
         test_message(cdc_message::CdcMessageType::Data, offset)
     }
 
-    /// Queue `batches` behind a finished reader task and collect the merged batches,
-    /// as offsets, until the stream reports the closed channel.
+    /// Queue `events` behind a finished reader task and collect the merged batches, as
+    /// offsets, until the stream reports the closed channel. A progress report is
+    /// collected as `["progress"]`.
     async fn collect_data_stream(
-        batches: Vec<Vec<SourceMessage>>,
+        events: Vec<SourceMessageEvent>,
         chunk_size: usize,
     ) -> Vec<Vec<String>> {
-        let (tx, rx) = mpsc::channel(batches.len().max(1));
-        for batch in batches {
-            tx.send(batch).await.unwrap();
+        let (tx, rx) = mpsc::channel(events.len().max(1));
+        for event in events {
+            tx.send(event).await.unwrap();
         }
         drop(tx);
         let mut source_ctx = crate::source::SourceContext::dummy();
@@ -1791,16 +1957,29 @@ mod tests {
         };
         let mut stream = std::pin::pin!(reader.into_data_stream());
         let mut merged = vec![];
-        while let Some(Ok(batch)) = stream.next().await {
-            merged.push(batch.into_iter().map(|msg| msg.offset).collect());
+        while let Some(Ok(event)) = stream.next().await {
+            merged.push(match event {
+                SourceMessageEvent::Data(batch) => {
+                    batch.into_iter().map(|msg| msg.offset).collect()
+                }
+                SourceMessageEvent::SplitProgress(_) => vec!["progress".to_owned()],
+            });
         }
         merged
+    }
+
+    fn batch(messages: Vec<SourceMessage>) -> SourceMessageEvent {
+        SourceMessageEvent::Data(messages)
     }
 
     #[tokio::test]
     async fn test_data_stream_merges_queued_data_batches() {
         let merged = collect_data_stream(
-            vec![vec![data("1")], vec![data("2"), data("3")], vec![data("4")]],
+            vec![
+                batch(vec![data("1")]),
+                batch(vec![data("2"), data("3")]),
+                batch(vec![data("4")]),
+            ],
             1024,
         )
         .await;
@@ -1812,10 +1991,10 @@ mod tests {
     async fn test_data_stream_merge_stops_at_chunk_size() {
         let merged = collect_data_stream(
             vec![
-                vec![data("1")],
-                vec![data("2"), data("3")],
-                vec![data("4")],
-                vec![data("5")],
+                batch(vec![data("1")]),
+                batch(vec![data("2"), data("3")]),
+                batch(vec![data("4")]),
+                batch(vec![data("5")]),
             ],
             3,
         )
@@ -1823,21 +2002,24 @@ mod tests {
         assert_eq!(merged, vec![vec!["1", "2", "3"], vec!["4", "5"]]);
     }
 
-    /// Schema changes and heartbeats keep their own batch, and order is preserved.
+    /// Schema changes, heartbeats and progress reports keep their own place, and order
+    /// is preserved, so a progress report never moves ahead of the batches it covers.
     #[tokio::test]
-    async fn test_data_stream_never_merges_schema_change_or_heartbeat() {
+    async fn test_data_stream_never_merges_schema_change_heartbeat_or_progress() {
         let schema_change = test_message(cdc_message::CdcMessageType::SchemaChange, "s");
         let heartbeat = |offset| test_message(cdc_message::CdcMessageType::Heartbeat, offset);
         let merged = collect_data_stream(
             vec![
-                vec![data("1")],
-                vec![data("2")],
-                vec![schema_change],
-                vec![data("3")],
-                vec![heartbeat("h1")],
-                vec![heartbeat("h2")],
-                vec![data("4")],
-                vec![data("5")],
+                batch(vec![data("1")]),
+                batch(vec![data("2")]),
+                batch(vec![schema_change]),
+                batch(vec![data("3")]),
+                batch(vec![heartbeat("h1")]),
+                batch(vec![heartbeat("h2")]),
+                batch(vec![data("4")]),
+                SourceMessageEvent::SplitProgress(HashMap::new()),
+                batch(vec![data("5")]),
+                batch(vec![data("6")]),
             ],
             1024,
         )
@@ -1850,7 +2032,9 @@ mod tests {
                 vec!["3"],
                 vec!["h1"],
                 vec!["h2"],
-                vec!["4", "5"],
+                vec!["4"],
+                vec!["progress"],
+                vec!["5", "6"],
             ]
         );
     }
@@ -1878,7 +2062,7 @@ mod tests {
         assert_eq!(offsets.offset_bounds(), (None, None));
 
         let t0 = OffsetDateTime::from_unix_timestamp(1_000).unwrap();
-        offsets.register(Some("a".to_owned()), t0);
+        offsets.register(Some("a".to_owned()), t0, &[]);
         assert_eq!(
             offsets.offset_bounds(),
             (Some(t0), Some(t0)),
@@ -1887,8 +2071,8 @@ mod tests {
 
         let t1 = OffsetDateTime::from_unix_timestamp(2_000).unwrap();
         let t2 = OffsetDateTime::from_unix_timestamp(3_000).unwrap();
-        offsets.register(Some("b".to_owned()), t1);
-        offsets.register(Some("c".to_owned()), t2);
+        offsets.register(Some("b".to_owned()), t1, &[]);
+        offsets.register(Some("c".to_owned()), t2, &[]);
         assert_eq!(offsets.offset_bounds(), (Some(t0), Some(t2)));
 
         // The straggler finishing lifts the watermark to the next oldest.
@@ -1904,9 +2088,9 @@ mod tests {
         let t1 = datetime!(2025-01-01 0:00 UTC);
         let t2 = datetime!(2025-01-02 0:00 UTC);
 
-        offsets.register(Some("C".to_owned()), t1);
+        offsets.register(Some("C".to_owned()), t1, &[]);
         // A later registration neither double-counts nor moves the offset.
-        offsets.register(Some("C".to_owned()), t2);
+        offsets.register(Some("C".to_owned()), t2, &[]);
         assert_eq!(offsets.watermark(), Some(t1));
 
         offsets.remove(&Some("C".to_owned()));
@@ -2061,8 +2245,8 @@ mod tests {
         let t2 = datetime!(2025-01-02 0:00 UTC);
         let t3 = datetime!(2025-01-03 0:00 UTC);
 
-        offsets.register(Some("A".to_owned()), t1);
-        offsets.register(Some("B".to_owned()), t3);
+        offsets.register(Some("A".to_owned()), t1, &[]);
+        offsets.register(Some("B".to_owned()), t3, &[]);
         assert_eq!(offsets.watermark(), Some(t1));
 
         offsets.update(&Some("A".to_owned()), t2);
@@ -2081,7 +2265,7 @@ mod tests {
         let t1 = datetime!(2025-01-01 0:00 UTC);
         let t2 = datetime!(2025-01-02 0:00 UTC);
 
-        offsets.register(Some("A".to_owned()), t2);
+        offsets.register(Some("A".to_owned()), t2, &[]);
         offsets.update(&Some("A".to_owned()), t1);
         assert_eq!(offsets.watermark(), Some(t2));
     }
@@ -2092,9 +2276,9 @@ mod tests {
         let t1 = datetime!(2025-01-01 0:00 UTC);
         let t2 = datetime!(2025-01-02 0:00 UTC);
 
-        offsets.register(Some("A".to_owned()), t1);
-        offsets.register(Some("B".to_owned()), t1);
-        offsets.register(Some("C".to_owned()), t2);
+        offsets.register(Some("A".to_owned()), t1, &[]);
+        offsets.register(Some("B".to_owned()), t1, &[]);
+        offsets.register(Some("C".to_owned()), t2, &[]);
 
         assert_eq!(offsets.watermark(), Some(t1));
 
@@ -2117,8 +2301,8 @@ mod tests {
         let t2 = datetime!(2025-01-02 0:00 UTC);
         let t3 = datetime!(2025-01-03 0:00 UTC);
 
-        offsets.register(Some("A".to_owned()), t1);
-        offsets.register(Some("B".to_owned()), t3);
+        offsets.register(Some("A".to_owned()), t1, &[]);
+        offsets.register(Some("B".to_owned()), t3, &[]);
         assert_eq!(offsets.watermark(), Some(t1));
 
         offsets.update(&Some("A".to_owned()), t2);
@@ -2562,6 +2746,7 @@ mod tests {
             stall_timeout: Duration::from_secs(60),
             source_id: 1,
             checkpointed_offset: Some(T0),
+            saved_partitions: Arc::new([]),
             metrics: Arc::new(SourceMetrics::default()),
             source_name: "test".to_owned(),
             fragment_id: "0".to_owned(),
@@ -2569,9 +2754,12 @@ mod tests {
     }
 
     /// Receive messages until a heartbeat at `ts` arrives.
-    async fn recv_heartbeat_at(rx: &mut mpsc::Receiver<Vec<SourceMessage>>, ts: OffsetDateTime) {
+    async fn recv_heartbeat_at(rx: &mut mpsc::Receiver<SourceMessageEvent>, ts: OffsetDateTime) {
         let ts_ms = (ts.unix_timestamp_nanos() / 1_000_000) as i64;
-        while let Some(batch) = rx.recv().await {
+        while let Some(event) = rx.recv().await {
+            let SourceMessageEvent::Data(batch) = event else {
+                continue;
+            };
             if batch.iter().any(|msg| {
                 msg.is_cdc_heartbeat()
                     && matches!(&msg.meta, SourceMeta::DebeziumCdc(meta) if meta.source_ts_ms == ts_ms)
@@ -2658,6 +2846,110 @@ mod tests {
 
         let starts: Vec<_> = querier.calls().iter().map(|q| q.start_timestamp).collect();
         assert_eq!(starts, vec![T0, t1]);
+    }
+
+    /// Saved partitions resume from their own offsets instead of the root query. A saved
+    /// child whose saved parent is unfinished waits for it; a parent that is not saved
+    /// counts as finished.
+    #[tokio::test(start_paused = true)]
+    async fn test_run_reader_resumes_saved_partitions() {
+        let t2 = T0 + Duration::from_secs(2);
+        let t3 = T0 + Duration::from_secs(3);
+        let querier = Arc::new(
+            FakeQuerier::default()
+                .script(
+                    Some("a"),
+                    vec![rows(vec![children_row(t2, &[("c", &["a", "x"])])])],
+                )
+                .script(
+                    Some("c"),
+                    vec![FakeQuery::Rows {
+                        rows: vec![Ok(heartbeat_row(t3))],
+                        then_hang: true,
+                    }],
+                ),
+        );
+        let mut ctx = test_reader_context(querier.clone(), 1);
+        ctx.saved_partitions = vec![
+            PartitionProgress {
+                token: Some("a".to_owned()),
+                parents: vec![],
+                offset: T0 + Duration::from_secs(1),
+            },
+            PartitionProgress {
+                token: Some("c".to_owned()),
+                parents: vec!["a".to_owned(), "x".to_owned()],
+                offset: t2,
+            },
+        ]
+        .into();
+        let (tx, mut rx) = mpsc::channel(16);
+        let reader = tokio::spawn(run_reader(ctx, tx));
+
+        recv_heartbeat_at(&mut rx, t3).await;
+        drop(rx);
+        reader.await.unwrap().unwrap();
+
+        let calls: Vec<_> = querier
+            .calls()
+            .into_iter()
+            .map(|q| (q.partition_token, q.start_timestamp))
+            .collect();
+        assert_eq!(
+            calls,
+            vec![
+                (Some("a".to_owned()), T0 + Duration::from_secs(1)),
+                (Some("c".to_owned()), t2),
+            ]
+        );
+    }
+
+    /// Progress reports follow the batches they cover: a partition's reported offset
+    /// never passes the last heartbeat already received from the channel.
+    #[tokio::test(start_paused = true)]
+    async fn test_run_reader_reports_progress_after_sent_batches() {
+        let t1 = T0 + Duration::from_secs(1);
+        let t2 = T0 + Duration::from_secs(2);
+        let querier = Arc::new(FakeQuerier::default().script(
+            None,
+            vec![FakeQuery::Rows {
+                rows: vec![Ok(heartbeat_row(t1)), Ok(heartbeat_row(t2))],
+                then_hang: true,
+            }],
+        ));
+        let (tx, mut rx) = mpsc::channel(16);
+        let reader = tokio::spawn(run_reader(test_reader_context(querier, 1), tx));
+
+        let mut received = T0;
+        loop {
+            match rx.recv().await.expect("reader stopped") {
+                SourceMessageEvent::Data(batch) => {
+                    for msg in batch {
+                        if let SourceMeta::DebeziumCdc(meta) = &msg.meta {
+                            let ts = OffsetDateTime::from_unix_timestamp_nanos(
+                                meta.source_ts_ms as i128 * 1_000_000,
+                            )
+                            .unwrap();
+                            received = received.max(ts);
+                        }
+                    }
+                }
+                SourceMessageEvent::SplitProgress(progress) => {
+                    let mut split = SpannerCdcSplit::new_root("stream".to_owned(), 1, T0);
+                    split.update_offset(progress["1"].clone()).unwrap();
+                    let [root] = &*split.partitions else {
+                        panic!("expected only the root, got {:?}", split.partitions);
+                    };
+                    assert_eq!(root.token, None);
+                    assert!(root.offset <= received, "{} > {received}", root.offset);
+                    if root.offset == t2 {
+                        break;
+                    }
+                }
+            }
+        }
+        drop(rx);
+        reader.await.unwrap().unwrap();
     }
 
     #[tokio::test(start_paused = true)]
@@ -2822,7 +3114,7 @@ mod tests {
 
         // Fill the channel so partition A has to wait for a slot.
         let (tx, mut rx) = mpsc::channel(1);
-        tx.send(vec![]).await.unwrap();
+        tx.send(SourceMessageEvent::Data(vec![])).await.unwrap();
         let partition_a = tokio::spawn({
             let (tracker, tx, split_id, new) =
                 (tracker.clone(), tx.clone(), split_id.clone(), new.clone());
@@ -2841,9 +3133,11 @@ mod tests {
             new.commit_time(),
         ));
 
-        assert!(rx.recv().await.unwrap().is_empty());
+        assert!(matches!(rx.recv().await, Some(SourceMessageEvent::Data(msgs)) if msgs.is_empty()));
         assert!(partition_a.await.unwrap());
-        let msgs = rx.recv().await.unwrap();
+        let Some(SourceMessageEvent::Data(msgs)) = rx.recv().await else {
+            panic!("expected the schema change batch");
+        };
         assert!(matches!(
             &msgs[0].meta,
             SourceMeta::DebeziumCdc(meta) if matches!(meta.msg_type, crate::source::cdc::CdcMessageType::SchemaChange)

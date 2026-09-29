@@ -951,9 +951,12 @@ impl<S: StateStore> SourceExecutor<S> {
                                                     tracing::info!(
                                                         split_id = spanner_split.index,
                                                         old_offset = ?spanner_split.offset,
+                                                        saved_partitions = spanner_split.partitions.len(),
                                                         "Clearing Spanner CDC offset"
                                                     );
                                                     spanner_split.offset = None;
+                                                    // The reader resumes saved partitions before `offset`.
+                                                    spanner_split.partitions = Default::default();
                                                 }
                                                 _ => {
                                                     tracing::warn!(

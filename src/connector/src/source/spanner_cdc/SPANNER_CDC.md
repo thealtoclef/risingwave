@@ -143,11 +143,14 @@ The `mpsc` channel provides natural **backpressure**: when the source executor i
 │  │ SpannerCdcSplit  │ ← Persisted state, restored on restart    │
 │  │ - partition_token│                                           │
 │  │ - parent_tokens │                                           │
-│  │ - offset         │ ← Resume position (commit timestamp)      │
+│  │ - offset         │ ← Watermark; resume point without partitions│
 │  │ - index          │ ← source_id.as_raw_id() (unique per source)│
+│  │ - partitions     │ ← Each unfinished partition: token,       │
+│  │                  │   parents, offset. Resumed one by one     │
 │  └────────┬────────┘                                           │
 └───────────┼─────────────────────────────────────────────────────┘
-            │ update_split_offset()
+            │ update_offset(): message offsets advance `offset`,
+            │ progress reports replace `partitions`
             ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │              SourceMessage.offset (Checkpoint)                  │
@@ -167,15 +170,16 @@ The `mpsc` channel provides natural **backpressure**: when the source executor i
 │  • ready_pool: Vec<Split> (parents all finished, spawn all)     │
 │  • deferred_children: Vec<Split> (registered, waiting for parents)│
 │  • child_discovery_tx: unbounded mpsc channel                   │
-│  • Recreated on restart from checkpointed watermark             │
+│  • Rebuilt on restart from `partitions`, or from the watermark  │
+│    by re-discovering the tree when there are none               │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
 | Layer | Purpose | Persisted |
 |-------|---------|-----------|
-| `SpannerCdcSplit` | Partition identity + offset | Yes (state table) |
+| `SpannerCdcSplit` | Watermark + every unfinished partition's progress | Yes (state table) |
 | `SpannerOffset` | Checkpoint watermark | Yes (message offset) |
-| Runtime coordination | Partition lifecycle (spawn, finish, discover) | No (recreated on restart) |
+| Runtime coordination | Partition lifecycle (spawn, finish, discover) | Rebuilt from `partitions` on restart |
 
 ---
 
@@ -192,7 +196,23 @@ The reader implements this via:
 
 **Watermark & Checkpoint**:
 
-The watermark = `min(offset)` across all registered, un-finished partitions. It is the safe recovery point and used for metrics. On restart, the root query restarts from the checkpointed watermark — all partitions are re-discovered from scratch.
+The watermark = `min(offset)` across all registered, un-finished partitions. Every message carries it as its offset, and it becomes the split's `offset`: a lower bound that is always safe to resume from, and the value v1 CDC backfill compares against.
+
+Every 5 seconds the reader also reports each unfinished partition's token, parents and offset,
+through the same channel as the data and after the batches it covers, as the split's
+`partitions`. A partition's offset advances only once its batch is in the channel, so the
+report never claims records that were not sent. On restart:
+
+- **With `partitions`**: each saved partition resumes from its own offset. A saved child still
+  waits for its saved parents; a parent that is not saved has finished. A restart therefore
+  replays about 5 seconds plus the time since the last checkpoint of each partition, not
+  everything since the slowest one.
+- **Without** (a split saved by an older version, or after `RESET SOURCE`): the root query
+  restarts from the watermark and all partitions are re-discovered from scratch.
+
+Queries resume from an offset inclusively, since other records can share its commit timestamp;
+the records at that timestamp are read again. A version that predates `partitions` ignores the
+field and resumes from `offset`, so a rollback is safe.
 
 ```
 PartitionOffsets (shared via Arc<Mutex<HashMap>>):
@@ -315,7 +335,7 @@ ALTER SOURCE spanner_cdc_source SET (
 );
 ```
 
-Under the hood, `ALTER SOURCE ... SET (...)` updates the source catalog and issues a `ConnectorPropsChange` barrier mutation; the running source executor then rebuilds its `SpannerCdcSplitReader` with the new properties. No backfill re-runs, but the new reader restarts every partition query from the saved offset, which is the position of the slowest partition. Changes since that position are read again (at-least-once), so on a source with a lagging partition an ALTER can cause a long catch-up. Changing `SOURCE_RATE_LIMIT` rebuilds the reader the same way. Only properties registered as `#[with_option(allow_alter_on_fly)]` on `SpannerCdcProperties` (see `mod.rs`) are accepted; anything else is rejected by `check_source_allow_alter_on_fly_fields`.
+Under the hood, `ALTER SOURCE ... SET (...)` updates the source catalog and issues a `ConnectorPropsChange` barrier mutation; the running source executor then rebuilds its `SpannerCdcSplitReader` with the new properties. No backfill re-runs, but the new reader restarts every partition query from that partition's last reported progress (see Watermark & Checkpoint), so a few seconds of each partition are read again (at-least-once). Changing `SOURCE_RATE_LIMIT` rebuilds the reader the same way. Only properties registered as `#[with_option(allow_alter_on_fly)]` on `SpannerCdcProperties` (see `mod.rs`) are accepted; anything else is rejected by `check_source_allow_alter_on_fly_fields`.
 
 `spanner.databoost.enabled` cannot be altered this way: it's injected into `CdcTableDesc.connect_properties` at `CREATE TABLE` time and read once by the backfill's external table reader, which doesn't subscribe to `ConnectorPropsChange`.
 
@@ -666,8 +686,10 @@ export GOOGLE_APPLICATION_CREDENTIALS="<path-to-service-account.json>"
 
 - **Full checkpoint support** via `SplitMetaData` trait
 - State persisted in RisingWave state table
-- Automatic recovery on restart from last committed watermark
-- On restart: root query restarts from watermark, all partitions re-discovered from scratch
+- On restart: each partition saved in `partitions` resumes from its own offset; without
+  saved partitions the root query restarts from the watermark (see Watermark & Checkpoint)
+- `risectl meta inject-source-offsets` only moves `offset` forward. It has no effect while
+  `partitions` is saved, since those are resumed first
 
 ### Retry with Exponential Backoff
 
@@ -687,7 +709,7 @@ retry_backoff_factor: 2
 - A start timestamp older than the change stream's retention period is not retried (see
   "start timestamp older than retention" below).
 - Once the budget runs out the reader fails and the source restarts every partition from
-  the checkpoint watermark.
+  its last reported progress.
 - This budget is the only retry layer. The Spanner SDK's own retry is turned off for change
   stream queries: it would retry inside a single call, hidden from the stall timeout and
   from the `spanner_cdc_partition_query_failure_count` metric.
@@ -738,12 +760,12 @@ unbounded and churn as Spanner splits and merges.
 ##### Reading the lag pair
 
 `spanner_cdc_watermark_lag_milliseconds` is the *worst* partition and is what gets stamped as the
-checkpoint offset, so it is the number that matters for freshness. Comparing it
+message offset, so it is the number that matters for freshness. Comparing it
 with `spanner_cdc_newest_partition_lag_milliseconds` tells you which failure you have:
 
 | `..._watermark_lag_milliseconds` | `..._newest_partition_lag_milliseconds` | Interpretation |
 |---|---|---|
-| high | low | One partition is stuck; it is pinning the checkpoint offset for every other partition. Check `spanner_cdc_partition_query_failure_count` by `cause` |
+| high | low | One partition is stuck; it pins the watermark, though a restart resumes the others from their own offsets. Check `spanner_cdc_partition_query_failure_count` by `cause` |
 | high | high | The reader is uniformly behind — a genuine throughput limit |
 | low | low | Healthy; both floor at `spanner.heartbeat_milliseconds` |
 
