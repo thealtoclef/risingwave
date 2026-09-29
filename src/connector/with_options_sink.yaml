@@ -285,6 +285,27 @@ DorisConfig:
       `create_table_if_not_exists` is enabled.
       When unset, the Doris cluster default is used.
     required: false
+  - name: doris.buckets
+    field_type: String
+    comments: |-
+      Bucket count of the auto-created table: a positive integer or `auto`. Only used when
+      `create_table_if_not_exists` is enabled.
+
+      When unset, the sink picks `AUTO` (or the alive BE count for an upsert auto-LIST table,
+      which Doris does not allow `BUCKETS AUTO` on). An explicit `auto` is rejected together
+      with an auto-LIST `partition_by`, for the same reason.
+    required: false
+  - name: doris.distributed_by
+    field_type: String
+    comments: |-
+      Distribution of the auto-created table: `random`, or comma-separated column(s) for
+      `DISTRIBUTED BY HASH(...)`. Only used when `create_table_if_not_exists` is enabled.
+
+      Hash columns must be key columns of the table. `random` is only valid for append-only
+      sinks, since Doris requires hash distribution on a UNIQUE KEY table. When unset, the
+      sink chooses the distribution itself (hash on the key columns, or Doris's default
+      random distribution for an append-only table without a primary key).
+    required: false
   - name: partition_by
     field_type: String
     comments: |-

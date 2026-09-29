@@ -169,6 +169,23 @@ pub struct DorisCommon {
     /// can only mean LIST, so the shape alone determines the partition kind.
     #[serde(rename = "partition_by")]
     pub partition_by: Option<String>,
+    /// Bucket count of the auto-created table: a positive integer or `auto`. Only used when
+    /// `create_table_if_not_exists` is enabled.
+    ///
+    /// When unset, the sink picks `AUTO` (or the alive BE count for an upsert auto-LIST table,
+    /// which Doris does not allow `BUCKETS AUTO` on). An explicit `auto` is rejected together
+    /// with an auto-LIST `partition_by`, for the same reason.
+    #[serde(rename = "doris.buckets")]
+    pub buckets: Option<String>,
+    /// Distribution of the auto-created table: `random`, or comma-separated column(s) for
+    /// `DISTRIBUTED BY HASH(...)`. Only used when `create_table_if_not_exists` is enabled.
+    ///
+    /// Hash columns must be key columns of the table. `random` is only valid for append-only
+    /// sinks, since Doris requires hash distribution on a UNIQUE KEY table. When unset, the
+    /// sink chooses the distribution itself (hash on the key columns, or Doris's default
+    /// random distribution for an append-only table without a primary key).
+    #[serde(rename = "doris.distributed_by")]
+    pub distributed_by: Option<String>,
     /// Store RisingWave `timestamptz` values in a Doris `DATETIME` column, accepting that the
     /// timezone is lost. Defaults to false.
     ///
@@ -412,6 +429,24 @@ impl DorisConfig {
         // `partition_by` only shapes the auto-created table, so it is meaningless without
         // `create_table_if_not_exists`. Parsing it here also surfaces grammar errors at config time (before any
         // Doris connection is opened) rather than only when the DDL is built during validation.
+        if !config.common.create_table_if_not_exists {
+            for (key, is_set) in [
+                ("doris.buckets", config.common.buckets.is_some()),
+                ("doris.distributed_by", config.common.distributed_by.is_some()),
+            ] {
+                if is_set {
+                    return Err(SinkError::Config(anyhow!(
+                        "`{key}` only takes effect when `create_table_if_not_exists` is enabled"
+                    )));
+                }
+            }
+        }
+        if let Some(buckets) = &config.common.buckets {
+            parse_buckets(buckets)?;
+        }
+        if let Some(distributed_by) = &config.common.distributed_by {
+            parse_distributed_by(distributed_by)?;
+        }
         if let Some(partition_by) = &config.common.partition_by {
             if !config.common.create_table_if_not_exists {
                 return Err(SinkError::Config(anyhow!(
@@ -554,7 +589,7 @@ enum DorisPartitionSpec {
 /// Whether `name` is a plain Doris identifier (letter or `_` first, then letters, digits,
 /// `_`). Partition columns are emitted into the DDL and looked up in the sink schema, so
 /// anything else is rejected rather than risking malformed DDL or a confusing Doris error.
-fn is_valid_partition_column(name: &str) -> bool {
+fn is_valid_identifier(name: &str) -> bool {
     let mut chars = name.chars();
     match chars.next() {
         Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
@@ -600,7 +635,7 @@ fn parse_partition_by(partition_by: &str) -> Result<DorisPartitionSpec> {
                     granularity
                 ))
             })?;
-        if !is_valid_partition_column(column) {
+        if !is_valid_identifier(column) {
             return Err(SinkError::Config(anyhow!(
                 "Invalid `partition_by` partition column {column:?}: only plain \
                  identifiers (letters, digits, `_`) are allowed"
@@ -619,7 +654,7 @@ fn parse_partition_by(partition_by: &str) -> Result<DorisPartitionSpec> {
         .map(str::to_owned)
         .collect();
     for column in &columns {
-        if column.is_empty() || !is_valid_partition_column(column) {
+        if column.is_empty() || !is_valid_identifier(column) {
             return Err(SinkError::Config(anyhow!(
                 "Invalid `partition_by` partition column {column:?}: expected bare \
                  identifiers (letters, digits, `_`) separated by commas, or a single \
@@ -628,6 +663,61 @@ fn parse_partition_by(partition_by: &str) -> Result<DorisPartitionSpec> {
         }
     }
     Ok(DorisPartitionSpec::List { columns })
+}
+
+/// Bucket count of an auto-created table.
+#[derive(Debug, PartialEq, Eq)]
+enum DorisBuckets {
+    Auto,
+    Fixed(u32),
+}
+
+impl std::fmt::Display for DorisBuckets {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Auto => write!(f, "AUTO"),
+            Self::Fixed(n) => write!(f, "{n}"),
+        }
+    }
+}
+
+/// Distribution of an auto-created table, parsed from `doris.distributed_by`.
+#[derive(Debug, PartialEq, Eq)]
+enum DorisDistribution {
+    Random,
+    Hash(Vec<String>),
+}
+
+fn parse_buckets(buckets: &str) -> Result<DorisBuckets> {
+    let buckets = buckets.trim();
+    if buckets.eq_ignore_ascii_case("auto") {
+        return Ok(DorisBuckets::Auto);
+    }
+    match buckets.parse::<u32>() {
+        Ok(n) if n > 0 => Ok(DorisBuckets::Fixed(n)),
+        _ => Err(SinkError::Config(anyhow!(
+            "`doris.buckets` must be a positive integer or `auto`, got {buckets:?}"
+        ))),
+    }
+}
+
+fn parse_distributed_by(distributed_by: &str) -> Result<DorisDistribution> {
+    let distributed_by = distributed_by.trim();
+    if distributed_by.eq_ignore_ascii_case("random") {
+        return Ok(DorisDistribution::Random);
+    }
+    let columns: Vec<String> = distributed_by
+        .split(',')
+        .map(|c| c.trim().to_owned())
+        .collect();
+    if columns.iter().any(|c| !is_valid_identifier(c)) {
+        return Err(SinkError::Config(anyhow!(
+            "Invalid `doris.distributed_by`: {distributed_by:?}\n\
+             HINT: use `random`, or comma-separated bare column names for HASH distribution \
+             (e.g. `id` or `id, city`)"
+        )));
+    }
+    Ok(DorisDistribution::Hash(columns))
 }
 
 impl DorisSink {
@@ -1210,7 +1300,8 @@ impl DorisSink {
             None => false,
         };
 
-        // Choose the distribution:
+        // Choose the distribution. `doris.distributed_by` and `doris.buckets` override the
+        // defaults below; without them:
         //
         // - An append-only (DUPLICATE KEY) table with no user primary key, or any append-only
         //   auto-LIST table, omits `DISTRIBUTED BY` so Doris auto-generates `RANDOM BUCKETS AUTO`
@@ -1228,17 +1319,75 @@ impl DorisSink {
         //   is `AUTO`, except for an upsert auto-LIST table, which rejects `BUCKETS AUTO` and so
         //   uses the alive BE count — matching the Doris sizing rule that the bucket count be an
         //   integer multiple of the BE count, and scaling with the cluster instead of hardcoding.
-        let omit_distribution = self.is_append_only
+        let buckets = self
+            .config
+            .common
+            .buckets
+            .as_deref()
+            .map(parse_buckets)
+            .transpose()?;
+        let distributed_by = self
+            .config
+            .common
+            .distributed_by
+            .as_deref()
+            .map(parse_distributed_by)
+            .transpose()?;
+
+        if is_auto_list_partition && buckets == Some(DorisBuckets::Auto) {
+            return Err(SinkError::Doris(
+                "`doris.buckets = 'auto'` cannot be used with a LIST `partition_by`: Doris \
+                 rejects auto bucket with auto list partition. Set a fixed bucket count."
+                    .to_owned(),
+            ));
+        }
+
+        let default_is_random = self.is_append_only
             && (self.pk_indices.is_empty() || is_auto_list_partition);
-        if omit_distribution {
-            // Omit `DISTRIBUTED BY`; Doris emits `RANDOM BUCKETS AUTO` and auto-sizes the buckets.
-        } else {
-            let buckets = if is_auto_list_partition {
-                alive_be_count.to_string()
-            } else {
-                "AUTO".to_owned()
+        let key_names: Vec<String> = key_indices
+            .iter()
+            .map(|&i| fields[i].name.clone())
+            .collect();
+
+        // `None` means omitting `DISTRIBUTED BY` altogether. A user-set `doris.buckets` alone has
+        // to spell out the default distribution, or the bucket count would have no effect.
+        let distribution = match distributed_by {
+            Some(DorisDistribution::Random) if !self.is_append_only => {
+                return Err(SinkError::Doris(
+                    "`doris.distributed_by = 'random'` is not allowed for an upsert sink: Doris \
+                     requires HASH distribution on a UNIQUE KEY table."
+                        .to_owned(),
+                ));
+            }
+            Some(DorisDistribution::Hash(columns)) => {
+                if let Some(column) = columns.iter().find(|c| !key_names.contains(c)) {
+                    return Err(SinkError::Doris(format!(
+                        "`doris.distributed_by` column `{column}` must be a key column of the \
+                         table (the sink's `primary_key`, or the auto-selected key)"
+                    )));
+                }
+                Some(DorisDistribution::Hash(columns))
+            }
+            Some(random) => Some(random),
+            None if default_is_random => buckets.is_some().then_some(DorisDistribution::Random),
+            None => Some(DorisDistribution::Hash(key_names)),
+        };
+
+        if let Some(distribution) = distribution {
+            let buckets = match buckets {
+                Some(buckets) => buckets.to_string(),
+                None if is_auto_list_partition => alive_be_count.to_string(),
+                None => "AUTO".to_owned(),
             };
-            sql.push_str(&format!("DISTRIBUTED BY HASH({}) BUCKETS {buckets}\n", key_list));
+            let target = match distribution {
+                DorisDistribution::Random => "RANDOM".to_owned(),
+                DorisDistribution::Hash(columns) => {
+                    let columns: Vec<String> =
+                        columns.iter().map(|c| Self::quote_ident(c)).collect();
+                    format!("HASH({})", columns.join(", "))
+                }
+            };
+            sql.push_str(&format!("DISTRIBUTED BY {target} BUCKETS {buckets}\n"));
         }
 
         let mut properties: Vec<String> = Vec::new();
@@ -2575,6 +2724,90 @@ mod tests {
         );
     }
 
+    fn build_sink_with(
+        r#type: &str,
+        is_append_only: bool,
+        extra: &[(&str, &str)],
+    ) -> DorisSink {
+        let mut props = base_properties(r#type);
+        props.insert("create_table_if_not_exists".to_owned(), "true".to_owned());
+        for (k, v) in extra {
+            props.insert((*k).to_owned(), (*v).to_owned());
+        }
+        let config = DorisConfig::from_btreemap(props).unwrap();
+        DorisSink::new(
+            config,
+            upsert_schema(),
+            vec![0],
+            is_append_only,
+            test_param(r#type, is_append_only),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_build_create_table_sql_custom_buckets_and_distribution() {
+        let sink = build_sink_with(SINK_TYPE_UPSERT, false, &[("doris.buckets", "16")]);
+        let sql = sink.build_create_table_sql(1).unwrap();
+        assert!(sql.contains("DISTRIBUTED BY HASH(`id`) BUCKETS 16"), "sql: {sql}");
+
+        let sink = build_sink_with(
+            SINK_TYPE_APPEND_ONLY,
+            true,
+            &[("doris.distributed_by", "random"), ("doris.buckets", "8")],
+        );
+        let sql = sink.build_create_table_sql(1).unwrap();
+        assert!(sql.contains("DISTRIBUTED BY RANDOM BUCKETS 8"), "sql: {sql}");
+
+        let sink = build_sink_with(
+            SINK_TYPE_APPEND_ONLY,
+            true,
+            &[("doris.distributed_by", "id")],
+        );
+        let sql = sink.build_create_table_sql(1).unwrap();
+        assert!(sql.contains("DISTRIBUTED BY HASH(`id`) BUCKETS AUTO"), "sql: {sql}");
+    }
+
+    #[test]
+    fn test_build_create_table_sql_rejects_invalid_distribution() {
+        // `random` is not allowed on a UNIQUE KEY table.
+        let sink = build_sink_with(
+            SINK_TYPE_UPSERT,
+            false,
+            &[("doris.distributed_by", "random")],
+        );
+        assert!(sink.build_create_table_sql(1).is_err());
+        // Hash column must be a key column.
+        let sink = build_sink_with(SINK_TYPE_UPSERT, false, &[("doris.distributed_by", "name")]);
+        assert!(sink.build_create_table_sql(1).is_err());
+        // `BUCKETS AUTO` is rejected with an auto-LIST partition.
+        let sink = build_sink_with(
+            SINK_TYPE_UPSERT,
+            false,
+            &[("partition_by", "id"), ("doris.buckets", "auto")],
+        );
+        assert!(sink.build_create_table_sql(1).is_err());
+    }
+
+    #[test]
+    fn test_config_validates_buckets_and_distributed_by() {
+        for (k, v) in [
+            ("doris.buckets", "0"),
+            ("doris.buckets", "x"),
+            ("doris.distributed_by", "a b"),
+            ("doris.distributed_by", ""),
+        ] {
+            let mut props = base_properties(SINK_TYPE_UPSERT);
+            props.insert("create_table_if_not_exists".to_owned(), "true".to_owned());
+            props.insert(k.to_owned(), v.to_owned());
+            assert!(DorisConfig::from_btreemap(props).is_err(), "{k}={v}");
+        }
+        // Meaningless without `create_table_if_not_exists`.
+        let mut props = base_properties(SINK_TYPE_UPSERT);
+        props.insert("doris.buckets".to_owned(), "4".to_owned());
+        assert!(DorisConfig::from_btreemap(props).is_err());
+    }
+
     #[test]
     fn test_build_create_table_sql_append_only_uses_duplicate_key() {
         let sink = build_sink(SINK_TYPE_APPEND_ONLY, true);
@@ -3435,6 +3668,8 @@ mod tests {
             create_table_if_not_exists: true,
             replication_num: None,
             partition_by: None,
+            buckets: None,
+            distributed_by: None,
             timestamptz_as_datetime: false,
         };
         assert_eq!(common.get_query_url().unwrap(), "mysql://doris-server:9030");
@@ -3456,6 +3691,8 @@ mod tests {
             create_table_if_not_exists: true,
             replication_num: None,
             partition_by: None,
+            buckets: None,
+            distributed_by: None,
             timestamptz_as_datetime: false,
         };
         let err = common.get_query_url().unwrap_err();

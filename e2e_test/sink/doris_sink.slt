@@ -201,6 +201,42 @@ FLUSH;
 system ok retry 10 backoff 1s
 test "$(mysql -uroot -N -B -h doris-server -P 9030 -e "show create table demo.demo_auto_partition_table;" | grep -c 'DISTRIBUTED BY HASH')" = "1"
 
+# Auto-create with `doris.buckets` and `doris.distributed_by` emits the user-chosen distribution
+# instead of the default `HASH(<key>) BUCKETS AUTO`.
+statement ok
+CREATE TABLE t6_dist (v1 int primary key, v2 varchar);
+
+statement ok
+CREATE MATERIALIZED VIEW mv6_dist AS SELECT * FROM t6_dist;
+
+statement ok
+CREATE SINK s6_dist
+FROM
+    mv6_dist WITH (
+    connector = 'doris',
+    type = 'upsert',
+    primary_key = 'v1',
+    doris.url = 'http://doris-server:8030',
+    doris.query_url = 'mysql://doris-server:9030',
+    doris.user = 'users',
+    doris.password = '123456',
+    doris.database = 'demo',
+    doris.table = 'demo_auto_dist_table',
+    doris.replication_num = '1',
+    doris.distributed_by = 'v1',
+    doris.buckets = '3',
+    create_table_if_not_exists = 'true'
+);
+
+statement ok
+INSERT INTO t6_dist VALUES (1, 'a');
+
+statement ok
+FLUSH;
+
+system ok retry 10 backoff 1s
+test "$(mysql -uroot -N -B -h doris-server -P 9030 -e "show create table demo.demo_auto_dist_table;" | grep -c 'DISTRIBUTED BY HASH(`v1`) BUCKETS 3')" = "1"
+
 # TIMESTAMPTZ: RisingWave's `timestamptz` value should land in Doris's native `TIMESTAMPTZ`
 # column (Doris 4.x) with the underlying UTC instant preserved. Doris stores in UTC and
 # re-renders in the session timezone at read time. The encoder emits RFC3339 with `Z` so
@@ -475,10 +511,19 @@ statement ok
 DROP TABLE t6_auto;
 
 statement ok
+DROP SINK s6_dist;
+
+statement ok
 DROP SINK s6_part;
 
 statement ok
+DROP MATERIALIZED VIEW mv6_dist;
+
+statement ok
 DROP MATERIALIZED VIEW mv6_part;
+
+statement ok
+DROP TABLE t6_dist;
 
 statement ok
 DROP TABLE t6_part;
