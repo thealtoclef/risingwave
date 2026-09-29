@@ -174,4 +174,56 @@ mod tests {
             std::time::Duration::from_millis(50_000)
         );
     }
+
+    fn props_with(overrides: &[(&str, &str)]) -> SpannerCdcProperties {
+        let mut json = serde_json::json!({
+            "connector": "spanner-cdc",
+            "spanner.project": "test-project",
+            "spanner.instance": "test-instance",
+            "database.name": "test-db",
+            "spanner.change_stream.name": "test-stream",
+        });
+        for (key, value) in overrides {
+            json[*key] = serde_json::Value::from(*value);
+        }
+        serde_json::from_value(json).unwrap()
+    }
+
+    #[test]
+    fn test_validate_options() {
+        props_with(&[]).validate().unwrap();
+        props_with(&[
+            ("spanner.heartbeat_milliseconds", "1000"),
+            ("spanner.max_missed_heartbeats", "1"),
+        ])
+        .validate()
+        .unwrap();
+        props_with(&[("spanner.heartbeat_milliseconds", "300000")])
+            .validate()
+            .unwrap();
+
+        for (key, value) in [
+            ("spanner.heartbeat_milliseconds", "999"),
+            ("spanner.heartbeat_milliseconds", "300001"),
+            ("spanner.max_missed_heartbeats", "0"),
+            ("spanner.retry_backoff_ms", "0"),
+            ("spanner.retry_backoff_max_delay_ms", "0"),
+            ("spanner.retry_backoff_factor", "0"),
+        ] {
+            let err = props_with(&[(key, value)]).validate().unwrap_err();
+            assert!(err.to_string().contains(key), "{key} = {value}: {err}");
+        }
+    }
+
+    #[test]
+    fn test_stall_timeout_saturates() {
+        let props = props_with(&[
+            ("spanner.heartbeat_milliseconds", &i64::MAX.to_string()),
+            ("spanner.max_missed_heartbeats", &u32::MAX.to_string()),
+        ]);
+        assert_eq!(
+            props.get_stall_timeout(),
+            std::time::Duration::from_millis(u64::MAX)
+        );
+    }
 }

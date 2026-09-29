@@ -288,7 +288,11 @@ from their own file systems and must name a regular file of at most 64 KiB. Pref
 | `spanner.retry_attempts` | `5` | Attempts per run of back-to-back query failures; a query that made progress before failing resets the count. `0` and `1` both mean a single attempt |
 | `spanner.retry_backoff_ms` | `1000` | Base backoff interval in milliseconds |
 | `spanner.retry_backoff_max_delay_ms` | `10000` | Maximum backoff delay in milliseconds |
-| `spanner.retry_backoff_factor` | `2` | Multiplier for each retry (doubles each time) |
+| `spanner.retry_backoff_factor` | `2` | Multiplier applied to every delay; delays grow by powers of `spanner.retry_backoff_ms` (see "Retry with Exponential Backoff") |
+
+`spanner.max_missed_heartbeats` and the three backoff options must be greater than 0, and
+`spanner.heartbeat_milliseconds` must be in its valid range. `CREATE SOURCE` rejects other
+values; an `ALTER` that sets one makes the reader fail to start with the same error.
 
 #### Advanced Configuration
 

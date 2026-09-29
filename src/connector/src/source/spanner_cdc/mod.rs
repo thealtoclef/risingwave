@@ -16,6 +16,7 @@ use std::collections::HashMap;
 
 use google_cloud_spanner::client::DatabaseClient;
 use phf::{Set, phf_set};
+use risingwave_common::bail;
 use serde::Deserialize;
 use serde_with::{DisplayFromStr, serde_as};
 use with_options::WithOptions;
@@ -111,7 +112,8 @@ pub struct SpannerCdcProperties {
     #[with_option(allow_alter_on_fly)]
     pub retry_backoff_max_delay_ms: Option<u64>,
 
-    /// Retry backoff factor (default: 2, meaning double each time)
+    /// Retry backoff factor (default: 2). Multiplies every delay; delays grow by powers of
+    /// `spanner.retry_backoff_ms`.
     #[serde_as(as = "Option<DisplayFromStr>")]
     #[serde(rename = "spanner.retry_backoff_factor")]
     #[with_option(allow_alter_on_fly)]
@@ -202,7 +204,7 @@ impl SpannerCdcProperties {
         self.retry_backoff_max_delay_ms.unwrap_or(10000)
     }
 
-    /// Get retry backoff factor (default: 2, meaning double each time)
+    /// Get retry backoff factor (default: 2)
     pub fn get_retry_backoff_factor(&self) -> u64 {
         self.retry_backoff_factor.unwrap_or(2)
     }
@@ -212,7 +214,34 @@ impl SpannerCdcProperties {
     pub fn get_stall_timeout(&self) -> std::time::Duration {
         let heartbeat_ms = self.heartbeat_milliseconds.max(1000) as u64;
         let max_missed = self.max_missed_heartbeats.unwrap_or(10).max(1) as u64;
-        std::time::Duration::from_millis(heartbeat_ms * max_missed)
+        std::time::Duration::from_millis(heartbeat_ms.saturating_mul(max_missed))
+    }
+
+    /// Rejects option values that Spanner refuses or that break the reader's retry and
+    /// stall handling. Checked when the enumerator and the reader are created.
+    pub(crate) fn validate(&self) -> ConnectorResult<()> {
+        // The range the change stream TVF accepts for `heartbeat_milliseconds`.
+        if !(1_000..=300_000).contains(&self.heartbeat_milliseconds) {
+            bail!("spanner.heartbeat_milliseconds must be between 1000 and 300000");
+        }
+        if self.max_missed_heartbeats == Some(0) {
+            bail!("spanner.max_missed_heartbeats must be greater than 0");
+        }
+        // Any of these at 0 makes every retry delay 0, so a failing partition retries in
+        // a tight loop.
+        for (name, value) in [
+            ("spanner.retry_backoff_ms", self.retry_backoff_ms),
+            (
+                "spanner.retry_backoff_max_delay_ms",
+                self.retry_backoff_max_delay_ms,
+            ),
+            ("spanner.retry_backoff_factor", self.retry_backoff_factor),
+        ] {
+            if value == Some(0) {
+                bail!("{name} must be greater than 0");
+            }
+        }
+        Ok(())
     }
 
     /// Create a Spanner `DatabaseClient` using the shared factory.

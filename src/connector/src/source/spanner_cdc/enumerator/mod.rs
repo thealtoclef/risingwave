@@ -46,6 +46,7 @@ impl SplitEnumerator for SpannerCdcSplitEnumerator {
         properties: Self::Properties,
         context: SourceEnumeratorContextRef,
     ) -> ConnectorResult<SpannerCdcSplitEnumerator> {
+        properties.validate()?;
         let source_id = context.info.source_id;
         let client = properties.create_client().await?;
 

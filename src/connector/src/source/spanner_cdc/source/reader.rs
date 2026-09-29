@@ -120,6 +120,7 @@ impl SplitReader for SpannerCdcSplitReader {
         _columns: Option<Vec<Column>>,
     ) -> Result<Self> {
         ensure!(!splits.is_empty(), "requires at least one split");
+        properties.validate()?;
 
         let source_id = source_ctx.source_id.as_raw_id();
         let (tx, rx) = mpsc::channel(DEFAULT_CHANNEL_SIZE);
