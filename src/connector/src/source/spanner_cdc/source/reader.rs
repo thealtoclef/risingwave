@@ -940,6 +940,7 @@ async fn run_reader(ctx: ReaderContext, tx: mpsc::Sender<SourceMessageEvent>) ->
     // are meant to show, and progress would be reported only when the tree changes.
     let mut progress_tick = tokio::time::interval(PROGRESS_INTERVAL);
     progress_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut progress_due = false;
 
     // Main event loop — partition lifecycle management only.
     // Records flow directly from partition tasks → tx.
@@ -1093,17 +1094,28 @@ async fn run_reader(ctx: ReaderContext, tx: mpsc::Sender<SourceMessageEvent>) ->
                 );
             }
 
-            // Re-sample the gauges (at the top of the loop) and report progress. Listed
-            // last so `biased` still prioritises partition progress.
-            _ = progress_tick.tick() => {
-                // Sent through the data channel, so it follows every batch the partitions
-                // sent before their offsets advanced. Skipped while the channel is full,
-                // so backpressure never stalls the lifecycle loop; the next tick retries.
-                let progress = SpannerCdcSplit::encode_partition_progress(offsets.snapshot());
-                let _ = tx.try_send(SourceMessageEvent::SplitProgress(HashMap::from([(
-                    split_id.clone(),
-                    progress,
-                )])));
+            // Send a due progress report once the channel has room. `reserve` queues
+            // behind partition tasks already waiting to send, where `try_send` would
+            // never get a slot while they wait; cancelling it gives up the queue place,
+            // so the tick below is paused until the report goes out.
+            permit = tx.reserve(), if progress_due => {
+                progress_due = false;
+                if let Ok(permit) = permit {
+                    // Snapshotted now, so it follows every batch the partitions sent
+                    // before their offsets advanced.
+                    let progress =
+                        SpannerCdcSplit::encode_partition_progress(offsets.snapshot());
+                    permit.send(SourceMessageEvent::SplitProgress(HashMap::from([(
+                        split_id.clone(),
+                        progress,
+                    )])));
+                }
+            }
+
+            // Re-sample the gauges (at the top of the loop) and schedule a progress
+            // report. Listed last so `biased` still prioritises partition progress.
+            _ = progress_tick.tick(), if !progress_due => {
+                progress_due = true;
             }
         }
     }
@@ -2948,6 +2960,50 @@ mod tests {
                 }
             }
         }
+        drop(rx);
+        reader.await.unwrap().unwrap();
+    }
+
+    /// Progress is still reported while a partition is always waiting to send, as under
+    /// sustained backpressure.
+    #[tokio::test(start_paused = true)]
+    async fn test_run_reader_reports_progress_under_backpressure() {
+        let last = T0 + Duration::from_secs(200);
+        let heartbeats = (1..=200)
+            .map(|s| Ok(heartbeat_row(T0 + Duration::from_secs(s))))
+            .collect();
+        let querier = Arc::new(FakeQuerier::default().script(
+            None,
+            vec![FakeQuery::Rows {
+                rows: heartbeats,
+                then_hang: true,
+            }],
+        ));
+        let (tx, mut rx) = mpsc::channel(1);
+        let reader = tokio::spawn(run_reader(test_reader_context(querier, 1), tx));
+
+        // The first report comes from the interval's immediate first tick, before the
+        // channel fills; wait for one that shows the partition part-way through.
+        let offset = loop {
+            // A slow consumer: the partition task refills the channel after every read.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if let SourceMessageEvent::SplitProgress(progress) =
+                rx.recv().await.expect("reader stopped")
+            {
+                let mut split = SpannerCdcSplit::new_root("stream".to_owned(), 1, T0);
+                split.update_offset(progress["1"].clone()).unwrap();
+                let [root] = &*split.partitions else {
+                    panic!("expected only the root, got {:?}", split.partitions);
+                };
+                if root.offset > T0 {
+                    break root.offset;
+                }
+            }
+        };
+        assert!(
+            offset < last,
+            "progress was reported only after the partition stopped sending"
+        );
         drop(rx);
         reader.await.unwrap().unwrap();
     }
