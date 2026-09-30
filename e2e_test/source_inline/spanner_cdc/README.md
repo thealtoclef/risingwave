@@ -4,11 +4,16 @@ End-to-end tests for the Spanner CDC source connector, run against the Spanner e
 
 ## Prerequisites
 
-- The `gcloud` CLI with the Spanner emulator component (`gcloud components install cloud-spanner-emulator`).
-  The `spanner-emulator` risedev profile checks for both before starting the emulator.
+- The `gcloud` CLI: `prepare-data.rs` uses it to create the instance and databases.
+- The Spanner emulator, either:
+  - the gcloud emulator component (`gcloud components install cloud-spanner-emulator`, Linux
+    only), started by the `spanner-emulator` profile, or
+  - the emulator Docker image, started by you, for the `spanner-emulator-docker` profile (macOS).
 - A nightly Rust toolchain: `prepare-data.rs` is a `cargo -Zscript` script.
 
 ## Running
+
+On Linux, with the gcloud emulator component:
 
 ```bash
 ./risedev d spanner-emulator
@@ -16,7 +21,17 @@ End-to-end tests for the Spanner CDC source connector, run against the Spanner e
 ./risedev k
 ```
 
-The `spanner-emulator` profile sets:
+On macOS, or anywhere without the component, run the emulator in Docker:
+
+```bash
+docker run -d --name spanner-emulator -p 9010:9010 -p 9020:9020 gcr.io/cloud-spanner-emulator/emulator
+./risedev d spanner-emulator-docker
+./risedev slt 'e2e_test/source_inline/spanner_cdc/spanner_cdc.slt.serial'
+./risedev k
+docker rm -f spanner-emulator
+```
+
+Both profiles set:
 - `SPANNER_EMULATOR_HOST`: the emulator's gRPC address
 - `SPANNER_PROJECT`, `SPANNER_INSTANCE`, `SPANNER_DATABASE`: the test resources
 - `RISEDEV_SPANNER_WITH_OPTIONS_COMMON`: the connection options for `CREATE SOURCE`

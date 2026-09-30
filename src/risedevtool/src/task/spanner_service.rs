@@ -19,8 +19,8 @@ use std::process::Command;
 use anyhow::{Result, anyhow};
 
 use super::{ExecuteContext, Task};
-use crate::SpannerConfig;
 use crate::util::stylized_risedev_subcmd;
+use crate::{DummyService, SpannerConfig};
 
 pub struct SpannerService {
     config: SpannerConfig,
@@ -45,6 +45,10 @@ impl SpannerService {
 
 impl Task for SpannerService {
     fn execute(&mut self, ctx: &mut ExecuteContext<impl std::io::Write>) -> anyhow::Result<()> {
+        if self.config.user_managed {
+            return DummyService::new(&self.id()).execute(ctx);
+        }
+
         ctx.service(self);
         ctx.pb.set_message("starting...");
 

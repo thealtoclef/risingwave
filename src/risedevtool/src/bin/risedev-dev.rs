@@ -295,6 +295,9 @@ fn task_main(
                 ServiceConfig::Spanner(c) => {
                     let mut service = risedev::SpannerService::new(c.clone())?;
                     service.execute(&mut ctx)?;
+                    let mut task =
+                        risedev::TcpReadyCheckTask::new(c.address.clone(), c.port, c.user_managed)?;
+                    task.execute(&mut ctx)?;
                     ctx.pb
                         .set_message(format!("spanner {}:{}", c.address, c.port));
                 }

@@ -343,6 +343,8 @@ pub struct SpannerConfig {
     #[serde(rename = "use")]
     phantom_use: Option<String>,
     pub id: String,
+    #[serde(default)]
+    pub user_managed: bool,
     #[serde(with = "string")]
     pub port: u16,
     pub address: String,
@@ -714,7 +716,7 @@ impl ServiceConfig {
             Self::Moto(c) => c.user_managed,
             Self::Kafka(c) => c.user_managed,
             Self::Pubsub(c) => c.user_managed,
-            Self::Spanner(_c) => false,
+            Self::Spanner(c) => c.user_managed,
             Self::Pulsar(c) => c.user_managed,
             Self::Redis(c) => c.user_managed,
             Self::Opendal(_c) => false,
