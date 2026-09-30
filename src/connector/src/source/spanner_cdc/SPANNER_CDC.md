@@ -272,6 +272,12 @@ connectors do. `spanner.credentials_path` is read by the frontend, meta and comp
 from their own file systems and must name a regular file of at most 64 KiB. Prefer
 `spanner.credentials = secret ...` over an inline key or a path.
 
+An inline `spanner.credentials` key is kept in the catalog as part of the source's SQL, and
+`rw_sources.definition` shows it to every user with privileges on the source. Store the key
+with `CREATE SECRET` (see "Using Secrets Manager"). When secret management is available,
+the `enforce_secret` system parameter makes `CREATE SOURCE` reject either credential option
+given as plain text.
+
 #### Change Stream Configuration
 
 | Parameter | Default | Description |
@@ -288,7 +294,7 @@ from their own file systems and must name a regular file of at most 64 KiB. Pref
 | `spanner.retry_attempts` | `5` | Attempts per run of back-to-back query failures; a query that made progress before failing resets the count. `0` and `1` both mean a single attempt |
 | `spanner.retry_backoff_ms` | `1000` | Base backoff interval in milliseconds |
 | `spanner.retry_backoff_max_delay_ms` | `10000` | Maximum backoff delay in milliseconds |
-| `spanner.retry_backoff_factor` | `2` | Multiplier applied to every delay; delays grow by powers of `spanner.retry_backoff_ms` (see "Retry with Exponential Backoff") |
+| `spanner.retry_backoff_factor` | `2` | Each back-to-back retry waits this many times longer than the previous one (see "Retry with Exponential Backoff") |
 
 `spanner.max_missed_heartbeats` and the three backoff options must be greater than 0, and
 `spanner.heartbeat_milliseconds` must be in its valid range. `CREATE SOURCE` rejects other
@@ -717,9 +723,9 @@ retry_backoff_factor: 2
 - This budget is the only retry layer. The Spanner SDK's own retry is turned off for change
   stream queries: it would retry inside a single call, hidden from the stall timeout and
   from the `spanner_cdc_partition_query_failure_count` metric.
-- `tokio-retry`'s `ExponentialBackoff` grows by powers of `retry_backoff_ms`, not of
-  `retry_backoff_factor`: with the defaults the delays are 2 s, then the 10 s cap. Each delay
-  is jittered to a random value below it.
+- The n-th back-to-back retry waits `retry_backoff_ms * retry_backoff_factor^(n-1)`, capped
+  at `retry_backoff_max_delay_ms`: with the defaults 1 s, 2 s, 4 s, 8 s. Each delay is
+  jittered to a random value below it.
 
 ### Log Levels
 
@@ -807,6 +813,18 @@ with `spanner_cdc_newest_partition_lag_milliseconds` tells you which failure you
 - Table rename
 - Primary key changes
 - Schema rollback
+
+### Throughput and Scaling
+
+- A source has exactly one split, read by one source actor. Every change stream partition is
+  a tokio task inside that reader, and all records are parsed by one parser task.
+- `ALTER SOURCE ... SET PARALLELISM` therefore has no effect on the change stream side; it only
+  changes how many actors sit idle. Backfill has its own parallelism (`backfill.parallelism`).
+- `spanner_cdc_parsed_chunk_queue_depth` shows which side is the limit: near `8` the source
+  actor or its downstream is, near `0` the parser task is.
+- To go beyond one source's limit, split heavy tables into separate change streams, each read
+  by its own source; raise the compute node's CPU limit; or reduce the downstream fan-out of
+  the source.
 
 ### Other Considerations
 

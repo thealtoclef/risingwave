@@ -64,7 +64,7 @@ use thiserror_ext::AsReport;
 use time::OffsetDateTime;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tokio_retry::strategy::{ExponentialBackoff, jitter};
+use tokio_retry::strategy::jitter;
 
 use super::{ChangeRecordContext, build_source_message};
 use crate::error::{ConnectorError, ConnectorResult as Result};
@@ -1610,26 +1610,25 @@ async fn execute_query(
 /// lifetime: a query that advanced the offset before failing resets the count and the
 /// backoff, so a long-lived partition is not failed by scattered transient errors.
 /// Values 0 and 1 both mean a single attempt.
+///
+/// The n-th back-to-back retry waits `base * factor^(n-1)`, capped at `max_delay` and
+/// jittered to a random value below it.
 struct RetryBudget {
     max_attempts: u32,
     failures: u32,
-    initial_backoff: Backoff,
-    backoff: Backoff,
+    base_ms: u64,
+    max_delay_ms: u64,
+    factor: u64,
 }
-
-type Backoff = std::iter::Map<ExponentialBackoff, fn(std::time::Duration) -> std::time::Duration>;
 
 impl RetryBudget {
     fn new(max_attempts: u32, base: std::time::Duration, max_delay_ms: u64, factor: u64) -> Self {
-        let initial_backoff = ExponentialBackoff::from_millis(base.as_millis() as u64)
-            .max_delay(std::time::Duration::from_millis(max_delay_ms))
-            .factor(factor)
-            .map(jitter as fn(_) -> _);
         Self {
             max_attempts,
             failures: 0,
-            backoff: initial_backoff.clone(),
-            initial_backoff,
+            base_ms: base.as_millis() as u64,
+            max_delay_ms,
+            factor,
         }
     }
 
@@ -1638,13 +1637,19 @@ impl RetryBudget {
     fn on_failure(&mut self, made_progress: bool, retryable: bool) -> Option<std::time::Duration> {
         if made_progress {
             self.failures = 0;
-            self.backoff = self.initial_backoff.clone();
         }
         self.failures += 1;
         if !retryable || self.failures >= self.max_attempts {
             return None;
         }
-        Some(self.backoff.next().expect("backoff is unbounded"))
+        Some(jitter(self.delay()))
+    }
+
+    /// The delay before the next attempt, before jitter.
+    fn delay(&self) -> std::time::Duration {
+        let growth = self.factor.saturating_pow(self.failures - 1);
+        let delay_ms = self.base_ms.saturating_mul(growth).min(self.max_delay_ms);
+        std::time::Duration::from_millis(delay_ms)
     }
 }
 
@@ -2135,6 +2140,42 @@ mod tests {
         // 0 and 1 both mean a single attempt.
         assert!(new(0).on_failure(false, true).is_none());
         assert!(new(1).on_failure(false, true).is_none());
+    }
+
+    #[test]
+    fn test_retry_budget_delay_grows_by_factor() {
+        let delays = |base_ms, max_delay_ms, factor| {
+            let mut retry = RetryBudget::new(
+                10,
+                std::time::Duration::from_millis(base_ms),
+                max_delay_ms,
+                factor,
+            );
+            let mut delays = Vec::new();
+            for _ in 0..5 {
+                retry.failures += 1;
+                delays.push(retry.delay().as_millis() as u64);
+            }
+            delays
+        };
+
+        // The defaults.
+        assert_eq!(delays(1000, 10000, 2), [1000, 2000, 4000, 8000, 10000]);
+        assert_eq!(delays(500, 60000, 3), [500, 1500, 4500, 13500, 40500]);
+        // A factor of 1 keeps the delay constant.
+        assert_eq!(delays(1000, 10000, 1), [1000; 5]);
+        // The cap applies even below the base.
+        assert_eq!(delays(1000, 300, 2), [300; 5]);
+        // Large values saturate instead of overflowing.
+        assert_eq!(delays(u64::MAX, u64::MAX, u64::MAX), [u64::MAX; 5]);
+
+        // Progress restarts the delay from the base.
+        let mut retry = RetryBudget::new(10, std::time::Duration::from_millis(1000), 10000, 2);
+        retry.on_failure(false, true);
+        retry.on_failure(false, true);
+        assert_eq!(retry.delay().as_millis(), 2000);
+        retry.on_failure(true, true);
+        assert_eq!(retry.delay().as_millis(), 1000);
     }
 
     fn make_child(token: &str, parents: Vec<&str>, offset: OffsetDateTime) -> SpannerCdcSplit {

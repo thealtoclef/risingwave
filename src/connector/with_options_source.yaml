@@ -1561,8 +1561,8 @@ SpannerCdcProperties:
   - name: spanner.retry_backoff_factor
     field_type: u64
     comments: |-
-      Retry backoff factor (default: 2). Multiplies every delay; delays grow by powers of
-      `spanner.retry_backoff_ms`.
+      Retry backoff factor (default: 2). Each back-to-back retry waits this many times
+      longer than the previous one.
     required: false
     allow_alter_on_fly: true
   - name: spanner.max_missed_heartbeats

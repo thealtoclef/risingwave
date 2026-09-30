@@ -644,8 +644,24 @@ select id, age from t_users where id = '6';
 # PART 10: RECOVERY
 # Changes committed while the cluster recovers must still arrive: the source
 # resumes from its saved offsets. Keyed tables absorb any replayed change, so
-# each table must end with exactly the expected rows.
+# each table must end with exactly the expected rows, and a change log of
+# t_users checks that changes saved before the recovery are not replayed.
 # =============================================================================
+
+statement ok
+CREATE MATERIALIZED VIEW users_log AS WITH l AS changelog FROM t_users SELECT id, age, changelog_op FROM l;
+
+system ok
+e2e_test/source_inline/spanner_cdc/prepare-data.rs dml "INSERT INTO users (id, name, email, age) VALUES ('9', 'Ivan', 'ivan@example.com', 45)"
+
+query TII retry 24 backoff 5s
+select id, age, changelog_op from users_log where id = '9';
+----
+9 45 1
+
+# Partition progress is saved every 5 s, so wait until it has passed the insert
+# and been checkpointed.
+sleep 10s
 
 statement ok
 recover;
@@ -687,6 +703,13 @@ select id, age from t_users order by id;
 6 41
 7 29
 8 33
+9 45
+
+# The insert saved before the recovery is still the only change of '9'.
+query TII
+select id, age, changelog_op from users_log where id = '9';
+----
+9 45 1
 
 query TR retry 24 backoff 5s
 select id, price from t_products order by id;

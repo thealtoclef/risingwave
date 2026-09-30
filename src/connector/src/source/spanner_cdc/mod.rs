@@ -112,8 +112,8 @@ pub struct SpannerCdcProperties {
     #[with_option(allow_alter_on_fly)]
     pub retry_backoff_max_delay_ms: Option<u64>,
 
-    /// Retry backoff factor (default: 2). Multiplies every delay; delays grow by powers of
-    /// `spanner.retry_backoff_ms`.
+    /// Retry backoff factor (default: 2). Each back-to-back retry waits this many times
+    /// longer than the previous one.
     #[serde_as(as = "Option<DisplayFromStr>")]
     #[serde(rename = "spanner.retry_backoff_factor")]
     #[with_option(allow_alter_on_fly)]
