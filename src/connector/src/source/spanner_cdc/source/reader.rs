@@ -3066,6 +3066,48 @@ mod tests {
         );
     }
 
+    /// A data change record with malformed `mods` fails the query before the heartbeat
+    /// behind it can move progress past the record.
+    #[tokio::test(start_paused = true)]
+    async fn test_run_reader_fails_malformed_record_before_later_heartbeat() {
+        let t1 = T0 + Duration::from_secs(1);
+        let bad_record = serde_json::json!([{ "data_change_record": [{
+            "commit_timestamp": rfc3339(T0),
+            "record_sequence": "00000000",
+            "server_transaction_id": "tx",
+            "is_last_record_in_transaction_in_partition": true,
+            "table_name": "users",
+            "value_capture_type": "NEW_ROW",
+            "column_types": [],
+            "mods": "not-an-array",
+            "mod_type": "INSERT",
+            "number_of_records_in_transaction": 1,
+            "number_of_partitions_in_transaction": 1,
+            "transaction_tag": "",
+            "is_system_transaction": false,
+        }] }]);
+        let querier = Arc::new(
+            FakeQuerier::default().script(None, vec![rows(vec![bad_record, heartbeat_row(t1)])]),
+        );
+        let (tx, mut rx) = mpsc::channel(16);
+        let err = run_reader(test_reader_context(querier, 1), tx)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_report_string().contains("DataChangeRecord.mods"),
+            "{}",
+            err.as_report()
+        );
+
+        let t1_ms = (t1.unix_timestamp_nanos() / 1_000_000) as i64;
+        while let Ok(event) = rx.try_recv() {
+            if let SourceMessageEvent::Data(batch) = event {
+                assert!(!batch.iter().any(|msg| msg.is_cdc_heartbeat()
+                    && matches!(&msg.meta, SourceMeta::DebeziumCdc(meta) if meta.source_ts_ms == t1_ms)));
+            }
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn test_run_reader_does_not_retry_start_before_retention() {
         let querier = Arc::new(FakeQuerier::default().script(

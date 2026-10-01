@@ -398,6 +398,18 @@ pub fn parse_change_record_json(json: JsonValue) -> anyhow::Result<Vec<ChangeStr
         .collect()
 }
 
+/// Read a field that every populated record carries as an ARRAY.
+///
+/// Reading a missing, NULL or mistyped field as empty would drop the rows or child
+/// partitions it holds, and a later heartbeat would move progress past them.
+fn required_array(value: Option<JsonValue>, field: &str) -> anyhow::Result<Vec<JsonValue>> {
+    match value {
+        Some(JsonValue::Array(a)) => Ok(a),
+        Some(other) => Err(anyhow::anyhow!("{}: not an array, got: {}", field, other)),
+        None => Err(anyhow::anyhow!("{}: missing", field)),
+    }
+}
+
 impl ChangeStreamRecord {
     fn from_json_object(mut obj: serde_json::Map<String, JsonValue>) -> anyhow::Result<Self> {
         // Take an ARRAY field out of the map so its elements can be *moved* into
@@ -495,13 +507,10 @@ impl DataChangeRecord {
         )
         .map_err(|e| anyhow::anyhow!("invalid commit_timestamp '{}': {}", commit_ts_str, e))?;
 
-        let column_types = match column_types_json {
-            Some(JsonValue::Array(a)) => a
-                .iter()
-                .map(ColumnType::from_json)
-                .collect::<anyhow::Result<Vec<_>>>()?,
-            _ => vec![],
-        };
+        let column_types = required_array(column_types_json, "DataChangeRecord.column_types")?
+            .iter()
+            .map(ColumnType::from_json)
+            .collect::<anyhow::Result<Vec<_>>>()?;
         let mod_type = get_str("mod_type")?;
         // These are the only types Spanner documents. Reading any other as an insert
         // would write rows the database never had.
@@ -511,13 +520,10 @@ impl DataChangeRecord {
                 mod_type
             ));
         }
-        let mods = match mods_json {
-            Some(JsonValue::Array(a)) => a
-                .into_iter()
-                .map(|m| Mod::from_json(m, &mod_type))
-                .collect::<anyhow::Result<Vec<_>>>()?,
-            _ => vec![],
-        };
+        let mods = required_array(mods_json, "DataChangeRecord.mods")?
+            .into_iter()
+            .map(|m| Mod::from_json(m, &mod_type))
+            .collect::<anyhow::Result<Vec<_>>>()?;
 
         Ok(Self {
             commit_timestamp,
@@ -679,13 +685,13 @@ impl ChildPartitionsRecord {
             )
         })?;
 
-        let child_partitions = match obj.get("child_partitions") {
-            Some(JsonValue::Array(a)) => a
-                .iter()
-                .map(ChildPartition::from_json)
-                .collect::<anyhow::Result<Vec<_>>>()?,
-            _ => vec![],
-        };
+        let child_partitions = required_array(
+            obj.get("child_partitions").cloned(),
+            "ChildPartitionsRecord.child_partitions",
+        )?
+        .iter()
+        .map(ChildPartition::from_json)
+        .collect::<anyhow::Result<Vec<_>>>()?;
 
         Ok(Self {
             start_timestamp,
@@ -705,13 +711,20 @@ impl ChildPartition {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("ChildPartition.token: missing or not a string"))?
             .to_owned();
-        let parent_partition_tokens = match obj.get("parent_partition_tokens") {
-            Some(JsonValue::Array(a)) => a
-                .iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect(),
-            _ => vec![],
-        };
+        let parent_partition_tokens = required_array(
+            obj.get("parent_partition_tokens").cloned(),
+            "ChildPartition.parent_partition_tokens",
+        )?
+        .iter()
+        .map(|v| {
+            v.as_str().map(String::from).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "ChildPartition.parent_partition_tokens: element is not a string, got: {}",
+                    v
+                )
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
         Ok(Self {
             token,
             parent_partition_tokens,
@@ -1369,6 +1382,67 @@ mod tests {
         assert!(
             err.to_string().contains("table_name"),
             "unexpected error: {err}"
+        );
+    }
+
+    /// The arrays a populated record always carries fail when missing, NULL or not an
+    /// array, instead of reading as empty and dropping their rows or child partitions.
+    #[test]
+    fn test_record_rejects_missing_or_mistyped_required_arrays() {
+        for (field, value) in [
+            ("mods", None),
+            ("mods", Some(JsonValue::Null)),
+            ("mods", Some(serde_json::json!("not-an-array"))),
+            ("column_types", None),
+            ("column_types", Some(serde_json::json!({}))),
+        ] {
+            let mut record = data_change_json();
+            let fields = record.as_object_mut().unwrap();
+            fields.remove(field);
+            if let Some(value) = value {
+                fields.insert(field.to_owned(), value);
+            }
+            let err = ChangeStreamRecord::from_json_object(obj(serde_json::json!({
+                "data_change_record": [record],
+            })))
+            .unwrap_err();
+            assert!(
+                err.to_string().contains(&format!("DataChangeRecord.{field}")),
+                "{err}"
+            );
+        }
+
+        let child_record = |child_partitions: JsonValue| {
+            ChangeStreamRecord::from_json_object(obj(serde_json::json!({
+                "child_partitions_record": [{
+                    "start_timestamp": "2025-01-01T00:00:00Z",
+                    "record_sequence": "0",
+                    "child_partitions": child_partitions,
+                }],
+            })))
+        };
+        for (child_partitions, field) in [
+            (JsonValue::Null, "ChildPartitionsRecord.child_partitions"),
+            (
+                serde_json::json!([{"token": "C1"}]),
+                "ChildPartition.parent_partition_tokens",
+            ),
+            (
+                serde_json::json!([{"token": "C1", "parent_partition_tokens": ["P1", 7]}]),
+                "ChildPartition.parent_partition_tokens",
+            ),
+        ] {
+            let err = child_record(child_partitions).unwrap_err();
+            assert!(err.to_string().contains(field), "{err}");
+        }
+
+        // Empty arrays stay valid: a root partition's children have no parents.
+        let cpr = child_record(serde_json::json!([{"token": "C1", "parent_partition_tokens": []}]))
+            .unwrap();
+        assert!(
+            cpr.child_partitions_record[0].child_partitions[0]
+                .parent_partition_tokens
+                .is_empty()
         );
     }
 

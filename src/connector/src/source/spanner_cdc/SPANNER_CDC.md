@@ -728,7 +728,11 @@ retry_backoff_factor: 2
   "start timestamp older than retention" below).
 - A change record that carries none of `data_change_record`, `heartbeat_record` and
   `child_partitions_record`, or has one of them with a non-array value, fails the query
-  instead of being skipped, so an unknown record type cannot drop changes unnoticed.
+  instead of being skipped, so an unknown record type cannot drop changes unnoticed. The
+  same holds for the arrays a populated record always carries (`mods`, `column_types`,
+  `child_partitions` and `parent_partition_tokens`): a missing, NULL or non-array value
+  fails the query rather than reading as empty, which would let a later heartbeat move
+  progress past the rows or child partitions it held.
 - Once the budget runs out the reader fails and the source restarts every partition from
   its last reported progress.
 - This budget is the only retry layer. The Spanner SDK's own retry is turned off for change
@@ -841,6 +845,17 @@ with `spanner_cdc_newest_partition_lag_milliseconds` tells you which failure you
 
 - Requires Spanner change streams to be created beforehand
 - At-least-once delivery (may have duplicates on failures)
+- No transaction atomicity. Each partition sends its records as they arrive, and the
+  transaction fields of a change record (`server_transaction_id`,
+  `number_of_records_in_transaction`, ...) are not used. A transaction that touches several
+  rows can therefore become visible across more than one RisingWave epoch, and a query can see
+  some of its rows changed and others not yet. Each row still converges to its final value.
+- With `value_capture_type = 'NEW_ROW_AND_OLD_VALUES'`, Spanner's `old_values` holds only
+  the modified columns, so an UPDATE's before row carries the key and those columns, with
+  every other column NULL. The table does not depend on it: it deletes by primary key and
+  replaces the before row with the row it has stored, so the table and its downstream
+  changes carry full rows. `NEW_ROW` sends no old values, and an UPDATE is written as an
+  upsert of the new row.
 - Emulator has limited functionality compared to production Spanner
 - The emulator sends NaN, Infinity and -Infinity in FLOAT64/FLOAT32 change events as JSON
   `null`, so they become NULL there. Production Spanner sends the strings `"NaN"`,
