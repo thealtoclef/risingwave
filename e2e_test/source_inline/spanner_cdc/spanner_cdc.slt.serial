@@ -439,7 +439,88 @@ t 0
 statement ok
 DROP TABLE t_arrays;
 
-# --- 6C: a table in a named schema is referenced as 'schema.table', the name
+# --- 6C: NUMERIC beyond DECIMAL. DECIMAL holds a 96-bit coefficient: a value
+# with too many fractional digits is rounded, and one whose integer part does
+# not fit reads as NULL. Rows 1 and 2 are read by the snapshot, rows 3 and 4 by
+# the change stream. A NUMERIC column declared VARCHAR keeps every digit, and
+# auto schema change still adds new columns to its table.
+
+system ok
+e2e_test/source_inline/spanner_cdc/prepare-data.rs ddl "CREATE TABLE numerics (id INT64 NOT NULL, n NUMERIC, v NUMERIC) PRIMARY KEY (id)"
+
+system ok
+e2e_test/source_inline/spanner_cdc/prepare-data.rs dml "INSERT INTO numerics (id, n, v) VALUES (1, NUMERIC '12345678901234567890123456789.123456789', NUMERIC '12345678901234567890123456789.123456789'), (2, NUMERIC '99999999999999999999999999999.999999999', NUMERIC '99999999999999999999999999999.999999999')"
+
+statement ok
+CREATE TABLE t_numerics (id bigint primary key, n decimal, v varchar) WITH (
+    spanner.databoost.enabled = 'false',
+)
+FROM spanner_source
+TABLE 'numerics';
+
+query I retry 24 backoff 5s
+select count(*) from t_numerics;
+----
+2
+
+system ok
+e2e_test/source_inline/spanner_cdc/prepare-data.rs dml "INSERT INTO numerics (id, n, v) VALUES (3, NUMERIC '12345678901234567890123456789.123456789', NUMERIC '12345678901234567890123456789.123456789'), (4, NUMERIC '99999999999999999999999999999.999999999', NUMERIC '99999999999999999999999999999.999999999')"
+
+query ITT retry 12 backoff 5s
+select id, n, v from t_numerics order by id;
+----
+1 12345678901234567890123456789 12345678901234567890123456789.123456789
+2 NULL 99999999999999999999999999999.999999999
+3 12345678901234567890123456789 12345678901234567890123456789.123456789
+4 NULL 99999999999999999999999999999.999999999
+
+system ok
+e2e_test/source_inline/spanner_cdc/prepare-data.rs ddl "ALTER TABLE numerics ADD COLUMN note STRING(MAX)"
+
+system ok
+e2e_test/source_inline/spanner_cdc/prepare-data.rs dml "INSERT INTO numerics (id, n, v, note) VALUES (5, NUMERIC '1.5', NUMERIC '1.5', 'added')"
+
+query ITTT retry 12 backoff 5s
+select id, n, v, note from t_numerics where id = 5;
+----
+5 1.5 1.5 added
+
+statement ok
+DROP TABLE t_numerics;
+
+# --- 6D: generated columns. A change stream does not carry a generated column
+# outside the primary key, so `(*)` leaves it out and naming it is rejected.
+
+system ok
+e2e_test/source_inline/spanner_cdc/prepare-data.rs ddl "CREATE TABLE people (id INT64 NOT NULL, first_name STRING(MAX), full_name STRING(MAX) AS (CONCAT(first_name, '!')) STORED) PRIMARY KEY (id)"
+
+system ok
+e2e_test/source_inline/spanner_cdc/prepare-data.rs dml "INSERT INTO people (id, first_name) VALUES (1, 'Ann')"
+
+statement error columns \["full_name"\] of table 'people' are generated columns
+CREATE TABLE t_people (id bigint primary key, first_name varchar, full_name varchar)
+FROM spanner_source
+TABLE 'people';
+
+statement ok
+CREATE TABLE t_people (*) WITH (
+    spanner.databoost.enabled = 'false',
+)
+FROM spanner_source
+TABLE 'people';
+
+system ok
+e2e_test/source_inline/spanner_cdc/prepare-data.rs dml "UPDATE people SET first_name = 'Bea' WHERE id = 1"
+
+query IT retry 24 backoff 5s
+select * from t_people;
+----
+1 Bea
+
+statement ok
+DROP TABLE t_people;
+
+# --- 6E: a table in a named schema is referenced as 'schema.table', the name
 # change records carry. The snapshot, later changes and auto schema change must
 # all reach the table.
 

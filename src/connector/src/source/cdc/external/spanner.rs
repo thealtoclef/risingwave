@@ -156,8 +156,9 @@ impl SpannerExternalTable {
     ) -> ConnectorResult<Self> {
         let table_name = config.table.clone();
 
-        let column_descs = Box::pin(Self::discover_columns(db_client, &table_name)).await?;
         let pk_names = Box::pin(Self::discover_primary_keys(db_client, &table_name)).await?;
+        let column_descs =
+            Box::pin(Self::discover_columns(db_client, &table_name, &pk_names)).await?;
 
         if pk_names.is_empty() {
             bail!(
@@ -173,13 +174,16 @@ impl SpannerExternalTable {
         })
     }
 
+    /// Generated columns outside the primary key are left out: a change stream does not
+    /// carry them, so every change would overwrite them with NULL.
     async fn discover_columns(
         db_client: &DatabaseClient,
         table_name: &str,
+        pk_names: &[String],
     ) -> ConnectorResult<Vec<ColumnDesc>> {
         let (schema, table) = split_table_name(table_name);
         let stmt = Statement::builder(
-            "SELECT COLUMN_NAME, SPANNER_TYPE \
+            "SELECT COLUMN_NAME, SPANNER_TYPE, IS_GENERATED \
              FROM INFORMATION_SCHEMA.COLUMNS \
              WHERE TABLE_SCHEMA = @schema AND TABLE_NAME = @table \
              ORDER BY ORDINAL_POSITION",
@@ -199,6 +203,10 @@ impl SpannerExternalTable {
         while let Some(row) = rows.next().await.transpose().context("column row")? {
             let name: String = row.try_get(0).context("COLUMN_NAME")?;
             let spanner_type: String = row.try_get(1).context("SPANNER_TYPE")?;
+            let is_generated: String = row.try_get(2).context("IS_GENERATED")?;
+            if is_generated == "ALWAYS" && !pk_names.contains(&name) {
+                continue;
+            }
             let dt = spanner_type_to_rw_type(&spanner_type)?;
             descs.push(ColumnDesc::named(name, ColumnId::placeholder(), dt));
         }
@@ -269,8 +277,10 @@ enum WatchedColumns {
 ///
 /// A change stream can watch a subset of tables and columns. A table the stream does not
 /// watch never receives a change after backfill. For a column the stream does not watch, a
-/// `NEW_ROW` record carries no value, so each update overwrites the column with NULL. Both
-/// are rejected. Filter options that drop some changes by design are returned as notices.
+/// `NEW_ROW` record carries no value, so each update overwrites the column with NULL. The
+/// same holds for a generated column outside the primary key, which no change stream
+/// carries. All three are rejected. Filter options that drop some changes by design are
+/// returned as notices.
 pub(crate) async fn check_change_stream_capture(
     config: &ExternalTableConfig,
     column_names: &[String],
@@ -289,6 +299,9 @@ pub(crate) async fn check_change_stream_capture(
     )
     .await?;
 
+    let generated = Box::pin(fetch_generated_columns(&client, &config.table)).await?;
+    check_generated_columns(&config.table, &generated, column_names, pk_names)?;
+
     let watched = Box::pin(fetch_watched_columns(&client, stream, &config.table)).await?;
     check_watched_columns(
         stream,
@@ -302,6 +315,63 @@ pub(crate) async fn check_change_stream_capture(
         crate::source::spanner_cdc::enumerator::fetch_change_stream_options(&client, stream)
             .await?;
     Ok(change_stream_filter_notices(stream, &options))
+}
+
+/// Read the generated columns of `table`, lowercased.
+async fn fetch_generated_columns(
+    client: &DatabaseClient,
+    table: &str,
+) -> ConnectorResult<HashSet<String>> {
+    let (schema, table) = split_table_name(table);
+    let stmt = Statement::builder(
+        "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS \
+         WHERE TABLE_SCHEMA = @schema AND TABLE_NAME = @t AND IS_GENERATED = 'ALWAYS'",
+    )
+    .add_param("schema", schema)
+    .add_param("t", table)
+    .build();
+    let mut rows = client
+        .single_use()
+        .build()
+        .execute_query(stmt)
+        .await
+        .context("generated column query")?;
+    let mut columns = HashSet::new();
+    while let Some(row) = rows
+        .next()
+        .await
+        .transpose()
+        .context("generated column row")?
+    {
+        let name: String = row.try_get(0).context("COLUMN_NAME")?;
+        columns.insert(name.to_lowercase());
+    }
+    Ok(columns)
+}
+
+/// Reject generated columns outside the primary key: change streams do not carry them.
+fn check_generated_columns(
+    table: &str,
+    generated: &HashSet<String>,
+    column_names: &[String],
+    pk_names: &[String],
+) -> ConnectorResult<()> {
+    let uncaptured: Vec<&str> = column_names
+        .iter()
+        .filter(|c| !pk_names.iter().any(|pk| pk.eq_ignore_ascii_case(c)))
+        .filter(|c| generated.contains(&c.to_lowercase()))
+        .map(String::as_str)
+        .collect();
+    if !uncaptured.is_empty() {
+        bail!(
+            "columns {:?} of table '{}' are generated columns, which change streams do not \
+             carry: every change would overwrite them with NULL. Leave these columns out of \
+             the table definition, or define them in RisingWave as generated columns",
+            uncaptured,
+            table,
+        );
+    }
+    Ok(())
 }
 
 /// Read what `stream` watches of `table`, or `None` if it does not watch the table.
@@ -1935,6 +2005,20 @@ mod tests {
         assert!(err.to_string().contains(r#"["Email"]"#), "{err}");
         // A table defined with only the watched columns is fine.
         check(Some(&name_only), &names(&["id", "name"])).unwrap();
+    }
+
+    #[test]
+    fn test_check_generated_columns() {
+        let names = |cols: &[&str]| cols.iter().map(|c| (*c).to_owned()).collect::<Vec<_>>();
+        let generated = ["full_name".to_owned(), "gid".to_owned()].into();
+        let check = |columns: &[&str]| {
+            check_generated_columns("users", &generated, &names(columns), &names(&["GID"]))
+        };
+
+        // A generated key column is carried; names match case-insensitively.
+        check(&["gid", "first_name"]).unwrap();
+        let err = check(&["gid", "first_name", "Full_Name"]).unwrap_err();
+        assert!(err.to_string().contains(r#"["Full_Name"]"#), "{err}");
     }
 
     #[test]

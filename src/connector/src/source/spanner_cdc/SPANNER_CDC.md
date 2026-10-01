@@ -418,8 +418,9 @@ CREATE TABLE large_table (*) FROM spanner_cdc_source TABLE 'large_table' WITH (
 
 ### Type Mapping Table
 
-All Spanner types are mapped to RisingWave types without data loss, except the non-finite
-float values described under [Limitations](#other-considerations).
+All Spanner types are mapped to RisingWave types without data loss, except NUMERIC values
+with more digits than `DECIMAL` holds and the non-finite float values described under
+[Limitations](#other-considerations).
 
 | Spanner Type | RisingWave Type | Notes |
 |--------------|-----------------|-------|
@@ -431,7 +432,7 @@ float values described under [Limitations](#other-considerations).
 | **BYTES** | `BYTEA` | Direct mapping |
 | **TIMESTAMP** | `TIMESTAMPTZ` | Direct mapping |
 | **DATE** | `DATE` | Direct mapping |
-| **NUMERIC** | `DECIMAL` | Passed to the parser as the exact decimal string (never through `f64`) |
+| **NUMERIC** | `DECIMAL` | Exact up to 28 significant digits; see below |
 | **JSON** | `JSONB` | Direct mapping |
 | **ARRAY\<T\>** | `LIST` | Element-wise mapping; e.g., `ARRAY<INT64>` → `LIST<BIGINT>` |
 | **STRUCT\<...\>** | `JSONB` | Serialized structure preserved |
@@ -460,6 +461,13 @@ tracing::info!("mapping ENUM type 'ENUM.my_enum' to VARCHAR (enum name preserved
 ```
 
 **STRUCT Types**: Serialized to `JSONB` for full structure preservation.
+
+**NUMERIC Types**: NUMERIC holds 38 significant digits, while `DECIMAL` holds a 96-bit
+coefficient: every value of up to 28 significant digits, and some of 29. A value with more
+fractional digits than fit is rounded. A value whose integer part alone does not fit is read as
+NULL, or fails the snapshot read if it is in the primary key. To keep every digit, declare the
+column `VARCHAR` in the table definition: both the snapshot and the change stream read NUMERIC
+as its decimal string, and auto schema change keeps the declared type.
 
 **ARRAY Types**: Element-wise mapping to `LIST` type. For example:
 - `ARRAY<INT64>` → `LIST<BIGINT>`
@@ -837,6 +845,9 @@ with `spanner_cdc_newest_partition_lag_milliseconds` tells you which failure you
 - A change record whose `mod_type` is not `INSERT`, `UPDATE` or `DELETE` fails the reader
   instead of being written as an insert.
 - DataBoost requires IAM permission `spanner.databases.useDataBoost`
+- Change streams do not carry generated columns outside the primary key. `CREATE TABLE ... (*)`
+  leaves them out, and a table definition that names one is rejected. Define such a column in
+  RisingWave as a generated column instead.
 
 ---
 
