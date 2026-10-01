@@ -401,25 +401,50 @@ pub fn parse_change_record_json(json: JsonValue) -> anyhow::Result<Vec<ChangeStr
 impl ChangeStreamRecord {
     fn from_json_object(mut obj: serde_json::Map<String, JsonValue>) -> anyhow::Result<Self> {
         // Take an ARRAY field out of the map so its elements can be *moved* into
-        // the parsers instead of copied. A missing field, or one that is not an
-        // array, reads as empty — only one of the three is populated per record.
-        fn array_field(obj: &mut serde_json::Map<String, JsonValue>, key: &str) -> Vec<JsonValue> {
+        // the parsers instead of copied. Spanner leaves the two unused fields empty
+        // or NULL, so a missing or NULL field reads as empty.
+        fn array_field(
+            obj: &mut serde_json::Map<String, JsonValue>,
+            key: &str,
+        ) -> anyhow::Result<Vec<JsonValue>> {
             match obj.remove(key) {
-                Some(JsonValue::Array(a)) => a,
-                _ => Vec::new(),
+                Some(JsonValue::Array(a)) => Ok(a),
+                None | Some(JsonValue::Null) => Ok(Vec::new()),
+                Some(other) => Err(anyhow::anyhow!(
+                    "ChangeRecord field '{}' is not an array, got: {}",
+                    key,
+                    other
+                )),
             }
         }
 
+        let data_change_record = array_field(&mut obj, "data_change_record")?;
+        let heartbeat_record = array_field(&mut obj, "heartbeat_record")?;
+        let child_partitions_record = array_field(&mut obj, "child_partitions_record")?;
+        // Spanner populates exactly one of the three fields per row. A row with none of
+        // them would otherwise be skipped without a trace, e.g. a record type this
+        // reader does not know.
+        if data_change_record.is_empty()
+            && heartbeat_record.is_empty()
+            && child_partitions_record.is_empty()
+        {
+            return Err(anyhow::anyhow!(
+                "ChangeRecord has no data change, heartbeat or child partitions record; \
+                 remaining fields: {:?}",
+                obj.keys().collect::<Vec<_>>()
+            ));
+        }
+
         Ok(Self {
-            data_change_record: array_field(&mut obj, "data_change_record")
+            data_change_record: data_change_record
                 .into_iter()
                 .map(DataChangeRecord::from_json)
                 .collect::<anyhow::Result<Vec<_>>>()?,
-            heartbeat_record: array_field(&mut obj, "heartbeat_record")
+            heartbeat_record: heartbeat_record
                 .iter()
                 .map(HeartbeatRecord::from_json)
                 .collect::<anyhow::Result<Vec<_>>>()?,
-            child_partitions_record: array_field(&mut obj, "child_partitions_record")
+            child_partitions_record: child_partitions_record
                 .iter()
                 .map(ChildPartitionsRecord::from_json)
                 .collect::<anyhow::Result<Vec<_>>>()?,
@@ -1289,24 +1314,45 @@ mod tests {
         );
     }
 
-    /// A field that is absent, null, or not an array reads as empty rather than
-    /// erroring — the lenient shape the SDK's STRUCT decoding relies on.
+    /// The two unused fields may be absent or NULL; Spanner leaves them empty or NULL.
     #[test]
-    fn test_change_stream_record_tolerates_missing_and_non_array_fields() {
-        let empty = ChangeStreamRecord::from_json_object(obj(serde_json::json!({}))).unwrap();
-        assert!(empty.data_change_record.is_empty());
-        assert!(empty.heartbeat_record.is_empty());
-        assert!(empty.child_partitions_record.is_empty());
-
-        let odd = ChangeStreamRecord::from_json_object(obj(serde_json::json!({
+    fn test_change_stream_record_tolerates_missing_and_null_fields() {
+        let hb = ChangeStreamRecord::from_json_object(obj(serde_json::json!({
             "data_change_record": null,
-            "heartbeat_record": "not-an-array",
-            "child_partitions_record": [],
+            "heartbeat_record": [{"timestamp": "2025-01-01T00:00:00Z"}],
         })))
         .unwrap();
-        assert!(odd.data_change_record.is_empty());
-        assert!(odd.heartbeat_record.is_empty());
-        assert!(odd.child_partitions_record.is_empty());
+        assert!(hb.data_change_record.is_empty());
+        assert_eq!(hb.heartbeat_record.len(), 1);
+        assert!(hb.child_partitions_record.is_empty());
+    }
+
+    /// A field of the wrong type, or a record with none of the three fields populated,
+    /// fails instead of being skipped.
+    #[test]
+    fn test_change_stream_record_rejects_malformed_fields() {
+        let err = ChangeStreamRecord::from_json_object(obj(serde_json::json!({
+            "heartbeat_record": "not-an-array",
+        })))
+        .unwrap_err();
+        assert!(err.to_string().contains("heartbeat_record"), "{err}");
+
+        for record in [
+            serde_json::json!({}),
+            serde_json::json!({
+                "data_change_record": null,
+                "heartbeat_record": [],
+                "child_partitions_record": [],
+                "partition_start_record": [{}],
+            }),
+        ] {
+            let err = ChangeStreamRecord::from_json_object(obj(record)).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("no data change, heartbeat or child partitions"),
+                "{err}"
+            );
+        }
     }
 
     /// A malformed element still fails the whole record — the refactor must not

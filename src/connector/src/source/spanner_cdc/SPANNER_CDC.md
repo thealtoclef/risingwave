@@ -726,6 +726,9 @@ retry_backoff_factor: 2
   a long-lived partition is not failed by occasional transient errors spread over days.
 - A start timestamp older than the change stream's retention period is not retried (see
   "start timestamp older than retention" below).
+- A change record that carries none of `data_change_record`, `heartbeat_record` and
+  `child_partitions_record`, or has one of them with a non-array value, fails the query
+  instead of being skipped, so an unknown record type cannot drop changes unnoticed.
 - Once the budget runs out the reader fails and the source restarts every partition from
   its last reported progress.
 - This budget is the only retry layer. The Spanner SDK's own retry is turned off for change
