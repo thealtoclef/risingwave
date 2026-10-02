@@ -465,9 +465,18 @@ tracing::info!("mapping ENUM type 'ENUM.my_enum' to VARCHAR (enum name preserved
 **NUMERIC Types**: NUMERIC holds 38 significant digits, while `DECIMAL` holds a 96-bit
 coefficient: every value of up to 28 significant digits, and some of 29. A value with more
 fractional digits than fit is rounded. A value whose integer part alone does not fit is read as
-NULL, or fails the snapshot read if it is in the primary key. To keep every digit, declare the
-column `VARCHAR` in the table definition: both the snapshot and the change stream read NUMERIC
-as its decimal string, and auto schema change keeps the declared type.
+NULL. To keep every digit, declare the column `VARCHAR` in the table definition: both the
+snapshot and the change stream read NUMERIC as its decimal string, and auto schema change keeps
+the declared type.
+
+A NUMERIC primary key column must be declared `VARCHAR`, so `CREATE TABLE ... (*)` rejects a
+table with one: read as `DECIMAL`, two keys that differ beyond its range would round to the same
+value and merge into one row. It also cannot be the snapshot backfill's split column
+(`backfill.split_pk_column_index`, the first key column by default), because Spanner orders the
+split bounds as numbers while the backfill compares the keys as text and would route changes to
+the wrong split. Split on another key column, or set `snapshot = 'false'`. The same holds for
+any other non-`STRING` key column declared `VARCHAR`, such as an `INT64` or `TIMESTAMP` key:
+`CREATE TABLE` rejects it as the split column.
 
 **ARRAY Types**: Element-wise mapping to `LIST` type. For example:
 - `ARRAY<INT64>` → `LIST<BIGINT>`

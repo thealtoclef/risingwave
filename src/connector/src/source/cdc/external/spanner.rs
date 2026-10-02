@@ -57,6 +57,7 @@ use risingwave_common::log::LogSuppressor;
 use risingwave_common::row::{OwnedRow, Row as OwnedRowTrait};
 use risingwave_common::types::{DataType, Datum, F32, F64, ListType, ListValue, ScalarImpl};
 use risingwave_common::util::env_var::env_var_is_true;
+use risingwave_common::util::iter_util::ZipEqFast;
 use thiserror_ext::AsReport;
 use time::OffsetDateTime;
 
@@ -273,18 +274,24 @@ enum WatchedColumns {
     Only(HashSet<String>),
 }
 
-/// Check that the source's change stream delivers every change the CDC table needs.
+/// Check that the upstream table and its change stream can feed the CDC table correctly.
 ///
 /// A change stream can watch a subset of tables and columns. A table the stream does not
 /// watch never receives a change after backfill. For a column the stream does not watch, a
 /// `NEW_ROW` record carries no value, so each update overwrites the column with NULL. The
 /// same holds for a generated column outside the primary key, which no change stream
-/// carries. All three are rejected. Filter options that drop some changes by design are
-/// returned as notices.
-pub(crate) async fn check_change_stream_capture(
+/// carries. All three are rejected, and so are key columns whose declared type cannot keep
+/// keys distinct or ordered (see [`check_key_types`]). Filter options that drop some
+/// changes by design are returned as notices.
+///
+/// `pk_types` holds the table's type of each `pk_names` column, and `split_pk_index` the
+/// key column the snapshot backfill splits on, or `None` without a snapshot backfill.
+pub(crate) async fn check_cdc_table_upstream(
     config: &ExternalTableConfig,
     column_names: &[String],
     pk_names: &[String],
+    pk_types: &[DataType],
+    split_pk_index: Option<usize>,
 ) -> ConnectorResult<Vec<String>> {
     let Some(stream) = config.spanner_change_stream_name.as_deref() else {
         return Ok(vec![]);
@@ -299,8 +306,14 @@ pub(crate) async fn check_change_stream_capture(
     )
     .await?;
 
-    let generated = Box::pin(fetch_generated_columns(&client, &config.table)).await?;
+    let columns = Box::pin(fetch_columns(&client, &config.table)).await?;
+    let generated = columns
+        .iter()
+        .filter(|(_, column)| column.generated)
+        .map(|(name, _)| name.clone())
+        .collect();
     check_generated_columns(&config.table, &generated, column_names, pk_names)?;
+    check_key_types(&config.table, &columns, pk_names, pk_types, split_pk_index)?;
 
     let watched = Box::pin(fetch_watched_columns(&client, stream, &config.table)).await?;
     check_watched_columns(
@@ -317,15 +330,21 @@ pub(crate) async fn check_change_stream_capture(
     Ok(change_stream_filter_notices(stream, &options))
 }
 
-/// Read the generated columns of `table`, lowercased.
-async fn fetch_generated_columns(
+/// A column of the upstream table, as `INFORMATION_SCHEMA.COLUMNS` describes it.
+struct UpstreamColumn {
+    spanner_type: String,
+    generated: bool,
+}
+
+/// Read the columns of `table`, keyed by lowercased name.
+async fn fetch_columns(
     client: &DatabaseClient,
     table: &str,
-) -> ConnectorResult<HashSet<String>> {
+) -> ConnectorResult<HashMap<String, UpstreamColumn>> {
     let (schema, table) = split_table_name(table);
     let stmt = Statement::builder(
-        "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS \
-         WHERE TABLE_SCHEMA = @schema AND TABLE_NAME = @t AND IS_GENERATED = 'ALWAYS'",
+        "SELECT COLUMN_NAME, SPANNER_TYPE, IS_GENERATED FROM INFORMATION_SCHEMA.COLUMNS \
+         WHERE TABLE_SCHEMA = @schema AND TABLE_NAME = @t",
     )
     .add_param("schema", schema)
     .add_param("t", table)
@@ -335,18 +354,72 @@ async fn fetch_generated_columns(
         .build()
         .execute_query(stmt)
         .await
-        .context("generated column query")?;
-    let mut columns = HashSet::new();
-    while let Some(row) = rows
-        .next()
-        .await
-        .transpose()
-        .context("generated column row")?
-    {
+        .context("column query")?;
+    let mut columns = HashMap::new();
+    while let Some(row) = rows.next().await.transpose().context("column row")? {
         let name: String = row.try_get(0).context("COLUMN_NAME")?;
-        columns.insert(name.to_lowercase());
+        let spanner_type: String = row.try_get(1).context("SPANNER_TYPE")?;
+        let is_generated: String = row.try_get(2).context("IS_GENERATED")?;
+        columns.insert(
+            name.to_lowercase(),
+            UpstreamColumn {
+                spanner_type,
+                generated: is_generated == "ALWAYS",
+            },
+        );
     }
     Ok(columns)
+}
+
+/// Reject key columns whose declared type cannot keep every key distinct and ordered.
+///
+/// NUMERIC holds 38 significant digits and `DECIMAL` a 96-bit coefficient, so two keys can
+/// round to the same `DECIMAL` and merge into one row; a NUMERIC key must be `VARCHAR`.
+///
+/// The snapshot backfill's split column must also order the same way on both sides:
+/// Spanner computes the split bounds in the column's own type, while the backfill routes
+/// changes by comparing the declared type. A split column declared `VARCHAR` over a
+/// non-STRING column compares as text (`"10" < "9"`), so a change can be routed to a split
+/// that has not started and be dropped.
+fn check_key_types(
+    table: &str,
+    columns: &HashMap<String, UpstreamColumn>,
+    pk_names: &[String],
+    pk_types: &[DataType],
+    split_pk_index: Option<usize>,
+) -> ConnectorResult<()> {
+    for (idx, (name, data_type)) in pk_names.iter().zip_eq_fast(pk_types).enumerate() {
+        // A key column missing upstream is reported by the other checks.
+        let Some(column) = columns.get(&name.to_lowercase()) else {
+            continue;
+        };
+        let spanner_type = column.spanner_type.as_str();
+        let base_type = spanner_type.split('(').next().unwrap_or(spanner_type);
+        if base_type == "NUMERIC" && *data_type != DataType::Varchar {
+            bail!(
+                "primary key column '{}' of table '{}' is NUMERIC, and reading it as {} \
+                 cannot keep every key exact: distinct keys can round to the same value and \
+                 merge into one row. Declare the column VARCHAR in the table definition",
+                name,
+                table,
+                data_type,
+            );
+        }
+        if split_pk_index == Some(idx) && *data_type == DataType::Varchar && base_type != "STRING" {
+            bail!(
+                "primary key column '{}' of table '{}' is {} declared VARCHAR, which cannot be \
+                 the snapshot backfill's split column: Spanner orders it as {} and the \
+                 backfill as text, so changes could be dropped. Set \
+                 'backfill.split_pk_column_index' to another primary key column, or \
+                 'snapshot' = 'false'",
+                name,
+                table,
+                spanner_type,
+                spanner_type,
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Reject generated columns outside the primary key: change streams do not carry them.
@@ -2019,6 +2092,65 @@ mod tests {
         check(&["gid", "first_name"]).unwrap();
         let err = check(&["gid", "first_name", "Full_Name"]).unwrap_err();
         assert!(err.to_string().contains(r#"["Full_Name"]"#), "{err}");
+    }
+
+    #[test]
+    fn test_check_key_types() {
+        let names = |cols: &[&str]| cols.iter().map(|c| (*c).to_owned()).collect::<Vec<_>>();
+        let column = |spanner_type: &str| UpstreamColumn {
+            spanner_type: spanner_type.to_owned(),
+            generated: false,
+        };
+        let columns = HashMap::from([
+            ("id".to_owned(), column("INT64")),
+            ("ref".to_owned(), column("NUMERIC")),
+            ("name".to_owned(), column("STRING(MAX)")),
+        ]);
+        let check = |pk: &[&str], types: &[DataType], split: Option<usize>| {
+            check_key_types("orders", &columns, &names(pk), types, split)
+        };
+
+        // A NUMERIC key read as DECIMAL can merge distinct keys; names match
+        // case-insensitively.
+        let err = check(
+            &["id", "Ref"],
+            &[DataType::Int64, DataType::Decimal],
+            Some(0),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("'Ref'"), "{err}");
+        assert!(
+            err.to_string().contains("Declare the column VARCHAR"),
+            "{err}"
+        );
+
+        // VARCHAR keeps every NUMERIC key, but not as the split column.
+        check(
+            &["id", "Ref"],
+            &[DataType::Int64, DataType::Varchar],
+            Some(0),
+        )
+        .unwrap();
+        check(&["id", "Ref"], &[DataType::Int64, DataType::Varchar], None).unwrap();
+        let err = check(
+            &["id", "Ref"],
+            &[DataType::Int64, DataType::Varchar],
+            Some(1),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("backfill.split_pk_column_index"),
+            "{err}"
+        );
+
+        // Any non-STRING split column declared VARCHAR compares as text.
+        let err = check(&["id"], &[DataType::Varchar], Some(0)).unwrap_err();
+        assert!(
+            err.to_string().contains("is INT64 declared VARCHAR"),
+            "{err}"
+        );
+        check(&["id"], &[DataType::Int32], Some(0)).unwrap();
+        check(&["name"], &[DataType::Varchar], Some(0)).unwrap();
     }
 
     #[test]

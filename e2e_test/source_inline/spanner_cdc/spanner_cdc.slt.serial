@@ -488,6 +488,48 @@ select id, n, v, note from t_numerics where id = 5;
 statement ok
 DROP TABLE t_numerics;
 
+# A NUMERIC key read as DECIMAL could merge keys that differ beyond its range,
+# so it is rejected, `(*)` included. Declared VARCHAR it keeps every key, but
+# not as the snapshot split column: Spanner orders it as a number, the backfill
+# as text.
+
+system ok
+e2e_test/source_inline/spanner_cdc/prepare-data.rs ddl "CREATE TABLE numeric_keys (region INT64 NOT NULL, k NUMERIC NOT NULL, v STRING(MAX)) PRIMARY KEY (region, k)"
+
+system ok
+e2e_test/source_inline/spanner_cdc/prepare-data.rs dml "INSERT INTO numeric_keys (region, k, v) VALUES (1, NUMERIC '12345678901234567890123456789.1', 'a'), (1, NUMERIC '12345678901234567890123456789.2', 'b')"
+
+statement error primary key column 'k' of table 'numeric_keys' is NUMERIC
+CREATE TABLE t_numeric_keys (*)
+FROM spanner_source
+TABLE 'numeric_keys';
+
+statement error primary key column 'k' of table 'numeric_keys' is NUMERIC declared VARCHAR, which cannot be the snapshot backfill's split column
+CREATE TABLE t_numeric_keys (region bigint, k varchar, v varchar, primary key (region, k)) WITH (
+    backfill.split_pk_column_index = '1',
+)
+FROM spanner_source
+TABLE 'numeric_keys';
+
+statement ok
+CREATE TABLE t_numeric_keys (region bigint, k varchar, v varchar, primary key (region, k)) WITH (
+    spanner.databoost.enabled = 'false',
+)
+FROM spanner_source
+TABLE 'numeric_keys';
+
+system ok
+e2e_test/source_inline/spanner_cdc/prepare-data.rs dml "UPDATE numeric_keys SET v = 'b2' WHERE region = 1 AND k = NUMERIC '12345678901234567890123456789.2'"
+
+query ITT retry 24 backoff 5s
+select region, k, v from t_numeric_keys order by k;
+----
+1 12345678901234567890123456789.1 a
+1 12345678901234567890123456789.2 b2
+
+statement ok
+DROP TABLE t_numeric_keys;
+
 # --- 6D: generated columns. A change stream does not carry a generated column
 # outside the primary key, so `(*)` leaves it out and naming it is rejected.
 

@@ -1519,8 +1519,9 @@ pub(super) async fn handle_create_table_plan(
             // corrupts downstream (UPDATE turns into a fresh INSERT, DELETE no-ops). Plain
             // (non-CDC) tables don't hit this check.
             reject_pk_filtered_by_debezium_column_filter(&pk_names, &cdc_with_options)?;
-            Box::pin(check_cdc_table_change_capture(
+            Box::pin(check_cdc_table_upstream(
                 &cdc_with_options,
+                &handler_args.with_options,
                 &columns,
                 &pk_names,
             ))
@@ -1711,15 +1712,17 @@ async fn bind_cdc_table_schema_externally(
     ))
 }
 
-/// Reject a CDC table whose columns the upstream does not fully capture, and tell the user
-/// about upstream filters that drop some changes. Only Spanner change streams can capture a
-/// subset of tables and columns; for other connectors this is a no-op.
-async fn check_cdc_table_change_capture(
+/// Reject a CDC table the upstream cannot feed correctly, and tell the user about upstream
+/// filters that drop some changes. See [`ExternalTableImpl::check_cdc_table_upstream`]; only
+/// Spanner CDC is checked.
+async fn check_cdc_table_upstream(
     cdc_with_options: &WithOptionsSecResolved,
+    table_with_options: &WithOptions,
     columns: &[ColumnCatalog],
     pk_names: &[String],
 ) -> Result<()> {
     let (options, secret_refs) = cdc_with_options.clone().into_parts();
+    let cdc_table_type = ExternalCdcTableType::from_properties(&options);
     let config = ExternalTableConfig::try_from_btreemap(options, secret_refs)
         .context("failed to extract external table config")?;
     let column_names = columns
@@ -1727,10 +1730,25 @@ async fn check_cdc_table_change_capture(
         .filter(|c| !c.is_generated())
         .map(|c| c.name().to_owned())
         .collect_vec();
-    let notices = Box::pin(ExternalTableImpl::check_change_capture(
+    let pk_types = pk_names
+        .iter()
+        .map(|pk| {
+            columns
+                .iter()
+                .find(|c| c.name() == pk)
+                .map(|c| c.data_type().clone())
+                .ok_or_else(|| anyhow!("primary key column {pk} not found"))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let scan_options = build_cdc_scan_options_with_options(table_with_options, &cdc_table_type)?;
+    let split_pk_index = (!scan_options.disable_backfill)
+        .then_some(scan_options.backfill_split_pk_column_index as usize);
+    let notices = Box::pin(ExternalTableImpl::check_cdc_table_upstream(
         &config,
         &column_names,
         pk_names,
+        &pk_types,
+        split_pk_index,
     ))
     .await?;
     for notice in notices {

@@ -29,6 +29,7 @@ use risingwave_common::bail;
 use risingwave_common::catalog::{CdcKeyComparison, ColumnDesc, Field, Schema};
 use risingwave_common::row::OwnedRow;
 use risingwave_common::secret::LocalSecretManager;
+use risingwave_common::types::DataType;
 use risingwave_pb::catalog::table::CdcTableType as PbCdcTableType;
 use risingwave_pb::secret::PbSecretRef;
 use serde::{Deserialize, Serialize};
@@ -717,6 +718,34 @@ impl ExternalTableImpl {
         }
     }
 
+    /// Check that the upstream can feed the CDC table correctly: it delivers every change to
+    /// `column_names`, and the declared key types (`pk_types`) keep every key distinct and,
+    /// for the snapshot split column `split_pk_index`, ordered as upstream orders them.
+    ///
+    /// Returns notices for upstream settings that drop some changes by design. Only Spanner
+    /// CDC is checked; other connectors return nothing.
+    pub async fn check_cdc_table_upstream(
+        config: &ExternalTableConfig,
+        column_names: &[String],
+        pk_names: &[String],
+        pk_types: &[DataType],
+        split_pk_index: Option<usize>,
+    ) -> ConnectorResult<Vec<String>> {
+        if config.connector != "spanner-cdc" {
+            return Ok(vec![]);
+        }
+        Box::pin(
+            crate::source::cdc::external::spanner::check_cdc_table_upstream(
+                config,
+                column_names,
+                pk_names,
+                pk_types,
+                split_pk_index,
+            ),
+        )
+        .await
+    }
+
     /// Discover CDC backfill comparison semantics without loading the full table schema.
     /// Used when SQL defines the columns explicitly, so there is no existing table
     /// instance whose metadata can be reused via [`Self::pk_column_comparisons`].
@@ -725,28 +754,6 @@ impl ExternalTableImpl {
     /// modes in the requested `pk_names` order, with case-insensitive name matching and
     /// an error for missing upstream PK names. Other connectors return `Native` for
     /// every requested name without querying upstream.
-    /// Check that the upstream delivers every change to `column_names` of the table.
-    ///
-    /// Returns notices for upstream settings that drop some changes by design. Only Spanner
-    /// CDC can filter what it captures per table and column; other connectors return nothing.
-    pub async fn check_change_capture(
-        config: &ExternalTableConfig,
-        column_names: &[String],
-        pk_names: &[String],
-    ) -> ConnectorResult<Vec<String>> {
-        if config.connector != "spanner-cdc" {
-            return Ok(vec![]);
-        }
-        Box::pin(
-            crate::source::cdc::external::spanner::check_change_stream_capture(
-                config,
-                column_names,
-                pk_names,
-            ),
-        )
-        .await
-    }
-
     pub async fn discover_pk_column_comparisons(
         config: &ExternalTableConfig,
         pk_names: &[String],
