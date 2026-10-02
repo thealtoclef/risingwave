@@ -711,11 +711,14 @@ impl ChildPartition {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("ChildPartition.token: missing or not a string"))?
             .to_owned();
+        // The children returned by the initial query have `[NULL]` as their parents.
+        // Dropping the NULL gives the empty list a root child is represented by.
         let parent_partition_tokens = required_array(
             obj.get("parent_partition_tokens").cloned(),
             "ChildPartition.parent_partition_tokens",
         )?
         .iter()
+        .filter(|v| !v.is_null())
         .map(|v| {
             v.as_str().map(String::from).ok_or_else(|| {
                 anyhow::anyhow!(
@@ -1407,7 +1410,8 @@ mod tests {
             })))
             .unwrap_err();
             assert!(
-                err.to_string().contains(&format!("DataChangeRecord.{field}")),
+                err.to_string()
+                    .contains(&format!("DataChangeRecord.{field}")),
                 "{err}"
             );
         }
@@ -1436,14 +1440,19 @@ mod tests {
             assert!(err.to_string().contains(field), "{err}");
         }
 
-        // Empty arrays stay valid: a root partition's children have no parents.
-        let cpr = child_record(serde_json::json!([{"token": "C1", "parent_partition_tokens": []}]))
+        // The initial query's children have `[NULL]` parents, which read as no parents;
+        // an empty array stays valid too.
+        for parents in [serde_json::json!([null]), serde_json::json!([])] {
+            let cpr = child_record(
+                serde_json::json!([{"token": "C1", "parent_partition_tokens": parents}]),
+            )
             .unwrap();
-        assert!(
-            cpr.child_partitions_record[0].child_partitions[0]
-                .parent_partition_tokens
-                .is_empty()
-        );
+            assert!(
+                cpr.child_partitions_record[0].child_partitions[0]
+                    .parent_partition_tokens
+                    .is_empty()
+            );
+        }
     }
 
     /// A `mod_type` Spanner does not document fails the record instead of being written

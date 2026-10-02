@@ -2762,6 +2762,12 @@ mod tests {
         let children: Vec<_> = children
             .iter()
             .map(|(token, parents)| {
+                // Spanner sends `[NULL]` as the parents of the initial query's children.
+                let parents = if parents.is_empty() {
+                    serde_json::json!([null])
+                } else {
+                    serde_json::json!(parents)
+                };
                 serde_json::json!({ "token": token, "parent_partition_tokens": parents })
             })
             .collect();

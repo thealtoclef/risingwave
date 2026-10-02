@@ -732,7 +732,8 @@ retry_backoff_factor: 2
   same holds for the arrays a populated record always carries (`mods`, `column_types`,
   `child_partitions` and `parent_partition_tokens`): a missing, NULL or non-array value
   fails the query rather than reading as empty, which would let a later heartbeat move
-  progress past the rows or child partitions it held.
+  progress past the rows or child partitions it held. The one NULL Spanner documents, the
+  `[NULL]` parents of the children the initial query returns, reads as "no parents".
 - Once the budget runs out the reader fails and the source restarts every partition from
   its last reported progress.
 - This budget is the only retry layer. The Spanner SDK's own retry is turned off for change
