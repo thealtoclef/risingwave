@@ -1,0 +1,108 @@
+control substitution on
+
+# Serial backfill and recovery must use the same order as utf8mb4_0900_ai_ci: a before B.
+system ok
+mysql -e "
+    CREATE DATABASE IF NOT EXISTS risedev;
+    USE risedev;
+    DROP TABLE IF EXISTS mysql_collated_recovery_t;
+    CREATE TABLE mysql_collated_recovery_t (k VARCHAR(32) PRIMARY KEY, v INT NOT NULL)
+        ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+    INSERT INTO mysql_collated_recovery_t VALUES ('a', 10), ('B', 20);
+    INSERT INTO mysql_collated_recovery_t
+    WITH RECURSIVE n AS (SELECT 0 AS i UNION ALL SELECT i + 1 FROM n WHERE i < 999)
+    SELECT CONCAT(IF(i < 998, 'C', 'c'), LPAD(i, 4, '0')), 0 FROM n;
+    "
+
+statement ok
+create source mysql_collated_recovery_source with (
+    ${RISEDEV_MYSQL_WITH_OPTIONS_COMMON},
+    username = '${RISEDEV_MYSQL_USER}',
+    password = '${MYSQL_PWD}',
+    database.name = 'risedev'
+);
+
+statement ok
+set backfill_rate_limit = 1;
+
+statement ok
+create table mysql_collated_recovery_t (k varchar primary key, v int)
+with (backfill.parallelism = 0, snapshot.batch_size = 2)
+from mysql_collated_recovery_source table 'risedev.mysql_collated_recovery_t';
+
+query I retry 60 backoff 1s
+select count(*) from mysql_collated_recovery_t where k = 'B';
+----
+1
+
+statement ok
+alter table mysql_collated_recovery_t set backfill_rate_limit = 0;
+
+# Keep the cursor at B or an uppercase C key: source order puts a/aa before it,
+# while byte order puts them after it. Neither lowercase tail key may be scanned.
+query I
+select count(*) from mysql_collated_recovery_t where k in ('c0998', 'c0999');
+----
+0
+
+system ok
+mysql -e "
+    USE risedev;
+    UPDATE mysql_collated_recovery_t SET v = 99 WHERE k = 'a';
+    DELETE FROM mysql_collated_recovery_t WHERE k = 'B';
+    INSERT INTO mysql_collated_recovery_t VALUES ('aa', 55);
+    UPDATE mysql_collated_recovery_t SET v = 77 WHERE k = 'c0999';
+    DELETE FROM mysql_collated_recovery_t WHERE k = 'c0998';
+    "
+
+query TI retry 60 backoff 1s
+select k, v from mysql_collated_recovery_t where k in ('a', 'aa', 'B') order by k;
+----
+a 99
+aa 55
+
+statement ok
+flush;
+
+statement ok
+recover;
+
+query I
+select count(*) from mysql_collated_recovery_t where k in ('c0998', 'c0999');
+----
+0
+
+system ok
+mysql -e "
+    USE risedev;
+    UPDATE mysql_collated_recovery_t SET v = 100 WHERE k = 'a';
+    DELETE FROM mysql_collated_recovery_t WHERE k = 'aa';
+    "
+
+query TI retry 60 backoff 1s
+select k, v from mysql_collated_recovery_t where k in ('a', 'aa', 'B') order by k;
+----
+a 100
+
+statement ok
+alter table mysql_collated_recovery_t set backfill_rate_limit = 10000;
+
+query II retry 60 backoff 1s
+select count(*), sum(v) from mysql_collated_recovery_t;
+----
+1000 177
+
+query TI
+select k, v from mysql_collated_recovery_t where k in ('a', 'aa', 'B', 'c0998', 'c0999') order by k;
+----
+a 100
+c0999 77
+
+statement ok
+drop source mysql_collated_recovery_source cascade;
+
+statement ok
+set backfill_rate_limit = default;
+
+system ok
+mysql -e "USE risedev; DROP TABLE IF EXISTS mysql_collated_recovery_t;"

@@ -1305,7 +1305,7 @@ mod tests {
     use risingwave_common::catalog::{
         CdcKeyComparison, ColumnDesc, ColumnId, Field, Schema, TableId,
     };
-    use risingwave_common::row::{OwnedRow, Row};
+    use risingwave_common::row::{OwnedRow, Row, RowExt};
     use risingwave_common::types::{DataType, Datum, JsonbVal, ScalarImpl};
     use risingwave_common::util::epoch::test_epoch;
     use risingwave_common::util::iter_util::ZipEqFast;
@@ -1320,7 +1320,8 @@ mod tests {
     use risingwave_storage::memory::MemoryStateStore;
 
     use super::{
-        PkCompareInfo, build_reader_and_poll_upstream, can_poll_upstream_while_creating_reader,
+        PkCompareInfo, UpstreamKeyOrder, UpstreamPkPositionOrder, build_reader_and_poll_upstream,
+        can_poll_upstream_while_creating_reader, resolve_upstream_pk_order,
     };
     use crate::common::table::test_utils::gen_pbtable;
     use crate::executor::backfill::cdc::cdc_backfill::transform_upstream;
@@ -2012,6 +2013,102 @@ mod tests {
             .await
             .unwrap();
         assert!(restored_state.restore_state().await.unwrap().is_finished);
+    }
+
+    #[tokio::test]
+    async fn test_collated_changes_survive_buffering_and_recovery() {
+        // The snapshot has passed `a` and reached `B` upstream, but bytes put `a` after `B`.
+        // Put the key after the value to also exercise PK projection during resolution.
+        let rows = [
+            (Op::Insert, "a", 99, 3),
+            (Op::Delete, "a", 99, 4),
+            (Op::Insert, "c", 1, 5),
+        ]
+        .map(|(op, key, value, offset)| {
+            (
+                op,
+                OwnedRow::new(vec![
+                    Some(ScalarImpl::Int32(value)),
+                    Some(ScalarImpl::from(key)),
+                    Some(ScalarImpl::from(format!(
+                        r#"{{"sourcePartition":{{}},"sourceOffset":{{"file":"1.binlog","pos":{offset}}},"isHeartbeat":false}}"#
+                    ))),
+                ]),
+            )
+        });
+        let chunk = StreamChunk::from_rows(
+            &rows,
+            &[DataType::Int32, DataType::Varchar, DataType::Varchar],
+        );
+        let position = OwnedRow::new(vec![Some(ScalarImpl::from("B"))]);
+        let table =
+            ExternalStorageTable::for_test_undefined().with_table_type(ExternalCdcTableType::Mock);
+        let mut upstream = Some((
+            UpstreamPkPositionOrder::new(&[CdcKeyComparison::Upstream]).unwrap(),
+            UpstreamKeyOrder::new(&table, vec!["k".to_owned()]),
+        ));
+        resolve_upstream_pk_order(&mut upstream, [&chunk], &[1], Some(&position))
+            .await
+            .unwrap();
+        let comparison = PkCompareInfo {
+            indices: &[1],
+            order: &[OrderType::ascending()],
+            needs_unsigned_i64_compare: &[false],
+            upstream: Some(&upstream.as_ref().unwrap().0),
+        };
+        let low = Some(CdcOffset::MySql(MySqlOffset::new("1.binlog".to_owned(), 2)));
+        let expected = StreamChunk::from_rows(
+            &rows[..2]
+                .iter()
+                .map(|(op, row)| (*op, row.project(&[1, 0]).to_owned_row()))
+                .collect::<Vec<_>>(),
+            &[DataType::Varchar, DataType::Int32],
+        );
+        let (recovered, _) = CdcBackfillExecutor::<MemoryStateStore>::filter_recovery_chunk(
+            &MockExternalTableReader::get_cdc_offset_parser(),
+            chunk.clone(),
+            &position,
+            comparison,
+            &low,
+            &[1, 0],
+        )
+        .unwrap();
+        assert_eq!(recovered.unwrap().compact_vis(), expected);
+
+        let mut buffer = vec![chunk];
+        let (emitted, count, offset) =
+            CdcBackfillExecutor::<MemoryStateStore>::consume_upstream_chunk_buffer(
+                &MockExternalTableReader::get_cdc_offset_parser(),
+                &mut buffer,
+                Some(&position),
+                PkCompareInfo {
+                    indices: &[1],
+                    order: &[OrderType::ascending()],
+                    needs_unsigned_i64_compare: &[false],
+                    upstream: Some(&upstream.as_ref().unwrap().0),
+                },
+                &low,
+                &[1, 0],
+            )
+            .unwrap();
+        assert_eq!(emitted[0].clone().compact_vis(), expected);
+        assert_eq!(count, 2);
+        assert_eq!(
+            offset,
+            Some(CdcOffset::MySql(MySqlOffset::new("1.binlog".to_owned(), 4)))
+        );
+        assert_eq!(buffer.len(), 1);
+        assert_eq!(
+            buffer[0]
+                .rows()
+                .next()
+                .unwrap()
+                .1
+                .datum_at(1)
+                .unwrap()
+                .into_utf8(),
+            "c"
+        );
     }
 
     #[test]

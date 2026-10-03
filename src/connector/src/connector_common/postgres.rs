@@ -348,31 +348,22 @@ impl PostgresExternalTable {
         Ok(pk_columns)
     }
 
-    /// Falls back to `Native` if the catalog cannot be read, e.g. on a PostgreSQL-compatible
-    /// database with a different catalog.
+    /// Ordering must be known before creating a CDC table: assuming native ordering on a
+    /// catalog error can silently discard changes during backfill.
     async fn discover_pk_comparisons(
         connection: &PgPool,
         schema_name: &str,
         table_name: &str,
         pk_names: &[String],
     ) -> ConnectorResult<Vec<CdcKeyComparison>> {
-        let rows = match sqlx::query(DISCOVER_KEY_ORDERING_QUERY)
+        let rows = sqlx::query(DISCOVER_KEY_ORDERING_QUERY)
             .bind(schema_name)
             .bind(table_name)
             .fetch_all(connection)
             .await
-        {
-            Ok(rows) => rows,
-            Err(error) => {
-                tracing::warn!(
-                    error = %error.as_report(),
-                    schema = schema_name,
-                    table = table_name,
-                    "failed to discover PostgreSQL key ordering; comparing primary keys natively"
-                );
-                return Ok(vec![CdcKeyComparison::Native; pk_names.len()]);
-            }
-        };
+            .with_context(|| {
+                format!("failed to discover PostgreSQL key ordering for {schema_name}.{table_name}")
+            })?;
         let orderings: HashMap<String, PgKeyOrdering> = rows
             .into_iter()
             .map(|row| {
@@ -1150,10 +1141,32 @@ mod tests {
     use risingwave_common::catalog::CdcKeyComparison;
 
     use super::{
-        PgKeyOrdering, format_grant_table_privilege, format_grant_usage, format_pg_table_name,
-        format_required_table_grants, parse_pgvector_dimension,
+        PgKeyOrdering, PostgresExternalTable, format_grant_table_privilege, format_grant_usage,
+        format_pg_table_name, format_required_table_grants, parse_pgvector_dimension,
         pk_column_comparisons_from_orderings,
     };
+
+    #[tokio::test]
+    async fn test_pg_key_ordering_discovery_error_is_not_native() {
+        // A closed lazy pool fails deterministically without contacting a database.
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://localhost/unused")
+            .unwrap();
+        pool.close().await;
+        let error = PostgresExternalTable::discover_pk_comparisons(
+            &pool,
+            "public",
+            "collated_keys",
+            &["k".to_owned()],
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("failed to discover PostgreSQL key ordering")
+        );
+    }
 
     fn text_ordering(database_provider: &str, database_locale: &str) -> PgKeyOrdering {
         PgKeyOrdering {

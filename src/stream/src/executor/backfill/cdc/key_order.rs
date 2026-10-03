@@ -45,6 +45,7 @@ const COMPARISON_TIMEOUT: Duration = Duration::from_secs(10);
 
 // Every scan actor receives every change event, so it caches the whole table's split keys.
 const MAX_CACHED_SPLIT_KEY_RANKS: usize = 65_536;
+const MAX_CACHED_PK_POSITION_ORDERINGS: usize = 65_536;
 
 pub(crate) struct UpstreamKeyOrder {
     external_table: ExternalStorageTable,
@@ -144,24 +145,38 @@ impl UpstreamKeyOrder {
         &mut self,
         op: impl AsyncFn(&KeyComparatorImpl) -> ConnectorResult<T>,
     ) -> StreamExecutorResult<T> {
-        let mut backoff = INITIAL_RETRY_BACKOFF;
-        let mut attempt = 1;
-        loop {
-            match self.try_once(&op).await {
-                Ok(value) => return Ok(value),
-                Err(error) if attempt < MAX_COMPARISON_ATTEMPTS => {
-                    tracing::warn!(
-                        error = %error.as_report(),
-                        attempt,
-                        table = self.external_table.qualified_table_name(),
-                        "failed to compare CDC keys upstream; retrying"
-                    );
-                    self.comparator = None;
-                    tokio::time::sleep(backoff).await;
-                    backoff *= 2;
-                    attempt += 1;
+        // Bound the whole operation, including reconnects and backoff. Giving each attempt
+        // its own timeout multiplies the time the actor cannot process barriers.
+        let retries = async {
+            let mut backoff = INITIAL_RETRY_BACKOFF;
+            let mut attempt = 1;
+            loop {
+                match self.try_once(&op).await {
+                    Ok(value) => return Ok(value),
+                    Err(error) if attempt < MAX_COMPARISON_ATTEMPTS => {
+                        tracing::warn!(
+                            error = %error.as_report(),
+                            attempt,
+                            table = self.external_table.qualified_table_name(),
+                            "failed to compare CDC keys upstream; retrying"
+                        );
+                        self.comparator = None;
+                        tokio::time::sleep(backoff).await;
+                        backoff *= 2;
+                        attempt += 1;
+                    }
+                    Err(error) => return Err(error.into()),
                 }
-                Err(error) => return Err(error.into()),
+            }
+        };
+        match tokio::time::timeout(COMPARISON_TIMEOUT, retries).await {
+            Ok(result) => result,
+            Err(_) => {
+                self.comparator = None;
+                Err(anyhow!(
+                    "CDC key comparison timed out after {COMPARISON_TIMEOUT:?}, including retries"
+                )
+                .into())
             }
         }
     }
@@ -170,17 +185,11 @@ impl UpstreamKeyOrder {
         &mut self,
         op: &impl AsyncFn(&KeyComparatorImpl) -> ConnectorResult<T>,
     ) -> ConnectorResult<T> {
-        let attempt = async {
-            if self.comparator.is_none() {
-                self.comparator = Some(self.connect().await?);
-            }
-            let comparator = self.comparator.as_ref().expect("connected above");
-            op(comparator).await
-        };
-        match tokio::time::timeout(COMPARISON_TIMEOUT, attempt).await {
-            Ok(result) => result,
-            Err(_) => Err(anyhow!("timed out after {COMPARISON_TIMEOUT:?}").into()),
+        if self.comparator.is_none() {
+            self.comparator = Some(self.connect().await?);
         }
+        let comparator = self.comparator.as_ref().expect("connected above");
+        op(comparator).await
     }
 
     async fn connect(&self) -> ConnectorResult<KeyComparatorImpl> {
@@ -373,11 +382,23 @@ impl UpstreamPkPositionOrder {
         }
 
         let chunks = chunks.into_iter().collect::<Vec<_>>();
+        let row_count = chunks
+            .iter()
+            .map(|chunk| chunk.cardinality())
+            .sum::<usize>();
         for (column, &pk_idx) in self.upstream_columns.iter().enumerate() {
             let Some(pivot) = position.datum_at(pk_idx) else {
                 continue;
             };
             let pivot = upstream_key_str(pivot)?;
+            // Evict before resolving the entire batch, so comparisons for every buffered
+            // chunk stay available until it is consumed. A single large batch may exceed the
+            // cache limit, but later batches cannot accumulate additional unbounded history.
+            if self.orderings[column].len().saturating_add(row_count)
+                > MAX_CACHED_PK_POSITION_ORDERINGS
+            {
+                self.orderings[column].clear();
+            }
             let mut missing = HashSet::new();
             for chunk in &chunks {
                 for value in visible_column_values(chunk, pk_indices[pk_idx]).flatten() {
@@ -465,7 +486,9 @@ impl CdcPkOrder<'_> {
 
 #[cfg(test)]
 mod tests {
-    use risingwave_common::array::{StreamChunk, StreamChunkTestExt};
+    use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
+
+    use risingwave_common::array::{Op, StreamChunk, StreamChunkTestExt};
     use risingwave_common::row::OwnedRow;
     use risingwave_common::types::ScalarImpl;
 
@@ -488,6 +511,66 @@ mod tests {
 
     fn text(value: &str) -> Option<ScalarImpl> {
         Some(ScalarImpl::from(value))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_comparison_retry_succeeds_after_transient_failure() {
+        let mut order = mock_order();
+        let attempts = AtomicU32::new(0);
+        let value = order
+            .with_retry(async |_| {
+                if attempts.fetch_add(1, AtomicOrdering::Relaxed) == 0 {
+                    Err(anyhow!("transient failure").into())
+                } else {
+                    Ok(42)
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(value, 42);
+        assert_eq!(attempts.load(AtomicOrdering::Relaxed), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_comparison_retry_preserves_terminal_error() {
+        let mut order = mock_order();
+        let attempts = AtomicU32::new(0);
+        let error = order
+            .with_retry(async |_| {
+                attempts.fetch_add(1, AtomicOrdering::Relaxed);
+                Err::<(), _>(anyhow!("permanent failure").into())
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(
+            attempts.load(AtomicOrdering::Relaxed),
+            MAX_COMPARISON_ATTEMPTS
+        );
+        assert!(error.as_report().to_string().contains("permanent failure"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_comparison_timeout_includes_all_retries() {
+        let mut order = mock_order();
+        let attempts = AtomicU32::new(0);
+        let start = tokio::time::Instant::now();
+        let error = order
+            .with_retry(async |_| {
+                attempts.fetch_add(1, AtomicOrdering::Relaxed);
+                tokio::time::sleep(Duration::from_secs(4)).await;
+                Err::<(), _>(anyhow!("slow failure").into())
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(start.elapsed(), COMPARISON_TIMEOUT);
+        assert_eq!(attempts.load(AtomicOrdering::Relaxed), 3);
+        assert!(error.as_report().to_string().contains("including retries"));
+        assert!(order.comparator.is_none());
+        // Cancellation must leave the comparator able to reconnect on the next operation.
+        assert_eq!(
+            order.compare(0, &["a"], "B").await.unwrap(),
+            vec![Ordering::Less]
+        );
     }
 
     #[test]
@@ -667,6 +750,80 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(cmp(&upstream, &key, &position), Ordering::Less);
+    }
+
+    #[tokio::test]
+    async fn test_pk_position_cache_eviction_preserves_all_buffered_chunks() {
+        let mut upstream =
+            UpstreamPkPositionOrder::new(&[CdcKeyComparison::Upstream, CdcKeyComparison::Upstream])
+                .unwrap();
+        let position = OwnedRow::new(vec![text("B"), text("B")]);
+        let first = StreamChunk::from_pretty("T T\n+ a a_z");
+        let second = StreamChunk::from_pretty("T T\n+ c a");
+        let mut order = mock_order();
+        upstream
+            .resolve([&first], &[0, 1], &position, &mut order)
+            .await
+            .unwrap();
+        for cache in &mut upstream.orderings {
+            cache.extend(
+                (0..MAX_CACHED_PK_POSITION_ORDERINGS)
+                    .map(|i| (format!("filler{i}").into_boxed_str(), Ordering::Less)),
+            );
+        }
+        upstream
+            .resolve([&first, &second], &[0, 1], &position, &mut order)
+            .await
+            .unwrap();
+        assert!(upstream.orderings.iter().all(|cache| cache.len() == 2));
+        assert_eq!(
+            upstream.cmp_with_position(0, Some(ScalarRefImpl::Utf8("a"))),
+            Some(Ordering::Less)
+        );
+        assert_eq!(
+            upstream.cmp_with_position(0, Some(ScalarRefImpl::Utf8("c"))),
+            Some(Ordering::Greater)
+        );
+        assert_eq!(
+            upstream.cmp_with_position(1, Some(ScalarRefImpl::Utf8("a_z"))),
+            Some(Ordering::Less)
+        );
+        assert_eq!(
+            upstream.cmp_with_position(1, Some(ScalarRefImpl::Utf8("a"))),
+            Some(Ordering::Less)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_pk_position_cache_accepts_batch_larger_than_limit() {
+        let mut upstream = UpstreamPkPositionOrder::new(&[CdcKeyComparison::Upstream]).unwrap();
+        let position = OwnedRow::new(vec![text("B")]);
+        let rows = (0..=MAX_CACHED_PK_POSITION_ORDERINGS)
+            .map(|i| (Op::Insert, OwnedRow::new(vec![text(&format!("a{i}"))])))
+            .collect::<Vec<_>>();
+        let chunk = StreamChunk::from_rows(&rows, &[risingwave_common::types::DataType::Varchar]);
+        let mut order = mock_order();
+        upstream
+            .resolve([&chunk], &[0], &position, &mut order)
+            .await
+            .unwrap();
+        for (_, row) in &rows {
+            assert_eq!(
+                upstream.cmp_with_position(0, row.datum_at(0)),
+                Some(Ordering::Less)
+            );
+        }
+        // A large batch is retained until consumed, then evicted on the next resolve.
+        let next = StreamChunk::from_pretty("T\n+ c");
+        upstream
+            .resolve([&next], &[0], &position, &mut order)
+            .await
+            .unwrap();
+        assert_eq!(upstream.orderings[0].len(), 1);
+        assert_eq!(
+            upstream.cmp_with_position(0, Some(ScalarRefImpl::Utf8("c"))),
+            Some(Ordering::Greater)
+        );
     }
 
     #[tokio::test]

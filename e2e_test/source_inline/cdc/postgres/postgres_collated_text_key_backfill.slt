@@ -111,6 +111,75 @@ f 1
 g 1
 h 2
 
+# Exercise changes while a second parallel snapshot is still in progress.
+system ok
+PGDATABASE=${PGDATABASE:-postgres} psql -v ON_ERROR_STOP=1 -c "
+    INSERT INTO public.collated_key_t
+    SELECT 'zzfill' || lpad(i::text, 4, '0'), 0 FROM generate_series(0, 999) AS i;
+    "
+
+query I retry 30 backoff 1s
+select count(*) from collated_key_t;
+----
+1019
+
+statement ok
+set backfill_rate_limit = 10;
+
+statement ok
+set background_ddl = true;
+
+statement ok
+create table collated_key_during (k varchar primary key, v int)
+with (backfill.parallelism = 4, backfill.num_rows_per_split = 10)
+from collated_key_source table 'public.collated_key_t';
+
+query B retry 60 backoff 1s
+select p.split_backfilled_count > 0 and p.split_backfilled_count < p.split_total_count
+from rw_catalog.rw_cdc_progress p join rw_catalog.rw_tables t on p.job_id = t.id
+where t.name = 'collated_key_during';
+----
+t
+
+system ok
+PGDATABASE=${PGDATABASE:-postgres} psql -v ON_ERROR_STOP=1 -c "
+    UPDATE public.collated_key_t SET v = v + 10;
+    DELETE FROM public.collated_key_t WHERE k IN ('a', 'h');
+    INSERT INTO public.collated_key_t VALUES ('A_0', 99), ('zlate', 99);
+    "
+
+query B
+select p.split_backfilled_count < p.split_total_count
+from rw_catalog.rw_cdc_progress p join rw_catalog.rw_tables t on p.job_id = t.id
+where t.name = 'collated_key_during';
+----
+t
+
+query II retry 30 backoff 1s
+select count(*), sum(v) from collated_key_t;
+----
+1019 10389
+
+query II retry 60 backoff 1s
+select count(*), sum(v) from collated_key_during;
+----
+1019 10389
+
+query I retry 30 backoff 1s
+select count(*) from (
+    (select k, v from collated_key_during except select k, v from collated_key_t)
+    union all
+    (select k, v from collated_key_t except select k, v from collated_key_during)
+) differences;
+----
+0
+
+statement ok
+set backfill_rate_limit = default;
+
+statement ok
+set background_ddl = default;
+
 statement ok
 drop source collated_key_source cascade;
 

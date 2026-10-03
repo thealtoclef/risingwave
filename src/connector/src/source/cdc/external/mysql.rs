@@ -339,8 +339,27 @@ fn pk_column_comparisons_from_orderings(
 ) -> ConnectorResult<Vec<CdcKeyComparison>> {
     pk_names
         .iter()
-        .map(|pk_name| find_key_ordering(orderings, pk_name).map(MySqlKeyOrdering::comparison))
+        .map(|pk_name| {
+            let ordering = find_key_ordering(orderings, pk_name)?;
+            ensure_supported_key_ordering(ordering)?;
+            Ok(ordering.comparison())
+        })
         .collect()
+}
+
+fn ensure_supported_key_ordering(ordering: &MySqlKeyOrdering) -> ConnectorResult<()> {
+    // ORDER BY uses enum ordinals, but the snapshot range predicates compare enum columns
+    // with string parameters. Until both use the same order, comparing CDC events by ordinal
+    // is unsafe even if the enum members are resolved using the correct collation.
+    if ordering.data_type == "enum" {
+        return Err(anyhow!(
+            "MySQL enum primary key column `{}` is not supported for CDC backfill: \
+             enum sorting and snapshot range comparisons use different orders",
+            ordering.column_name
+        )
+        .into());
+    }
+    Ok(())
 }
 
 fn find_key_ordering<'a>(
@@ -359,27 +378,14 @@ fn find_key_ordering<'a>(
 const KEY_COMPARISON_BATCH_SIZE: usize = 1_000;
 
 /// How a key value is cast to compare like the column in MySQL.
-enum MySqlKeyExpr {
-    Collated {
-        character_set: String,
-        collation: String,
-    },
-    /// Enum members as SQL literals, as listed in `COLUMN_TYPE`.
-    Enum { members: String },
+struct MySqlKeyExpr {
+    character_set: String,
+    collation: String,
 }
 
 impl MySqlKeyExpr {
     fn new(ordering: &MySqlKeyOrdering) -> ConnectorResult<Self> {
-        if ordering.data_type == "enum" {
-            let members = ordering
-                .column_type
-                .strip_prefix("enum(")
-                .and_then(|members| members.strip_suffix(')'))
-                .with_context(|| format!("invalid enum type `{}`", ordering.column_type))?;
-            return Ok(Self::Enum {
-                members: members.to_owned(),
-            });
-        }
+        ensure_supported_key_ordering(ordering)?;
         let identifier = |name: Option<&String>| {
             name.filter(|name| name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
                 .cloned()
@@ -390,24 +396,21 @@ impl MySqlKeyExpr {
                     )
                 })
         };
-        Ok(Self::Collated {
+        Ok(Self {
             character_set: identifier(ordering.character_set.as_ref())?,
             collation: identifier(ordering.collation.as_ref())?,
         })
     }
 
     fn typed(&self, value: &str) -> String {
-        match self {
-            Self::Collated {
-                character_set,
-                collation,
-            } => format!("CONVERT({value} USING {character_set}) COLLATE {collation}"),
-            Self::Enum { members } => format!("FIELD({value}, {members})"),
-        }
+        format!(
+            "CONVERT({value} USING {}) COLLATE {}",
+            self.character_set, self.collation
+        )
     }
 }
 
-/// Compares key values in MySQL, cast to the key column's collation (or enum order), so results
+/// Compares key values in MySQL, cast to the key column's collation, so results
 /// match the snapshot range predicates on that column. Queries never read the table.
 pub struct MySqlKeyComparator {
     pool: mysql_async::Pool,
@@ -1709,6 +1712,38 @@ mod tests {
     }
 
     #[test]
+    fn test_mysql_enum_keys_are_rejected_before_backfill() {
+        for (members, collation) in [
+            ("enum('z','a')", "utf8mb4_0900_ai_ci"),
+            ("enum('a','A')", "utf8mb4_0900_as_cs"),
+        ] {
+            let ordering = key_ordering("enum", members, Some(collation));
+            let error =
+                pk_column_comparisons_from_orderings(&[ordering], &["K".to_owned()]).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("enum sorting and snapshot range comparisons use different orders")
+            );
+        }
+        // An enum in a non-key column does not prevent CDC backfill.
+        assert_eq!(
+            pk_column_comparisons_from_orderings(
+                &[
+                    key_ordering("int", "int", None),
+                    MySqlKeyOrdering {
+                        column_name: "status".to_owned(),
+                        ..key_ordering("enum", "enum('z','a')", Some("utf8mb4_0900_ai_ci"))
+                    },
+                ],
+                &["k".to_owned()],
+            )
+            .unwrap(),
+            vec![CdcKeyComparison::Native]
+        );
+    }
+
+    #[test]
     fn test_mysql_key_expr() {
         let collated = MySqlKeyExpr::new(&key_ordering(
             "varchar",
@@ -1720,9 +1755,7 @@ mod tests {
             collated.typed("k.v"),
             "CONVERT(k.v USING utf8mb4) COLLATE utf8mb4_0900_ai_ci"
         );
-        let enum_expr =
-            MySqlKeyExpr::new(&key_ordering("enum", "enum('zzz','aaa')", None)).unwrap();
-        assert_eq!(enum_expr.typed("?"), "FIELD(?, 'zzz','aaa')");
+        assert!(MySqlKeyExpr::new(&key_ordering("enum", "enum('zzz','aaa')", None)).is_err());
         assert!(
             MySqlKeyExpr::new(&key_ordering("varchar", "varchar(10)", Some("x; DROP"))).is_err()
         );

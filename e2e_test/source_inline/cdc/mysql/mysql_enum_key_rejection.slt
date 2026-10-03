@@ -1,0 +1,53 @@
+control substitution on
+
+# Enum ORDER BY uses declaration order, while snapshot predicates against string parameters
+# use text order. Reject enum keys in both explicit and discovered schemas.
+system ok
+mysql -e "
+    CREATE DATABASE IF NOT EXISTS risedev;
+    USE risedev;
+    DROP TABLE IF EXISTS mysql_enum_key_order_t, mysql_enum_key_case_t, mysql_enum_payload_t;
+    CREATE TABLE mysql_enum_key_order_t (k ENUM('z','a') PRIMARY KEY, v INT)
+        ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+    CREATE TABLE mysql_enum_key_case_t (k ENUM('a','A') PRIMARY KEY, v INT)
+        ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_as_cs;
+    CREATE TABLE mysql_enum_payload_t (id INT PRIMARY KEY, v ENUM('z','a'));
+    INSERT INTO mysql_enum_payload_t VALUES (1, 'z'), (2, 'a');
+    "
+
+statement ok
+create source mysql_enum_key_source with (
+    ${RISEDEV_MYSQL_WITH_OPTIONS_COMMON},
+    username = '${RISEDEV_MYSQL_USER}',
+    password = '${MYSQL_PWD}',
+    database.name = 'risedev'
+);
+
+statement error MySQL enum primary key column
+create table rw_mysql_enum_key_order_t (k varchar primary key, v int)
+from mysql_enum_key_source table 'risedev.mysql_enum_key_order_t';
+
+statement error MySQL enum primary key column
+create table rw_mysql_enum_key_order_t (*)
+from mysql_enum_key_source table 'risedev.mysql_enum_key_order_t';
+
+statement error MySQL enum primary key column
+create table rw_mysql_enum_key_case_t (k varchar primary key, v int)
+with (backfill.parallelism = 4, backfill.num_rows_per_split = 1)
+from mysql_enum_key_source table 'risedev.mysql_enum_key_case_t';
+
+statement ok
+create table rw_mysql_enum_payload_t (*)
+from mysql_enum_key_source table 'risedev.mysql_enum_payload_t';
+
+query IT retry 30 backoff 1s
+select id, v from rw_mysql_enum_payload_t order by id;
+----
+1 z
+2 a
+
+statement ok
+drop source mysql_enum_key_source cascade;
+
+system ok
+mysql -e "USE risedev; DROP TABLE IF EXISTS mysql_enum_key_order_t, mysql_enum_key_case_t, mysql_enum_payload_t;"

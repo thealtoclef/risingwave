@@ -329,8 +329,8 @@ impl<S: StateStore> ParallelizedCdcBackfillExecutor<S> {
             };
 
             // A reader is only needed while at least one assigned snapshot split is unfinished.
-            // Once all splits are complete, the executor only forwards the table-filtered CDC
-            // stream and must not depend on the upstream snapshot table still existing.
+            // Live CDC events still need split routing after the snapshot completes. Collated
+            // split keys may therefore require upstream comparisons even without a reader.
             if let Some(next_split_idx) = next_split_idx {
                 let external_table = self.external_table.clone();
                 let actor_id = self.actor_ctx.id;

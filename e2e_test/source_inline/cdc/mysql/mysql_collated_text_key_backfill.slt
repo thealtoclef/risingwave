@@ -96,6 +96,81 @@ e 1
 g 1
 j 2
 
+# Exercise changes during a second, deliberately slow parallel snapshot of the same table.
+system ok
+mysql -e "
+    USE risedev;
+    INSERT INTO mysql_collated_key_t
+    WITH RECURSIVE n AS (SELECT 0 AS i UNION ALL SELECT i + 1 FROM n WHERE i < 999)
+    SELECT CONCAT('zzfill', LPAD(i, 4, '0')), 0 FROM n;
+"
+
+query I retry 30 backoff 1s
+select count(*) from rw_mysql_collated_key_t;
+----
+1018
+
+statement ok
+set backfill_rate_limit = 10;
+
+statement ok
+set background_ddl = true;
+
+statement ok
+create table rw_mysql_collated_key_during (k varchar primary key, v int)
+with (backfill.parallelism = 4, backfill.num_rows_per_split = 10)
+from s_mysql_collated_key table 'risedev.mysql_collated_key_t';
+
+query B retry 60 backoff 1s
+select p.split_backfilled_count > 0 and p.split_backfilled_count < p.split_total_count
+from rw_catalog.rw_cdc_progress p join rw_catalog.rw_tables t on p.job_id = t.id
+where t.name = 'rw_mysql_collated_key_during';
+----
+t
+
+system ok
+mysql -e "
+    USE risedev;
+    UPDATE mysql_collated_key_t SET v = v + 10;
+    DELETE FROM mysql_collated_key_t WHERE k IN ('a', 'j');
+    INSERT INTO mysql_collated_key_t VALUES ('A_0', 99), ('zlate', 99);
+"
+
+query B
+select p.split_backfilled_count < p.split_total_count
+from rw_catalog.rw_cdc_progress p join rw_catalog.rw_tables t on p.job_id = t.id
+where t.name = 'rw_mysql_collated_key_during';
+----
+t
+
+query II retry 30 backoff 1s
+select count(*), sum(v) from rw_mysql_collated_key_t;
+----
+1018 10378
+
+query II retry 60 backoff 1s
+select count(*), sum(v) from rw_mysql_collated_key_during;
+----
+1018 10378
+
+query I retry 30 backoff 1s
+select count(*) from (
+    (select k, v from rw_mysql_collated_key_during except select k, v from rw_mysql_collated_key_t)
+    union all
+    (select k, v from rw_mysql_collated_key_t except select k, v from rw_mysql_collated_key_during)
+) differences;
+----
+0
+
+statement ok
+drop table rw_mysql_collated_key_during;
+
+statement ok
+set backfill_rate_limit = default;
+
+statement ok
+set background_ddl = default;
+
 statement ok
 drop table rw_mysql_collated_key_t;
 
