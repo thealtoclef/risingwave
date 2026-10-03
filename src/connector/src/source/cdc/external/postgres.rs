@@ -1025,6 +1025,200 @@ pub fn pg_type_to_rw_type(pg_type: &PgType) -> ConnectorResult<DataType> {
     Ok(data_type)
 }
 
+/// The type is taken without its modifier, since casting to `char(n)` or `varchar(n)` could
+/// truncate values.
+const DISCOVER_KEY_COLUMN_TYPES_QUERY: &str = "\
+    SELECT a.attname, \
+           quote_ident(tn.nspname) || '.' || quote_ident(t.typname) AS type_name, \
+           CASE WHEN a.attcollation = 0 THEN NULL \
+                ELSE quote_ident(cn.nspname) || '.' || quote_ident(co.collname) \
+           END AS collation_name, \
+           a.attcollation::int8 AS collation_oid \
+    FROM pg_attribute a \
+    JOIN pg_class c ON c.oid = a.attrelid \
+    JOIN pg_namespace n ON n.oid = c.relnamespace \
+    JOIN pg_type t ON t.oid = a.atttypid \
+    JOIN pg_namespace tn ON tn.oid = t.typnamespace \
+    LEFT JOIN pg_collation co ON co.oid = a.attcollation \
+    LEFT JOIN pg_namespace cn ON cn.oid = co.collnamespace \
+    WHERE n.nspname = $1 AND c.relname = $2 AND a.attnum > 0 AND NOT a.attisdropped";
+
+const DEFAULT_COLLATION_OID: i64 = 100;
+
+const KEY_COMPARISON_BATCH_SIZE: usize = 10_000;
+
+/// Compares key values in PostgreSQL, cast to the key column's type and collation, so results
+/// match the snapshot range predicates on that column. Queries never read the table.
+///
+/// It has its own connection, because a snapshot read holds the reader's for the whole stream.
+pub struct PostgresKeyComparator {
+    client: tokio_postgres::Client,
+    columns: Vec<KeyColumnStatements>,
+}
+
+struct KeyColumnStatements {
+    rank: tokio_postgres::Statement,
+    compare: tokio_postgres::Statement,
+}
+
+impl PostgresKeyComparator {
+    pub async fn connect(
+        config: &ExternalTableConfig,
+        table: &SchemaTableName,
+        column_names: &[String],
+    ) -> ConnectorResult<Self> {
+        let client = create_pg_client(&config.snapshot_pg_connection_config()?, None).await?;
+        let rows = client
+            .query(
+                DISCOVER_KEY_COLUMN_TYPES_QUERY,
+                &[&table.schema_name, &table.table_name],
+            )
+            .await?;
+
+        let mut columns = Vec::with_capacity(column_names.len());
+        for column_name in column_names {
+            let row = rows
+                .iter()
+                .find(|row| row.get::<_, String>(0) == *column_name)
+                .with_context(|| {
+                    format!(
+                        "key column `{column_name}` not found in upstream PostgreSQL table {}",
+                        Self::get_qualified_name(table)
+                    )
+                })?;
+            let type_name: String = row.get(1);
+            let collation_name: Option<String> = row.get(2);
+            let collation_oid: i64 = row.get(3);
+            if collation_name.is_some() {
+                warn_on_collation_version_mismatch(&client, collation_oid).await;
+            }
+
+            let collate = collation_name
+                .map(|name| format!(" COLLATE {name}"))
+                .unwrap_or_default();
+            let typed = |value: &str| format!("({value})::{type_name}{collate}");
+            let rank = client
+                .prepare(&format!(
+                    "SELECT (SELECT count(*) FROM unnest($2::text[]) AS b(v) WHERE {} <= {}) \
+                     FROM unnest($1::text[]) WITH ORDINALITY AS k(v, i) ORDER BY k.i",
+                    typed("b.v"),
+                    typed("k.v"),
+                ))
+                .await?;
+            let compare = client
+                .prepare(&format!(
+                    "SELECT CASE WHEN {key} < {pivot} THEN -1 WHEN {key} = {pivot} THEN 0 ELSE 1 END \
+                     FROM unnest($1::text[]) WITH ORDINALITY AS k(v, i) ORDER BY k.i",
+                    key = typed("k.v"),
+                    pivot = typed("$2::text"),
+                ))
+                .await?;
+            columns.push(KeyColumnStatements { rank, compare });
+        }
+
+        tracing::info!(
+            table = Self::get_qualified_name(table),
+            ?column_names,
+            "created upstream PostgreSQL key comparator"
+        );
+        Ok(Self { client, columns })
+    }
+
+    /// For each value, the number of `bounds` less than or equal to it.
+    pub async fn rank(
+        &self,
+        column: usize,
+        values: &[&str],
+        bounds: &[&str],
+    ) -> ConnectorResult<Vec<usize>> {
+        let statement = &self.columns[column].rank;
+        let mut ranks = Vec::with_capacity(values.len());
+        for batch in values.chunks(KEY_COMPARISON_BATCH_SIZE) {
+            for row in self.client.query(statement, &[&batch, &bounds]).await? {
+                let rank: i64 = row.get(0);
+                ranks.push(usize::try_from(rank).context("negative key rank")?);
+            }
+        }
+        Ok(ranks)
+    }
+
+    pub async fn compare(
+        &self,
+        column: usize,
+        values: &[&str],
+        pivot: &str,
+    ) -> ConnectorResult<Vec<Ordering>> {
+        let statement = &self.columns[column].compare;
+        let mut orderings = Vec::with_capacity(values.len());
+        for batch in values.chunks(KEY_COMPARISON_BATCH_SIZE) {
+            for row in self.client.query(statement, &[&batch, &pivot]).await? {
+                let ordering: i32 = row.get(0);
+                orderings.push(ordering.cmp(&0));
+            }
+        }
+        Ok(orderings)
+    }
+
+    fn get_qualified_name(table: &SchemaTableName) -> String {
+        PostgresExternalTableReader::get_normalized_table_name(table)
+    }
+}
+
+/// Indexes built under another collation version may disagree with comparisons until rebuilt.
+async fn warn_on_collation_version_mismatch(client: &tokio_postgres::Client, collation_oid: i64) {
+    let result = async {
+        let row = if collation_oid == DEFAULT_COLLATION_OID {
+            let version_num: i32 = client
+                .query_one("SELECT current_setting('server_version_num')::int4", &[])
+                .await?
+                .get(0);
+            if version_num < 150000 {
+                return Ok(None);
+            }
+            client
+                .query_opt(
+                    "SELECT datcollversion, pg_database_collation_actual_version(oid) \
+                     FROM pg_database WHERE datname = current_database()",
+                    &[],
+                )
+                .await?
+        } else {
+            client
+                .query_opt(
+                    "SELECT collversion, pg_collation_actual_version(oid) \
+                     FROM pg_collation WHERE oid = $1::int8::oid",
+                    &[&collation_oid],
+                )
+                .await?
+        };
+        Ok::<_, tokio_postgres::Error>(row.map(|row| {
+            (
+                row.get::<_, Option<String>>(0),
+                row.get::<_, Option<String>>(1),
+            )
+        }))
+    }
+    .await;
+    match result {
+        Ok(Some((Some(recorded), Some(actual)))) if recorded != actual => {
+            tracing::warn!(
+                collation_oid,
+                recorded,
+                actual,
+                "upstream PostgreSQL collation version mismatch; indexes using it may need REINDEX"
+            );
+        }
+        Ok(_) => {}
+        Err(error) => {
+            tracing::debug!(
+                error = %error.as_report(),
+                collation_oid,
+                "failed to check upstream PostgreSQL collation version"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::cmp::Ordering;
@@ -1037,8 +1231,10 @@ mod tests {
     use risingwave_common::row::OwnedRow;
     use risingwave_common::types::{DataType, ScalarImpl};
 
-    use crate::connector_common::PostgresExternalTable;
-    use crate::source::cdc::external::postgres::{PostgresExternalTableReader, PostgresOffset};
+    use crate::connector_common::{PostgresExternalTable, create_pg_client};
+    use crate::source::cdc::external::postgres::{
+        PostgresExternalTableReader, PostgresKeyComparator, PostgresOffset,
+    };
     use crate::source::cdc::external::{ExternalTableConfig, ExternalTableReader, SchemaTableName};
 
     #[ignore]
@@ -1316,5 +1512,102 @@ mod tests {
         for row in stream {
             println!("OwnedRow: {:?}", row);
         }
+    }
+
+    /// Needs a local PostgreSQL with `en_US.utf8`, e.g. `docker run -p 8432:5432
+    /// -e POSTGRES_USER=myuser -e POSTGRES_PASSWORD=123456 -e POSTGRES_DB=mydb postgres:16`.
+    #[ignore]
+    #[tokio::test]
+    async fn test_pg_key_comparator_matches_range_predicates() {
+        let config = ExternalTableConfig {
+            connector: "postgres-cdc".to_owned(),
+            host: "localhost".to_owned(),
+            port: "8432".to_owned(),
+            username: "myuser".to_owned(),
+            password: "123456".to_owned(),
+            database: "mydb".to_owned(),
+            schema: "public".to_owned(),
+            table: "rw_key_comparator_test".to_owned(),
+            ..Default::default()
+        };
+        let client = create_pg_client(&config.pg_connection_config().unwrap(), None)
+            .await
+            .unwrap();
+        client
+            .batch_execute(
+                "DROP TABLE IF EXISTS rw_key_comparator_test; \
+                 CREATE TABLE rw_key_comparator_test ( \
+                    k text COLLATE \"en_US.utf8\" PRIMARY KEY, \
+                    c text COLLATE \"C\")",
+            )
+            .await
+            .unwrap();
+        let keys = [
+            "a", "A", "a_z", "ab", "a-b", "aB", "b", "B", "etl_x", "etl-x", "ETL_x", "z", "_z",
+        ];
+        for key in keys {
+            client
+                .execute(
+                    "INSERT INTO rw_key_comparator_test VALUES ($1, $1)",
+                    &[&key],
+                )
+                .await
+                .unwrap();
+        }
+        let table = SchemaTableName {
+            schema_name: "public".to_owned(),
+            table_name: "rw_key_comparator_test".to_owned(),
+        };
+        let comparator =
+            PostgresKeyComparator::connect(&config, &table, &["k".to_owned(), "c".to_owned()])
+                .await
+                .unwrap();
+
+        for (column_idx, column) in ["k", "c"].into_iter().enumerate() {
+            let bounds = ["a_z", "b", "etl-x"];
+            let ranks = comparator.rank(column_idx, &keys, &bounds).await.unwrap();
+            let orderings = comparator.compare(column_idx, &keys, "ab").await.unwrap();
+            for ((key, rank), ordering) in keys.iter().zip(ranks).zip(orderings) {
+                let expected_rank: i64 = client
+                    .query_one(
+                        &format!(
+                            "SELECT count(*) FROM unnest($2::text[]) AS b(v) \
+                             WHERE EXISTS (SELECT 1 FROM rw_key_comparator_test \
+                                           WHERE {column} = $1 AND {column} >= b.v)"
+                        ),
+                        &[key, &bounds.as_slice()],
+                    )
+                    .await
+                    .unwrap()
+                    .get(0);
+                assert_eq!(rank as i64, expected_rank, "rank of {key} on {column}");
+
+                let (less, equal): (bool, bool) = {
+                    let row = client
+                        .query_one(
+                            &format!(
+                                "SELECT {column} < 'ab', {column} = 'ab' \
+                                 FROM rw_key_comparator_test WHERE {column} = $1"
+                            ),
+                            &[key],
+                        )
+                        .await
+                        .unwrap();
+                    (row.get(0), row.get(1))
+                };
+                let expected = if less {
+                    Ordering::Less
+                } else if equal {
+                    Ordering::Equal
+                } else {
+                    Ordering::Greater
+                };
+                assert_eq!(ordering, expected, "{key} vs ab on {column}");
+            }
+        }
+        let locale_ranks = comparator.rank(0, &["ab"], &["a_z"]).await.unwrap();
+        let c_ranks = comparator.rank(1, &["ab"], &["a_z"]).await.unwrap();
+        assert_eq!(locale_ranks, vec![0]);
+        assert_eq!(c_ranks, vec![1]);
     }
 }

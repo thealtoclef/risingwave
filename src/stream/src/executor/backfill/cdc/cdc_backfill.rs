@@ -41,14 +41,16 @@ use rw_futures_util::pausable;
 use thiserror_ext::AsReport;
 use tracing::Instrument;
 
+use crate::executor::backfill::cdc::key_order::{
+    CdcPkOrder, UpstreamKeyOrder, UpstreamPkPositionOrder,
+};
 use crate::executor::backfill::cdc::state::CdcBackfillState;
 use crate::executor::backfill::cdc::upstream_table::external::ExternalStorageTable;
 use crate::executor::backfill::cdc::upstream_table::snapshot::{
     SnapshotReadArgs, UpstreamTableRead, UpstreamTableReader,
 };
 use crate::executor::backfill::utils::{
-    cmp_pk_unsigned_aware, get_cdc_chunk_last_offset, get_new_pos, mapping_chunk, mapping_message,
-    mark_cdc_chunk,
+    get_cdc_chunk_last_offset, get_new_pos, mapping_chunk, mapping_message, mark_cdc_chunk,
 };
 use crate::executor::monitor::CdcBackfillMetrics;
 use crate::executor::prelude::*;
@@ -62,6 +64,17 @@ struct PkCompareInfo<'a> {
     indices: &'a [usize],
     order: &'a [OrderType],
     needs_unsigned_i64_compare: &'a [bool],
+    upstream: Option<&'a UpstreamPkPositionOrder>,
+}
+
+impl<'a> PkCompareInfo<'a> {
+    fn pk_order(&self) -> CdcPkOrder<'a> {
+        CdcPkOrder {
+            order: self.order,
+            needs_unsigned_i64_compare: self.needs_unsigned_i64_compare,
+            upstream: self.upstream,
+        }
+    }
 }
 
 fn can_poll_upstream_while_creating_reader(
@@ -69,6 +82,23 @@ fn can_poll_upstream_while_creating_reader(
     pk_comparisons_are_known: bool,
 ) -> bool {
     current_pk_pos.is_none() || pk_comparisons_are_known
+}
+
+/// Must run before comparing rows of `chunks` with `position`.
+async fn resolve_upstream_pk_order<'a>(
+    upstream: &mut Option<(UpstreamPkPositionOrder, UpstreamKeyOrder)>,
+    chunks: impl IntoIterator<Item = &'a StreamChunk>,
+    pk_indices: &[usize],
+    position: Option<&OwnedRow>,
+) -> StreamExecutorResult<()> {
+    if let Some((position_order, key_order)) = upstream
+        && let Some(position) = position
+    {
+        position_order
+            .resolve(chunks, pk_indices, position, key_order)
+            .await?;
+    }
+    Ok(())
 }
 
 // The TimestampHandling/TimestamptzHandling/TimeHandling parser's behavior depends on the debezium.time.precision.mode setting:
@@ -240,14 +270,10 @@ impl<S: StateStore> CdcBackfillExecutor<S> {
                     .as_ref()
                     .is_none_or(|binlog_low| *binlog_low <= event_offset);
 
-                let row_pk = row.project(pk_compare.indices);
-                let reached_current_pos = cmp_pk_unsigned_aware(
-                    row_pk.iter(),
-                    current_pos.iter(),
-                    pk_compare.order,
-                    pk_compare.needs_unsigned_i64_compare,
-                )
-                .is_le();
+                let reached_current_pos = pk_compare
+                    .pk_order()
+                    .cmp_with_position(row.project(pk_compare.indices), current_pos)
+                    .is_le();
                 if !in_binlog_range {
                     continue;
                 }
@@ -310,8 +336,7 @@ impl<S: StateStore> CdcBackfillExecutor<S> {
                 chunk,
                 current_pos,
                 pk_compare.indices,
-                pk_compare.order,
-                pk_compare.needs_unsigned_i64_compare,
+                pk_compare.pk_order(),
                 last_binlog_offset.clone(),
             )?,
             output_indices,
@@ -336,6 +361,22 @@ impl<S: StateStore> CdcBackfillExecutor<S> {
                     .iter()
                     .map(|comparison| *comparison == CdcKeyComparison::UnsignedInt64)
                     .collect_vec()
+            });
+
+        // Legacy graphs never compare upstream: their comparisons are `Native` or MySQL signedness.
+        let mut upstream_pk_order = self
+            .external_table
+            .pk_comparisons()
+            .and_then(UpstreamPkPositionOrder::new)
+            .map(|position_order| {
+                let pk_names = self.external_table.pk_names();
+                let column_names = position_order
+                    .upstream_columns()
+                    .iter()
+                    .map(|&idx| pk_names[idx].clone())
+                    .collect_vec();
+                let key_order = UpstreamKeyOrder::new(&self.external_table, column_names);
+                (position_order, key_order)
             });
 
         let table_id = self.external_table.table_id();
@@ -465,6 +506,13 @@ impl<S: StateStore> CdcBackfillExecutor<S> {
                                     pk_needs_unsigned_i64_compare.as_deref().expect(
                                         "recovery may only poll upstream with known PK comparisons",
                                     );
+                                resolve_upstream_pk_order(
+                                    &mut upstream_pk_order,
+                                    [&chunk],
+                                    &pk_indices,
+                                    Some(current_pos),
+                                )
+                                .await?;
                                 let (chunk, consumed_offset) = Self::filter_recovery_chunk(
                                     &offset_parse_func,
                                     chunk,
@@ -473,6 +521,9 @@ impl<S: StateStore> CdcBackfillExecutor<S> {
                                         indices: &pk_indices,
                                         order: &pk_order,
                                         needs_unsigned_i64_compare: pk_needs_unsigned_i64_compare,
+                                        upstream: upstream_pk_order
+                                            .as_ref()
+                                            .map(|(position_order, _)| position_order),
                                     },
                                     &last_binlog_offset,
                                     &self.output_indices,
@@ -594,6 +645,13 @@ impl<S: StateStore> CdcBackfillExecutor<S> {
                     }
                     Message::Chunk(chunk) => {
                         if let Some(current_pos) = current_pk_pos.as_ref() {
+                            resolve_upstream_pk_order(
+                                &mut upstream_pk_order,
+                                [&chunk],
+                                &pk_indices,
+                                Some(current_pos),
+                            )
+                            .await?;
                             let (chunk, consumed_offset) = Self::filter_recovery_chunk(
                                 &offset_parse_func,
                                 chunk,
@@ -602,6 +660,9 @@ impl<S: StateStore> CdcBackfillExecutor<S> {
                                     indices: &pk_indices,
                                     order: &pk_order,
                                     needs_unsigned_i64_compare: &pk_needs_unsigned_i64_compare,
+                                    upstream: upstream_pk_order
+                                        .as_ref()
+                                        .map(|(position_order, _)| position_order),
                                 },
                                 &last_binlog_offset,
                                 &self.output_indices,
@@ -742,6 +803,13 @@ impl<S: StateStore> CdcBackfillExecutor<S> {
                                         break;
                                     } else {
                                         // Drain the in-memory buffer to ensure no data is lost during the recovery process.
+                                        resolve_upstream_pk_order(
+                                            &mut upstream_pk_order,
+                                            &upstream_chunk_buffer,
+                                            &pk_indices,
+                                            current_pk_pos.as_ref(),
+                                        )
+                                        .await?;
                                         let (
                                             emitted_upstream_chunks,
                                             consumed_upstream_row_count,
@@ -755,6 +823,9 @@ impl<S: StateStore> CdcBackfillExecutor<S> {
                                                 order: &pk_order,
                                                 needs_unsigned_i64_compare:
                                                     &pk_needs_unsigned_i64_compare,
+                                                upstream: upstream_pk_order
+                                                    .as_ref()
+                                                    .map(|(position_order, _)| position_order),
                                             },
                                             &last_binlog_offset,
                                             &self.output_indices,
@@ -954,6 +1025,20 @@ impl<S: StateStore> CdcBackfillExecutor<S> {
                 // If the number of barriers reaches the snapshot interval,
                 // consume the buffered upstream chunks.
                 if let Some(current_pos) = &current_pk_pos {
+                    resolve_upstream_pk_order(
+                        &mut upstream_pk_order,
+                        &upstream_chunk_buffer,
+                        &pk_indices,
+                        Some(current_pos),
+                    )
+                    .await?;
+                    let cdc_pk_order = CdcPkOrder {
+                        order: &pk_order,
+                        needs_unsigned_i64_compare: &pk_needs_unsigned_i64_compare,
+                        upstream: upstream_pk_order
+                            .as_ref()
+                            .map(|(position_order, _)| position_order),
+                    };
                     for chunk in upstream_chunk_buffer.drain(..) {
                         cur_barrier_upstream_processed_rows += chunk.cardinality() as u64;
 
@@ -968,8 +1053,7 @@ impl<S: StateStore> CdcBackfillExecutor<S> {
                                 chunk,
                                 current_pos,
                                 &pk_indices,
-                                &pk_order,
-                                &pk_needs_unsigned_i64_compare,
+                                cdc_pk_order,
                                 last_binlog_offset.clone(),
                             )?,
                             &self.output_indices,
@@ -1749,6 +1833,7 @@ mod tests {
                     indices: &[0],
                     order: &[OrderType::ascending()],
                     needs_unsigned_i64_compare: &[false],
+                    upstream: None,
                 },
                 &Some(CdcOffset::MySql(MySqlOffset::new("1.binlog".to_owned(), 2))),
                 &[0, 1],
@@ -1968,6 +2053,7 @@ mod tests {
                     indices: &[0],
                     order: &[OrderType::ascending()],
                     needs_unsigned_i64_compare: &[false],
+                    upstream: None,
                 },
                 &Some(CdcOffset::MySql(MySqlOffset::new("1.binlog".to_owned(), 2))),
                 &[0, 1],
@@ -2049,6 +2135,7 @@ mod tests {
                     indices: &[0],
                     order: &[OrderType::ascending()],
                     needs_unsigned_i64_compare: &[true],
+                    upstream: None,
                 },
                 &Some(CdcOffset::MySql(MySqlOffset::new("1.binlog".to_owned(), 2))),
                 &[0, 1],
@@ -2138,6 +2225,7 @@ mod tests {
                     indices: &[0],
                     order: &[OrderType::ascending()],
                     needs_unsigned_i64_compare: &[false],
+                    upstream: None,
                 },
                 &Some(CdcOffset::MySql(MySqlOffset::new("1.binlog".to_owned(), 2))),
                 &[0, 1],
@@ -2243,6 +2331,7 @@ mod tests {
                     indices: &[0],
                     order: &[OrderType::ascending()],
                     needs_unsigned_i64_compare: &[false],
+                    upstream: None,
                 },
                 &Some(CdcOffset::MySql(MySqlOffset::new("1.binlog".to_owned(), 2))),
                 &[0, 1],
@@ -2323,6 +2412,7 @@ mod tests {
                     indices: &[0],
                     order: &[OrderType::ascending()],
                     needs_unsigned_i64_compare: &[false],
+                    upstream: None,
                 },
                 &Some(CdcOffset::MySql(MySqlOffset::new("1.binlog".to_owned(), 3))),
                 &[0, 1],

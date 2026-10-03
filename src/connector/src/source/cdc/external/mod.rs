@@ -752,19 +752,21 @@ impl ExternalTableImpl {
     /// Return CDC backfill comparison semantics in the requested `pk_names` order.
     /// Reuses metadata loaded by [`Self::connect`], without querying upstream again.
     ///
-    /// MySQL `BIGINT UNSIGNED` keys use `UnsignedInt64` to preserve upstream ordering
-    /// when represented as signed `i64` values; other types use `Native`. MySQL names
-    /// are matched case-insensitively, and missing upstream PK names return an error.
-    /// PostgreSQL and SQL Server return `Native` for every requested name.
+    /// MySQL `BIGINT UNSIGNED` keys use `UnsignedInt64` to preserve upstream ordering when
+    /// represented as signed `i64` values. MySQL and PostgreSQL keys that RisingWave cannot
+    /// order, such as text under a case-insensitive or locale collation, use `Upstream`. MySQL
+    /// names are matched case-insensitively, PostgreSQL names exactly, and missing upstream PK
+    /// names return an error. SQL Server and Spanner return `Native`.
     pub fn pk_column_comparisons(
         &self,
         pk_names: &[String],
     ) -> ConnectorResult<Vec<CdcKeyComparison>> {
         match self {
             ExternalTableImpl::MySql(mysql) => mysql.pk_column_comparisons(pk_names),
-            ExternalTableImpl::Postgres(_)
-            | ExternalTableImpl::SqlServer(_)
-            | ExternalTableImpl::Spanner(_) => Ok(vec![CdcKeyComparison::Native; pk_names.len()]),
+            ExternalTableImpl::Postgres(postgres) => postgres.pk_column_comparisons(pk_names),
+            ExternalTableImpl::SqlServer(_) | ExternalTableImpl::Spanner(_) => {
+                Ok(vec![CdcKeyComparison::Native; pk_names.len()])
+            }
         }
     }
 
@@ -772,9 +774,9 @@ impl ExternalTableImpl {
     /// Used when SQL defines the columns explicitly, so there is no existing table
     /// instance whose metadata can be reused via [`Self::pk_column_comparisons`].
     ///
-    /// For MySQL, queries upstream PK names and types and returns the same comparison
-    /// modes in the requested `pk_names` order, with case-insensitive name matching and
-    /// an error for missing upstream PK names. Other connectors return `Native` for
+    /// For MySQL and PostgreSQL, queries upstream column metadata and returns the same
+    /// comparison modes as [`Self::pk_column_comparisons`] in the requested `pk_names` order,
+    /// with an error for missing upstream PK names. Other connectors return `Native` for
     /// every requested name without querying upstream.
     pub async fn discover_pk_column_comparisons(
         config: &ExternalTableConfig,
@@ -783,6 +785,15 @@ impl ExternalTableImpl {
         match CdcSourceType::from(config.connector.as_str()) {
             CdcSourceType::Mysql => {
                 MySqlExternalTable::discover_pk_column_comparisons(config, pk_names).await
+            }
+            CdcSourceType::Postgres => {
+                PostgresExternalTable::discover_pk_column_comparisons(
+                    &config.pg_connection_config()?,
+                    &config.schema,
+                    &config.table,
+                    pk_names,
+                )
+                .await
             }
             _ => Ok(vec![CdcKeyComparison::Native; pk_names.len()]),
         }

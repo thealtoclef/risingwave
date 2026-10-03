@@ -1,0 +1,109 @@
+control substitution on
+
+# Parallel backfill of a text key under MySQL's default `utf8mb4_0900_ai_ci`, which disagrees with
+# byte order: `a_z < ab < B < cake_challenge < cake-dbt`, bytes sort `B < a_z < ab < cake-dbt <
+# cake_challenge`.
+
+system ok
+mysql -e "
+    CREATE DATABASE IF NOT EXISTS risedev;
+    USE risedev;
+    DROP TABLE IF EXISTS mysql_collated_key_t;
+    CREATE TABLE mysql_collated_key_t (
+        k VARCHAR(32) NOT NULL PRIMARY KEY,
+        v INT NOT NULL
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+    INSERT INTO mysql_collated_key_t VALUES
+        ('a', 0), ('a_z', 0), ('ab', 0), ('B', 0), ('b_1', 0), ('c', 0), ('C_1', 0), ('c-2', 0),
+        ('cake_challenge', 0), ('cake-dbt', 0), ('D', 0), ('e', 0), ('F', 0), ('g', 0), ('H', 0),
+        ('i', 0);
+"
+
+statement ok
+create source s_mysql_collated_key with (
+  ${RISEDEV_MYSQL_WITH_OPTIONS_COMMON},
+  username = '${RISEDEV_MYSQL_USER}',
+  password = '${MYSQL_PWD}',
+  database.name = 'risedev'
+);
+
+# Two rows per split yields bounds that are unordered as bytes.
+statement ok
+create table rw_mysql_collated_key_t (k varchar primary key, v int)
+with (
+  backfill.parallelism = 4,
+  backfill.num_rows_per_split = 2
+) from s_mysql_collated_key table 'risedev.mysql_collated_key_t';
+
+query I retry 30 backoff 1s
+select count(*) from rw_mysql_collated_key_t;
+----
+16
+
+query TI
+select k, v from rw_mysql_collated_key_t order by k;
+----
+B 0
+C_1 0
+D 0
+F 0
+H 0
+a 0
+a_z 0
+ab 0
+b_1 0
+c 0
+c-2 0
+cake-dbt 0
+cake_challenge 0
+e 0
+g 0
+i 0
+
+# Change rows in every split after backfill, and insert keys between and beyond the bounds.
+system ok
+mysql -e "
+    USE risedev;
+    UPDATE mysql_collated_key_t SET v = v + 1;
+    DELETE FROM mysql_collated_key_t WHERE k IN ('B', 'c-2', 'i');
+    INSERT INTO mysql_collated_key_t VALUES ('aa', 2), ('b_0', 2), ('cake', 2), ('j', 2), ('0', 2);
+"
+
+query I retry 30 backoff 1s
+select count(*) from rw_mysql_collated_key_t where v = 2;
+----
+5
+
+query TI retry 30 backoff 1s
+select k, v from rw_mysql_collated_key_t order by k;
+----
+0 2
+C_1 1
+D 1
+F 1
+H 1
+a 1
+a_z 1
+aa 2
+ab 1
+b_0 2
+b_1 1
+c 1
+cake 2
+cake-dbt 1
+cake_challenge 1
+e 1
+g 1
+j 2
+
+statement ok
+drop table rw_mysql_collated_key_t;
+
+statement ok
+drop source s_mysql_collated_key cascade;
+
+system ok
+mysql -e "
+    USE risedev;
+    DROP TABLE IF EXISTS mysql_collated_key_t;
+"

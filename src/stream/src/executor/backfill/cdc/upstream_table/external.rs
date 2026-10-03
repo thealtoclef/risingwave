@@ -125,6 +125,12 @@ impl ExternalStorageTable {
     }
 
     #[cfg(test)]
+    pub fn with_table_type(mut self, table_type: ExternalCdcTableType) -> Self {
+        self.table_type = table_type;
+        self
+    }
+
+    #[cfg(test)]
     pub fn with_mock_snapshot_errors(
         mut self,
         snapshot_errors: impl IntoIterator<Item = usize>,

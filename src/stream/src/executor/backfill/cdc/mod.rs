@@ -18,6 +18,7 @@ pub use upstream_table::external::ExternalStorageTable;
 
 mod cdc_backfill;
 mod cdc_backill_v2;
+pub(crate) mod key_order;
 mod state;
 mod state_v2;
 mod upstream_table;

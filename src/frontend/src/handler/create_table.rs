@@ -34,6 +34,8 @@ use risingwave_common::catalog::{
 use risingwave_common::config::MetaBackend;
 use risingwave_common::global_jvm::Jvm;
 use risingwave_common::session_config::sink_decouple::SinkDecouple;
+use risingwave_common::types::DataType;
+use risingwave_common::util::iter_util::ZipEqFast;
 use risingwave_common::util::sort_util::{ColumnOrder, OrderType};
 use risingwave_common::util::value_encoding::DatumToProtoExt;
 use risingwave_common::{bail, bail_not_implemented};
@@ -907,6 +909,24 @@ pub(crate) fn gen_create_table_plan_for_cdc_table(
         .iter()
         .map(|idx| ColumnOrder::new(*idx, OrderType::ascending()))
         .collect();
+
+    // Keys compared upstream are sent to the upstream database as text.
+    for (&idx, comparison) in pk_column_indices.iter().zip_eq_fast(&pk_comparisons) {
+        let column = &columns[idx];
+        if *comparison == CdcKeyComparison::Upstream && *column.data_type() != DataType::Varchar {
+            return Err(ErrorCode::NotSupported(
+                format!(
+                    "primary key column `{}` of type {} on a CDC table",
+                    column.name(),
+                    column.data_type()
+                ),
+                "The upstream orders this key differently from RisingWave, so it must be \
+                 declared as varchar."
+                    .to_owned(),
+            )
+            .into());
+        }
+    }
 
     let (options, secret_refs) = cdc_with_options.into_parts();
 

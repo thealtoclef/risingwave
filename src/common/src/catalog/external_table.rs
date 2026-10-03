@@ -32,6 +32,8 @@ pub enum CdcKeyComparison {
     #[default]
     Native,
     UnsignedInt64,
+    /// RisingWave cannot reproduce the upstream order of these values
+    Upstream,
 }
 
 impl CdcKeyComparison {
@@ -40,6 +42,7 @@ impl CdcKeyComparison {
             Comparison::Unspecified => unreachable!("comparison must be specified"),
             Comparison::Native => Self::Native,
             Comparison::UnsignedInt64 => Self::UnsignedInt64,
+            Comparison::Upstream => Self::Upstream,
         }
     }
 
@@ -47,6 +50,7 @@ impl CdcKeyComparison {
         match self {
             Self::Native => Comparison::Native,
             Self::UnsignedInt64 => Comparison::UnsignedInt64,
+            Self::Upstream => Comparison::Upstream,
         }
     }
 }
@@ -128,21 +132,26 @@ mod tests {
             pk: vec![
                 ColumnOrder::new(3, OrderType::ascending()),
                 ColumnOrder::new(1, OrderType::ascending()),
+                ColumnOrder::new(0, OrderType::ascending()),
             ],
-            pk_comparisons: vec![CdcKeyComparison::UnsignedInt64, CdcKeyComparison::Native],
+            pk_comparisons: vec![
+                CdcKeyComparison::UnsignedInt64,
+                CdcKeyComparison::Native,
+                CdcKeyComparison::Upstream,
+            ],
             columns: vec![],
-            stream_key: vec![3, 1],
+            stream_key: vec![3, 1, 0],
             connect_properties: BTreeMap::new(),
             secret_refs: BTreeMap::new(),
         };
 
         let protobuf = table_desc.to_protobuf();
-        assert_eq!(protobuf.pk.len(), 2);
+        assert_eq!(protobuf.pk.len(), 3);
         assert_eq!(protobuf.pk[0].column_index, 3);
         assert_eq!(protobuf.pk[1].column_index, 1);
 
         let pk_columns = protobuf.pk_ordering.unwrap().columns;
-        assert_eq!(pk_columns.len(), 2);
+        assert_eq!(pk_columns.len(), 3);
         assert_eq!(pk_columns[0].pk_col_idx, 3);
         assert_eq!(
             pk_columns[0].get_comparison().unwrap(),
@@ -150,5 +159,16 @@ mod tests {
         );
         assert_eq!(pk_columns[1].pk_col_idx, 1);
         assert_eq!(pk_columns[1].get_comparison().unwrap(), Comparison::Native);
+        assert_eq!(pk_columns[2].pk_col_idx, 0);
+        assert_eq!(
+            pk_columns[2].get_comparison().unwrap(),
+            Comparison::Upstream
+        );
+        for (column, comparison) in pk_columns.iter().zip_eq_fast(&table_desc.pk_comparisons) {
+            assert_eq!(
+                CdcKeyComparison::from_protobuf(column.get_comparison().unwrap()),
+                *comparison
+            );
+        }
     }
 }

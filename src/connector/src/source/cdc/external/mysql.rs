@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
 
 use anyhow::{Context, anyhow};
@@ -163,22 +164,7 @@ impl MySqlExternalTable {
         let indexes = schema_discovery.discover_indexes(schema, table).await?;
         let pk_names = primary_key_names(&indexes)
             .ok_or_else(|| anyhow!("MySQL table doesn't define the primary key"))?;
-        let pk_comparisons = pk_names
-            .iter()
-            .map(|pk_name| {
-                let column = columns
-                    .iter()
-                    .find(|column| column.name.eq_ignore_ascii_case(pk_name))
-                    .ok_or_else(|| {
-                        anyhow!("primary key column `{pk_name}` not found in upstream MySQL schema")
-                    })?;
-                Ok(if mysql_type_is_unsigned_bigint(&column.col_type) {
-                    CdcKeyComparison::UnsignedInt64
-                } else {
-                    CdcKeyComparison::Native
-                })
-            })
-            .collect::<ConnectorResult<Vec<_>>>()?;
+        let pk_comparisons = Self::discover_pk_column_comparisons(&config, &pk_names).await?;
         let mut column_descs = vec![];
         for col in columns {
             let data_type = mysql_type_to_rw_type(&col.col_type)?;
@@ -262,16 +248,275 @@ impl MySqlExternalTable {
             &config.database,
             config.ssl_mode.clone(),
         );
-        let pk_infos = MySqlExternalTableReader::query_upstream_pk_infos(
-            &pool,
-            &config.database,
-            &config.table,
-        )
-        .await?;
+        let orderings = query_upstream_key_orderings(&pool, &config.database, &config.table).await;
         pool.disconnect().await?;
 
-        pk_column_comparisons_from_infos(&pk_infos, pk_names)
+        pk_column_comparisons_from_orderings(&orderings?, pk_names)
     }
+}
+
+/// Ordering facts of one MySQL key column, read from `INFORMATION_SCHEMA.COLUMNS`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MySqlKeyOrdering {
+    column_name: String,
+    data_type: String,
+    column_type: String,
+    character_set: Option<String>,
+    collation: Option<String>,
+}
+
+impl MySqlKeyOrdering {
+    /// RisingWave compares text by UTF-8 bytes, which matches MySQL only for UTF-8 `NO PAD`
+    /// binary collations. Others ignore case, accents or trailing spaces, and enums sort by
+    /// declaration.
+    fn comparison(&self) -> CdcKeyComparison {
+        let column_type = type_name_to_mysql_type(&self.column_type);
+        if column_type
+            .as_ref()
+            .is_some_and(mysql_type_is_unsigned_bigint)
+        {
+            return CdcKeyComparison::UnsignedInt64;
+        }
+        let needs_upstream_order = match self.data_type.as_str() {
+            "char" | "varchar" | "tinytext" | "text" | "mediumtext" | "longtext" => !matches!(
+                self.collation.as_deref(),
+                Some(
+                    "utf8mb4_0900_bin"
+                        | "utf8mb4_nopad_bin"
+                        | "utf8mb3_nopad_bin"
+                        | "utf8_nopad_bin"
+                )
+            ),
+            "enum" => true,
+            _ => false,
+        };
+        if needs_upstream_order {
+            CdcKeyComparison::Upstream
+        } else {
+            CdcKeyComparison::Native
+        }
+    }
+}
+
+async fn query_upstream_key_orderings(
+    pool: &mysql_async::Pool,
+    database: &str,
+    table: &str,
+) -> ConnectorResult<Vec<MySqlKeyOrdering>> {
+    let mut conn = pool.get_conn().await?;
+    let rows: Vec<mysql_async::Row> = conn
+        .exec(
+            "SELECT COLUMN_NAME, DATA_TYPE, COLUMN_TYPE, CHARACTER_SET_NAME, COLLATION_NAME \
+             FROM INFORMATION_SCHEMA.COLUMNS \
+             WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? \
+             ORDER BY ORDINAL_POSITION",
+            (database, table),
+        )
+        .await?;
+    rows.into_iter()
+        .map(|mut row| {
+            let mut take = |idx| -> ConnectorResult<Option<String>> {
+                Ok(row
+                    .take_opt::<Option<String>, _>(idx)
+                    .transpose()
+                    .context("invalid INFORMATION_SCHEMA.COLUMNS row")?
+                    .flatten())
+            };
+            Ok(MySqlKeyOrdering {
+                column_name: take(0)?.unwrap_or_default(),
+                data_type: take(1)?.unwrap_or_default().to_lowercase(),
+                column_type: take(2)?.unwrap_or_default(),
+                character_set: take(3)?,
+                collation: take(4)?,
+            })
+        })
+        .collect()
+}
+
+fn pk_column_comparisons_from_orderings(
+    orderings: &[MySqlKeyOrdering],
+    pk_names: &[String],
+) -> ConnectorResult<Vec<CdcKeyComparison>> {
+    pk_names
+        .iter()
+        .map(|pk_name| find_key_ordering(orderings, pk_name).map(MySqlKeyOrdering::comparison))
+        .collect()
+}
+
+fn find_key_ordering<'a>(
+    orderings: &'a [MySqlKeyOrdering],
+    column_name: &str,
+) -> ConnectorResult<&'a MySqlKeyOrdering> {
+    orderings
+        .iter()
+        .find(|ordering| ordering.column_name.eq_ignore_ascii_case(column_name))
+        .ok_or_else(|| {
+            anyhow!("key column `{column_name}` not found in upstream MySQL table").into()
+        })
+}
+
+/// Values per comparison query, well below MySQL's limit of 65,535 placeholders.
+const KEY_COMPARISON_BATCH_SIZE: usize = 1_000;
+
+/// How a key value is cast to compare like the column in MySQL.
+enum MySqlKeyExpr {
+    Collated {
+        character_set: String,
+        collation: String,
+    },
+    /// Enum members as SQL literals, as listed in `COLUMN_TYPE`.
+    Enum { members: String },
+}
+
+impl MySqlKeyExpr {
+    fn new(ordering: &MySqlKeyOrdering) -> ConnectorResult<Self> {
+        if ordering.data_type == "enum" {
+            let members = ordering
+                .column_type
+                .strip_prefix("enum(")
+                .and_then(|members| members.strip_suffix(')'))
+                .with_context(|| format!("invalid enum type `{}`", ordering.column_type))?;
+            return Ok(Self::Enum {
+                members: members.to_owned(),
+            });
+        }
+        let identifier = |name: Option<&String>| {
+            name.filter(|name| name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+                .cloned()
+                .with_context(|| {
+                    format!(
+                        "key column `{}` has no comparable character set and collation",
+                        ordering.column_name
+                    )
+                })
+        };
+        Ok(Self::Collated {
+            character_set: identifier(ordering.character_set.as_ref())?,
+            collation: identifier(ordering.collation.as_ref())?,
+        })
+    }
+
+    fn typed(&self, value: &str) -> String {
+        match self {
+            Self::Collated {
+                character_set,
+                collation,
+            } => format!("CONVERT({value} USING {character_set}) COLLATE {collation}"),
+            Self::Enum { members } => format!("FIELD({value}, {members})"),
+        }
+    }
+}
+
+/// Compares key values in MySQL, cast to the key column's collation (or enum order), so results
+/// match the snapshot range predicates on that column. Queries never read the table.
+pub struct MySqlKeyComparator {
+    pool: mysql_async::Pool,
+    columns: Vec<MySqlKeyExpr>,
+}
+
+impl MySqlKeyComparator {
+    pub async fn connect(
+        config: &ExternalTableConfig,
+        column_names: &[String],
+    ) -> ConnectorResult<Self> {
+        let pool = build_mysql_connection_pool(
+            &config.host,
+            config.port.parse::<u16>().context("invalid MySQL port")?,
+            &config.username,
+            &config.password,
+            &config.database,
+            config.ssl_mode.clone(),
+        );
+        let orderings =
+            query_upstream_key_orderings(&pool, &config.database, &config.table).await?;
+        let columns = column_names
+            .iter()
+            .map(|name| MySqlKeyExpr::new(find_key_ordering(&orderings, name)?))
+            .try_collect()?;
+        tracing::info!(
+            database = config.database,
+            table = config.table,
+            ?column_names,
+            "created upstream MySQL key comparator"
+        );
+        Ok(Self { pool, columns })
+    }
+
+    /// For each value, the number of `bounds` less than or equal to it.
+    pub async fn rank(
+        &self,
+        column: usize,
+        values: &[&str],
+        bounds: &[&str],
+    ) -> ConnectorResult<Vec<usize>> {
+        if bounds.is_empty() {
+            return Ok(vec![0; values.len()]);
+        }
+        let expr = &self.columns[column];
+        let bounds_table = vec!["SELECT ? AS v"; bounds.len()].join(" UNION ALL ");
+        let mut conn = self.pool.get_conn().await?;
+        let mut ranks = Vec::with_capacity(values.len());
+        for batch in values.chunks(KEY_COMPARISON_BATCH_SIZE) {
+            let sql = format!(
+                "SELECT (SELECT COUNT(*) FROM ({bounds_table}) AS b WHERE {} <= {}) \
+                 FROM ({}) AS k ORDER BY k.i",
+                expr.typed("b.v"),
+                expr.typed("k.v"),
+                indexed_values_table(batch.len()),
+            );
+            let params = bounds
+                .iter()
+                .chain(batch)
+                .map(|value| Value::from(*value))
+                .collect_vec();
+            for rank in conn.exec::<i64, _, _>(sql, params).await? {
+                ranks.push(usize::try_from(rank).context("negative key rank")?);
+            }
+        }
+        Ok(ranks)
+    }
+
+    pub async fn compare(
+        &self,
+        column: usize,
+        values: &[&str],
+        pivot: &str,
+    ) -> ConnectorResult<Vec<Ordering>> {
+        let expr = &self.columns[column];
+        let mut conn = self.pool.get_conn().await?;
+        let mut orderings = Vec::with_capacity(values.len());
+        for batch in values.chunks(KEY_COMPARISON_BATCH_SIZE) {
+            let sql = format!(
+                "SELECT CASE WHEN {key} < {pivot} THEN -1 WHEN {key} = {pivot} THEN 0 ELSE 1 END \
+                 FROM ({}) AS k ORDER BY k.i",
+                indexed_values_table(batch.len()),
+                key = expr.typed("k.v"),
+                pivot = expr.typed("?"),
+            );
+            let params = [pivot, pivot]
+                .iter()
+                .chain(batch)
+                .map(|value| Value::from(*value))
+                .collect_vec();
+            for ordering in conn.exec::<i64, _, _>(sql, params).await? {
+                orderings.push(ordering.cmp(&0));
+            }
+        }
+        Ok(orderings)
+    }
+}
+
+/// `SELECT 0 AS i, ? AS v UNION ALL SELECT 1, ? ...`, since MySQL has no `unnest`.
+fn indexed_values_table(len: usize) -> String {
+    (0..len)
+        .map(|i| {
+            if i == 0 {
+                "SELECT 0 AS i, ? AS v".to_owned()
+            } else {
+                format!("SELECT {i}, ?")
+            }
+        })
+        .join(" UNION ALL ")
 }
 
 fn primary_key_names(indexes: &[IndexInfo]) -> Option<Vec<String>> {
@@ -1384,8 +1629,9 @@ mod tests {
     use sea_schema::mysql::def::{ColumnType, IndexInfo, IndexOrder, IndexPart, IndexType};
 
     use super::{
-        mysql_type_is_unsigned_bigint, mysql_type_to_rw_type, pk_column_comparisons_from_infos,
-        primary_key_names, type_name_to_mysql_type,
+        MySqlKeyExpr, MySqlKeyOrdering, indexed_values_table, mysql_type_is_unsigned_bigint,
+        mysql_type_to_rw_type, pk_column_comparisons_from_infos,
+        pk_column_comparisons_from_orderings, primary_key_names, type_name_to_mysql_type,
     };
     use crate::source::cdc::external::mysql::MySqlExternalTable;
     use crate::source::cdc::external::{
@@ -1395,6 +1641,95 @@ mod tests {
 
     fn parse_mysql_type_name(ty_name: &str) -> ColumnType {
         type_name_to_mysql_type(ty_name).unwrap()
+    }
+
+    fn key_ordering(
+        data_type: &str,
+        column_type: &str,
+        collation: Option<&str>,
+    ) -> MySqlKeyOrdering {
+        MySqlKeyOrdering {
+            column_name: "k".to_owned(),
+            data_type: data_type.to_owned(),
+            column_type: column_type.to_owned(),
+            character_set: collation.map(|_| "utf8mb4".to_owned()),
+            collation: collation.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn test_mysql_key_ordering_depends_on_collation() {
+        for (data_type, collation) in [
+            ("varchar", "utf8mb4_0900_ai_ci"),
+            ("varchar", "utf8mb4_general_ci"),
+            // PAD SPACE: ignores trailing spaces.
+            ("varchar", "utf8mb4_bin"),
+            ("char", "latin1_bin"),
+            ("text", "utf8mb4_0900_as_cs"),
+        ] {
+            assert_eq!(
+                key_ordering(data_type, data_type, Some(collation)).comparison(),
+                CdcKeyComparison::Upstream,
+                "{collation}"
+            );
+        }
+        for collation in ["utf8mb4_0900_bin", "utf8mb4_nopad_bin"] {
+            assert_eq!(
+                key_ordering("varchar", "varchar(10)", Some(collation)).comparison(),
+                CdcKeyComparison::Native,
+                "{collation}"
+            );
+        }
+        assert_eq!(
+            key_ordering("enum", "enum('zzz','aaa')", None).comparison(),
+            CdcKeyComparison::Upstream
+        );
+        assert_eq!(
+            key_ordering("bigint", "bigint unsigned", None).comparison(),
+            CdcKeyComparison::UnsignedInt64
+        );
+        for (data_type, column_type) in [("int", "int"), ("varbinary", "varbinary(16)")] {
+            assert_eq!(
+                key_ordering(data_type, column_type, None).comparison(),
+                CdcKeyComparison::Native
+            );
+        }
+        assert_eq!(
+            pk_column_comparisons_from_orderings(
+                &[key_ordering(
+                    "varchar",
+                    "varchar(10)",
+                    Some("utf8mb4_0900_ai_ci")
+                )],
+                &["K".to_owned()]
+            )
+            .unwrap(),
+            vec![CdcKeyComparison::Upstream]
+        );
+    }
+
+    #[test]
+    fn test_mysql_key_expr() {
+        let collated = MySqlKeyExpr::new(&key_ordering(
+            "varchar",
+            "varchar(10)",
+            Some("utf8mb4_0900_ai_ci"),
+        ))
+        .unwrap();
+        assert_eq!(
+            collated.typed("k.v"),
+            "CONVERT(k.v USING utf8mb4) COLLATE utf8mb4_0900_ai_ci"
+        );
+        let enum_expr =
+            MySqlKeyExpr::new(&key_ordering("enum", "enum('zzz','aaa')", None)).unwrap();
+        assert_eq!(enum_expr.typed("?"), "FIELD(?, 'zzz','aaa')");
+        assert!(
+            MySqlKeyExpr::new(&key_ordering("varchar", "varchar(10)", Some("x; DROP"))).is_err()
+        );
+        assert_eq!(
+            indexed_values_table(3),
+            "SELECT 0 AS i, ? AS v UNION ALL SELECT 1, ? UNION ALL SELECT 2, ?"
+        );
     }
 
     #[test]

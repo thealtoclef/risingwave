@@ -1,0 +1,130 @@
+control substitution on
+
+# Parallel backfill of a text key whose collation disagrees with byte order: ICU sorts
+# `a < A < b < B`, bytes sort `A < B < a < b`.
+
+statement ok
+drop table if exists collated_key_t;
+
+statement ok
+drop source if exists collated_key_source;
+
+system ok
+PGDATABASE=${PGDATABASE:-postgres} psql -c "
+    SELECT pg_terminate_backend(active_pid)
+    FROM pg_replication_slots
+    WHERE slot_name = 'collated_key_slot' AND active_pid IS NOT NULL;
+    SELECT pg_sleep(1);
+    SELECT pg_drop_replication_slot(slot_name)
+    FROM pg_replication_slots
+    WHERE slot_name = 'collated_key_slot';
+    DROP PUBLICATION IF EXISTS collated_key_pub;
+    DROP TABLE IF EXISTS public.collated_key_t CASCADE;
+    CREATE TABLE public.collated_key_t (k varchar COLLATE \"und-x-icu\" PRIMARY KEY, v int);
+    INSERT INTO public.collated_key_t
+    SELECT k, 0
+    FROM unnest(ARRAY['a', 'A', 'a_z', 'ab', 'b', 'B', 'c', 'C_1', 'c-2', 'd', 'D', 'e', 'E', 'f', 'F', 'g', 'G']) AS k;
+    CREATE PUBLICATION collated_key_pub FOR TABLE public.collated_key_t;
+    "
+
+statement ok
+create source collated_key_source with (
+    connector = 'postgres-cdc',
+    hostname = '${PGHOST:localhost}',
+    port = '${PGPORT:5432}',
+    username = '${PGUSER:$USER}',
+    password = '${PGPASSWORD:}',
+    database.name = '${PGDATABASE:postgres}',
+    schema.name = 'public',
+    publication.name = 'collated_key_pub',
+    slot.name = 'collated_key_slot'
+);
+
+# Two rows per split yields bounds that are unordered as bytes.
+statement ok
+create table collated_key_t (k varchar primary key, v int)
+with (
+    backfill.parallelism = 4,
+    backfill.num_rows_per_split = 2
+)
+from collated_key_source table 'public.collated_key_t';
+
+query I retry 30 backoff 1s
+select count(*) from collated_key_t;
+----
+17
+
+query TI
+select k, v from collated_key_t order by k;
+----
+A 0
+B 0
+C_1 0
+D 0
+E 0
+F 0
+G 0
+a 0
+a_z 0
+ab 0
+b 0
+c 0
+c-2 0
+d 0
+e 0
+f 0
+g 0
+
+# Change rows in every split after backfill, and insert keys between and beyond the bounds.
+system ok
+PGDATABASE=${PGDATABASE:-postgres} psql -c "
+    UPDATE public.collated_key_t SET v = v + 1;
+    DELETE FROM public.collated_key_t WHERE k IN ('A', 'c-2', 'G');
+    INSERT INTO public.collated_key_t VALUES ('Ab', 2), ('b_0', 2), ('C', 2), ('h', 2), ('0', 2);
+    "
+
+query I retry 30 backoff 1s
+select count(*) from collated_key_t where v = 2;
+----
+5
+
+query TI retry 30 backoff 1s
+select k, v from collated_key_t order by k;
+----
+0 2
+Ab 2
+B 1
+C 2
+C_1 1
+D 1
+E 1
+F 1
+a 1
+a_z 1
+ab 1
+b 1
+b_0 2
+c 1
+d 1
+e 1
+f 1
+g 1
+h 2
+
+statement ok
+drop source collated_key_source cascade;
+
+sleep 2s
+
+system ok
+PGDATABASE=${PGDATABASE:-postgres} psql -c "
+    SELECT pg_terminate_backend(active_pid)
+    FROM pg_replication_slots
+    WHERE slot_name = 'collated_key_slot' AND active_pid IS NOT NULL;
+    SELECT pg_sleep(1);
+    SELECT pg_drop_replication_slot(slot_name)
+    FROM pg_replication_slots
+    WHERE slot_name = 'collated_key_slot';
+    DROP PUBLICATION IF EXISTS collated_key_pub;
+    DROP TABLE IF EXISTS public.collated_key_t CASCADE;
+    "

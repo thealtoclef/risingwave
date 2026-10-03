@@ -21,7 +21,7 @@ use either::Either;
 use futures::stream::select_with_strategy;
 use futures::{Stream, stream};
 use itertools::Itertools;
-use risingwave_common::bitmap::BitmapBuilder;
+use risingwave_common::bitmap::{Bitmap, BitmapBuilder};
 use risingwave_common::catalog::{CdcKeyComparison, ColumnDesc, Field};
 use risingwave_common::row::RowDeserializer;
 use risingwave_common::types::DatumRef;
@@ -39,6 +39,7 @@ use tracing::Instrument;
 use crate::executor::backfill::cdc::cdc_backfill::{
     get_cdc_json_parse_handling_from_properties, transform_upstream,
 };
+use crate::executor::backfill::cdc::key_order::{UpstreamKeyOrder, UpstreamSplitKeyRanks};
 use crate::executor::backfill::cdc::state_v2::{CdcStateRecord, ParallelizedCdcBackfillState};
 use crate::executor::backfill::cdc::upstream_table::external::ExternalStorageTable;
 use crate::executor::backfill::cdc::upstream_table::snapshot::{
@@ -153,6 +154,19 @@ impl<S: StateStore> ParallelizedCdcBackfillExecutor<S> {
                 comparisons.get(self.options.backfill_split_pk_column_index as usize)
             })
             .map(|comparison| *comparison == CdcKeyComparison::UnsignedInt64);
+        let split_key_compared_upstream = self
+            .external_table
+            .pk_comparisons()
+            .and_then(|comparisons| {
+                comparisons.get(self.options.backfill_split_pk_column_index as usize)
+            })
+            .is_some_and(|comparison| *comparison == CdcKeyComparison::Upstream);
+        let mut upstream_key_order = split_key_compared_upstream.then(|| {
+            UpstreamKeyOrder::new(
+                &self.external_table,
+                vec![cdc_table_snapshot_split_column[0].name.clone()],
+            )
+        });
 
         let mut upstream = self.upstream.execute();
         // Poll the upstream to get the first barrier.
@@ -223,7 +237,14 @@ impl<S: StateStore> ParallelizedCdcBackfillExecutor<S> {
                 generation = Some(*snapshot_generation);
             }
             tracing::debug!(?actor_snapshot_splits, ?generation, "actor splits");
-            assert_consecutive_splits(&actor_snapshot_splits, split_key_needs_unsigned_i64_compare);
+            assert_consecutive_splits(
+                &actor_snapshot_splits,
+                if split_key_compared_upstream {
+                    None
+                } else {
+                    split_key_needs_unsigned_i64_compare
+                },
+            );
 
             let mut is_snapshot_paused = reset_barrier.is_pause_on_startup();
             let barrier_epoch = reset_barrier.epoch;
@@ -301,6 +322,11 @@ impl<S: StateStore> ParallelizedCdcBackfillExecutor<S> {
                 resolved_reader = Some(table_reader);
             }
             let split_key_unsigned = split_key_needs_unsigned_i64_compare.unwrap_or_default();
+            let mut split_key_locator = if split_key_compared_upstream {
+                SplitKeyLocator::Upstream(UpstreamSplitKeyRanks::new(&actor_snapshot_splits)?)
+            } else {
+                SplitKeyLocator::Local { split_key_unsigned }
+            };
 
             // A reader is only needed while at least one assigned snapshot split is unfinished.
             // Once all splits are complete, the executor only forwards the table-filtered CDC
@@ -362,13 +388,19 @@ impl<S: StateStore> ParallelizedCdcBackfillExecutor<S> {
                                 }
 
                                 let chunk = mapping_chunk(chunk, &self.output_indices);
+                                split_key_locator
+                                    .resolve(
+                                        &chunk,
+                                        snapshot_split_column_in_output_index,
+                                        &mut upstream_key_order,
+                                    )
+                                    .await?;
                                 let (forwarded_chunk, buffered_chunk) = route_cdc_chunk(
                                     chunk,
-                                    &actor_snapshot_splits,
                                     &split_states,
                                     next_split_idx,
                                     snapshot_split_column_in_output_index,
-                                    split_key_unsigned,
+                                    |key| split_key_locator.locate(&actor_snapshot_splits, key),
                                 );
 
                                 if let Some(forwarded_chunk) = forwarded_chunk {
@@ -595,13 +627,22 @@ impl<S: StateStore> ParallelizedCdcBackfillExecutor<S> {
 
                                             // emit chunks belonging to past splits which are processed
                                             let chunk = mapping_chunk(chunk, &self.output_indices);
+                                            split_key_locator
+                                                .resolve(
+                                                    &chunk,
+                                                    snapshot_split_column_in_output_index,
+                                                    &mut upstream_key_order,
+                                                )
+                                                .await?;
                                             let (forwarded_chunk, buffered_chunk) = route_cdc_chunk(
                                                 chunk,
-                                                &actor_snapshot_splits,
                                                 &split_states,
                                                 split_idx,
                                                 snapshot_split_column_in_output_index,
-                                                split_key_unsigned,
+                                                |key| {
+                                                    split_key_locator
+                                                        .locate(&actor_snapshot_splits, key)
+                                                },
                                             );
 
                                             if let Some(forwarded_chunk) = forwarded_chunk {
@@ -755,14 +796,23 @@ impl<S: StateStore> ParallelizedCdcBackfillExecutor<S> {
                                             Message::Chunk(chunk) => {
                                                 let chunk =
                                                     mapping_chunk(chunk, &self.output_indices);
+                                                split_key_locator
+                                                    .resolve(
+                                                        &chunk,
+                                                        snapshot_split_column_in_output_index,
+                                                        &mut upstream_key_order,
+                                                    )
+                                                    .await?;
                                                 let (forwarded_chunk, buffered_chunk) =
                                                     route_cdc_chunk(
                                                         chunk,
-                                                        &actor_snapshot_splits,
                                                         &split_states,
                                                         split_idx,
                                                         snapshot_split_column_in_output_index,
-                                                        split_key_unsigned,
+                                                        |key| {
+                                                            split_key_locator
+                                                                .locate(&actor_snapshot_splits, key)
+                                                        },
                                                     );
 
                                                 if let Some(forwarded_chunk) = forwarded_chunk {
@@ -934,12 +984,27 @@ impl<S: StateStore> ParallelizedCdcBackfillExecutor<S> {
                             }
                         }
                         let chunk = mapping_chunk(chunk, &self.output_indices);
-                        if let Some(filtered_chunk) = filter_stream_chunk(
-                            chunk,
-                            &current_actor_bounds,
-                            snapshot_split_column_in_output_index,
-                            split_key_unsigned,
-                        ) {
+                        split_key_locator
+                            .resolve(
+                                &chunk,
+                                snapshot_split_column_in_output_index,
+                                &mut upstream_key_order,
+                            )
+                            .await?;
+                        let filtered_chunk = match &split_key_locator {
+                            SplitKeyLocator::Local { split_key_unsigned } => filter_stream_chunk(
+                                chunk,
+                                &current_actor_bounds,
+                                snapshot_split_column_in_output_index,
+                                *split_key_unsigned,
+                            ),
+                            SplitKeyLocator::Upstream(ranks) => filter_stream_chunk_by_split(
+                                chunk,
+                                snapshot_split_column_in_output_index,
+                                |key| ranks.locate(key).is_some(),
+                            ),
+                        };
+                        if let Some(filtered_chunk) = filtered_chunk {
                             yield Message::Chunk(filtered_chunk);
                         }
                     }
@@ -966,48 +1031,16 @@ impl<S: StateStore> ParallelizedCdcBackfillExecutor<S> {
 ///   cursor, we cannot determine which side of the durable snapshot progress contains this row.
 fn route_cdc_chunk(
     chunk: StreamChunk,
-    splits: &[CdcTableSnapshotSplit],
     states: &[CdcStateRecord],
     current_split_idx: usize,
     snapshot_split_column_index: usize,
-    split_key_unsigned: bool,
+    locate: impl Fn(DatumRef<'_>) -> Option<usize>,
 ) -> (Option<StreamChunk>, Option<StreamChunk>) {
     let mut forwarded = BitmapBuilder::zeroed(chunk.capacity());
     let mut buffered = BitmapBuilder::zeroed(chunk.capacity());
 
     for (_, row) in chunk.rows() {
-        let split_key = row.datum_at(snapshot_split_column_index);
-
-        let Ok(split_idx) = splits.binary_search_by(|split| {
-            let right_bound_le_key = !is_rightmost_bound(&split.right_bound_exclusive)
-                && cmp_split_key(
-                    split.right_bound_exclusive.datum_at(0),
-                    split_key,
-                    OrderType::ascending_nulls_first(),
-                    split_key_unsigned,
-                )
-                .is_le();
-
-            let left_bound_gt_key = !is_leftmost_bound(&split.left_bound_inclusive)
-                && cmp_split_key(
-                    split.left_bound_inclusive.datum_at(0),
-                    split_key,
-                    OrderType::ascending_nulls_first(),
-                    split_key_unsigned,
-                )
-                .is_gt();
-
-            if right_bound_le_key {
-                // The split is entirely before the key, so search to the right.
-                Ordering::Less
-            } else if left_bound_gt_key {
-                // The split is entirely after the key, so search to the left.
-                Ordering::Greater
-            } else {
-                // The split contains the key: left <= key < right.
-                Ordering::Equal
-            }
-        }) else {
+        let Some(split_idx) = locate(row.datum_at(snapshot_split_column_index)) else {
             // The key is outside the assigned split ranges or lies in a gap.
             continue;
         };
@@ -1043,6 +1076,83 @@ fn route_cdc_chunk(
         .then(|| chunk.clone_with_vis(buffered).compact_vis());
 
     (forwarded_chunk, buffered_chunk)
+}
+
+/// Finds the assigned split containing a split key.
+enum SplitKeyLocator {
+    Local {
+        split_key_unsigned: bool,
+    },
+    /// See [`CdcKeyComparison::Upstream`].
+    Upstream(UpstreamSplitKeyRanks),
+}
+
+impl SplitKeyLocator {
+    /// Must be called on a chunk before [`Self::locate`] on its rows.
+    async fn resolve(
+        &mut self,
+        chunk: &StreamChunk,
+        snapshot_split_column_index: usize,
+        upstream_key_order: &mut Option<UpstreamKeyOrder>,
+    ) -> StreamExecutorResult<()> {
+        if let Self::Upstream(ranks) = self {
+            let upstream_key_order = upstream_key_order
+                .as_mut()
+                .expect("split keys compared upstream need an upstream key order");
+            ranks
+                .resolve(chunk, snapshot_split_column_index, upstream_key_order)
+                .await?;
+        }
+        Ok(())
+    }
+
+    fn locate(&self, splits: &[CdcTableSnapshotSplit], split_key: DatumRef<'_>) -> Option<usize> {
+        match self {
+            Self::Local { split_key_unsigned } => {
+                locate_split_natively(splits, split_key, *split_key_unsigned)
+            }
+            Self::Upstream(ranks) => ranks.locate(split_key),
+        }
+    }
+}
+
+fn locate_split_natively(
+    splits: &[CdcTableSnapshotSplit],
+    split_key: DatumRef<'_>,
+    split_key_unsigned: bool,
+) -> Option<usize> {
+    splits
+        .binary_search_by(|split| {
+            let right_bound_le_key = !is_rightmost_bound(&split.right_bound_exclusive)
+                && cmp_split_key(
+                    split.right_bound_exclusive.datum_at(0),
+                    split_key,
+                    OrderType::ascending_nulls_first(),
+                    split_key_unsigned,
+                )
+                .is_le();
+
+            let left_bound_gt_key = !is_leftmost_bound(&split.left_bound_inclusive)
+                && cmp_split_key(
+                    split.left_bound_inclusive.datum_at(0),
+                    split_key,
+                    OrderType::ascending_nulls_first(),
+                    split_key_unsigned,
+                )
+                .is_gt();
+
+            if right_bound_le_key {
+                // The split is entirely before the key, so search to the right.
+                Ordering::Less
+            } else if left_bound_gt_key {
+                // The split is entirely after the key, so search to the left.
+                Ordering::Greater
+            } else {
+                // The split contains the key: left <= key < right.
+                Ordering::Equal
+            }
+        })
+        .ok()
 }
 
 fn extend_backfill_progress(progress: &mut Option<(i64, i64)>, split_id: i64) {
@@ -1139,6 +1249,22 @@ fn filter_stream_chunk(
     visibility
         .any()
         .then_some(StreamChunk::with_visibility(ops, columns, visibility))
+}
+
+fn filter_stream_chunk_by_split(
+    chunk: StreamChunk,
+    snapshot_split_column_index: usize,
+    in_actor_splits: impl Fn(DatumRef<'_>) -> bool,
+) -> Option<StreamChunk> {
+    let (ops, columns, visibility) = chunk.into_inner();
+    let visibility = columns[snapshot_split_column_index]
+        .iter()
+        .zip_eq_fast(visibility.iter())
+        .map(|(split_key, visible)| visible && in_actor_splits(split_key))
+        .collect::<Bitmap>();
+    visibility
+        .any()
+        .then(|| StreamChunk::with_visibility(ops, columns, visibility))
 }
 
 // has no left bound, e.g. [-inf, N)
@@ -1245,8 +1371,9 @@ async fn gated_snapshot_read_table_split(
     }
 }
 
-/// `split_key_unsigned` is `None` when the split key comparison is not resolved yet; the bound
-/// order is then not checked, since a `BIGINT UNSIGNED` key would look unordered as `i64`.
+/// `split_key_unsigned` is `None` when the bound order cannot be checked in RisingWave: the split
+/// key comparison is not resolved yet, since a `BIGINT UNSIGNED` key would look unordered as
+/// `i64`, or the split key is compared upstream.
 fn assert_consecutive_splits(
     actor_snapshot_splits: &[CdcTableSnapshotSplit],
     split_key_unsigned: Option<bool>,
@@ -1286,7 +1413,7 @@ mod tests {
         CdcKeyComparison, ColumnDesc, ColumnId, Field, Schema, TableId,
     };
     use risingwave_common::row::{OwnedRow, Row};
-    use risingwave_common::types::{DataType, ScalarImpl};
+    use risingwave_common::types::{DataType, ScalarImpl, ScalarRefImpl};
     use risingwave_common::util::epoch::{EpochExt, test_epoch};
     use risingwave_common::util::sort_util::OrderType;
     use risingwave_connector::source::CdcTableSnapshotSplitRaw;
@@ -1509,8 +1636,9 @@ mod tests {
             .collect::<Vec<_>>();
         let chunk = StreamChunk::from_rows(&rows, &[DataType::Int64]);
 
-        let (forwarded_chunk, buffered_chunk) =
-            route_cdc_chunk(chunk, &splits, &states, 1, 0, true);
+        let (forwarded_chunk, buffered_chunk) = route_cdc_chunk(chunk, &states, 1, 0, |key| {
+            locate_split_natively(&splits, key, true)
+        });
         // 50 is in the finished split; 200 and 2^63 + 5 are in the active split; u64::MAX is
         // in the not-started split and is dropped.
         assert_eq!(
@@ -1556,6 +1684,123 @@ mod tests {
             },
         ];
         assert_consecutive_splits(&splits, Some(false));
+    }
+
+    /// Upstream `ab < a_z < B`, bytes `B < a_z < ab`.
+    fn upstream_ordered_text_splits() -> Vec<CdcTableSnapshotSplit> {
+        let split = |split_id, left: Option<&str>, right: Option<&str>| CdcTableSnapshotSplit {
+            split_id,
+            left_bound_inclusive: OwnedRow::new(vec![left.map(ScalarImpl::from)]),
+            right_bound_exclusive: OwnedRow::new(vec![right.map(ScalarImpl::from)]),
+        };
+        vec![
+            split(1, None, Some("ab")),
+            split(2, Some("ab"), Some("a_z")),
+            split(3, Some("a_z"), Some("B")),
+            split(4, Some("B"), None),
+        ]
+    }
+
+    fn mock_upstream_key_order() -> UpstreamKeyOrder {
+        let table =
+            ExternalStorageTable::for_test_undefined().with_table_type(ExternalCdcTableType::Mock);
+        UpstreamKeyOrder::new(&table, vec!["k".to_owned()])
+    }
+
+    #[test]
+    fn test_assert_consecutive_splits_skips_order_check_for_upstream_ordered_keys() {
+        assert_consecutive_splits(&upstream_ordered_text_splits(), None);
+    }
+
+    #[tokio::test]
+    async fn test_route_cdc_chunk_upstream_ordered_split_key() {
+        use risingwave_common::array::StreamChunkTestExt;
+        let splits = upstream_ordered_text_splits();
+        let states = vec![
+            CdcStateRecord {
+                is_finished: true,
+                ..Default::default()
+            },
+            CdcStateRecord::default(),
+            CdcStateRecord::default(),
+            CdcStateRecord::default(),
+        ];
+        // `aa` is in the finished split 1, `ab` and `a_y` in the active split 2, `a_z` in the
+        // not-started split 3, `b` and `c` in the not-started split 4.
+        let chunk = StreamChunk::from_pretty(
+            " T
+            + aa
+            + a_z
+            + ab
+            + b
+            + a_y
+            + c",
+        );
+        let mut locator = SplitKeyLocator::Upstream(UpstreamSplitKeyRanks::new(&splits).unwrap());
+        let mut upstream_key_order = Some(mock_upstream_key_order());
+        locator
+            .resolve(&chunk, 0, &mut upstream_key_order)
+            .await
+            .unwrap();
+
+        let (forwarded_chunk, buffered_chunk) =
+            route_cdc_chunk(chunk, &states, 1, 0, |key| locator.locate(&splits, key));
+        assert_eq!(
+            forwarded_chunk.unwrap(),
+            StreamChunk::from_pretty(
+                " T
+                + aa"
+            )
+        );
+        assert_eq!(
+            buffered_chunk.unwrap(),
+            StreamChunk::from_pretty(
+                " T
+                + ab
+                + a_y"
+            )
+        );
+
+        // Byte order would drop `a_y` instead of buffering it.
+        let native = SplitKeyLocator::Local {
+            split_key_unsigned: false,
+        };
+        assert_ne!(
+            native.locate(&splits, Some(ScalarRefImpl::Utf8("a_y"))),
+            Some(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_filter_stream_chunk_by_upstream_ordered_split_key() {
+        use risingwave_common::array::StreamChunkTestExt;
+        // An actor owning splits 2 and 3: `ab <= key < B` upstream.
+        let splits = upstream_ordered_text_splits()[1..3].to_vec();
+        let mut ranks = UpstreamSplitKeyRanks::new(&splits).unwrap();
+        let chunk = StreamChunk::from_pretty(
+            "  T  I
+             + aa 1
+             + ab 2
+            U- a_z 3
+            U+ a_z 4
+             - B  5
+             + a_y 6",
+        );
+        ranks
+            .resolve(&chunk, 0, &mut mock_upstream_key_order())
+            .await
+            .unwrap();
+        let filtered = filter_stream_chunk_by_split(chunk, 0, |key| ranks.locate(key).is_some());
+        assert_eq!(
+            filtered.unwrap().compact_vis(),
+            StreamChunk::from_pretty(
+                "  T  I
+                 + ab 2
+                U- a_z 3
+                U+ a_z 4
+                 + a_y 6",
+            )
+        );
     }
 
     #[test]
@@ -1715,8 +1960,9 @@ mod tests {
              + 450 45
              + 500 50",
         );
-        let (forwarded_chunk, buffered_chunk) =
-            route_cdc_chunk(chunk, &splits, &states, 1, 0, false);
+        let (forwarded_chunk, buffered_chunk) = route_cdc_chunk(chunk, &states, 1, 0, |key| {
+            locate_split_natively(&splits, key, false)
+        });
 
         assert_eq!(
             forwarded_chunk.unwrap(),

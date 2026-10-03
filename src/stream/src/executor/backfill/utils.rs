@@ -41,6 +41,7 @@ use risingwave_storage::row_serde::value_serde::ValueRowSerde;
 use risingwave_storage::table::collect_data_chunk_with_builder;
 
 use crate::common::table::state_table::{ReplicatedStateTable, StateTableInner};
+use crate::executor::backfill::cdc::key_order::CdcPkOrder;
 use crate::executor::{Message, StreamExecutorError, StreamExecutorResult, Watermark};
 
 /// `vnode`, `is_finished`, `row_count`, all occupy 1 column each.
@@ -302,8 +303,7 @@ pub(crate) fn mark_cdc_chunk(
     chunk: StreamChunk,
     current_pos: &OwnedRow,
     pk_in_output_indices: &[usize],
-    pk_order: &[OrderType],
-    pk_needs_unsigned_i64_compare: &[bool],
+    pk_order: CdcPkOrder<'_>,
     last_cdc_offset: Option<CdcOffset>,
 ) -> StreamExecutorResult<StreamChunk> {
     let chunk = chunk.compact_vis();
@@ -314,7 +314,6 @@ pub(crate) fn mark_cdc_chunk(
         last_cdc_offset,
         pk_in_output_indices,
         pk_order,
-        pk_needs_unsigned_i64_compare,
     )
 }
 
@@ -470,8 +469,7 @@ fn mark_cdc_chunk_inner(
     current_pos: &OwnedRow,
     last_cdc_offset: Option<CdcOffset>,
     pk_in_output_indices: &[usize],
-    pk_order: &[OrderType],
-    pk_needs_unsigned_i64_compare: &[bool],
+    pk_order: CdcPkOrder<'_>,
 ) -> StreamExecutorResult<StreamChunk> {
     let (data, ops) = chunk.into_parts();
     let mut new_visibility = BitmapBuilder::with_capacity(ops.len());
@@ -490,15 +488,9 @@ fn mark_cdc_chunk_inner(
             };
 
             if in_binlog_range {
-                let lhs = row.project(pk_in_output_indices);
-                let rhs = current_pos;
-                cmp_pk_unsigned_aware(
-                    lhs.iter(),
-                    rhs.iter(),
-                    pk_order,
-                    pk_needs_unsigned_i64_compare,
-                )
-                .is_le()
+                pk_order
+                    .cmp_with_position(row.project(pk_in_output_indices), current_pos)
+                    .is_le()
             } else {
                 false
             }

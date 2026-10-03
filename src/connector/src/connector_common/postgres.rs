@@ -19,7 +19,7 @@ use anyhow::{Context, anyhow};
 use openssl::ssl::{SslConnector, SslMethod, SslVerifyMode};
 use postgres_openssl::MakeTlsConnector;
 use risingwave_common::bail;
-use risingwave_common::catalog::{ColumnDesc, ColumnId};
+use risingwave_common::catalog::{CdcKeyComparison, ColumnDesc, ColumnId};
 use risingwave_common::types::{DataType, ScalarImpl, StructType};
 use sea_schema::postgres::def::{ColumnType as SeaType, TableDef, TableInfo};
 use sea_schema::postgres::discovery::SchemaDiscovery;
@@ -88,6 +88,75 @@ const CHECK_TABLE_PRIVILEGE_QUERY: &str = r#"
       AND c.relkind IN ('r', 'p')
     LIMIT 1
 "#;
+
+/// Columns that differ across versions, e.g. `datlocprovider` (since 15), are read through
+/// `to_jsonb`.
+const DISCOVER_KEY_ORDERING_QUERY: &str = r#"
+    SELECT
+      a.attname AS column_name,
+      t.typcategory::text AS type_category,
+      t.typname::text AS type_name,
+      a.attcollation = 100 AS uses_database_collation,
+      COALESCE(to_jsonb(co) ->> 'collprovider', '') AS collation_provider,
+      COALESCE(to_jsonb(co) ->> 'collcollate', '') AS collation_locale,
+      COALESCE(to_jsonb(d) ->> 'datlocprovider', 'c') AS database_provider,
+      d.datcollate::text AS database_locale,
+      pg_encoding_to_char(d.encoding)::text AS server_encoding
+    FROM pg_attribute a
+    JOIN pg_class c ON c.oid = a.attrelid
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    JOIN pg_type t ON t.oid = a.atttypid
+    LEFT JOIN pg_collation co ON co.oid = a.attcollation
+    JOIN pg_database d ON d.datname = current_database()
+    WHERE n.nspname = $1
+      AND c.relname = $2
+      AND a.attnum > 0
+      AND NOT a.attisdropped
+"#;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PgKeyOrdering {
+    type_category: String,
+    type_name: String,
+    uses_database_collation: bool,
+    collation_provider: String,
+    collation_locale: String,
+    database_provider: String,
+    database_locale: String,
+    server_encoding: String,
+}
+
+impl PgKeyOrdering {
+    /// RisingWave compares text by UTF-8 bytes, which matches PostgreSQL only for
+    /// `text`/`varchar`/`name` under libc `C`/`POSIX` in a UTF-8 database. Other text-decoded
+    /// types sort differently upstream: `char(n)` ignores trailing spaces, `citext` case, enums
+    /// sort by declaration, and network addresses, MAC addresses and ranges by value.
+    fn comparison(&self) -> CdcKeyComparison {
+        let needs_upstream_order = match self.type_category.as_str() {
+            "E" | "I" | "R" => true,
+            "S" => !self.is_bytewise_text(),
+            "U" => matches!(self.type_name.as_str(), "macaddr" | "macaddr8"),
+            _ => false,
+        };
+        if needs_upstream_order {
+            CdcKeyComparison::Upstream
+        } else {
+            CdcKeyComparison::Native
+        }
+    }
+
+    fn is_bytewise_text(&self) -> bool {
+        let (provider, locale) = if self.uses_database_collation {
+            (&self.database_provider, &self.database_locale)
+        } else {
+            (&self.collation_provider, &self.collation_locale)
+        };
+        matches!(self.type_name.as_str(), "text" | "varchar" | "name")
+            && provider == "c"
+            && matches!(locale.as_str(), "C" | "POSIX")
+            && self.server_encoding == "UTF8"
+    }
+}
 
 /// Canonical Postgres connection parameters shared across sink, source CDC, batch
 /// executor, and frontend `postgres_query` table function. Each caller constructs
@@ -244,6 +313,7 @@ pub enum SslMode {
 pub struct PostgresExternalTable {
     column_descs: Vec<ColumnDesc>,
     pk_names: Vec<String>,
+    pk_comparisons: Vec<CdcKeyComparison>,
 }
 
 struct PostgresTablePrivilege {
@@ -276,6 +346,66 @@ impl PostgresExternalTable {
             .collect();
 
         Ok(pk_columns)
+    }
+
+    /// Falls back to `Native` if the catalog cannot be read, e.g. on a PostgreSQL-compatible
+    /// database with a different catalog.
+    async fn discover_pk_comparisons(
+        connection: &PgPool,
+        schema_name: &str,
+        table_name: &str,
+        pk_names: &[String],
+    ) -> ConnectorResult<Vec<CdcKeyComparison>> {
+        let rows = match sqlx::query(DISCOVER_KEY_ORDERING_QUERY)
+            .bind(schema_name)
+            .bind(table_name)
+            .fetch_all(connection)
+            .await
+        {
+            Ok(rows) => rows,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error.as_report(),
+                    schema = schema_name,
+                    table = table_name,
+                    "failed to discover PostgreSQL key ordering; comparing primary keys natively"
+                );
+                return Ok(vec![CdcKeyComparison::Native; pk_names.len()]);
+            }
+        };
+        let orderings: HashMap<String, PgKeyOrdering> = rows
+            .into_iter()
+            .map(|row| {
+                (
+                    row.get::<String, _>("column_name"),
+                    PgKeyOrdering {
+                        type_category: row.get("type_category"),
+                        type_name: row.get("type_name"),
+                        uses_database_collation: row.get("uses_database_collation"),
+                        collation_provider: row.get("collation_provider"),
+                        collation_locale: row.get("collation_locale"),
+                        database_provider: row.get("database_provider"),
+                        database_locale: row.get("database_locale"),
+                        server_encoding: row.get("server_encoding"),
+                    },
+                )
+            })
+            .collect();
+        pk_column_comparisons_from_orderings(&orderings, pk_names)
+    }
+
+    /// Used when SQL defines the columns explicitly.
+    pub async fn discover_pk_column_comparisons(
+        config: &PgConnectionConfig,
+        schema: &str,
+        table: &str,
+        pk_names: &[String],
+    ) -> ConnectorResult<Vec<CdcKeyComparison>> {
+        let options = config.to_sqlx_connect_options();
+        let connection = PgPool::connect_with(options).await?;
+        let comparisons = Self::discover_pk_comparisons(&connection, schema, table, pk_names).await;
+        connection.close().await;
+        comparisons
     }
 
     /// Discover column comments from PostgreSQL system catalog.
@@ -322,6 +452,7 @@ impl PostgresExternalTable {
     ) -> ConnectorResult<(
         Vec<sea_schema::postgres::def::ColumnInfo>,
         Vec<String>,
+        Vec<CdcKeyComparison>,
         HashMap<String, String>,
     )> {
         let options = config.to_sqlx_connect_options();
@@ -372,11 +503,13 @@ impl PostgresExternalTable {
 
         // Use direct system table query for primary key discovery
         let pk_columns = Self::discover_primary_key(&connection, schema, table).await?;
+        let pk_comparisons =
+            Self::discover_pk_comparisons(&connection, schema, table, &pk_columns).await?;
 
         // Discover column comments from pg_description
         let comments = Self::discover_column_comments(&connection, schema, table).await?;
 
-        Ok((columns, pk_columns, comments))
+        Ok((columns, pk_columns, pk_comparisons, comments))
     }
 
     async fn ensure_table_privilege(
@@ -477,7 +610,7 @@ impl PostgresExternalTable {
     ) -> ConnectorResult<Self> {
         tracing::debug!("connect to postgres external table");
 
-        let (columns, pk_names, comments) =
+        let (columns, pk_names, pk_comparisons, comments) =
             Self::discover_pk_and_full_columns(config, schema, table, required_table_privilege)
                 .await?;
 
@@ -532,6 +665,7 @@ impl PostgresExternalTable {
         Ok(Self {
             column_descs,
             pk_names,
+            pk_comparisons,
         })
     }
 
@@ -565,6 +699,46 @@ impl PostgresExternalTable {
     pub fn pk_names(&self) -> &Vec<String> {
         &self.pk_names
     }
+
+    /// Names must match exactly: PostgreSQL identifiers are case-sensitive.
+    pub fn pk_column_comparisons(
+        &self,
+        pk_names: &[String],
+    ) -> ConnectorResult<Vec<CdcKeyComparison>> {
+        pk_names
+            .iter()
+            .map(|pk_name| {
+                self.pk_names
+                    .iter()
+                    .position(|name| name == pk_name)
+                    .map(|idx| self.pk_comparisons[idx])
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "primary key column `{pk_name}` not found in upstream PostgreSQL table"
+                        )
+                        .into()
+                    })
+            })
+            .collect()
+    }
+}
+
+fn pk_column_comparisons_from_orderings(
+    orderings: &HashMap<String, PgKeyOrdering>,
+    pk_names: &[String],
+) -> ConnectorResult<Vec<CdcKeyComparison>> {
+    pk_names
+        .iter()
+        .map(|pk_name| {
+            orderings
+                .get(pk_name)
+                .map(PgKeyOrdering::comparison)
+                .ok_or_else(|| {
+                    anyhow!("primary key column `{pk_name}` not found in upstream PostgreSQL table")
+                        .into()
+                })
+        })
+        .collect()
 }
 
 fn format_pg_table_name(schema: &str, table: &str) -> String {
@@ -971,10 +1145,140 @@ pub async fn wait_for_snapshot_catchup(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
+    use risingwave_common::catalog::CdcKeyComparison;
+
     use super::{
-        format_grant_table_privilege, format_grant_usage, format_pg_table_name,
+        PgKeyOrdering, format_grant_table_privilege, format_grant_usage, format_pg_table_name,
         format_required_table_grants, parse_pgvector_dimension,
+        pk_column_comparisons_from_orderings,
     };
+
+    fn text_ordering(database_provider: &str, database_locale: &str) -> PgKeyOrdering {
+        PgKeyOrdering {
+            type_category: "S".to_owned(),
+            type_name: "text".to_owned(),
+            uses_database_collation: true,
+            collation_provider: "d".to_owned(),
+            collation_locale: String::new(),
+            database_provider: database_provider.to_owned(),
+            database_locale: database_locale.to_owned(),
+            server_encoding: "UTF8".to_owned(),
+        }
+    }
+
+    #[test]
+    fn test_pg_text_key_ordering_depends_on_collation() {
+        assert_eq!(
+            text_ordering("c", "C").comparison(),
+            CdcKeyComparison::Native
+        );
+        assert_eq!(
+            text_ordering("c", "POSIX").comparison(),
+            CdcKeyComparison::Native
+        );
+        assert_eq!(
+            text_ordering("c", "en_US.utf8").comparison(),
+            CdcKeyComparison::Upstream
+        );
+        // ICU and builtin providers are not proven to match bytes, even under `C`.
+        assert_eq!(
+            text_ordering("i", "C").comparison(),
+            CdcKeyComparison::Upstream
+        );
+        assert_eq!(
+            text_ordering("b", "C").comparison(),
+            CdcKeyComparison::Upstream
+        );
+
+        let c_column_in_locale_db = PgKeyOrdering {
+            uses_database_collation: false,
+            collation_provider: "c".to_owned(),
+            collation_locale: "C".to_owned(),
+            ..text_ordering("c", "en_US.utf8")
+        };
+        assert_eq!(c_column_in_locale_db.comparison(), CdcKeyComparison::Native);
+        let locale_column_in_c_db = PgKeyOrdering {
+            uses_database_collation: false,
+            collation_provider: "c".to_owned(),
+            collation_locale: "en_US.utf8".to_owned(),
+            ..text_ordering("c", "C")
+        };
+        assert_eq!(
+            locale_column_in_c_db.comparison(),
+            CdcKeyComparison::Upstream
+        );
+
+        let latin1 = PgKeyOrdering {
+            server_encoding: "LATIN1".to_owned(),
+            ..text_ordering("c", "C")
+        };
+        assert_eq!(latin1.comparison(), CdcKeyComparison::Upstream);
+    }
+
+    #[test]
+    fn test_pg_key_ordering_by_type() {
+        let of_type = |type_category: &str, type_name: &str| PgKeyOrdering {
+            type_category: type_category.to_owned(),
+            type_name: type_name.to_owned(),
+            ..text_ordering("c", "C")
+        };
+        for (category, name) in [("S", "varchar"), ("S", "name")] {
+            assert_eq!(
+                of_type(category, name).comparison(),
+                CdcKeyComparison::Native
+            );
+        }
+        for (category, name) in [
+            ("S", "bpchar"),
+            ("S", "citext"),
+            ("E", "mood"),
+            ("I", "inet"),
+            ("R", "int4range"),
+            ("U", "macaddr"),
+        ] {
+            assert_eq!(
+                of_type(category, name).comparison(),
+                CdcKeyComparison::Upstream,
+                "{name}"
+            );
+        }
+        for (category, name) in [
+            ("N", "int8"),
+            ("D", "timestamptz"),
+            ("U", "uuid"),
+            ("U", "bytea"),
+            ("U", "pg_lsn"),
+        ] {
+            assert_eq!(
+                of_type(category, name).comparison(),
+                CdcKeyComparison::Native,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_pg_pk_column_comparisons_follow_requested_order() {
+        let orderings = HashMap::from([
+            (
+                "id".to_owned(),
+                PgKeyOrdering {
+                    type_category: "N".to_owned(),
+                    type_name: "int8".to_owned(),
+                    ..text_ordering("c", "en_US.utf8")
+                },
+            ),
+            ("Name".to_owned(), text_ordering("c", "en_US.utf8")),
+        ]);
+        assert_eq!(
+            pk_column_comparisons_from_orderings(&orderings, &["Name".to_owned(), "id".to_owned()])
+                .unwrap(),
+            vec![CdcKeyComparison::Upstream, CdcKeyComparison::Native]
+        );
+        assert!(pk_column_comparisons_from_orderings(&orderings, &["name".to_owned()]).is_err());
+    }
 
     #[test]
     fn test_parse_pgvector_dimension() {
