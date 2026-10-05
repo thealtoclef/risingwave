@@ -365,6 +365,13 @@ pub struct StreamingDeveloperConfig {
     #[serde(default = "default::developer::kv_log_store_flushed_read_ahead")]
     pub kv_log_store_flushed_read_ahead: usize,
 
+    /// The maximum number of per-vnode snapshot iterators an arrangement backfill opens and reads
+    /// at the same time. Iterators are opened lazily, so a barrier waits for at most this many
+    /// iterator openings instead of one per vnode. Set to 0 to open the iterators of all vnodes
+    /// at once.
+    #[serde(default = "default::developer::arrangement_backfill_snapshot_iter_concurrency")]
+    pub arrangement_backfill_snapshot_iter_concurrency: usize,
+
     #[serde(default, flatten)]
     #[serde_prefix_all(skip)]
     #[config_doc(omitted)]

@@ -500,6 +500,10 @@ pub mod default {
         pub fn kv_log_store_flushed_read_ahead() -> usize {
             4
         }
+
+        pub fn arrangement_backfill_snapshot_iter_concurrency() -> usize {
+            16
+        }
     }
 }
 

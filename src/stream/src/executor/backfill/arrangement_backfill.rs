@@ -15,7 +15,7 @@
 use std::collections::HashMap;
 
 use either::Either;
-use futures::stream::{select_all, select_with_strategy};
+use futures::stream::select_with_strategy;
 use futures::{TryStreamExt, stream};
 use itertools::Itertools;
 use risingwave_common::array::{DataChunk, Op};
@@ -68,6 +68,9 @@ pub struct ArrangementBackfillExecutor<S: StateStore, SD: ValueRowSerde> {
 
     rate_limiter: MonitoredRateLimiter,
 
+    /// The maximum number of per-vnode snapshot iterators opened and read at the same time.
+    snapshot_iter_concurrency: usize,
+
     /// Fragment id of the fragment this backfill node belongs to.
     fragment_id: FragmentId,
 }
@@ -88,6 +91,7 @@ where
         metrics: Arc<StreamingMetrics>,
         chunk_size: usize,
         rate_limit: RateLimit,
+        snapshot_iter_concurrency: usize,
         fragment_id: FragmentId,
     ) -> Self {
         let rate_limiter = RateLimiter::new(rate_limit).monitored(upstream_table.table_id());
@@ -101,6 +105,7 @@ where
             metrics,
             chunk_size,
             rate_limiter,
+            snapshot_iter_concurrency,
             fragment_id,
         }
     }
@@ -245,6 +250,7 @@ where
                             backfill_state.clone(), // FIXME: Use mutable reference instead.
                             paused,
                             &self.rate_limiter,
+                            self.snapshot_iter_concurrency,
                         )
                         .map(Either::Right)
                     );
@@ -676,6 +682,7 @@ where
         backfill_state: BackfillState,
         paused: bool,
         rate_limiter: &'a MonitoredRateLimiter,
+        snapshot_iter_concurrency: usize,
     ) {
         if paused {
             #[for_await]
@@ -685,7 +692,11 @@ where
         } else {
             // Checked the rate limit is not zero.
             #[for_await]
-            for r in Self::snapshot_read_per_vnode(upstream_table, backfill_state) {
+            for r in Self::snapshot_read_per_vnode(
+                upstream_table,
+                backfill_state,
+                snapshot_iter_concurrency,
+            ) {
                 let r = r?;
                 rate_limiter.wait(1).await;
                 yield r;
@@ -723,10 +734,13 @@ where
 
     /// Read snapshot per vnode.
     /// These streams should be sorted in storage layer.
-    /// 1. Get row iterator / vnode.
-    /// 2. Merge it with `select_all`.
-    /// 3. Change it into a chunk iterator with `iter_chunks`.
-    /// This means it should fetch a row from each iterator to form a chunk.
+    /// 1. Get the range to read for each vnode that has not finished backfill.
+    /// 2. Lazily open a row iterator per vnode, at most `iter_concurrency` at a time, and merge
+    ///    the opened iterators.
+    ///
+    /// The snapshot stream is rebuilt on every barrier. Opening the iterators of all vnodes before
+    /// yielding the first row makes every barrier wait for one iterator opening per vnode, which
+    /// stalls barriers when iterator opening is slow and the actor owns many vnodes.
     ///
     /// We interleave at chunk per vnode level rather than rows.
     /// This is so that we can compute `current_pos` once per chunk, since they correspond to 1
@@ -749,8 +763,9 @@ where
     async fn snapshot_read_per_vnode(
         upstream_table: &ReplicatedStateTable<S, SD>,
         backfill_state: BackfillState,
+        iter_concurrency: usize,
     ) {
-        let mut iterators = vec![];
+        let mut vnode_ranges = vec![];
         for vnode in upstream_table.vnodes().iter_vnodes() {
             let backfill_progress = backfill_state.get_progress(&vnode)?;
             let current_pos = match backfill_progress {
@@ -775,23 +790,31 @@ where
                 range_bounds = ?range_bounds,
                 "iter_with_vnode"
             );
-            let vnode_row_iter = upstream_table
-                .iter_with_vnode(
-                    vnode,
-                    &range_bounds,
-                    PrefetchOptions::prefetch_for_small_range_scan(),
-                )
-                .await?;
-
-            let vnode_row_iter = vnode_row_iter.map_ok(move |row| (vnode, row));
-
-            let vnode_row_iter = Box::pin(vnode_row_iter);
-
-            iterators.push(vnode_row_iter);
+            vnode_ranges.push((vnode, range_bounds));
         }
 
-        // TODO(kwannoel): We can provide an option between snapshot read in parallel vs serial.
-        let vnode_row_iter = select_all(iterators);
+        // 0 means opening the iterators of all vnodes at once.
+        let iter_concurrency = if iter_concurrency == 0 {
+            vnode_ranges.len().max(1)
+        } else {
+            iter_concurrency
+        };
+        // The row iterators borrow their ranges, so the ranges are kept in `vnode_ranges`.
+        let vnode_row_iter = stream::iter(&vnode_ranges)
+            .map(|&(vnode, ref range_bounds)| async move {
+                let vnode_row_iter = upstream_table
+                    .iter_with_vnode(
+                        vnode,
+                        range_bounds,
+                        PrefetchOptions::prefetch_for_small_range_scan(),
+                    )
+                    .await?;
+                Ok::<_, StreamExecutorError>(Box::pin(
+                    vnode_row_iter.map_ok(move |row| (vnode, row)),
+                ))
+            })
+            .buffer_unordered(iter_concurrency)
+            .try_flatten_unordered(iter_concurrency);
 
         #[for_await]
         for vnode_and_row in vnode_row_iter {

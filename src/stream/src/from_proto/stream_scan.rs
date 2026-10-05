@@ -141,6 +141,10 @@ impl ExecutorBuilder for StreamScanExecutorBuilder {
                             params.executor_stats.clone(),
                             params.config.developer.chunk_size,
                             node.rate_limit.into(),
+                            params
+                                .config
+                                .developer
+                                .arrangement_backfill_snapshot_iter_concurrency,
                             params.fragment_id,
                         )
                         .boxed()

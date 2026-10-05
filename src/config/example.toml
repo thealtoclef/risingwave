@@ -274,6 +274,7 @@ max_concurrent_kv_log_store_historical_read = 0
 kv_log_store_max_buffer_row_count = 65536
 kv_log_store_flushed_read_max_rows = 8192
 kv_log_store_flushed_read_ahead = 4
+arrangement_backfill_snapshot_iter_concurrency = 16
 
 [streaming.developer.compute_client_config]
 connect_timeout_secs = 5
