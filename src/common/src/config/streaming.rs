@@ -347,6 +347,24 @@ pub struct StreamingDeveloperConfig {
     #[serde(default = "default::developer::max_concurrent_kv_log_store_historical_read")]
     pub max_concurrent_kv_log_store_historical_read: usize,
 
+    /// The maximum number of rows a sink's kv log store keeps in memory. Once the buffer is
+    /// full, new chunks are written to the state store and only referenced from the buffer.
+    #[serde(default = "default::developer::kv_log_store_max_buffer_row_count")]
+    pub kv_log_store_max_buffer_row_count: usize,
+
+    /// The maximum number of rows covered by a single read of kv log store data spilled to the
+    /// state store. Consecutive chunks spilled in the same epoch are merged up to this size, so a
+    /// sink catching up from the state store issues fewer and larger reads. Values smaller than
+    /// `chunk_size` are raised to `chunk_size`.
+    #[serde(default = "default::developer::kv_log_store_flushed_read_max_rows")]
+    pub kv_log_store_flushed_read_max_rows: usize,
+
+    /// The maximum number of reads of spilled kv log store data a sink keeps in flight while
+    /// catching up from the state store. Results are still returned in order. Set to 1 to read
+    /// one spilled chunk at a time.
+    #[serde(default = "default::developer::kv_log_store_flushed_read_ahead")]
+    pub kv_log_store_flushed_read_ahead: usize,
+
     #[serde(default, flatten)]
     #[serde_prefix_all(skip)]
     #[config_doc(omitted)]

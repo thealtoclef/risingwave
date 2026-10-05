@@ -342,17 +342,21 @@ impl ExecutorBuilder for SinkExecutorBuilder {
                 let input_schema = input_executor.schema();
                 let pk_info = resolve_pk_info(input_schema, &table)?;
 
-                // TODO: support setting max row count in config
+                let developer_config = &params.config.developer;
                 let factory = KvLogStoreFactory::new(
                     state_store,
                     table,
                     params.vnode_bitmap.clone().map(Arc::new),
-                    65536,
-                    params.config.developer.chunk_size,
+                    developer_config.kv_log_store_max_buffer_row_count,
+                    developer_config.chunk_size,
                     metrics,
                     log_store_identity,
                     params.env.kv_log_store_historical_read_semaphore(),
                     pk_info,
+                )
+                .with_flushed_read_options(
+                    developer_config.kv_log_store_flushed_read_max_rows,
+                    developer_config.kv_log_store_flushed_read_ahead,
                 );
 
                 SinkExecutor::new(

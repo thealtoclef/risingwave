@@ -13,7 +13,6 @@
 // limitations under the License.
 
 use std::future::Future;
-use std::mem::replace;
 use std::ops::Bound::{Excluded, Included, Unbounded};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -22,7 +21,8 @@ use std::time::Duration;
 use anyhow::anyhow;
 use await_tree::InstrumentAwait;
 use foyer::Hint;
-use futures::future::{BoxFuture, try_join_all};
+use futures::future::{BoxFuture, ready, try_join_all};
+use futures::stream::FuturesOrdered;
 use futures::{FutureExt, TryFutureExt};
 use risingwave_common::array::StreamChunk;
 use risingwave_common::bitmap::Bitmap;
@@ -33,6 +33,7 @@ use risingwave_connector::sink::log_store::{
     ChunkId, LogReader, LogStoreReadItem, LogStoreResult, TruncateOffset,
 };
 use risingwave_hummock_sdk::key::prefixed_range_with_vnode;
+use risingwave_pb::stream_plan::PbSinkSchemaChange;
 use risingwave_storage::hummock::CachePolicy;
 use risingwave_storage::store::timeout_auto_rebuild::{
     TimeoutAutoRebuildIter, iter_with_timeout_rebuild,
@@ -77,7 +78,6 @@ mod rewind_backoff_policy {
 }
 
 use rewind_backoff_policy::*;
-use risingwave_common::must_match;
 
 struct RewindDelay {
     last_rewind_truncate_offset: Option<TruncateOffset>,
@@ -129,47 +129,31 @@ enum KvLogStoreReaderFutureState<S: StateStoreRead> {
         /// when this variant is replaced (i.e. stream fully consumed or reset).
         Option<OwnedSemaphorePermit>,
     ),
-    ReadFlushedChunk(BoxFuture<'static, LogStoreResult<(ChunkId, StreamChunk, u64)>>),
     Reset,
     Empty,
 }
 
-impl<S: StateStoreRead> KvLogStoreReaderFutureState<S> {
-    async fn set_and_drive_future<F: Future + Unpin>(
-        &mut self,
-        future_state: Self,
-        get_future: impl FnOnce(&mut Self) -> &mut F,
-    ) -> F::Output {
-        // Store the future in case that in the subsequent pending await point,
-        // the future is cancelled, and we lose an item.
-        must_match!(replace(self, future_state),
-                    KvLogStoreReaderFutureState::Empty => {});
-
-        // for cancellation test
-        #[cfg(test)]
-        {
-            sleep(Duration::from_secs(1)).await;
-        }
-
-        let output = get_future(self).await;
-        *self = KvLogStoreReaderFutureState::Empty;
-        output
-    }
+/// An item popped from the log store buffer, resolved to what the reader returns.
+enum ReadAheadItem {
+    StreamChunk {
+        chunk: StreamChunk,
+        chunk_id: ChunkId,
+        /// Whether the chunk was read back from the state store.
+        flushed: bool,
+    },
+    Barrier {
+        is_checkpoint: bool,
+        next_epoch: u64,
+        schema_change: Option<PbSinkSchemaChange>,
+        is_stop: bool,
+    },
 }
 
-macro_rules! set_and_drive_future {
-    ($future_state:expr, $item_name:ident, $future:expr) => {
-        $future_state.set_and_drive_future(
-            KvLogStoreReaderFutureState::$item_name($future),
-            |future_state| match future_state {
-                KvLogStoreReaderFutureState::$item_name(future) => future,
-                _ => {
-                    unreachable!()
-                }
-            },
-        )
-    };
-}
+type ReadAheadFuture = BoxFuture<'static, LogStoreResult<(u64, ReadAheadItem)>>;
+
+/// The maximum number of items kept in the read-ahead queue for each flushed item read
+/// concurrently. It bounds how many barriers and in-memory chunks are popped ahead.
+const READ_AHEAD_ITEMS_PER_FLUSHED_READ: usize = 16;
 
 pub struct KvLogStoreReader<S: StateStoreRead> {
     state: LogStoreReadState<S>,
@@ -198,6 +182,18 @@ pub struct KvLogStoreReader<S: StateStoreRead> {
     /// Shared semaphore to limit concurrent historical reads across the compute node.
     /// `None` means unlimited.
     historical_read_semaphore: Option<Arc<Semaphore>>,
+
+    /// Items popped from the buffer but not returned yet, in buffer order. Reads of flushed items
+    /// in the queue run concurrently, so a reader catching up from the state store does not pay
+    /// the read latency of each flushed item one after another.
+    ///
+    /// Keeping the queue in `self` makes `next_item` cancellation safe: popped items are never
+    /// lost when the `next_item` future is dropped.
+    read_ahead: FuturesOrdered<ReadAheadFuture>,
+    /// Number of flushed items in `read_ahead`.
+    read_ahead_flushed_count: usize,
+    /// The maximum number of flushed items in `read_ahead`. 1 disables reading ahead.
+    max_flushed_read_ahead: usize,
 }
 
 impl<S: StateStoreRead> KvLogStoreReader<S> {
@@ -211,6 +207,7 @@ impl<S: StateStoreRead> KvLogStoreReader<S> {
         is_paused: watch::Receiver<bool>,
         identity: String,
         historical_read_semaphore: Option<Arc<Semaphore>>,
+        max_flushed_read_ahead: usize,
     ) -> Self {
         let rewind_delay = RewindDelay::new(&metrics);
         Self {
@@ -227,6 +224,9 @@ impl<S: StateStoreRead> KvLogStoreReader<S> {
             identity,
             rewind_delay,
             historical_read_semaphore,
+            read_ahead: FuturesOrdered::new(),
+            read_ahead_flushed_count: 0,
+            max_flushed_read_ahead: max_flushed_read_ahead.max(1),
         }
     }
 }
@@ -242,6 +242,94 @@ impl<S: StateStoreRead> KvLogStoreReader<S> {
             self.first_write_epoch.expect("should have init"),
             range_start,
         )
+    }
+
+    /// Drop the items popped ahead. Called when the reader is reset, after which the popped items
+    /// are read again from the buffer (`rewind`) or are no longer valid (`init`).
+    fn reset_read_ahead(&mut self) {
+        self.read_ahead = FuturesOrdered::new();
+        self.read_ahead_flushed_count = 0;
+    }
+
+    fn push_read_ahead(&mut self, item_epoch: u64, item: LogStoreBufferItem) {
+        let future: ReadAheadFuture = match item {
+            LogStoreBufferItem::StreamChunk {
+                chunk, chunk_id, ..
+            } => ready(Ok((
+                item_epoch,
+                ReadAheadItem::StreamChunk {
+                    chunk,
+                    chunk_id,
+                    flushed: false,
+                },
+            )))
+            .boxed(),
+            LogStoreBufferItem::Flushed {
+                vnode_bitmap,
+                start_seq_id,
+                end_seq_id,
+                chunk_id,
+            } => {
+                self.read_ahead_flushed_count += 1;
+                let read_flushed_chunk_future = self.state.read_flushed_chunk(
+                    vnode_bitmap,
+                    chunk_id,
+                    start_seq_id,
+                    end_seq_id,
+                    item_epoch,
+                    self.metrics.flushed_buffer_read_metrics.clone(),
+                );
+                async move {
+                    // for cancellation test
+                    #[cfg(test)]
+                    {
+                        sleep(Duration::from_secs(1)).await;
+                    }
+                    let (chunk_id, chunk, item_epoch) = read_flushed_chunk_future.await?;
+                    Ok((
+                        item_epoch,
+                        ReadAheadItem::StreamChunk {
+                            chunk,
+                            chunk_id,
+                            flushed: true,
+                        },
+                    ))
+                }
+                .boxed()
+            }
+            LogStoreBufferItem::Barrier {
+                is_checkpoint,
+                next_epoch,
+                schema_change,
+                is_stop,
+            } => ready(Ok((
+                item_epoch,
+                ReadAheadItem::Barrier {
+                    is_checkpoint,
+                    next_epoch,
+                    schema_change,
+                    is_stop,
+                },
+            )))
+            .boxed(),
+        };
+        self.read_ahead.push_back(future);
+    }
+
+    /// Pop more items from the buffer without waiting, so that up to `max_flushed_read_ahead`
+    /// flushed items are read concurrently. Only read ahead while a flushed item is in the queue,
+    /// i.e. while catching up from the state store.
+    fn fill_read_ahead(&mut self) {
+        while self.read_ahead_flushed_count > 0
+            && self.read_ahead_flushed_count < self.max_flushed_read_ahead
+            && self.read_ahead.len()
+                < self.max_flushed_read_ahead * READ_AHEAD_ITEMS_PER_FLUSHED_READ
+        {
+            let Some((item_epoch, item)) = self.rx.try_next_item() else {
+                break;
+            };
+            self.push_read_ahead(item_epoch, item);
+        }
     }
 }
 
@@ -340,6 +428,7 @@ impl<S: StateStoreRead> LogReader for KvLogStoreReader<S> {
         };
 
         self.future_state = KvLogStoreReaderFutureState::Reset;
+        self.reset_read_ahead();
         self.latest_offset = None;
         self.truncate_offset = None;
         self.rewind_delay = RewindDelay::new(&self.metrics);
@@ -396,22 +485,6 @@ impl<S: StateStoreRead> LogReader for KvLogStoreReader<S> {
                     }
                 }
             }
-            KvLogStoreReaderFutureState::ReadFlushedChunk(future) => {
-                let (chunk_id, chunk, item_epoch) = future.await?;
-                self.future_state = KvLogStoreReaderFutureState::Empty;
-                let offset = TruncateOffset::Chunk {
-                    epoch: item_epoch,
-                    chunk_id,
-                };
-                if let Some(latest_offset) = &self.latest_offset {
-                    assert!(offset > *latest_offset);
-                }
-                self.latest_offset = Some(offset);
-                return Ok((
-                    item_epoch,
-                    LogStoreReadItem::StreamChunk { chunk, chunk_id },
-                ));
-            }
             KvLogStoreReaderFutureState::Empty => {}
             KvLogStoreReaderFutureState::Reset => {
                 unreachable!("Must call log_reader.start_from() for a Reset reader.")
@@ -419,16 +492,34 @@ impl<S: StateStoreRead> LogReader for KvLogStoreReader<S> {
         }
 
         // Now the historical state store has been consumed.
-        let (item_epoch, item) = self
-            .rx
-            .next_item()
-            .instrument_await("Wait Next Item from Buffer")
-            .await;
+        if self.read_ahead.is_empty() {
+            let (item_epoch, item) = self
+                .rx
+                .next_item()
+                .instrument_await("Wait Next Item from Buffer")
+                .await;
+            self.push_read_ahead(item_epoch, item);
+        }
+        self.fill_read_ahead();
+        let result = self
+            .read_ahead
+            .next()
+            .instrument_await("Read Next Buffered Item")
+            .await
+            .expect("read ahead queue should not be empty");
+        // Only flushed reads can fail, so an error also releases a flushed slot.
+        if matches!(
+            result,
+            Ok((_, ReadAheadItem::StreamChunk { flushed: true, .. })) | Err(_)
+        ) {
+            self.read_ahead_flushed_count = self.read_ahead_flushed_count.saturating_sub(1);
+        }
+        let (item_epoch, item) = result?;
         if let Some(latest_offset) = &self.latest_offset {
             latest_offset.check_next_item_epoch(item_epoch)?;
         }
         Ok(match item {
-            LogStoreBufferItem::StreamChunk {
+            ReadAheadItem::StreamChunk {
                 chunk, chunk_id, ..
             } => {
                 let offset = TruncateOffset::Chunk {
@@ -444,47 +535,7 @@ impl<S: StateStoreRead> LogReader for KvLogStoreReader<S> {
                     LogStoreReadItem::StreamChunk { chunk, chunk_id },
                 )
             }
-            LogStoreBufferItem::Flushed {
-                vnode_bitmap,
-                start_seq_id,
-                end_seq_id,
-                chunk_id,
-            } => {
-                let read_flushed_chunk_future = {
-                    let read_metrics = self.metrics.flushed_buffer_read_metrics.clone();
-                    self.state
-                        .read_flushed_chunk(
-                            vnode_bitmap,
-                            chunk_id,
-                            start_seq_id,
-                            end_seq_id,
-                            item_epoch,
-                            read_metrics,
-                        )
-                        .boxed()
-                };
-
-                let (_, chunk, _) = set_and_drive_future!(
-                    &mut self.future_state,
-                    ReadFlushedChunk,
-                    read_flushed_chunk_future
-                )
-                .await?;
-
-                let offset = TruncateOffset::Chunk {
-                    epoch: item_epoch,
-                    chunk_id,
-                };
-                if let Some(latest_offset) = &self.latest_offset {
-                    assert!(offset > *latest_offset);
-                }
-                self.latest_offset = Some(offset);
-                (
-                    item_epoch,
-                    LogStoreReadItem::StreamChunk { chunk, chunk_id },
-                )
-            }
-            LogStoreBufferItem::Barrier {
+            ReadAheadItem::Barrier {
                 is_checkpoint,
                 next_epoch,
                 schema_change,
@@ -553,6 +604,7 @@ impl<S: StateStoreRead> LogReader for KvLogStoreReader<S> {
         self.rewind_delay.rewind_delay(self.truncate_offset).await;
         self.latest_offset = None;
         self.future_state = KvLogStoreReaderFutureState::Reset;
+        self.reset_read_ahead();
         Ok(())
     }
 }
@@ -854,6 +906,7 @@ mod tests {
                 pause_rx,
                 identity.to_owned(),
                 Some(semaphore),
+                1,
             ),
             tx,
         )

@@ -514,6 +514,10 @@ pub struct KvLogStoreFactory<S: StateStore> {
     max_buffer_row_count: usize,
     chunk_size: usize,
 
+    /// See [`Self::with_flushed_read_options`].
+    flushed_read_max_rows: usize,
+    flushed_read_ahead: usize,
+
     metrics: KvLogStoreMetrics,
 
     identity: String,
@@ -544,11 +548,33 @@ impl<S: StateStore> KvLogStoreFactory<S> {
             vnodes,
             max_buffer_row_count,
             chunk_size,
+            flushed_read_max_rows: chunk_size,
+            flushed_read_ahead: 1,
             metrics,
             identity: identity.into(),
             pk_info,
             historical_read_semaphore,
         }
+    }
+
+    /// Tune how chunks spilled to the state store are read back.
+    ///
+    /// - `flushed_read_max_rows`: consecutive spilled chunks of the same epoch are merged until
+    ///   they cover this many rows, and each merged item is read back with one read. Values
+    ///   smaller than `chunk_size` are raised to `chunk_size`.
+    /// - `flushed_read_ahead`: the maximum number of spilled items read concurrently. Values
+    ///   smaller than 1 are raised to 1, which reads one spilled item at a time.
+    ///
+    /// Without calling this, spilled chunks are merged up to `chunk_size` rows and read one at a
+    /// time.
+    pub(crate) fn with_flushed_read_options(
+        mut self,
+        flushed_read_max_rows: usize,
+        flushed_read_ahead: usize,
+    ) -> Self {
+        self.flushed_read_max_rows = flushed_read_max_rows.max(self.chunk_size);
+        self.flushed_read_ahead = flushed_read_ahead.max(1);
+        self
     }
 }
 
@@ -582,7 +608,7 @@ impl<S: StateStore> LogStoreFactory for KvLogStoreFactory<S> {
 
         let (tx, rx) = new_log_store_buffer(
             self.max_buffer_row_count,
-            self.chunk_size,
+            self.flushed_read_max_rows,
             self.metrics.clone(),
         );
 
@@ -601,6 +627,7 @@ impl<S: StateStore> LogStoreFactory for KvLogStoreFactory<S> {
             pause_rx,
             self.identity.clone(),
             self.historical_read_semaphore,
+            self.flushed_read_ahead,
         );
 
         let writer = KvLogStoreWriter::new(
@@ -634,6 +661,7 @@ mod tests {
     use risingwave_common::catalog::{ColumnCatalog, ColumnDesc, ColumnId};
     use risingwave_common::hash::VirtualNode;
     use risingwave_common::row::{OwnedRow, Row};
+    use risingwave_common::test_prelude::StreamChunkTestExt;
     use risingwave_common::types::{DataType, ScalarImpl};
     use risingwave_common::util::chunk_coalesce::DataChunkBuilder;
     use risingwave_common::util::epoch::{EpochExt, EpochPair};
@@ -642,7 +670,7 @@ mod tests {
         TruncateOffset,
     };
     use risingwave_hummock_sdk::HummockReadEpoch;
-    use risingwave_hummock_test::test_utils::prepare_hummock_test_env;
+    use risingwave_hummock_test::test_utils::{HummockTestEnv, prepare_hummock_test_env};
     use risingwave_pb::plan_common::PbField;
     use risingwave_pb::stream_plan::{PbSinkAddColumnsOp, PbSinkSchemaChange};
     use risingwave_storage::table::batch_table::BatchTable;
@@ -2626,5 +2654,191 @@ mod tests {
         .expect("batch scan after schema change should not hang");
         ages.sort_unstable();
         assert_eq!(ages, vec![40, 50]);
+    }
+
+    const SPILLED_CHUNKS_PER_EPOCH: usize = 4;
+
+    /// Write `SPILLED_CHUNKS_PER_EPOCH` chunks in each of two epochs with an in-memory buffer of 0
+    /// rows, so that every chunk is spilled to the state store. Return the test env, which must be
+    /// kept alive while reading, the reader, the written chunks and their epochs.
+    async fn prepare_spilled_log_store(
+        flushed_read_max_rows: usize,
+        flushed_read_ahead: usize,
+    ) -> (
+        HummockTestEnv,
+        impl LogReader,
+        [Vec<StreamChunk>; 2],
+        [u64; 2],
+    ) {
+        let pk_info: &'static KvLogStorePkInfo = &KV_LOG_STORE_V2_INFO;
+        let test_env = prepare_hummock_test_env().await;
+        let table = gen_test_log_store_table(pk_info);
+        test_env.register_table(table.clone()).await;
+
+        let gen_epoch_chunks = |epoch_idx: usize| {
+            (0..SPILLED_CHUNKS_PER_EPOCH)
+                .map(|i| {
+                    let chunk_idx = epoch_idx * SPILLED_CHUNKS_PER_EPOCH + i;
+                    gen_stream_chunk_with_info((chunk_idx * TEST_DATA_SIZE) as i64, pk_info)
+                })
+                .collect_vec()
+        };
+        let chunks = [gen_epoch_chunks(0), gen_epoch_chunks(1)];
+        let bitmap = calculate_vnode_bitmap(chunks.iter().flatten().flat_map(|chunk| chunk.rows()));
+
+        let factory = KvLogStoreFactory::new(
+            test_env.storage.clone(),
+            table.clone(),
+            Some(Arc::new(bitmap)),
+            0,
+            TEST_DATA_SIZE,
+            KvLogStoreMetrics::for_test(),
+            "test",
+            None,
+            pk_info,
+        )
+        .with_flushed_read_options(flushed_read_max_rows, flushed_read_ahead);
+        let (mut reader, mut writer) = factory.build().await;
+
+        let epoch1 = test_env
+            .storage
+            .get_pinned_version()
+            .table_committed_epoch(table.id)
+            .unwrap()
+            .next_epoch();
+        test_env
+            .storage
+            .start_epoch(epoch1, HashSet::from_iter([table.id]));
+        writer
+            .init(EpochPair::new_test_epoch(epoch1), false)
+            .await
+            .unwrap();
+        for chunk in &chunks[0] {
+            writer.write_chunk(chunk.clone()).await.unwrap();
+        }
+        let epoch2 = epoch1.next_epoch();
+        test_env
+            .storage
+            .start_epoch(epoch2, HashSet::from_iter([table.id]));
+        writer
+            .flush_current_epoch_for_test(epoch2, false)
+            .await
+            .unwrap();
+        for chunk in &chunks[1] {
+            writer.write_chunk(chunk.clone()).await.unwrap();
+        }
+        let epoch3 = epoch2.next_epoch();
+        test_env
+            .storage
+            .start_epoch(epoch3, HashSet::from_iter([table.id]));
+        writer
+            .flush_current_epoch_for_test(epoch3, true)
+            .await
+            .unwrap();
+
+        reader.init().await.unwrap();
+        reader.start_from(None).await.unwrap();
+        (test_env, reader, chunks, [epoch1, epoch2])
+    }
+
+    async fn expect_chunk(
+        reader: &mut impl LogReader,
+        expected_epoch: u64,
+        expected: &StreamChunk,
+    ) {
+        match reader.next_item().await.unwrap() {
+            (epoch, LogStoreReadItem::StreamChunk { chunk, .. }) => {
+                assert_eq!(epoch, expected_epoch);
+                assert!(
+                    check_stream_chunk_eq(expected, &chunk),
+                    "expected: {:?}, read: {:?}",
+                    expected,
+                    chunk
+                );
+            }
+            item => unreachable!("{:?}", item),
+        }
+    }
+
+    async fn expect_barrier(reader: &mut impl LogReader, expected_epoch: u64) {
+        match reader.next_item().await.unwrap() {
+            (epoch, LogStoreReadItem::Barrier { .. }) => assert_eq!(epoch, expected_epoch),
+            item => unreachable!("{:?}", item),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_merge_flushed_reads() {
+        // All chunks spilled in an epoch fit in one read.
+        let (_test_env, mut reader, chunks, epochs) =
+            prepare_spilled_log_store(TEST_DATA_SIZE * SPILLED_CHUNKS_PER_EPOCH, 1).await;
+        for (epoch, epoch_chunks) in epochs.into_iter().zip_eq(chunks) {
+            expect_chunk(&mut reader, epoch, &StreamChunk::concat(epoch_chunks)).await;
+            expect_barrier(&mut reader, epoch).await;
+        }
+
+        // Reads are never merged across epochs, and stop at the merge limit.
+        let (_test_env, mut reader, chunks, epochs) =
+            prepare_spilled_log_store(TEST_DATA_SIZE * 3, 1).await;
+        for (epoch, mut epoch_chunks) in epochs.into_iter().zip_eq(chunks) {
+            let last = epoch_chunks.pop().unwrap();
+            expect_chunk(&mut reader, epoch, &StreamChunk::concat(epoch_chunks)).await;
+            expect_chunk(&mut reader, epoch, &last).await;
+            expect_barrier(&mut reader, epoch).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_flushed_read_ahead_keeps_order() {
+        for read_ahead in [1, 2, 4, 16] {
+            let (_test_env, mut reader, chunks, epochs) =
+                prepare_spilled_log_store(TEST_DATA_SIZE, read_ahead).await;
+            for (epoch, epoch_chunks) in epochs.into_iter().zip_eq(chunks) {
+                for chunk in &epoch_chunks {
+                    expect_chunk(&mut reader, epoch, chunk).await;
+                }
+                expect_barrier(&mut reader, epoch).await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_rewind_with_flushed_read_ahead() {
+        let (_test_env, mut reader, chunks, epochs) =
+            prepare_spilled_log_store(TEST_DATA_SIZE, 4).await;
+        // Read part of the first epoch, while later flushed items are being read ahead.
+        expect_chunk(&mut reader, epochs[0], &chunks[0][0]).await;
+        expect_chunk(&mut reader, epochs[0], &chunks[0][1]).await;
+
+        // Nothing is truncated, so the reader replays everything from the start.
+        reader.rewind().await.unwrap();
+        reader.start_from(None).await.unwrap();
+        for (epoch, epoch_chunks) in epochs.into_iter().zip_eq(chunks) {
+            for chunk in &epoch_chunks {
+                expect_chunk(&mut reader, epoch, chunk).await;
+            }
+            expect_barrier(&mut reader, epoch).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_flushed_read_ahead_cancellation_safe() {
+        let (_test_env, mut reader, chunks, epochs) =
+            prepare_spilled_log_store(TEST_DATA_SIZE, 4).await;
+        // Drop `next_item` while flushed reads are in flight. No item should be lost.
+        for _ in 0..3 {
+            let mut future = pin!(reader.next_item());
+            assert!(
+                poll_fn(|cx| Poll::Ready(future.as_mut().poll(cx)))
+                    .await
+                    .is_pending()
+            );
+        }
+        for (epoch, epoch_chunks) in epochs.into_iter().zip_eq(chunks) {
+            for chunk in &epoch_chunks {
+                expect_chunk(&mut reader, epoch, chunk).await;
+            }
+            expect_barrier(&mut reader, epoch).await;
+        }
     }
 }

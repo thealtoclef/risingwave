@@ -97,7 +97,10 @@ struct LogStoreBufferInner {
     consumed_queue: VecDeque<(u64, LogStoreBufferItem)>,
     row_count: usize,
     max_row_count: usize,
-    chunk_size: usize,
+    /// Consecutive flushed items of the same epoch are merged until they cover this many rows.
+    /// Each flushed item is read back from the state store with one read, so a larger value
+    /// means fewer and larger reads when the reader falls behind the writer.
+    flushed_merge_max_rows: usize,
 
     truncation_list: VecDeque<ReaderTruncationOffsetType>,
 
@@ -263,7 +266,7 @@ impl LogStoreBufferInner {
             },
         )) = self.unconsumed_queue.front()
             && let prev_chunk_size = (*prev_end_seq_id - *prev_start_seq_id + 1) as usize
-            && curr_chunk_size + prev_chunk_size <= self.chunk_size
+            && curr_chunk_size + prev_chunk_size <= self.flushed_merge_max_rows
         {
             assert!(
                 *prev_end_seq_id < start_seq_id,
@@ -532,6 +535,11 @@ impl LogStoreBufferReceiver {
         }
     }
 
+    /// Pop the next item without waiting. Return `None` if no item is available yet.
+    pub(crate) fn try_next_item(&self) -> Option<(u64, LogStoreBufferItem)> {
+        self.buffer.inner().pop_item()
+    }
+
     pub(crate) fn truncate_buffer(&mut self, offset: TruncateOffset) {
         let mut inner = self.buffer.inner();
         let mut latest_offset: Option<ReaderTruncationOffsetType> = None;
@@ -609,7 +617,7 @@ impl LogStoreBufferReceiver {
 
 pub(crate) fn new_log_store_buffer(
     max_row_count: usize,
-    chunk_size: usize,
+    flushed_merge_max_rows: usize,
     metrics: KvLogStoreMetrics,
 ) -> (LogStoreBufferSender, LogStoreBufferReceiver) {
     let buffer = SharedMutex::new(LogStoreBufferInner {
@@ -617,7 +625,7 @@ pub(crate) fn new_log_store_buffer(
         consumed_queue: VecDeque::new(),
         row_count: 0,
         max_row_count,
-        chunk_size,
+        flushed_merge_max_rows,
         truncation_list: VecDeque::new(),
         next_chunk_id: 0,
         metrics,

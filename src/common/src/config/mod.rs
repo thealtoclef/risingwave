@@ -488,6 +488,18 @@ pub mod default {
         pub fn max_concurrent_kv_log_store_historical_read() -> usize {
             0
         }
+
+        pub fn kv_log_store_max_buffer_row_count() -> usize {
+            65536
+        }
+
+        pub fn kv_log_store_flushed_read_max_rows() -> usize {
+            8192
+        }
+
+        pub fn kv_log_store_flushed_read_ahead() -> usize {
+            4
+        }
     }
 }
 
