@@ -764,7 +764,8 @@ replication lag and confirm checkpoints are advancing on the upstream.
 
 | Metric                                       | Type                    | Labels                   | Source / Meaning |
 |----------------------------------------------|-------------------------|--------------------------|-------------------|
-| `source_cdc_event_lag_duration_milliseconds` | histogram| `table_name`             | Per-event lag between the source's commit timestamp and RisingWave's ingest timestamp — the canonical "CDC freshness" metric. Use `histogram_quantile(0.99, …)`. |
+| `source_cdc_event_lag_duration_milliseconds` | histogram | `table_name`, `cdc_table_id` | Source-event timestamp to reader-processing delay. Shared sources may capture uncreated upstream tables; join by `cdc_table_id` to `cdc_table_info` for created RisingWave CDC tables. Idle tables have no recent percentile. |
+| `cdc_table_info` | gauge | `cdc_table_id`, `table_id`, `database`, `schema`, `table_name` | Catalog membership for created shared-source CDC tables. The value is 1; labels are refreshed to remove dropped or renamed tables. See [created CDC table metrics](created-cdc-tables.md). |
 | **Postgres CDC** |  |  |  |
 | `pg_cdc_confirmed_flush_lsn`                 | gauge | `source_id`, `slot_name` | LSN up to which RisingWave has confirmed the replication slot can advance. If this stops moving, the upstream WAL will grow unbounded. |
 | `pg_cdc_upstream_max_lsn`                    | gauge | `source_id`, `slot_name` | Upstream's latest LSN. Subtract `pg_cdc_confirmed_flush_lsn` for replication lag in LSN units. |

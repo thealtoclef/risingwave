@@ -7,6 +7,7 @@ mysql_cdc_binlog_file_seq_min = metric(
 mysql_cdc_binlog_file_seq_max = metric(
     "mysql_cdc_binlog_file_seq_max", node_filter_enabled=False
 )
+cdc_table_info = metric("cdc_table_info", node_filter_enabled=False)
 stream_mysql_cdc_state_binlog_file_seq = metric(
     "stream_mysql_cdc_state_binlog_file_seq", node_filter_enabled=False
 )
@@ -42,13 +43,18 @@ def _(outer_panels: Panels):
                     ],
                 ),
                 panels.timeseries_latency_ms(
-                    "CDC Consume Lag Latency",
-                    "",
+                    "Created CDC Table Event Lag",
+                    "Source-event timestamp to reader-processing delay for created shared-source "
+                    "CDC tables only. Joins catalog membership by source-scoped CDC identity; "
+                    "idle tables have no recent percentile, and dropped tables disappear after "
+                    "the catalog metrics refresh. Not destination visibility or unread backlog age.",
                     [
                         *quantile(
                             lambda quantile, legend: panels.target(
-                                f"histogram_quantile({quantile}, sum(rate({metric('source_cdc_event_lag_duration_milliseconds_bucket')}[$__rate_interval])) by (le, table_name))",
-                                f"lag p{legend}" + " - {{table_name}}",
+                                f"histogram_quantile({quantile}, sum(rate({metric('source_cdc_event_lag_duration_milliseconds_bucket')}[$__rate_interval])) by (le, cdc_table_id)) "
+                                f"* on(cdc_table_id) group_right() "
+                                f"max by(cdc_table_id, table_id, database, schema, table_name) ({cdc_table_info})",
+                                f"lag p{legend}" + " - {{database}}.{{schema}}.{{table_name}} ({{table_id}})",
                             ),
                             [50, 99, "max"],
                         ),

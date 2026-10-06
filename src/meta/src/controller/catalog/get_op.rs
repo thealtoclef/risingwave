@@ -662,6 +662,56 @@ impl CatalogController {
             .await?)
     }
 
+    /// Catalog mappings for CDC tables whose streaming jobs have finished creation.
+    pub async fn list_created_cdc_table_objects(
+        &self,
+    ) -> MetaResult<Vec<(TableId, String, String, String, String)>> {
+        let inner = self.inner.read().await;
+        let tables: Vec<(
+            TableId,
+            String,
+            String,
+            String,
+            String,
+            Option<risingwave_meta_model::table::CdcTableType>,
+        )> = Object::find()
+            .select_only()
+            .join(JoinType::InnerJoin, object::Relation::Table.def())
+            .join(JoinType::InnerJoin, object::Relation::Database2.def())
+            .join(JoinType::InnerJoin, object::Relation::Schema2.def())
+            .join(JoinType::InnerJoin, object::Relation::StreamingJob.def())
+            .column(object::Column::Oid)
+            .column(database::Column::Name)
+            .column(schema::Column::Name)
+            .column(table::Column::Name)
+            .column(table::Column::CdcTableId)
+            .column(table::Column::CdcTableType)
+            .filter(table::Column::TableType.eq(TableType::Table))
+            .filter(table::Column::CdcTableId.is_not_null())
+            .filter(streaming_job::Column::JobStatus.eq(JobStatus::Created))
+            .into_tuple()
+            .all(&inner.db)
+            .await?;
+        Ok(tables
+            .into_iter()
+            .map(|(id, db, schema, name, cdc_table_id, cdc_type)| {
+                // Legacy SQL Server catalogs store source.db.schema.table, while routing
+                // accepts schema.table. Apply the same compatibility rule as CdcFilter.
+                let cdc_table_id = if cdc_type
+                    == Some(risingwave_meta_model::table::CdcTableType::Sqlserver)
+                    && let Some((source_id, upstream_name)) = cdc_table_id.split_once('.')
+                    && let [_, schema, table] =
+                        upstream_name.split('.').collect::<Vec<_>>().as_slice()
+                {
+                    format!("{source_id}.{schema}.{table}")
+                } else {
+                    cdc_table_id
+                };
+                (id, db, schema, name, cdc_table_id)
+            })
+            .collect())
+    }
+
     // Output: Vec<(source id, db name, schema name, source name, resource group)>
     pub async fn list_source_objects(
         &self,

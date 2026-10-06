@@ -329,8 +329,12 @@ impl SourceMetrics {
         )
         .unwrap();
 
-        let direct_cdc_event_lag_latency =
-            register_guarded_histogram_vec_with_registry!(opts, &["table_name"], registry).unwrap();
+        let direct_cdc_event_lag_latency = register_guarded_histogram_vec_with_registry!(
+            opts,
+            &["table_name", "cdc_table_id"],
+            registry
+        )
+        .unwrap();
 
         let rdkafka_native_metric = Arc::new(RdKafkaStats::new(registry.clone()));
 

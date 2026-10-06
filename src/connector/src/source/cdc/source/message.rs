@@ -65,6 +65,11 @@ pub struct DebeziumCdcMeta {
 }
 
 impl DebeziumCdcMeta {
+    /// The upstream table identifier used by CDC routing and catalog table mappings.
+    pub fn routing_table_name(&self) -> &str {
+        &self.full_table_name[self.table_name_start..]
+    }
+
     // These `extract_xxx` methods are used to support the `INCLUDE TIMESTAMP/DATABASE_NAME/TABLE_NAME` feature
     pub fn extract_timestamp(&self) -> DatumRef<'_> {
         // Yield NULL rather than panicking on an out-of-range upstream `source.ts_ms`.
@@ -78,9 +83,7 @@ impl DebeziumCdcMeta {
     }
 
     pub fn extract_table_name(&self) -> DatumRef<'_> {
-        Some(ScalarRefImpl::Utf8(
-            &self.full_table_name.as_str()[self.table_name_start..],
-        ))
+        Some(ScalarRefImpl::Utf8(self.routing_table_name()))
     }
 
     /// Extract the *object* table name (the last part) from `full_table_name`.
@@ -199,6 +202,41 @@ impl From<CdcMessage> for SourceMessage {
                 msg_type,
                 source_type,
             )),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use risingwave_common::id::SourceId;
+
+    use super::*;
+    use crate::source::cdc::build_cdc_table_id;
+
+    #[test]
+    fn test_cdc_lag_catalog_identity() {
+        for (source_type, full_name, routing_name) in [
+            (SourceType::Mysql, "db.orders", "db.orders"),
+            (SourceType::Postgres, "db.public.orders", "public.orders"),
+            (SourceType::Postgres, "public.orders", "public.orders"),
+            (SourceType::SqlServer, "db.dbo.orders", "dbo.orders"),
+            (SourceType::SqlServer, "dbo.orders", "dbo.orders"),
+        ] {
+            let meta = DebeziumCdcMeta::new(
+                full_name.to_owned(),
+                0,
+                cdc_message::CdcMessageType::Data,
+                source_type,
+            );
+            assert_eq!(meta.routing_table_name(), routing_name);
+            assert_eq!(
+                build_cdc_table_id(SourceId::new(7), meta.routing_table_name()),
+                format!("7.{routing_name}")
+            );
+            assert_ne!(
+                build_cdc_table_id(SourceId::new(7), meta.routing_table_name()),
+                build_cdc_table_id(SourceId::new(8), meta.routing_table_name()),
+            );
         }
     }
 }

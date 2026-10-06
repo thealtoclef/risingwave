@@ -223,6 +223,8 @@ pub struct MetaMetrics {
     pub sink_info: IntGaugeVec,
     /// A dummy gauge metrics with its label to be relation info
     pub relation_info: IntGaugeVec,
+    /// Created shared-source CDC tables, keyed by the source-scoped upstream routing identity.
+    pub cdc_table_info: IntGaugeVec,
     /// A dummy gauge metrics with its label to be the mapping from database id to database name
     pub database_info: IntGaugeVec,
     /// Backfill progress per fragment
@@ -770,6 +772,20 @@ impl MetaMetrics {
         )
         .unwrap();
 
+        let cdc_table_info = register_int_gauge_vec_with_registry!(
+            "cdc_table_info",
+            "Mapping from a source-scoped CDC table identity to a created RisingWave table",
+            &[
+                "cdc_table_id",
+                "table_id",
+                "database",
+                "schema",
+                "table_name"
+            ],
+            registry
+        )
+        .unwrap();
+
         let sink_info = register_int_gauge_vec_with_registry!(
             "sink_info",
             "Mapping from actor id to (actor id, sink name)",
@@ -1058,6 +1074,7 @@ impl MetaMetrics {
             table_info,
             sink_info,
             relation_info,
+            cdc_table_info,
             database_info,
             backfill_fragment_progress,
             streaming_table_change_log_retention_seconds,
@@ -1299,6 +1316,15 @@ pub async fn refresh_relation_info_metrics(
     catalog_controller: &CatalogControllerRef,
     meta_metrics: Arc<MetaMetrics>,
 ) {
+    // Refresh independently of other relation queries. An empty catalog clears dropped tables;
+    // a failed query clears membership too, rather than continuing to claim stale tables exist.
+    match catalog_controller.list_created_cdc_table_objects().await {
+        Ok(tables) => refresh_cdc_table_info(&meta_metrics.cdc_table_info, tables),
+        Err(err) => {
+            meta_metrics.cdc_table_info.reset();
+            tracing::warn!(error=%err.as_report(), "failed to get created CDC tables");
+        }
+    }
     let table_objects = match catalog_controller.list_table_objects().await {
         Ok(table_objects) => table_objects,
         Err(err) => {
@@ -1397,6 +1423,82 @@ pub async fn refresh_relation_info_metrics(
             .streaming_table_change_log_retention_seconds
             .with_label_values(&[&table_id.to_string()])
             .set(retention_seconds as _);
+    }
+}
+
+fn refresh_cdc_table_info(
+    metric: &IntGaugeVec,
+    tables: impl IntoIterator<
+        Item = (
+            risingwave_meta_model::TableId,
+            String,
+            String,
+            String,
+            String,
+        ),
+    >,
+) {
+    metric.reset();
+    for (id, database, schema, name, cdc_table_id) in tables {
+        metric
+            .with_label_values(&[&cdc_table_id, &id.to_string(), &database, &schema, &name])
+            .set(1);
+    }
+}
+
+#[cfg(test)]
+mod cdc_table_metric_tests {
+    use prometheus::core::Collector;
+
+    use super::*;
+
+    #[test]
+    fn test_created_cdc_table_metric_refresh() {
+        let metric = IntGaugeVec::new(
+            prometheus::Opts::new("cdc_table_info", "Created CDC table mappings"),
+            &[
+                "cdc_table_id",
+                "table_id",
+                "database",
+                "schema",
+                "table_name",
+            ],
+        )
+        .unwrap();
+        let entry = |id, source: &str, name: &str| {
+            (
+                risingwave_meta_model::TableId::new(id),
+                "database".to_owned(),
+                "public".to_owned(),
+                name.to_owned(),
+                format!("{source}.public.orders"),
+            )
+        };
+        // Distinguish two sources with identically named upstream tables and two RW tables
+        // subscribed to the same source table. Keep all mappings, including idle tables.
+        refresh_cdc_table_info(
+            &metric,
+            [
+                entry(1, "7", "orders"),
+                entry(2, "8", "orders"),
+                entry(3, "7", "orders_copy"),
+            ],
+        );
+        assert_eq!(metric.collect()[0].get_metric().len(), 3);
+
+        // A rename must replace its label, and dropped tables must stop being exported.
+        refresh_cdc_table_info(&metric, [entry(1, "7", "renamed_orders")]);
+        let families = metric.collect();
+        let samples = families[0].get_metric();
+        assert_eq!(samples.len(), 1);
+        assert!(
+            samples[0]
+                .get_label()
+                .iter()
+                .any(|label| { label.name() == "table_name" && label.value() == "renamed_orders" })
+        );
+        refresh_cdc_table_info(&metric, []);
+        assert!(metric.collect()[0].get_metric().is_empty());
     }
 }
 

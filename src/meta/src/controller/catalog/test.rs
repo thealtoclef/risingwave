@@ -37,6 +37,85 @@ mod tests {
     const TEST_SCHEMA_ID: SchemaId = SchemaId::new(2);
     const TEST_OWNER_ID: UserId = UserId::new(1);
 
+    #[tokio::test]
+    async fn test_created_cdc_table_metric_membership() -> MetaResult<()> {
+        let mgr = CatalogController::new(MetaSrvEnv::for_test().await).await?;
+        let inner = mgr.inner.write().await;
+        let txn = inner.db.begin().await?;
+        let mut created_id = None;
+        for (name, cdc_table_id, status) in [
+            ("created_cdc", Some("7.public.orders"), JobStatus::Created),
+            (
+                "creating_cdc",
+                Some("7.public.pending"),
+                JobStatus::Creating,
+            ),
+            ("ordinary_table", None, JobStatus::Created),
+        ] {
+            let job_id = CatalogController::create_object(
+                &txn,
+                ObjectType::Table,
+                TEST_OWNER_ID,
+                Some(TEST_SCHEMA_ID.as_object_id()),
+            )
+            .await?
+            .oid
+            .as_job_id();
+            let table_id = job_id.as_mv_table_id();
+            insert_test_table(&txn, table_id, name, TableType::Table, None, "").await?;
+            insert_test_streaming_job_model(&txn, job_id, None).await?;
+            Table::update(table::ActiveModel {
+                table_id: Set(table_id),
+                cdc_table_id: Set(cdc_table_id.map(str::to_owned)),
+                ..Default::default()
+            })
+            .exec(&txn)
+            .await?;
+            StreamingJob::update(streaming_job::ActiveModel {
+                job_id: Set(job_id),
+                job_status: Set(status),
+                ..Default::default()
+            })
+            .exec(&txn)
+            .await?;
+            if name == "created_cdc" {
+                created_id = Some(table_id);
+            }
+        }
+        txn.commit().await?;
+        drop(inner);
+
+        let tables = mgr.list_created_cdc_table_objects().await?;
+        assert_eq!(tables.len(), 1);
+        assert_eq!(tables[0].0, created_id.unwrap());
+        assert_eq!(tables[0].3, "created_cdc");
+        assert_eq!(tables[0].4, "7.public.orders");
+
+        let inner = mgr.inner.write().await;
+        // The catalog may still contain the historical three-part SQL Server spelling.
+        Table::update(table::ActiveModel {
+            table_id: Set(created_id.unwrap()),
+            cdc_table_id: Set(Some("7.production.dbo.orders".to_owned())),
+            cdc_table_type: Set(Some(risingwave_meta_model::table::CdcTableType::Sqlserver)),
+            ..Default::default()
+        })
+        .exec(&inner.db)
+        .await?;
+        drop(inner);
+        assert_eq!(
+            mgr.list_created_cdc_table_objects().await?[0].4,
+            "7.dbo.orders"
+        );
+
+        let inner = mgr.inner.write().await;
+        Table::delete_by_id(created_id.unwrap())
+            .exec(&inner.db)
+            .await?;
+        drop(inner);
+        assert!(mgr.list_created_cdc_table_objects().await?.is_empty());
+        Ok(())
+    }
+
     async fn insert_test_table(
         txn: &DatabaseTransaction,
         table_id: TableId,

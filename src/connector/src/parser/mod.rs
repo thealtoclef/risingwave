@@ -59,6 +59,7 @@ use self::upsert_parser::UpsertParser;
 use crate::error::ConnectorResult;
 use crate::parser::maxwell::MaxwellParser;
 use crate::schema::schema_registry::SchemaRegistryConfig;
+use crate::source::cdc::build_cdc_table_id;
 use crate::source::monitor::GLOBAL_SOURCE_METRICS;
 use crate::source::{
     BoxSourceMessageEventStream, SourceChunkStream, SourceColumnDesc, SourceColumnType,
@@ -384,6 +385,7 @@ async fn parse_message_stream<P: ByteStreamSourceParser>(
         SourceStreamChunkBuilder::new(parser.columns().to_vec(), source_ctrl_opts);
 
     let mut direct_cdc_event_lag_latency_metrics = HashMap::new();
+    let source_id = parser.source_ctx().source_id;
 
     #[for_await]
     for event in msg_stream {
@@ -427,14 +429,17 @@ async fn parse_message_stream<P: ByteStreamSourceParser>(
             // calculate process_time - event_time lag
             if let SourceMeta::DebeziumCdc(msg_meta) = &msg.meta {
                 let lag_ms = process_time_ms - msg_meta.source_ts_ms;
-                // report to promethus
+                // Include the source-scoped routing identity so catalog metrics can distinguish
+                // created CDC tables from other tables captured by a shared source.
                 let full_table_name = msg_meta.full_table_name.clone();
                 let direct_cdc_event_lag_latency = direct_cdc_event_lag_latency_metrics
                     .entry(full_table_name)
                     .or_insert_with(|| {
+                        let cdc_table_id =
+                            build_cdc_table_id(source_id, msg_meta.routing_table_name());
                         GLOBAL_SOURCE_METRICS
                             .direct_cdc_event_lag_latency
-                            .with_guarded_label_values(&[&msg_meta.full_table_name])
+                            .with_guarded_label_values(&[&msg_meta.full_table_name, &cdc_table_id])
                     });
                 direct_cdc_event_lag_latency.observe(lag_ms as f64);
             }

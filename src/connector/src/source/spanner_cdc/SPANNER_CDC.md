@@ -704,7 +704,7 @@ with `spanner_cdc_newest_partition_lag_milliseconds` tells you which failure you
 
 | Metric | Description |
 |--------|-------------|
-| `source_cdc_event_lag_duration_milliseconds` | CDC event lag latency (histogram, labels: `table_name`) |
+| `source_cdc_event_lag_duration_milliseconds` | CDC event lag latency (histogram, labels: `table_name`, `cdc_table_id`). Join `cdc_table_info` by source-scoped identity to display only created CDC tables |
 | `stream_source_output_rows_counts` | Total rows output from source |
 | `stream_source_split_change_event_count` | Split change events |
 | `stream_cdc_backfill_snapshot_read_row_count` | Rows read during snapshot backfill |
