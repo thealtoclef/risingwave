@@ -20,8 +20,9 @@ use risingwave_common::catalog::{ColumnCatalog, ColumnDesc, ColumnId, max_column
 use risingwave_common::types::{DataType, StructType};
 use risingwave_pb::plan_common::additional_column::ColumnType as AdditionalColumnType;
 use risingwave_pb::plan_common::{
-    AdditionalCollectionName, AdditionalColumn, AdditionalColumnFilename, AdditionalColumnHeader,
-    AdditionalColumnHeaders, AdditionalColumnIngestionTimestamp, AdditionalColumnKey,
+    AdditionalCollectionName, AdditionalColumn, AdditionalColumnDeliveryAttempt,
+    AdditionalColumnFilename, AdditionalColumnHeader, AdditionalColumnHeaders,
+    AdditionalColumnIngestionTimestamp, AdditionalColumnKey, AdditionalColumnMessageId,
     AdditionalColumnOffset, AdditionalColumnPartition, AdditionalColumnPayload,
     AdditionalColumnPulsarMessageIdData, AdditionalColumnTimestamp, AdditionalDatabaseName,
     AdditionalSchemaName, AdditionalSubject, AdditionalTableName,
@@ -30,8 +31,8 @@ use risingwave_pb::plan_common::{
 use crate::error::ConnectorResult;
 use crate::source::cdc::MONGODB_CDC_CONNECTOR;
 use crate::source::{
-    AZBLOB_CONNECTOR, GCS_CONNECTOR, KAFKA_CONNECTOR, KINESIS_CONNECTOR, MQTT_CONNECTOR,
-    NATS_CONNECTOR, OPENDAL_S3_CONNECTOR, POSIX_FS_CONNECTOR, PULSAR_CONNECTOR,
+    AZBLOB_CONNECTOR, GCS_CONNECTOR, GOOGLE_PUBSUB_CONNECTOR, KAFKA_CONNECTOR, KINESIS_CONNECTOR,
+    MQTT_CONNECTOR, NATS_CONNECTOR, OPENDAL_S3_CONNECTOR, POSIX_FS_CONNECTOR, PULSAR_CONNECTOR,
 };
 
 // Hidden additional columns connectors which do not support `include` syntax.
@@ -117,6 +118,19 @@ pub static COMPATIBLE_ADDITIONAL_COLUMNS: LazyLock<HashMap<&'static str, HashSet
             (
                 MQTT_CONNECTOR,
                 HashSet::from(["offset", "partition", "ingestion_timestamp"]),
+            ),
+            (
+                GOOGLE_PUBSUB_CONNECTOR,
+                HashSet::from([
+                    "key",
+                    "timestamp",
+                    "message_id",
+                    "header",
+                    "delivery_attempt",
+                    "partition",
+                    "offset",
+                    "ingestion_timestamp",
+                ]),
             ),
         ])
     });
@@ -325,6 +339,26 @@ pub fn build_additional_column_desc(
             AdditionalColumn {
                 column_type: Some(AdditionalColumnType::PulsarMessageIdData(
                     AdditionalColumnPulsarMessageIdData {},
+                )),
+            },
+        ),
+        "message_id" => ColumnDesc::named_with_additional_column(
+            column_name,
+            column_id,
+            DataType::Varchar,
+            AdditionalColumn {
+                column_type: Some(AdditionalColumnType::MessageId(
+                    AdditionalColumnMessageId {},
+                )),
+            },
+        ),
+        "delivery_attempt" => ColumnDesc::named_with_additional_column(
+            column_name,
+            column_id,
+            DataType::Int32,
+            AdditionalColumn {
+                column_type: Some(AdditionalColumnType::DeliveryAttempt(
+                    AdditionalColumnDeliveryAttempt {},
                 )),
             },
         ),

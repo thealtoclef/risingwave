@@ -29,7 +29,8 @@ use thiserror_ext::AsReport;
 
 use super::MessageMeta;
 use crate::parser::utils::{
-    extract_cdc_meta_column, extract_header_inner_from_meta, extract_headers_from_meta,
+    extract_cdc_meta_column, extract_delivery_attempt_from_meta, extract_header_inner_from_meta,
+    extract_headers_from_meta, extract_key_from_meta, extract_message_id_from_meta,
     extract_pulsar_message_id_data_from_meta, extract_subject_from_meta,
     extract_timestamp_from_meta,
 };
@@ -375,6 +376,24 @@ impl SourceStreamChunkRowWriter<'_> {
                 (_, &Some(AdditionalColumnType::IngestionTimestamp(_))) => Ok(A::output_for(Some(
                     ScalarRefImpl::Timestamptz(risingwave_common::types::Timestamptz::now()),
                 ))),
+                (_, &Some(AdditionalColumnType::Key(_)))
+                    if let Some(key) = self
+                        .row_meta
+                        .as_ref()
+                        .and_then(|ele| extract_key_from_meta(ele.source_meta)) =>
+                {
+                    Ok(A::output_for(key))
+                }
+                (_, &Some(AdditionalColumnType::MessageId(_))) => {
+                    Ok(A::output_for(self.row_meta.as_ref().and_then(|ele| {
+                        extract_message_id_from_meta(ele.source_meta)
+                    })))
+                }
+                (_, &Some(AdditionalColumnType::DeliveryAttempt(_))) => {
+                    Ok(A::output_for(self.row_meta.as_ref().and_then(|ele| {
+                        extract_delivery_attempt_from_meta(ele.source_meta)
+                    })))
+                }
                 (_, &Some(AdditionalColumnType::CollectionName(_))) => {
                     // collection name for `mongodb-cdc` should be parsed from the message payload
                     parse_field(desc)

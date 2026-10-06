@@ -45,6 +45,25 @@ CREATE TABLE s1 (v1 int, v2 varchar) WITH (
     pubsub.ack_deadline_seconds = 10
 ) FORMAT PLAIN ENCODE JSON;
 
+statement error additional column type payload is not supported for connector google_pubsub
+CREATE TABLE s_bad (v1 int, v2 varchar) INCLUDE payload WITH (
+    ${RISEDEV_PUBSUB_WITH_OPTIONS_COMMON},
+    pubsub.subscription = 'test-subscription-2',
+) FORMAT PLAIN ENCODE JSON;
+
+statement ok
+CREATE TABLE s2 (v1 int, v2 varchar)
+INCLUDE timestamp AS publish_time
+INCLUDE message_id AS message_id
+INCLUDE key AS ordering_key
+INCLUDE header AS attributes
+INCLUDE header 'source' varchar AS attr_source
+INCLUDE delivery_attempt AS delivery_attempt
+WITH (
+    ${RISEDEV_PUBSUB_WITH_OPTIONS_COMMON},
+    pubsub.subscription = 'test-subscription-2',
+) FORMAT PLAIN ENCODE JSON;
+
 # Disable checkpointing to test ack-on-checkpoint behavior.
 # Note that DDL & flush will trigger checkpoint.
 statement ok
@@ -70,6 +89,24 @@ set visibility_mode = 'all';
 # while the stream is active, so only assert the distinct payloads we care about.
 query I retry 60 backoff 1s
 select count(distinct v1) from s1;
+----
+10
+
+# `INCLUDE timestamp` exposes the Pub/Sub publish time and `INCLUDE message_id` the
+# server-assigned id. Redeliveries keep the same id, so distinct ids match distinct payloads.
+query II retry 60 backoff 1s
+select count(distinct v1), count(distinct message_id) from s2
+where publish_time is not null and publish_time <= now() and message_id is not null;
+----
+10 10
+
+query I retry 60 backoff 1s
+select count(*) from s2
+where attr_source = 'app' || v1
+  and array_length(attributes) = 1
+  and (attributes[1]).key = 'source'
+  and ordering_key = ('k' || v1)::bytea
+  and delivery_attempt is null;
 ----
 10
 
@@ -116,6 +153,9 @@ select count(distinct v1) from s1;
 
 statement ok
 DROP TABLE s1;
+
+statement ok
+DROP TABLE s2;
 
 # Attempted to verify no redelivery after ack: drop and recreate on the same subscription.
 # But ack can happen in any time, we can not guarantee the messages are ack-ed in time.

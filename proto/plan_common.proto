@@ -294,6 +294,12 @@ message AdditionalColumnPulsarMessageIdData {}
 
 message AdditionalColumnIngestionTimestamp {}
 
+// message id assigned by the broker, e.g. Pub/Sub `message_id`
+message AdditionalColumnMessageId {}
+
+// delivery attempt counter, e.g. Pub/Sub `delivery_attempt` (needs a dead-letter policy)
+message AdditionalColumnDeliveryAttempt {}
+
 message AdditionalColumn {
   oneof column_type {
     AdditionalColumnKey key = 1;
@@ -311,6 +317,8 @@ message AdditionalColumn {
     AdditionalSubject subject = 13;
     AdditionalColumnPulsarMessageIdData pulsar_message_id_data = 14;
     AdditionalColumnIngestionTimestamp ingestion_timestamp = 15;
+    AdditionalColumnMessageId message_id = 16;
+    AdditionalColumnDeliveryAttempt delivery_attempt = 17;
   }
 }
 

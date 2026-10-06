@@ -126,6 +126,7 @@ pub fn extract_timestamp_from_meta(meta: &SourceMeta) -> DatumRef<'_> {
         SourceMeta::Kafka(kafka_meta) => kafka_meta.extract_timestamp(),
         SourceMeta::DebeziumCdc(cdc_meta) => cdc_meta.extract_timestamp(),
         SourceMeta::Kinesis(kinesis_meta) => kinesis_meta.extract_timestamp(),
+        SourceMeta::GooglePubsub(pubsub_meta) => pubsub_meta.extract_timestamp(),
         _ => None,
     }
 }
@@ -151,6 +152,30 @@ pub fn extract_headers_from_meta(meta: &SourceMeta) -> Option<Datum> {
     match meta {
         SourceMeta::Kafka(kafka_meta) => kafka_meta.extract_headers(), /* expect output of type `array[struct<varchar, bytea>]` */
         SourceMeta::Pulsar(pulsar_meta) => pulsar_meta.extract_headers(), /* expect output of type `array[struct<varchar, bytea>]` */
+        SourceMeta::GooglePubsub(pubsub_meta) => pubsub_meta.extract_headers(), /* expect output of type `array[struct<varchar, bytea>]` */
+        _ => None,
+    }
+}
+
+pub fn extract_message_id_from_meta(meta: &SourceMeta) -> DatumRef<'_> {
+    match meta {
+        SourceMeta::GooglePubsub(pubsub_meta) => pubsub_meta.extract_message_id(),
+        _ => None,
+    }
+}
+
+/// Key column served from source meta instead of `SourceMessage::key`; `None` means
+/// the connector has no such meta and the key should be parsed as usual.
+pub fn extract_key_from_meta(meta: &SourceMeta) -> Option<DatumRef<'_>> {
+    match meta {
+        SourceMeta::GooglePubsub(pubsub_meta) => Some(pubsub_meta.extract_ordering_key()),
+        _ => None,
+    }
+}
+
+pub fn extract_delivery_attempt_from_meta(meta: &SourceMeta) -> DatumRef<'_> {
+    match meta {
+        SourceMeta::GooglePubsub(pubsub_meta) => pubsub_meta.extract_delivery_attempt(),
         _ => None,
     }
 }
@@ -173,6 +198,9 @@ pub fn extract_header_inner_from_meta<'a>(
     match meta {
         SourceMeta::Kafka(kafka_meta) => kafka_meta.extract_header_inner(inner_field, data_type), /* expect output of type `bytea` or `varchar` */
         SourceMeta::Pulsar(pulsar_meta) => pulsar_meta.extract_header_inner(inner_field, data_type),
+        SourceMeta::GooglePubsub(pubsub_meta) => {
+            pubsub_meta.extract_header_inner(inner_field, data_type)
+        }
         _ => None,
     }
 }

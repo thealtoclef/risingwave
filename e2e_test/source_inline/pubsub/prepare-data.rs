@@ -67,6 +67,8 @@ async fn main() -> anyhow::Result<()> {
             let a = publisher
                 .publish(PubsubMessage {
                     data: data.to_string().into_bytes(),
+                    attributes: [("source".to_string(), format!("app{i}"))].into(),
+                    ordering_key: format!("k{i}"),
                     ..Default::default()
                 })
                 .await;
