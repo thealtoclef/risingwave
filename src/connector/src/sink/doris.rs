@@ -32,8 +32,9 @@ use risingwave_common::array::{Array, ArrayError, ArrayImpl, Op, StreamChunk, St
 use risingwave_common::catalog::Schema;
 use risingwave_common::id::SinkId;
 use risingwave_common::row::Row;
-use risingwave_common::types::DataType;
+use risingwave_common::types::{DataType, ScalarImpl, ToText};
 use risingwave_common::util::iter_util::ZipEqFast;
+use risingwave_common::util::value_encoding::deserialize_datum;
 use risingwave_common_estimate_size::EstimateSize;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -1443,21 +1444,81 @@ impl DorisSink {
 
 }
 
+/// A column to add to the Doris target table via a schema change.
+#[derive(Debug, PartialEq, Eq)]
+struct DorisAddColumn {
+    name: String,
+    doris_type: String,
+    /// Rendered constant default value (the SQL literal, without the `DEFAULT` keyword), if the
+    /// column has a constant default that Doris can represent. `None` adds the column without a
+    /// default.
+    default_value: Option<String>,
+}
+
+/// Render a constant default scalar into a Doris SQL literal.
+///
+/// Doris backfills existing rows with this value on `ADD COLUMN ... DEFAULT`, which is exactly what
+/// we want for the pre-existing rows that RisingWave fills from `DefaultColumnDesc.snapshot_value`.
+///
+/// Returns `None` for values Doris cannot represent as an `ADD COLUMN` default (JSON/VARIANT and
+/// other composite types, non-finite floats, ...) or that cannot be encoded unambiguously, so the
+/// column is added without a default instead of emitting a wrong value.
+fn doris_default_literal(scalar: &ScalarImpl) -> Option<String> {
+    match scalar {
+        ScalarImpl::Bool(v) => Some(if *v { "1".to_owned() } else { "0".to_owned() }),
+        ScalarImpl::Int16(v) => Some(v.to_text()),
+        ScalarImpl::Int32(v) => Some(v.to_text()),
+        ScalarImpl::Int64(v) => Some(v.to_text()),
+        ScalarImpl::Serial(v) => Some(v.to_text()),
+        ScalarImpl::Float32(v) => v.0.is_finite().then(|| v.to_text()),
+        ScalarImpl::Float64(v) => v.0.is_finite().then(|| v.to_text()),
+        ScalarImpl::Decimal(v) => Some(v.to_text()),
+        ScalarImpl::Date(v) => Some(format!("'{}'", v.to_text())),
+        ScalarImpl::Utf8(v) => doris_string_literal(v),
+        // JSON/VARIANT defaults are rejected by Doris, and time/timestamp/interval/bytea have
+        // formatting subtleties (timezone, encoding) we do not want to guess at here.
+        _ => None,
+    }
+}
+
+/// Encode a string as a Doris `DEFAULT` literal.
+///
+/// Doris stores the string body between the delimiters verbatim, so we pick a delimiter that does
+/// not occur in the value. Values containing control characters (which would corrupt the DDL) or
+/// both quote kinds cannot be encoded and yield `None`.
+fn doris_string_literal(s: &str) -> Option<String> {
+    if s.chars().any(char::is_control) {
+        return None;
+    }
+    if !s.contains('"') {
+        Some(format!("\"{s}\""))
+    } else if !s.contains('\'') {
+        Some(format!("'{s}'"))
+    } else {
+        None
+    }
+}
+
 /// Build an `ALTER TABLE ... ADD COLUMN` statement adding the given new columns to the target
-/// table. Each `(name, doris_type)` pair becomes one column definition; names are quoted with
-/// backticks so a name containing a backtick can't break out of the DDL.
+/// table. Each column becomes one definition; names are quoted with backticks so a name containing
+/// a backtick can't break out of the DDL. When a column carries a constant default, a
+/// `DEFAULT <literal>` clause is added so Doris backfills existing rows with the same value
+/// RisingWave uses for them.
 ///
 /// Doris has no `ADD COLUMN IF NOT EXISTS`. The Doris sink is coordinated, so the coordinator
 /// issues exactly one `ALTER` per schema change; if it fails the meta retries, and since an `ALTER`
 /// that failed did not add the column, the retried statement is identical and does not duplicate.
-fn build_alter_add_column_sql(
-    database: &str,
-    table: &str,
-    columns: &[(String, String)],
-) -> String {
+fn build_alter_add_column_sql(database: &str, table: &str, columns: &[DorisAddColumn]) -> String {
     let column_definitions = columns
         .iter()
-        .map(|(name, typ)| format!("{} {}", DorisSink::quote_ident(name), typ))
+        .map(|col| {
+            let mut definition = format!("{} {}", DorisSink::quote_ident(&col.name), col.doris_type);
+            if let Some(default) = &col.default_value {
+                definition.push_str(" DEFAULT ");
+                definition.push_str(default);
+            }
+            definition
+        })
         .collect::<Vec<_>>()
         .join(", ");
     format!(
@@ -1502,14 +1563,15 @@ impl DorisSinkCommitCoordinator {
         Self { config }
     }
 
-    /// Map an `AddColumns` schema change to `(name, doris_type)` pairs, reusing the same type
+    /// Map an `AddColumns` schema change to Doris column definitions, reusing the same type
     /// mapping as auto-create so a column added here exactly matches what `CREATE TABLE` would
-    /// have produced. Any other operation (`DropColumns`, ...) is rejected, matching the
-    /// Snowflake/Redshift sinks.
+    /// have produced. When the column carries a constant default, it is rendered so Doris
+    /// backfills existing rows with the same value RisingWave uses for them. Any other operation
+    /// (`DropColumns`, ...) is rejected, matching the Snowflake/Redshift sinks.
     fn add_columns_from_schema_change(
         schema_change: &risingwave_pb::stream_plan::PbSinkSchemaChange,
         timestamptz_as_datetime: bool,
-    ) -> Result<Vec<(String, String)>> {
+    ) -> Result<Vec<DorisAddColumn>> {
         use risingwave_pb::stream_plan::sink_schema_change::Op as SinkSchemaChangeOp;
         let schema_change_op = schema_change
             .op
@@ -1522,7 +1584,7 @@ impl DorisSinkCommitCoordinator {
         };
 
         let mut columns = Vec::with_capacity(add_columns.fields.len());
-        for f in &add_columns.fields {
+        for (idx, f) in add_columns.fields.iter().enumerate() {
             let data_type = f.data_type.as_ref().ok_or_else(|| {
                 SinkError::Coordinator(anyhow!("Missing data type for column '{}'", f.name))
             })?;
@@ -1532,7 +1594,20 @@ impl DorisSinkCommitCoordinator {
                 false, // new columns are never keys
                 timestamptz_as_datetime,
             )?;
-            columns.push((f.name.clone(), doris_type));
+            // `default_values` is index-aligned with `fields`; a missing or empty entry (or an
+            // unsupported value) means the column is added without a default.
+            let default_value = add_columns
+                .default_values
+                .get(idx)
+                .filter(|pb| !pb.body.is_empty())
+                .and_then(|pb| deserialize_datum(pb.body.as_slice(), &rw_type).ok())
+                .flatten()
+                .and_then(|scalar| doris_default_literal(&scalar));
+            columns.push(DorisAddColumn {
+                name: f.name.clone(),
+                doris_type,
+                default_value,
+            });
         }
         Ok(columns)
     }
@@ -2541,14 +2616,14 @@ mod tests {
 
     use risingwave_common::catalog::{ColumnDesc, ColumnId, Field, Schema};
     use risingwave_common::id::SinkId;
-    use risingwave_common::types::{DataType, ListType, MapType, StructType};
+    use risingwave_common::types::{DataType, ListType, MapType, ScalarImpl, StructType};
 
     use super::{
-        DorisConfig, DorisField, DorisInsertResultResponse, DorisPartitionSpec,
+        DorisAddColumn, DorisConfig, DorisField, DorisInsertResultResponse, DorisPartitionSpec,
         DorisSink, DorisSinkCommitCoordinator, DorisSinkWriter, LoadRequestSizeDecision,
         build_alter_add_column_sql, build_alter_drop_column_sql, decide_load_request_size,
-        doris_arrow_schema, normalize_doris_type, parse_doris_schema,
-        parse_partition_by, stringify_fallback_array,
+        doris_arrow_schema, doris_default_literal, doris_string_literal, normalize_doris_type,
+        parse_doris_schema, parse_partition_by, stringify_fallback_array,
     };
     use crate::sink::doris_starrocks_connector::InserterInnerBuilder;
     use risingwave_common::array::arrow::arrow_schema_58;
@@ -3380,8 +3455,8 @@ mod tests {
             "demo",
             "sink_table",
             &[
-                ("nickname".to_owned(), "STRING".to_owned()),
-                ("score".to_owned(), "FLOAT".to_owned()),
+                add_column("nickname", "STRING"),
+                add_column("score", "FLOAT"),
             ],
         );
         assert_eq!(
@@ -3392,14 +3467,87 @@ mod tests {
 
     #[test]
     fn test_build_alter_add_column_sql_escapes_backtick() {
-        let sql = build_alter_add_column_sql(
-            "demo",
-            "sink_table",
-            &[("we`ird".to_owned(), "INT".to_owned())],
-        );
+        let sql = build_alter_add_column_sql("demo", "sink_table", &[add_column("we`ird", "INT")]);
         assert_eq!(
             sql,
             "ALTER TABLE `demo`.`sink_table` ADD COLUMN (`we``ird` INT)"
+        );
+    }
+
+    /// A column definition without a default.
+    fn add_column(name: &str, doris_type: &str) -> DorisAddColumn {
+        DorisAddColumn {
+            name: name.to_owned(),
+            doris_type: doris_type.to_owned(),
+            default_value: None,
+        }
+    }
+
+    #[test]
+    fn test_build_alter_add_column_sql_with_default() {
+        let sql = build_alter_add_column_sql(
+            "demo",
+            "sink_table",
+            &[
+                DorisAddColumn {
+                    name: "channel".to_owned(),
+                    doris_type: "STRING".to_owned(),
+                    default_value: Some("\"sip\"".to_owned()),
+                },
+                add_column("score", "FLOAT"),
+            ],
+        );
+        assert_eq!(
+            sql,
+            "ALTER TABLE `demo`.`sink_table` ADD COLUMN (`channel` STRING DEFAULT \"sip\", `score` FLOAT)"
+        );
+    }
+
+    #[test]
+    fn test_doris_default_literal() {
+        use risingwave_common::types::{Date, Decimal, F32, F64};
+        // Simple strings use double quotes; a value containing a double quote falls back to single
+        // quotes; a value containing both quote kinds cannot be encoded.
+        assert_eq!(doris_string_literal("sip").as_deref(), Some("\"sip\""));
+        assert_eq!(
+            doris_string_literal("O'Brien").as_deref(),
+            Some("\"O'Brien\"")
+        );
+        assert_eq!(
+            doris_string_literal("a \"b\" c").as_deref(),
+            Some("'a \"b\" c'")
+        );
+        assert_eq!(doris_string_literal("a 'b' \"c\""), None);
+        assert_eq!(doris_string_literal("line\nbreak"), None);
+
+        assert_eq!(
+            doris_default_literal(&ScalarImpl::Bool(true)).as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            doris_default_literal(&ScalarImpl::Int64(42)).as_deref(),
+            Some("42")
+        );
+        assert_eq!(
+            doris_default_literal(&ScalarImpl::Decimal(Decimal::from(123))).as_deref(),
+            Some("123")
+        );
+        assert_eq!(
+            doris_default_literal(&ScalarImpl::Float64(F64::from(1.5))).as_deref(),
+            Some("1.5")
+        );
+        assert_eq!(
+            doris_default_literal(&ScalarImpl::Utf8("sip".into())).as_deref(),
+            Some("\"sip\"")
+        );
+        assert_eq!(
+            doris_default_literal(&ScalarImpl::Date(Date::from_ymd_uncheck(2026, 10, 7))).as_deref(),
+            Some("'2026-10-07'")
+        );
+        // Non-finite floats are skipped.
+        assert_eq!(
+            doris_default_literal(&ScalarImpl::Float32(F32::from(f32::NAN))),
+            None
         );
     }
 
@@ -3414,6 +3562,7 @@ mod tests {
                 Field::with_name(DataType::Varchar, "name").to_prost(),
                 Field::with_name(DataType::Timestamptz, "ts").to_prost(),
             ],
+            default_values: vec![],
         };
         let change = risingwave_pb::stream_plan::PbSinkSchemaChange {
             original_schema: vec![],
@@ -3425,15 +3574,15 @@ mod tests {
         assert_eq!(
             cols,
             vec![
-                ("id".to_owned(), "BIGINT".to_owned()),
-                ("name".to_owned(), "STRING".to_owned()),
-                ("ts".to_owned(), "TIMESTAMPTZ(6)".to_owned()),
+                add_column("id", "BIGINT"),
+                add_column("name", "STRING"),
+                add_column("ts", "TIMESTAMPTZ(6)"),
             ]
         );
 
         // `timestamptz_as_datetime = true` (a Doris 3 target): `timestamptz` maps to `DATETIME`.
         let cols = DorisSinkCommitCoordinator::add_columns_from_schema_change(&change, true).unwrap();
-        assert_eq!(cols[2], ("ts".to_owned(), "DATETIME(6)".to_owned()));
+        assert_eq!(cols[2], add_column("ts", "DATETIME(6)"));
     }
 
     #[test]
@@ -3459,6 +3608,35 @@ mod tests {
                 Field::with_name(DataType::Int64, "id").to_prost(),
                 Field::with_name(DataType::Varchar, "name").to_prost(),
             ],
+            default_values: vec![],
+        };
+        let change = risingwave_pb::stream_plan::PbSinkSchemaChange {
+            original_schema: vec![],
+            op: Some(SinkSchemaChangeOp::AddColumns(add_columns)),
+        };
+        let cols = DorisSinkCommitCoordinator::add_columns_from_schema_change(&change, false).unwrap();
+        assert_eq!(cols, vec![add_column("id", "BIGINT"), add_column("name", "STRING")]);
+    }
+
+    #[test]
+    fn test_add_columns_from_schema_change_renders_constant_default() {
+        use risingwave_common::util::value_encoding::serialize_datum;
+        use risingwave_pb::data::PbDatum;
+        use risingwave_pb::stream_plan::sink_schema_change::Op as SinkSchemaChangeOp;
+        use risingwave_pb::stream_plan::SinkAddColumnsOp;
+
+        let add_columns = SinkAddColumnsOp {
+            fields: vec![
+                Field::with_name(DataType::Varchar, "channel").to_prost(),
+                Field::with_name(DataType::Int64, "n").to_prost(),
+            ],
+            default_values: vec![
+                PbDatum {
+                    body: serialize_datum(Some(ScalarImpl::Utf8("sip".into()))),
+                },
+                // Empty body = no constant default = no `DEFAULT` clause.
+                PbDatum { body: vec![] },
+            ],
         };
         let change = risingwave_pb::stream_plan::PbSinkSchemaChange {
             original_schema: vec![],
@@ -3468,9 +3646,17 @@ mod tests {
         assert_eq!(
             cols,
             vec![
-                ("id".to_owned(), "BIGINT".to_owned()),
-                ("name".to_owned(), "STRING".to_owned()),
+                DorisAddColumn {
+                    name: "channel".to_owned(),
+                    doris_type: "STRING".to_owned(),
+                    default_value: Some("\"sip\"".to_owned()),
+                },
+                add_column("n", "BIGINT"),
             ]
+        );
+        assert_eq!(
+            build_alter_add_column_sql("db", "calls", &cols),
+            "ALTER TABLE `db`.`calls` ADD COLUMN (`channel` STRING DEFAULT \"sip\", `n` BIGINT)"
         );
     }
 

@@ -51,6 +51,7 @@ use risingwave_pb::catalog::{
     Comment, Connection, CreateType, Database, Function, PbTable, Schema, Secret, Source,
     Subscription, Table, View,
 };
+use risingwave_pb::data::PbDatum;
 use risingwave_pb::ddl_service::alter_owner_request::Object;
 use risingwave_pb::ddl_service::{
     DdlProgress, TableJobType, WaitVersion, alter_name_request, alter_set_schema_request,
@@ -58,6 +59,7 @@ use risingwave_pb::ddl_service::{
 };
 use risingwave_pb::meta::table_fragments::fragment::FragmentDistributionType as PbFragmentDistributionType;
 use risingwave_pb::plan_common::PbColumnCatalog;
+use risingwave_pb::plan_common::column_desc::GeneratedOrDefaultColumn;
 use risingwave_pb::stream_plan::stream_node::NodeBody;
 use risingwave_pb::stream_plan::{
     PbDispatchOutputMapping, PbStreamFragmentGraph, PbStreamNode, PbUpstreamSinkInfo,
@@ -1761,6 +1763,10 @@ impl DdlController {
                             .iter()
                             .map(|col| Field::from(&col.column_desc))
                             .collect(),
+                        newly_add_defaults: newly_added_columns
+                            .iter()
+                            .map(constant_default_value)
+                            .collect(),
                         removed_column_names: removed_columns
                             .iter()
                             .map(|col| col.name.clone())
@@ -2525,6 +2531,22 @@ impl DdlController {
             .catalog_controller
             .alter_streaming_job_config(job_id, entries_to_add, keys_to_remove)
             .await
+    }
+}
+
+/// Extract the constant default value of a newly added column, if any.
+///
+/// CDC auto schema change fills pre-existing rows with `DefaultColumnDesc.snapshot_value`
+/// (a constant evaluated from the upstream `ADD COLUMN ... DEFAULT ...`). We forward that
+/// same constant to downstream sinks so they can backfill existing rows identically.
+/// Non-constant defaults (e.g. `now()`) have no snapshot value and yield an empty datum,
+/// matching RisingWave leaving such columns `NULL` for existing rows.
+fn constant_default_value(col: &ColumnCatalog) -> PbDatum {
+    match col.column_desc.generated_or_default_column.as_ref() {
+        Some(GeneratedOrDefaultColumn::DefaultColumn(desc)) => {
+            desc.snapshot_value.clone().unwrap_or_default()
+        }
+        _ => PbDatum::default(),
     }
 }
 

@@ -27,6 +27,7 @@ use risingwave_connector::source::CdcTableSnapshotSplitRaw;
 use risingwave_meta_model::prelude::Fragment as FragmentModel;
 use risingwave_meta_model::{StreamingParallelism, WorkerId, fragment, streaming_job};
 use risingwave_pb::catalog::{CreateType, PbSink, PbTable, Subscription};
+use risingwave_pb::data::PbDatum;
 use risingwave_pb::ddl_service::streaming_job_resource_type;
 use risingwave_pb::expr::PbExprNode;
 use risingwave_pb::plan_common::{PbColumnCatalog, PbField};
@@ -249,6 +250,9 @@ pub struct AutoRefreshSchemaSinkContext {
     /// before a pk column is dropped.
     pub new_downstream_pk: Vec<i32>,
     pub newly_add_fields: Vec<Field>,
+    /// Constant default value for each newly added column, index-aligned with `newly_add_fields`.
+    /// An empty `body` means the column has no constant default.
+    pub newly_add_defaults: Vec<PbDatum>,
     pub removed_column_names: Vec<String>,
     pub new_fragment: Fragment,
     pub new_log_store_table: Option<Box<PbTable>>,

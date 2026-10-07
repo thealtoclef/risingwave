@@ -2777,6 +2777,7 @@ mod tests {
                     name: "new_col".into(),
                     description: None,
                 }],
+                default_values: vec![],
             })),
         };
 

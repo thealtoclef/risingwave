@@ -1467,6 +1467,16 @@ message SinkSchemaChange {
 message SinkAddColumnsOp {
   // Columns to add
   repeated plan_common.Field fields = 1;
+
+  // Constant default value for each newly added column, index-aligned with `fields`.
+  // It is taken from the column's `DefaultColumnDesc.snapshot_value`, i.e. the value
+  // the upstream column was added with and that RisingWave uses to fill existing rows.
+  // A connector may use it to backfill existing rows in the downstream table with the
+  // same value (e.g. `ALTER TABLE ... ADD COLUMN ... DEFAULT <value>`). An empty `body`
+  // (or a missing entry) means the column has no constant default.
+  //
+  // Tag 100: kept out of the low range so it does not collide with fields added upstream.
+  repeated data.Datum default_values = 100;
 }
 
 // Drop columns operation

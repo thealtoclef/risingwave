@@ -1705,6 +1705,7 @@ impl Command {
                                     .iter()
                                     .map(|field| field.to_prost())
                                     .collect(),
+                                default_values: sink.newly_add_defaults.clone(),
                             })
                         };
                         (

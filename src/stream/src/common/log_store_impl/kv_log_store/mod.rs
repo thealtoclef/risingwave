@@ -2276,6 +2276,7 @@ mod tests {
                     name: "new_col".to_owned(),
                     description: None,
                 }],
+                default_values: vec![],
             })),
         };
 
@@ -2494,6 +2495,7 @@ mod tests {
                             data_type: Some(DataType::Int32.to_protobuf()),
                             name: "age".to_owned(),
                         }],
+                        default_values: vec![],
                     },
                 ),
             ),
