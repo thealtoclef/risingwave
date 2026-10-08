@@ -373,7 +373,7 @@ IcebergProperties:
     comments: |-
       Namespace properties for creating Iceberg namespaces/schemas.
       Format: "key1=value1;key2=value2"
-      Example for BigQuery: "location=gs://my-bucket/{namespace};gcp-region=us-east1"
+      Example for `BigQuery`: "location=gs://my-bucket/{namespace};gcp-region=us-east1"
       The {namespace} placeholder will be replaced with the actual namespace name.
     required: false
   - name: table.properties
@@ -381,7 +381,7 @@ IcebergProperties:
     comments: |-
       Table properties for creating Iceberg tables.
       Format: "key1=value1;key2=value2"
-      Example for BigQuery: "bq_connection=projects/my-project/locations/us/connections/my-connection"
+      Example for `BigQuery`: "bq_connection=projects/my-project/locations/us/connections/my-connection"
     required: false
   - name: database.name
     field_type: String
@@ -1530,14 +1530,14 @@ SpannerCdcProperties:
     field_type: String
     comments: |-
       GCP credentials JSON string
-      See: https://developers.google.com/workspace/guides/create-credentials#create_credentials_for_a_service_account
+      See: <https://developers.google.com/workspace/guides/create-credentials#create_credentials_for_a_service_account>
     required: false
   - name: spanner.credentials_path
     field_type: String
     comments: |-
       Path to GCP service account credentials file
       Alternative to `spanner.credentials` for file-based credentials
-      See: https://cloud.google.com/docs/authentication/provide-credentials-adc
+      See: <https://cloud.google.com/docs/authentication/provide-credentials-adc>
     required: false
   - name: spanner.emulator_host
     field_type: String
@@ -1573,11 +1573,6 @@ SpannerCdcProperties:
       Kafka connector's `connector.spanner.max.missed.heartbeats`).
     required: false
     allow_alter_on_fly: true
-  - name: spanner.start_timestamp
-    field_type: i64
-    comments: Start timestamp for the change stream query (RFC3339 format)
-    required: false
-    default: Default::default
   - name: auto.schema.change
     field_type: String
     comments: Auto schema change flag

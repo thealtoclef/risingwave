@@ -325,9 +325,6 @@ DorisConfig:
     required: true
   - name: doris.stream_load.http.timeout.ms
     field_type: u64
-    comments: |-
-      The timeout in milliseconds for stream load http request. The default, 30 seconds, matches
-      Doris's default per-load timeout (`streaming_load_max_seconds`), not a hardcoded Doris limit.
     required: false
     default: 30 * 1000
     allow_alter_on_fly: true
@@ -827,7 +824,7 @@ IcebergConfig:
     comments: |-
       Namespace properties for creating Iceberg namespaces/schemas.
       Format: "key1=value1;key2=value2"
-      Example for BigQuery: "location=gs://my-bucket/{namespace};gcp-region=us-east1"
+      Example for `BigQuery`: "location=gs://my-bucket/{namespace};gcp-region=us-east1"
       The {namespace} placeholder will be replaced with the actual namespace name.
     required: false
   - name: table.properties
@@ -835,7 +832,7 @@ IcebergConfig:
     comments: |-
       Table properties for creating Iceberg tables.
       Format: "key1=value1;key2=value2"
-      Example for BigQuery: "bq_connection=projects/my-project/locations/us/connections/my-connection"
+      Example for `BigQuery`: "bq_connection=projects/my-project/locations/us/connections/my-connection"
     required: false
   - name: database.name
     field_type: String
@@ -883,14 +880,14 @@ IcebergConfig:
     field_type: u64
     comments: |-
       Commit on the next checkpoint barrier after total buffered write size across
-      all writers exceeds this threshold in MiB. The coordinator sums per-writer
+      all writers exceeds this threshold in `MiB`. The coordinator sums per-writer
       byte reports and broadcasts the same commit decision to all writers, ensuring
       vnode-aligned commits at the same epoch.
 
       Size-based commits are opt-in: leaving this unset (or setting it to `0`)
       disables them, and commits are driven solely by `commit_checkpoint_interval`.
-      A value around 512 MiB is a good starting point, balancing Iceberg's
-      recommended on-disk file size (128-512 MiB) against the ~3-10x
+      A value around 512 `MiB` is a good starting point, balancing Iceberg's
+      recommended on-disk file size (128-512 `MiB`) against the ~3-10x
       in-memory-to-columnar-compressed ratio.
     required: false
     default: Default::default

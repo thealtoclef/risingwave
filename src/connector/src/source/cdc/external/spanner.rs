@@ -1562,29 +1562,6 @@ fn build_service_account_credentials(json: &str) -> ConnectorResult<Credentials>
     Ok(creds)
 }
 
-/// Current time as microseconds since epoch.
-pub fn now_micros() -> ConnectorResult<i64> {
-    Ok(i64::try_from(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|e| anyhow!("system clock before Unix epoch: {}", e))?
-            .as_micros(),
-    )
-    .map_err(|_| anyhow!("timestamp out of i64 range"))?)
-}
-
-/// Convert RFC3339 string to microseconds since epoch.
-pub fn rfc3339_to_micros(s: &str) -> ConnectorResult<i64> {
-    let offset = time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339)
-        .map_err(|e| anyhow!("invalid RFC3339 timestamp '{}': {}", s, e))?;
-    let nanos = offset.unix_timestamp_nanos();
-    let micros = nanos.div_euclid(1000);
-    Ok(
-        i64::try_from(micros)
-            .map_err(|_| anyhow!("timestamp out of i64 range: {} nanos", nanos))?,
-    )
-}
-
 /// Convert microseconds since epoch to `OffsetDateTime`.
 pub fn micros_to_offset_datetime(micros: i64) -> ConnectorResult<OffsetDateTime> {
     Ok(

@@ -35,6 +35,10 @@ pub struct SpannerCdcSplitEnumerator {
     metrics: Arc<EnumeratorMetrics>,
     client: DatabaseClient,
     change_stream_timestamp: Option<LabelGuardedIntGauge>,
+    /// Start offset for the root partition, taken from Spanner's own clock. Resolved
+    /// once so repeated `list_splits` calls return the same root split, and so a
+    /// frontend clock skewed relative to Spanner cannot pick a bad start point.
+    start_offset: OffsetDateTime,
 }
 
 #[async_trait]
@@ -113,30 +117,30 @@ impl SplitEnumerator for SpannerCdcSplitEnumerator {
         let options = fetch_change_stream_options(&client, &properties.change_stream_name).await?;
         validate_change_stream_options(&properties.change_stream_name, &options)?;
 
+        // Start from Spanner's own current time. Using the frontend clock could pick a
+        // timestamp in the future (if the frontend runs ahead) or one predating a
+        // newly created change stream (if it runs behind).
+        let start_offset = fetch_current_timestamp(&client).await?;
+
         Ok(Self {
             source_id,
             properties,
             metrics: context.metrics.clone(),
             client,
             change_stream_timestamp: None,
+            start_offset,
         })
     }
 
     async fn list_splits(&mut self) -> ConnectorResult<Vec<SpannerCdcSplit>> {
-        // Use start_ts from properties (user-provided or auto-generated at CREATE SOURCE).
-        let start_ts = self.properties.start_ts.ok_or_else(|| {
-            anyhow::anyhow!("spanner.start_timestamp must be set during CREATE SOURCE")
-        })?;
-        let offset = crate::source::cdc::external::spanner::micros_to_offset_datetime(start_ts)?;
-
         let split = SpannerCdcSplit::new_root(
             self.properties.change_stream_name.clone(),
             self.source_id.as_raw_id(),
-            offset,
+            self.start_offset,
         );
 
         tracing::debug!(
-            ?offset,
+            offset = ?self.start_offset,
             change_stream = %self.properties.change_stream_name,
             "created root CDC split"
         );
@@ -148,33 +152,37 @@ impl SplitEnumerator for SpannerCdcSplitEnumerator {
         // Report Spanner's current time as the upstream head, like
         // `pg_cdc_upstream_max_lsn`. It is not the source's read position: that is
         // `stream_spanner_cdc_state_timestamp`, and the difference is the checkpoint lag.
-        let mut rows = self
-            .client
-            .single_use()
-            .build()
-            .execute_query(Statement::builder("SELECT CURRENT_TIMESTAMP()").build())
-            .await
-            .map_err(|e| anyhow::anyhow!("CURRENT_TIMESTAMP query: {}", e))?;
-        if let Some(row) = rows
-            .next()
-            .await
-            .transpose()
-            .map_err(|e| anyhow::anyhow!("timestamp read: {}", e))?
-        {
-            let now: OffsetDateTime = row
-                .try_get(0)
-                .map_err(|e| anyhow::anyhow!("timestamp column: {}", e))?;
-            let ts_micros = (now.unix_timestamp_nanos() / 1_000) as i64;
-            self.change_stream_timestamp
-                .get_or_insert_with(|| {
-                    self.metrics
-                        .spanner_cdc_change_stream_timestamp
-                        .with_guarded_label_values(&[&self.source_id.to_string()])
-                })
-                .set(ts_micros);
-        }
+        let now = fetch_current_timestamp(&self.client).await?;
+        let ts_micros = (now.unix_timestamp_nanos() / 1_000) as i64;
+        self.change_stream_timestamp
+            .get_or_insert_with(|| {
+                self.metrics
+                    .spanner_cdc_change_stream_timestamp
+                    .with_guarded_label_values(&[&self.source_id.to_string()])
+            })
+            .set(ts_micros);
         Ok(())
     }
+}
+
+/// Read Spanner's current time, the connector's upstream clock.
+async fn fetch_current_timestamp(client: &DatabaseClient) -> ConnectorResult<OffsetDateTime> {
+    let mut rows = client
+        .single_use()
+        .build()
+        .execute_query(Statement::builder("SELECT CURRENT_TIMESTAMP()").build())
+        .await
+        .map_err(|e| anyhow::anyhow!("CURRENT_TIMESTAMP query: {}", e))?;
+    let row = rows
+        .next()
+        .await
+        .transpose()
+        .map_err(|e| anyhow::anyhow!("timestamp read: {}", e))?
+        .ok_or_else(|| anyhow::anyhow!("CURRENT_TIMESTAMP() returned no row"))?;
+    let ts = row
+        .try_get(0)
+        .map_err(|e| anyhow::anyhow!("timestamp column: {}", e))?;
+    Ok(ts)
 }
 
 /// Value capture types whose records the reader can turn into correct rows.

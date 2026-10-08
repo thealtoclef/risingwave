@@ -284,7 +284,6 @@ given as plain text.
 |-----------|---------|-------------|
 | `spanner.heartbeat_milliseconds` | `2000` | Heartbeat interval in milliseconds for partition health monitoring. Maps to the `heartbeat_milliseconds` TVF argument. Valid range: 1,000–300,000. |
 | `spanner.max_missed_heartbeats` | `10` | Maximum consecutive missed heartbeats before a partition stream is considered stalled and restarted. Stall timeout = `spanner.heartbeat_milliseconds` × `spanner.max_missed_heartbeats`. |
-| `spanner.start_timestamp` | current time | Start timestamp for the change stream query (RFC3339 format) |
 | `table.name` | - | Filter by upstream table (set via `TABLE 'name'` in CREATE TABLE; `'schema.name'` for a table in a named schema) |
 
 #### Retry Configuration
@@ -636,7 +635,7 @@ When you create a table FROM a Spanner CDC source, RisingWave performs:
   committed state at read time — there is no pinned snapshot timestamp.
 - The CDC offset is the read timestamp resolved by a strong read-only transaction
   (`current_cdc_offset()`), the Spanner analogue of Postgres's current WAL LSN.
-- CDC streaming starts from `spanner.start_timestamp` (user-provided or auto-generated at source creation time)
+- CDC streaming starts from Spanner's own current time (`SELECT CURRENT_TIMESTAMP()`), resolved when the enumerator starts, so a frontend clock skewed relative to Spanner cannot select a bad start point
 - Spanner CDC tables always use the parallelized backfill (`backfill.parallelism`
   defaults to 1 instead of 0). The non-parallel `CdcBackfillExecutor` drops change-log
   events whose offset is below a low offset that it advances to each consumed event,

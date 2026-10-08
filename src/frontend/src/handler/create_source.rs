@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::LazyLock;
 
-use anyhow::{Context, anyhow};
+use anyhow::Context;
 use either::Either;
 use external_schema::debezium::extract_debezium_avro_table_pk_columns;
 use external_schema::nexmark::check_nexmark_schema;
@@ -69,7 +69,7 @@ pub use risingwave_connector::source::{
 use risingwave_connector::source::{
     AZBLOB_CONNECTOR, ConnectorProperties, GCS_CONNECTOR, GOOGLE_PUBSUB_CONNECTOR, KAFKA_CONNECTOR,
     KINESIS_CONNECTOR, LEGACY_S3_CONNECTOR, MQTT_CONNECTOR, NATS_CONNECTOR, NEXMARK_CONNECTOR,
-    OPENDAL_S3_CONNECTOR, POSIX_FS_CONNECTOR, PULSAR_CONNECTOR, SPANNER_CDC_CONNECTOR,
+    OPENDAL_S3_CONNECTOR, POSIX_FS_CONNECTOR, PULSAR_CONNECTOR,
 };
 use risingwave_connector::{AUTO_SCHEMA_CHANGE_KEY, WithPropertiesExt};
 use risingwave_pb::catalog::connection_params::PbConnectionType;
@@ -1188,36 +1188,10 @@ pub async fn handle_create_source(
     }
 
     let format_encode = stmt.format_encode.into_v2_with_warning();
-    let (mut with_properties, refresh_mode) =
+    let (with_properties, refresh_mode) =
         bind_connector_props(&handler_args, &format_encode, true)?;
     if let Some(connector) = with_properties.get_connector() {
         ensure_local_fs_connector_allowed(&session, &connector)?;
-    }
-
-    // For Spanner CDC, ensure spanner.start_timestamp is stored as microseconds since epoch.
-    // User provides RFC3339; we convert to microseconds for internal storage.
-    if with_properties.get(UPSTREAM_SOURCE_KEY).map(|s| s.as_str()) == Some(SPANNER_CDC_CONNECTOR) {
-        use risingwave_connector::source::cdc::external::SPANNER_START_TS_KEY;
-        use risingwave_connector::source::cdc::external::spanner::{now_micros, rfc3339_to_micros};
-
-        let now = now_micros()?;
-        let start_micros = if let Some(user_val) = with_properties.get(SPANNER_START_TS_KEY) {
-            rfc3339_to_micros(user_val)
-                .map_err(|e| anyhow!("invalid spanner.start_timestamp: {}", e))?
-        } else {
-            now
-        };
-
-        if start_micros > now {
-            return Err(anyhow!(
-                "spanner.start_timestamp ({}) must not be in the future (now: {})",
-                start_micros,
-                now
-            )
-            .into());
-        }
-
-        with_properties.insert(SPANNER_START_TS_KEY.to_owned(), start_micros.to_string());
     }
 
     let create_source_type = CreateSourceType::for_newly_created(&session, &*with_properties);

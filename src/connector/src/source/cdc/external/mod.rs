@@ -175,7 +175,6 @@ pub const SCHEMA_NAME_KEY: &str = "schema.name";
 pub const DATABASE_NAME_KEY: &str = "database.name";
 
 /// Spanner-specific keys for table-level properties
-pub const SPANNER_START_TS_KEY: &str = "spanner.start_timestamp";
 pub const SPANNER_DATABOOST_ENABLED_KEY: &str = "spanner.databoost.enabled";
 
 impl SchemaTableName {

@@ -127,11 +127,6 @@ pub struct SpannerCdcProperties {
     #[with_option(allow_alter_on_fly)]
     pub max_missed_heartbeats: Option<u32>,
 
-    /// Start timestamp for the change stream query (RFC3339 format)
-    #[serde(rename = "spanner.start_timestamp", default)]
-    #[serde(deserialize_with = "crate::deserialize_i64_from_string_opt")]
-    pub start_ts: Option<i64>,
-
     // ---------------------------------------------------------------------------
     // Fields below are NOT read by the Spanner CDC connector itself.
     //
