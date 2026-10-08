@@ -42,7 +42,7 @@
 //! without saved partitions restarts the root query from the watermark, and all
 //! partitions are re-discovered from scratch.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -200,7 +200,7 @@ impl SplitReader for SpannerCdcSplitReader {
         // stops it polling the message stream and parks the Spanner partition readers
         // once `DEFAULT_CHANNEL_SIZE` fills.
         let (tx, rx) = mpsc::channel(PARSED_CHUNK_CHANNEL_SIZE);
-        tokio::spawn(async move {
+        let parser_task = tokio::spawn(async move {
             let mut event_stream = std::pin::pin!(event_stream);
             loop {
                 let item = tokio::select! {
@@ -225,7 +225,7 @@ impl SplitReader for SpannerCdcSplitReader {
             }
         });
 
-        Self::forward_parsed_events(rx, queue_depth)
+        Self::forward_parsed_events(rx, queue_depth, parser_task)
     }
 }
 
@@ -239,10 +239,19 @@ impl SpannerCdcSplitReader {
     async fn forward_parsed_events(
         mut rx: mpsc::Receiver<Result<SourceReaderEvent>>,
         queue_depth: LabelGuardedIntGauge,
+        parser_task: JoinHandle<()>,
     ) {
         while let Some(event) = rx.recv().await {
             queue_depth.set(rx.len() as i64);
             yield event?;
+        }
+        // The parser dropped its sender. If it panicked, the channel would otherwise
+        // look like a clean end-of-stream, so the source would stop without retrying.
+        if let Err(e) = parser_task.await {
+            return Err(ConnectorError::from(anyhow::anyhow!(
+                "Spanner CDC parser task failed: {}",
+                e
+            )));
         }
     }
 
@@ -963,6 +972,19 @@ async fn run_reader(ctx: ReaderContext, tx: mpsc::Sender<SourceMessageEvent>) ->
                     Some(Ok(Ok(pr))) => {
                         // Partition finished — remove from offsets (excludes from watermark).
                         reader_metrics.partitions_finished.inc();
+                        // The finishing task has already reported every child it will
+                        // ever report, and they are sitting in the discovery channel.
+                        // Drain them now so `collect_finished_partitions` below does not
+                        // drop a finished token a not-yet-ingested child still names.
+                        ingest_children(
+                            &mut child_discovery_rx,
+                            &mut discovered,
+                            &mut deferred,
+                            &mut ready_pool,
+                            &offsets,
+                            &split_id,
+                            &reader_metrics,
+                        );
                         offsets.remove(&pr.partition_token);
                         if let Some(ref token) = pr.partition_token {
                             discovered.insert(Some(token.clone()), true);
@@ -976,6 +998,9 @@ async fn run_reader(ctx: ReaderContext, tx: mpsc::Sender<SourceMessageEvent>) ->
                             &mut ready_pool,
                             &discovered,
                         );
+                        // Drop finished tokens no deferred child still needs, so the map
+                        // tracks the active partition tree instead of all history.
+                        collect_finished_partitions(&mut discovered, &deferred);
 
                         active_count -= 1;
                         spawn_from_pool(
@@ -1207,6 +1232,31 @@ fn promote_deferred(
             true
         }
     });
+}
+
+/// Drop finished tokens that no deferred child still names as a parent.
+///
+/// Call after `ingest_children` and `promote_deferred`, so a finished partition's
+/// children are already discovered: a deferred child keeps its parents, while a
+/// promoted or active child no longer consults them. Without this, `discovered`
+/// grows with every partition the reader has ever seen. Spanner never reuses a
+/// partition token, so a collected finished token is never reported again.
+fn collect_finished_partitions(
+    discovered: &mut HashMap<Option<String>, bool>,
+    deferred: &[SpannerCdcSplit],
+) {
+    let mut needed: HashSet<Option<String>> = HashSet::new();
+    for child in deferred {
+        if child.parent_partition_tokens.is_empty() {
+            // A root child names no parent; the root is tracked under `None`.
+            needed.insert(None);
+        } else {
+            for parent in &child.parent_partition_tokens {
+                needed.insert(Some(parent.clone()));
+            }
+        }
+    }
+    discovered.retain(|token, finished| !*finished || needed.contains(token));
 }
 
 fn spawn_from_pool(
@@ -1839,6 +1889,11 @@ mod tests {
             .with_guarded_label_values(&["0", "test", "0"])
     }
 
+    /// A parser task that has already finished normally.
+    fn finished_parser_task() -> JoinHandle<()> {
+        tokio::spawn(async {})
+    }
+
     fn chunk_event(pretty: &str) -> Result<SourceReaderEvent> {
         Ok(SourceReaderEvent::DataChunk(StreamChunk::from_pretty(
             pretty,
@@ -1855,10 +1910,13 @@ mod tests {
         tx.send(chunk_event("I\n + 2")).await.unwrap();
         drop(tx);
 
-        let events: Vec<_> =
-            SpannerCdcSplitReader::forward_parsed_events(rx, test_queue_depth_gauge())
-                .collect()
-                .await;
+        let events: Vec<_> = SpannerCdcSplitReader::forward_parsed_events(
+            rx,
+            test_queue_depth_gauge(),
+            finished_parser_task(),
+        )
+        .collect()
+        .await;
         assert_eq!(events.len(), 3);
         assert!(matches!(&events[0], Ok(SourceReaderEvent::DataChunk(c)) if c.cardinality() == 1));
         assert!(matches!(
@@ -1879,10 +1937,13 @@ mod tests {
             .unwrap();
         drop(tx);
 
-        let chunks: Vec<_> =
-            SpannerCdcSplitReader::forward_parsed_events(rx, test_queue_depth_gauge())
-                .collect()
-                .await;
+        let chunks: Vec<_> = SpannerCdcSplitReader::forward_parsed_events(
+            rx,
+            test_queue_depth_gauge(),
+            finished_parser_task(),
+        )
+        .collect()
+        .await;
         assert_eq!(chunks.len(), 2);
         assert!(chunks[0].is_ok());
         let err = chunks[1].as_ref().unwrap_err();
@@ -1898,11 +1959,36 @@ mod tests {
         let (tx, rx) = mpsc::channel::<Result<SourceReaderEvent>>(PARSED_CHUNK_CHANNEL_SIZE);
         drop(tx);
 
+        let chunks: Vec<_> = SpannerCdcSplitReader::forward_parsed_events(
+            rx,
+            test_queue_depth_gauge(),
+            finished_parser_task(),
+        )
+        .collect()
+        .await;
+        assert!(chunks.is_empty());
+    }
+
+    /// A panicking parser task must surface as an error, not a clean end of stream, so
+    /// the source retries instead of going quiet.
+    #[tokio::test]
+    async fn test_forward_parsed_events_propagates_parser_panic() {
+        let (tx, rx) = mpsc::channel::<Result<SourceReaderEvent>>(PARSED_CHUNK_CHANNEL_SIZE);
+        drop(tx);
+        let parser_task = tokio::spawn(async {
+            panic!("parser task panicked");
+        });
+
         let chunks: Vec<_> =
-            SpannerCdcSplitReader::forward_parsed_events(rx, test_queue_depth_gauge())
+            SpannerCdcSplitReader::forward_parsed_events(rx, test_queue_depth_gauge(), parser_task)
                 .collect()
                 .await;
-        assert!(chunks.is_empty());
+        assert_eq!(chunks.len(), 1);
+        let err = chunks[0].as_ref().unwrap_err();
+        assert!(
+            err.to_string().contains("parser task failed"),
+            "unexpected error: {err}"
+        );
     }
 
     fn test_split_reader(reader_task: JoinHandle<Result<()>>) -> SpannerCdcSplitReader {
@@ -2284,6 +2370,45 @@ mod tests {
 
         // Parent "PX" was never discovered — should return false (child waits forever).
         assert!(!parents_all_finished(&["PX".to_owned()], &discovered));
+    }
+
+    /// A finished token no deferred child names is collected; one a deferred child
+    /// still names is kept, as is any unfinished token.
+    #[test]
+    fn test_collect_finished_partitions() {
+        let ts = datetime!(2025-01-01 0:00 UTC);
+        let mut discovered = HashMap::from([
+            (None, true),
+            (Some("root-child".to_owned()), true),
+            (Some("live".to_owned()), false),
+            (Some("pending-parent".to_owned()), true),
+            (Some("orphan".to_owned()), true),
+        ]);
+        // A deferred child still names `pending-parent` as a parent.
+        let deferred = vec![make_child("C1", vec!["pending-parent"], ts)];
+
+        collect_finished_partitions(&mut discovered, &deferred);
+
+        assert!(!discovered.contains_key(&Some("root-child".to_owned())));
+        assert!(!discovered.contains_key(&Some("orphan".to_owned())));
+        // The root is finished but not named by this child, so it is collected too.
+        assert!(!discovered.contains_key(&None));
+        assert!(discovered.contains_key(&Some("pending-parent".to_owned())));
+        // An unfinished token is always kept.
+        assert!(discovered.contains_key(&Some("live".to_owned())));
+    }
+
+    /// A root child names no parent, so it keeps the root's finished token.
+    #[test]
+    fn test_collect_finished_partitions_keeps_root_for_root_child() {
+        let ts = datetime!(2025-01-01 0:00 UTC);
+        let mut discovered = HashMap::from([(None, true), (Some("x".to_owned()), true)]);
+        let deferred = vec![make_child("C1", vec![], ts)];
+
+        collect_finished_partitions(&mut discovered, &deferred);
+
+        assert!(discovered.contains_key(&None));
+        assert!(!discovered.contains_key(&Some("x".to_owned())));
     }
 
     // -----------------------------------------------------------------------

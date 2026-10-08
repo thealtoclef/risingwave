@@ -12457,6 +12457,7 @@ dependencies = [
  "indexmap 2.14.0",
  "itertools 0.14.0",
  "jni",
+ "libc",
  "madsim-rdkafka",
  "madsim-tokio",
  "madsim-tonic",

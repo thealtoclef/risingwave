@@ -477,9 +477,20 @@ the wrong split. Split on another key column, or set `snapshot = 'false'`. The s
 any other non-`STRING` key column declared `VARCHAR`, such as an `INT64` or `TIMESTAMP` key:
 `CREATE TABLE` rejects it as the split column.
 
+An `INT64` key read as `DOUBLE PRECISION`/`REAL`, or a `FLOAT64` key read as `REAL`, is also
+rejected: `f64`/`f32` cannot represent every 64-bit integer or every `f64` exactly, so distinct
+keys above 2⁵³ (or floats that round together) would merge into one row. Declare the key as a
+type that represents every upstream value exactly.
+
 **ARRAY Types**: Element-wise mapping to `LIST` type. For example:
 - `ARRAY<INT64>` → `LIST<BIGINT>`
 - `ARRAY<STRING>` → `LIST<VARCHAR>`
+
+A narrower integer element, such as `INTEGER[]` over an `ARRAY<INT64>`, is decoded with a checked
+conversion, matching the scalar case, so in-range elements are preserved instead of the whole
+column being nulled. An out-of-range element is a decode error; because an array is never a
+primary key, it is handled like any other non-key decode failure — logged, and the whole column
+read as NULL.
 
 **Fallback Strategy**: Unknown types are mapped to `VARCHAR` with a warning log, ensuring no data is lost.
 

@@ -82,6 +82,11 @@ const DEFAULT_SPANNER_ENDPOINT: &str = "https://spanner.googleapis.com";
 /// about 2.4 KB.
 const MAX_CREDENTIALS_FILE_BYTES: u64 = 64 * 1024;
 
+/// Upper bound on the number of splits `as_even_splits` generates. The step is
+/// widened past `backfill_num_rows_per_split` when the integer key span would
+/// otherwise produce more than this many splits, so sparse keys stay bounded.
+const MAX_EVEN_SPLITS: i64 = 100_000;
+
 /// A position in the Spanner change stream, used as the CDC offset.
 ///
 /// Ordered by the commit timestamp (microseconds since epoch), which is what the
@@ -406,6 +411,19 @@ fn check_key_types(
                 data_type,
             );
         }
+        if let Some(reason) = lossy_key_conversion(base_type, data_type) {
+            bail!(
+                "primary key column '{}' of table '{}' is {} read as {}: {}. Distinct upstream \
+                 keys can map to the same RisingWave key and merge into one row. Declare the \
+                 column as a type that represents every {} value exactly",
+                name,
+                table,
+                spanner_type,
+                data_type,
+                reason,
+                spanner_type,
+            );
+        }
         if split_pk_index == Some(idx) && *data_type == DataType::Varchar && base_type != "STRING" {
             bail!(
                 "primary key column '{}' of table '{}' is {} declared VARCHAR, which cannot be \
@@ -421,6 +439,26 @@ fn check_key_types(
         }
     }
     Ok(())
+}
+
+/// Why reading a Spanner column of `base_type` as `data_type` cannot keep every key
+/// distinct, or `None` if it can.
+///
+/// Spanner's only integer type is `INT64`, whose range exceeds what `f64`/`f32` can
+/// represent exactly, so two distinct keys can round to the same value. A `FLOAT64`
+/// key does not fit in `f32` without rounding either. Narrower integer declarations
+/// fail loudly on an out-of-range value instead of merging two keys, so they are not
+/// rejected here.
+fn lossy_key_conversion(base_type: &str, data_type: &DataType) -> Option<&'static str> {
+    match base_type {
+        "INT64" if matches!(data_type, DataType::Float64 | DataType::Float32) => {
+            Some("a floating-point key cannot represent every 64-bit integer exactly")
+        }
+        "FLOAT64" if matches!(data_type, DataType::Float32) => {
+            Some("a 32-bit float cannot represent every 64-bit float exactly")
+        }
+        _ => None,
+    }
 }
 
 /// Reject generated columns outside the primary key: change streams do not carry them.
@@ -933,12 +971,17 @@ impl SpannerExternalTableReader {
             split_column.data_type
         );
 
-        let saturated_split_max_size = options
+        let requested_step = options
             .backfill_num_rows_per_split
             .try_into()
             .unwrap_or(i64::MAX);
+        // `backfill_num_rows_per_split` is a numeric increment, so two widely separated
+        // integer keys would otherwise yield one split per step across the whole range —
+        // billions for sparse keys, most of them empty. Widen the step so the split count
+        // stays bounded regardless of the key span; dense keys are unaffected.
+        let step = even_split_step(min_value, max_value, requested_step);
         let mut left: Option<i64> = None;
-        let mut right: Option<i64> = Some(min_value.saturating_add(saturated_split_max_size));
+        let mut right: Option<i64> = Some(min_value.saturating_add(step));
         let mut split_id = CDC_TABLE_SPLIT_ID_START;
 
         loop {
@@ -966,7 +1009,7 @@ impl SpannerExternalTableReader {
             }
 
             left = right;
-            right = left.map(|l| l.saturating_add(saturated_split_max_size));
+            right = left.map(|l| l.saturating_add(step));
         }
     }
 
@@ -1300,6 +1343,18 @@ fn to_int_scalar(i: i64, data_type: &DataType) -> ScalarImpl {
     }
 }
 
+/// The increment `as_even_splits` uses between split boundaries.
+///
+/// Starts from `requested` (`backfill_num_rows_per_split`) but widens it when the
+/// integer span `max - min` would produce more than [`MAX_EVEN_SPLITS`] splits, so
+/// sparse keys cannot enumerate billions of mostly empty ranges.
+fn even_split_step(min_value: i64, max_value: i64, requested: i64) -> i64 {
+    let requested = requested.max(1);
+    let span = (max_value as i128) - (min_value as i128);
+    let min_step = i64::try_from(span / MAX_EVEN_SPLITS as i128 + 1).unwrap_or(i64::MAX);
+    requested.max(min_step)
+}
+
 /// Tries to increase the split ID, returns an error if overflow.
 ///
 /// Follows Postgres CDC's `try_increase_split_id` pattern.
@@ -1524,6 +1579,26 @@ pub(crate) async fn create_spanner_client(
     Ok(db_client)
 }
 
+/// Open `path` for reading without blocking on a FIFO.
+///
+/// On Unix the open is non-blocking, so opening a FIFO with no writer returns
+/// immediately instead of parking the caller; the caller then validates the
+/// descriptor as a regular file. Other platforms fall back to a plain open.
+#[cfg(unix)]
+fn open_credentials_file(path: &str) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_credentials_file(path: &str) -> std::io::Result<std::fs::File> {
+    std::fs::File::open(path)
+}
+
 /// Read a service account key file from a path given in the source options.
 ///
 /// The path comes from the user, so only regular files up to
@@ -1532,7 +1607,9 @@ pub(crate) async fn create_spanner_client(
 fn read_credentials_file(path: &str) -> std::io::Result<String> {
     use std::io::Read;
 
-    let file = std::fs::File::open(path)?;
+    let file = open_credentials_file(path)?;
+    // Validate the opened descriptor. On Unix the open is non-blocking, so a FIFO
+    // reaches this check instead of parking the caller.
     let metadata = file.metadata()?;
     if !metadata.is_file() {
         return Err(std::io::Error::other("not a regular file"));
@@ -1798,6 +1875,17 @@ fn spanner_array_to_list(
     match elem_type {
         DataType::Boolean => collect(row, idx, elem_type, |v: bool| Ok(ScalarImpl::Bool(v))),
         DataType::Int64 => collect(row, idx, elem_type, |v: i64| Ok(ScalarImpl::Int64(v))),
+        // Spanner's only integer element type is INT64. Narrow with a checked conversion,
+        // as the scalar branch does, so an out-of-range element is a decode error rather
+        // than a silent truncation. An array cannot be a primary key, so the error is
+        // handled like any other non-key decode failure: logged, and the whole column
+        // read as NULL. In-range elements decode normally.
+        DataType::Int32 => collect(row, idx, elem_type, |v: i64| {
+            Ok(ScalarImpl::Int32(i32::try_from(v)?))
+        }),
+        DataType::Int16 => collect(row, idx, elem_type, |v: i64| {
+            Ok(ScalarImpl::Int16(i16::try_from(v)?))
+        }),
         DataType::Float64 => collect(row, idx, elem_type, |v: f64| {
             Ok(ScalarImpl::Float64(F64::from(v)))
         }),
@@ -1980,6 +2068,34 @@ mod tests {
         assert_eq!(read_credentials_file(key.to_str().unwrap()).unwrap(), "{}");
     }
 
+    /// A FIFO with no writer blocks a plain `File::open`. The non-blocking open must
+    /// return so the descriptor check can reject it, so this runs the read on a thread
+    /// and fails if it does not return.
+    #[cfg(unix)]
+    #[test]
+    fn test_read_credentials_file_rejects_fifo_without_blocking() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("creds.fifo");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo should be available on unix");
+        assert!(status.success(), "mkfifo failed");
+
+        let path = fifo.to_str().unwrap().to_owned();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(read_credentials_file(&path).map_err(|e| e.to_string()));
+        });
+        let result = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("read_credentials_file blocked on a FIFO with no writer");
+        assert!(
+            result.unwrap_err().contains("not a regular file"),
+            "FIFO must be rejected as a non-regular file"
+        );
+    }
+
     #[test]
     fn test_spanner_offset() {
         let offset = SpannerOffset::new(1234567890);
@@ -2083,6 +2199,7 @@ mod tests {
             ("id".to_owned(), column("INT64")),
             ("ref".to_owned(), column("NUMERIC")),
             ("name".to_owned(), column("STRING(MAX)")),
+            ("score".to_owned(), column("FLOAT64")),
         ]);
         let check = |pk: &[&str], types: &[DataType], split: Option<usize>| {
             check_key_types("orders", &columns, &names(pk), types, split)
@@ -2129,6 +2246,36 @@ mod tests {
         );
         check(&["id"], &[DataType::Int32], Some(0)).unwrap();
         check(&["name"], &[DataType::Varchar], Some(0)).unwrap();
+
+        // An INT64 key read as a float can round two distinct keys together, with or
+        // without the snapshot.
+        for split in [Some(0), None] {
+            let err = check(&["id"], &[DataType::Float64], split).unwrap_err();
+            assert!(err.to_string().contains("floating-point"), "{err}");
+            let err = check(&["id"], &[DataType::Float32], split).unwrap_err();
+            assert!(err.to_string().contains("floating-point"), "{err}");
+        }
+        // A FLOAT64 key read as a 32-bit float can round two distinct keys together.
+        let err = check(&["score"], &[DataType::Float32], None).unwrap_err();
+        assert!(err.to_string().contains("32-bit float"), "{err}");
+        // The exact float type is accepted.
+        check(&["score"], &[DataType::Float64], Some(0)).unwrap();
+    }
+
+    #[test]
+    fn test_even_split_step_bounds_sparse_keys() {
+        // Dense keys keep the requested increment; a zero increment becomes one.
+        assert_eq!(even_split_step(0, 1_000, 100), 100);
+        assert_eq!(even_split_step(0, 1_000, 0), 1);
+
+        // Sparse keys widen the step so the split count stays bounded.
+        let max = 1_000_000_000_000_000;
+        let step = even_split_step(0, max, 100_000);
+        let count = max / step + 1;
+        assert!(count <= MAX_EVEN_SPLITS + 1, "count={count} step={step}");
+
+        // A full-width range does not overflow and still makes progress.
+        assert!(even_split_step(i64::MIN, i64::MAX, 1) > 0);
     }
 
     #[test]
