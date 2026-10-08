@@ -114,7 +114,11 @@ impl SplitEnumerator for SpannerCdcSplitEnumerator {
             );
         }
 
-        let options = fetch_change_stream_options(&client, &properties.change_stream_name).await?;
+        let options = Box::pin(fetch_change_stream_options(
+            &client,
+            &properties.change_stream_name,
+        ))
+        .await?;
         validate_change_stream_options(&properties.change_stream_name, &options)?;
 
         // Start from Spanner's own current time. Using the frontend clock could pick a

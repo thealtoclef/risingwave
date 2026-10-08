@@ -2074,7 +2074,7 @@ dependencies = [
  "bitflags 2.13.1",
  "cexpr",
  "clang-sys",
- "itertools 0.10.5",
+ "itertools 0.13.0",
  "log",
  "prettyplease",
  "proc-macro2",
@@ -6284,8 +6284,9 @@ dependencies = [
 
 [[package]]
 name = "google-cloud-auth"
-version = "1.16.0"
-source = "git+https://github.com/googleapis/google-cloud-rust?rev=4855fdd8be0e9c6063d3eac9f7d80bcb71782732#4855fdd8be0e9c6063d3eac9f7d80bcb71782732"
+version = "1.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac9870b8ea484519aa8601e14886f2efc148ea490034e43d04bef1d246170cc9"
 dependencies = [
  "async-trait",
  "aws-lc-rs",
@@ -6313,7 +6314,8 @@ dependencies = [
 [[package]]
 name = "google-cloud-gax"
 version = "1.15.0"
-source = "git+https://github.com/googleapis/google-cloud-rust?rev=4855fdd8be0e9c6063d3eac9f7d80bcb71782732#4855fdd8be0e9c6063d3eac9f7d80bcb71782732"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fc64ee071c0d22cb68662b454f1bea5424506cafeaddc51260fbc585bac1d29d"
 dependencies = [
  "bytes",
  "futures",
@@ -6331,8 +6333,9 @@ dependencies = [
 
 [[package]]
 name = "google-cloud-gax-internal"
-version = "0.7.19"
-source = "git+https://github.com/googleapis/google-cloud-rust?rev=4855fdd8be0e9c6063d3eac9f7d80bcb71782732#4855fdd8be0e9c6063d3eac9f7d80bcb71782732"
+version = "0.7.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e873f7e6e39030c07b6d9697bf3b999a269175c8b433e058f56ae10d129f12f7"
 dependencies = [
  "bytes",
  "futures",
@@ -6346,9 +6349,9 @@ dependencies = [
  "http-body-util",
  "hyper 1.11.1",
  "lazy_static",
- "opentelemetry 0.32.0",
- "opentelemetry-semantic-conventions 0.32.0",
- "opentelemetry_sdk 0.32.1",
+ "opentelemetry 0.33.0",
+ "opentelemetry-semantic-conventions 0.33.0",
+ "opentelemetry_sdk 0.33.0",
  "percent-encoding",
  "pin-project",
  "prost 0.14.3",
@@ -6364,13 +6367,14 @@ dependencies = [
  "tonic-prost",
  "tower",
  "tracing",
- "tracing-opentelemetry 0.33.0",
+ "tracing-opentelemetry 0.34.0",
 ]
 
 [[package]]
 name = "google-cloud-iam-v1"
-version = "1.12.0"
-source = "git+https://github.com/googleapis/google-cloud-rust?rev=4855fdd8be0e9c6063d3eac9f7d80bcb71782732#4855fdd8be0e9c6063d3eac9f7d80bcb71782732"
+version = "1.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "48f0895fa7b7bd70629ae58daaa962677e93a72c251b2f297bc058a035940821"
 dependencies = [
  "async-trait",
  "bytes",
@@ -6386,8 +6390,9 @@ dependencies = [
 
 [[package]]
 name = "google-cloud-longrunning"
-version = "1.13.0"
-source = "git+https://github.com/googleapis/google-cloud-rust?rev=4855fdd8be0e9c6063d3eac9f7d80bcb71782732#4855fdd8be0e9c6063d3eac9f7d80bcb71782732"
+version = "1.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e8ea252eee22a4e2187025ea6789c682a0d791a9748ea99de2abec3026a32cb4"
 dependencies = [
  "async-trait",
  "bytes",
@@ -6403,8 +6408,9 @@ dependencies = [
 
 [[package]]
 name = "google-cloud-lro"
-version = "1.10.0"
-source = "git+https://github.com/googleapis/google-cloud-rust?rev=4855fdd8be0e9c6063d3eac9f7d80bcb71782732#4855fdd8be0e9c6063d3eac9f7d80bcb71782732"
+version = "1.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dfb938b40ede9ef70c24f49c2687d84f289c9e9104ddfece739985e4b4844b8f"
 dependencies = [
  "google-cloud-gax",
  "google-cloud-gax-internal",
@@ -6419,7 +6425,8 @@ dependencies = [
 [[package]]
 name = "google-cloud-rpc"
 version = "1.6.0"
-source = "git+https://github.com/googleapis/google-cloud-rust?rev=4855fdd8be0e9c6063d3eac9f7d80bcb71782732#4855fdd8be0e9c6063d3eac9f7d80bcb71782732"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e2162c08a89118130979ba261080e960e44cdcb2d6e2ab8ca9b1da245285d353"
 dependencies = [
  "bytes",
  "google-cloud-wkt",
@@ -6430,8 +6437,9 @@ dependencies = [
 
 [[package]]
 name = "google-cloud-spanner"
-version = "0.34.5-preview"
-source = "git+https://github.com/googleapis/google-cloud-rust?rev=4855fdd8be0e9c6063d3eac9f7d80bcb71782732#4855fdd8be0e9c6063d3eac9f7d80bcb71782732"
+version = "0.34.7-preview"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "387509e344e5d1d4f837a7af42256c3e318b81a24bdb50ba24776ef446a48229"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -6460,8 +6468,9 @@ dependencies = [
 
 [[package]]
 name = "google-cloud-spanner-admin-database-v1"
-version = "1.14.0"
-source = "git+https://github.com/googleapis/google-cloud-rust?rev=4855fdd8be0e9c6063d3eac9f7d80bcb71782732#4855fdd8be0e9c6063d3eac9f7d80bcb71782732"
+version = "1.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c32884dfe358622c9f26f9d08af6725f8bcedc173bad8720eb9052230c67b4bf"
 dependencies = [
  "async-trait",
  "bytes",
@@ -6480,8 +6489,9 @@ dependencies = [
 
 [[package]]
 name = "google-cloud-spanner-admin-instance-v1"
-version = "1.14.0"
-source = "git+https://github.com/googleapis/google-cloud-rust?rev=4855fdd8be0e9c6063d3eac9f7d80bcb71782732#4855fdd8be0e9c6063d3eac9f7d80bcb71782732"
+version = "1.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8653975ef2ee11344ba6329ee6f166ff91d6516357837c5f601fcd3a2994a279"
 dependencies = [
  "async-trait",
  "bytes",
@@ -6500,7 +6510,8 @@ dependencies = [
 [[package]]
 name = "google-cloud-type"
 version = "1.6.0"
-source = "git+https://github.com/googleapis/google-cloud-rust?rev=4855fdd8be0e9c6063d3eac9f7d80bcb71782732#4855fdd8be0e9c6063d3eac9f7d80bcb71782732"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "63acc3a92a85f96bab021c3a3e29b53bbacc97651e1b524d4c2991960a63eb82"
 dependencies = [
  "bytes",
  "google-cloud-wkt",
@@ -6511,8 +6522,9 @@ dependencies = [
 
 [[package]]
 name = "google-cloud-wkt"
-version = "1.7.0"
-source = "git+https://github.com/googleapis/google-cloud-rust?rev=4855fdd8be0e9c6063d3eac9f7d80bcb71782732#4855fdd8be0e9c6063d3eac9f7d80bcb71782732"
+version = "1.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f3037907e542cf8b8580aa4cf8ad68568d7ac8e7274519a7d0a121867d434da"
 dependencies = [
  "base64 0.23.1",
  "bytes",
@@ -9132,7 +9144,7 @@ version = "0.7.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77e878c846a8abae00dd069496dbe8751b16ac1c3d6bd2a7283a938e8228f90d"
 dependencies = [
- "proc-macro-crate 1.3.1",
+ "proc-macro-crate 3.4.0",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -9441,9 +9453,9 @@ dependencies = [
 
 [[package]]
 name = "opentelemetry"
-version = "0.32.0"
+version = "0.33.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b0142c63252a9e054e68a4c61a5778f7b14f576274d593f8ce883d191a099682"
+checksum = "6cdb0b1b267eb9db3331b434ed9ddab10d50e280a9adf9d13e5233e2002b61b5"
 dependencies = [
  "futures-core",
  "futures-sink",
@@ -9506,9 +9518,9 @@ checksum = "e62e29dfe041afb8ed2a6c9737ab57db4907285d999ef8ad3a59092a36bdc846"
 
 [[package]]
 name = "opentelemetry-semantic-conventions"
-version = "0.32.0"
+version = "0.33.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6ca2f98a0437b427b4b08f19f1caa3c44db885a202bc12cfea13d6c702243d68"
+checksum = "d288b1e1bc3590052fbb8f0f635ef248dd9022cf1fbaeb6582b7ad6081a17b87"
 
 [[package]]
 name = "opentelemetry_sdk"
@@ -9529,14 +9541,14 @@ dependencies = [
 
 [[package]]
 name = "opentelemetry_sdk"
-version = "0.32.1"
+version = "0.33.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9b59f80e1ac4d5ff7a2db8fb6c80badb7f0f3f858211fba08dd9aaec750894f9"
+checksum = "cb39533d9d1c912123efd7d41d7e0c29d16917b60ce15b4c8d87cb1af7f67520"
 dependencies = [
  "futures-channel",
  "futures-executor",
  "futures-util",
- "opentelemetry 0.32.0",
+ "opentelemetry 0.33.0",
  "percent-encoding",
  "portable-atomic",
  "rand 0.9.2",
@@ -10750,7 +10762,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "be769465445e8c1474e9c5dac2018218498557af32d9ed057325ec9a41ae81bf"
 dependencies = [
  "heck 0.5.0",
- "itertools 0.10.5",
+ "itertools 0.14.0",
  "log",
  "multimap",
  "once_cell",
@@ -10769,7 +10781,7 @@ version = "0.14.3"
 source = "git+https://github.com/risingwavelabs/prost.git?rev=040a192409e45069158300baec4f402ad1fe101a#040a192409e45069158300baec4f402ad1fe101a"
 dependencies = [
  "heck 0.5.0",
- "itertools 0.10.5",
+ "itertools 0.14.0",
  "log",
  "multimap",
  "petgraph 0.8.3",
@@ -10790,7 +10802,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
 dependencies = [
  "anyhow",
- "itertools 0.10.5",
+ "itertools 0.14.0",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -10802,7 +10814,7 @@ version = "0.14.3"
 source = "git+https://github.com/risingwavelabs/prost.git?rev=040a192409e45069158300baec4f402ad1fe101a#040a192409e45069158300baec4f402ad1fe101a"
 dependencies = [
  "anyhow",
- "itertools 0.10.5",
+ "itertools 0.14.0",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -16588,12 +16600,12 @@ dependencies = [
 
 [[package]]
 name = "tracing-opentelemetry"
-version = "0.33.0"
+version = "0.34.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "adbc64cba7137545b8044cb1fe9814f7aacf3c6b5f9b45be8bb5db538befdb26"
+checksum = "0a904802a1b902f43638b677ff2a650847e3b4404101b6c586d648e8c1e3e8fe"
 dependencies = [
  "js-sys",
- "opentelemetry 0.32.0",
+ "opentelemetry 0.33.0",
  "tracing",
  "tracing-core",
  "tracing-subscriber",

@@ -79,7 +79,7 @@ futures = { version = "0.3", default-features = false, features = ["alloc"] }
 futures-async-stream = { workspace = true }
 gcp-bigquery-client = { version = "0.28.0", optional = true }
 glob = "0.3"
-google-cloud-auth = { git = "https://github.com/googleapis/google-cloud-rust", rev = "4855fdd8be0e9c6063d3eac9f7d80bcb71782732" }
+google-cloud-auth = "1.17"
 google-cloud-bigquery = { package = "gcloud-bigquery", version = "1.6", features = [
     "auth",
 ], optional = true }
@@ -92,13 +92,13 @@ google-cloud-googleapis = { package = "gcloud-googleapis", version = "1", featur
 google-cloud-pubsub = { package = "gcloud-pubsub", version = "1.5" }
 # `builtin-metrics` (a default feature) starts a Cloud Monitoring exporter per client; the
 # source reports its own `spanner_cdc_*` metrics, so keep it off.
-google-cloud-spanner = { git = "https://github.com/googleapis/google-cloud-rust", rev = "4855fdd8be0e9c6063d3eac9f7d80bcb71782732", default-features = false, features = [
+google-cloud-spanner = { version = "=0.34.7-preview", default-features = false, features = [
     "default-rustls-provider",
 ] }
-google-cloud-wkt = { git = "https://github.com/googleapis/google-cloud-rust", rev = "4855fdd8be0e9c6063d3eac9f7d80bcb71782732" }
+google-cloud-wkt = "1.9"
 # The gax crate that `google-cloud-spanner` uses. The `google-cloud-gax` key above is the
 # unrelated `gcloud-gax` crate used by Pub/Sub and BigQuery.
-googleapis-gax = { package = "google-cloud-gax", git = "https://github.com/googleapis/google-cloud-rust", rev = "4855fdd8be0e9c6063d3eac9f7d80bcb71782732" }
+googleapis-gax = { package = "google-cloud-gax", version = "1.15" }
 iceberg = { workspace = true }
 iceberg-catalog-glue = { workspace = true }
 iceberg-catalog-rest = { workspace = true }

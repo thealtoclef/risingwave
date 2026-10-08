@@ -324,9 +324,10 @@ pub(crate) async fn check_cdc_table_upstream(
         pk_names,
     )?;
 
-    let options =
-        crate::source::spanner_cdc::enumerator::fetch_change_stream_options(&client, stream)
-            .await?;
+    let options = Box::pin(
+        crate::source::spanner_cdc::enumerator::fetch_change_stream_options(&client, stream),
+    )
+    .await?;
     Ok(change_stream_filter_notices(stream, &options))
 }
 
