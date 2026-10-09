@@ -1631,11 +1631,35 @@ impl DdlService for DdlServiceImpl {
                                         table_change.cdc_table_id.clone(),
                                         table_change.upstream_ddl.clone(),
                                         &self.env.event_log_manager_ref(),
-                                        fail_info,
+                                        fail_info.clone(),
                                         "replace_failed",
                                     );
+                                    // Report the failure so the compute side stops the source
+                                    // instead of continuing without the new column.
+                                    return Err(Status::internal(fail_info));
                                 }
                             };
+                        } else {
+                            // A schema change was requested, so a replacement plan must be
+                            // returned; without one the change would be silently dropped.
+                            tracing::error!(
+                                target: "auto_schema_change",
+                                table_id = %table.id,
+                                cdc_table_id = table.cdc_table_id,
+                                "frontend returned no replace table plan",
+                            );
+                            let fail_info = "frontend returned no replace table plan".to_owned();
+                            add_auto_schema_change_fail_event_log(
+                                &self.meta_metrics,
+                                table.id,
+                                table.name.clone(),
+                                table_change.cdc_table_id.clone(),
+                                table_change.upstream_ddl.clone(),
+                                &self.env.event_log_manager_ref(),
+                                fail_info.clone(),
+                                "get_plan_failed",
+                            );
+                            return Err(Status::internal(fail_info));
                         }
                     }
                     Err(e) => {
@@ -1658,6 +1682,7 @@ impl DdlService for DdlServiceImpl {
                             fail_info,
                             "get_plan_failed",
                         );
+                        return Err(e);
                     }
                 };
             }
