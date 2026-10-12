@@ -530,6 +530,69 @@ select region, k, v from t_numeric_keys order by k;
 statement ok
 DROP TABLE t_numeric_keys;
 
+# A TIMESTAMP key holds nanoseconds and TIMESTAMPTZ microseconds, so keys within
+# the same microsecond would merge; read as a microsecond type it is rejected,
+# `(*)` included. Declared VARCHAR, every key stays distinct through the
+# snapshot (rows a and b) and the change stream (rows c and d), and updates and
+# deletes reach only their own row.
+
+system ok
+e2e_test/source_inline/spanner_cdc/prepare-data.rs ddl "CREATE TABLE timestamp_keys (region INT64 NOT NULL, k TIMESTAMP NOT NULL, v STRING(MAX)) PRIMARY KEY (region, k)"
+
+system ok
+e2e_test/source_inline/spanner_cdc/prepare-data.rs dml "INSERT INTO timestamp_keys (region, k, v) VALUES (1, TIMESTAMP '2024-03-04T05:06:07.123456001Z', 'a'), (1, TIMESTAMP '2024-03-04T05:06:07.123456999Z', 'b')"
+
+statement error primary key column 'k' of table 'timestamp_keys' is TIMESTAMP
+CREATE TABLE t_timestamp_keys (*)
+FROM spanner_source
+TABLE 'timestamp_keys';
+
+statement error primary key column 'k' of table 'timestamp_keys' is TIMESTAMP
+CREATE TABLE t_timestamp_keys (region bigint, k timestamptz, v varchar, primary key (region, k))
+FROM spanner_source
+TABLE 'timestamp_keys';
+
+statement ok
+CREATE TABLE t_timestamp_keys (region bigint, k varchar, v varchar, primary key (region, k)) WITH (
+    spanner.databoost.enabled = 'false',
+)
+FROM spanner_source
+TABLE 'timestamp_keys';
+
+query I retry 24 backoff 5s
+select count(*) from t_timestamp_keys;
+----
+2
+
+system ok
+e2e_test/source_inline/spanner_cdc/prepare-data.rs dml "INSERT INTO timestamp_keys (region, k, v) VALUES (1, TIMESTAMP '2024-03-04T05:06:08.000000001Z', 'c'), (1, TIMESTAMP '2024-03-04T05:06:08.000000002Z', 'd')"
+
+query ITT retry 12 backoff 5s
+select region, k, v from t_timestamp_keys order by k;
+----
+1 2024-03-04T05:06:07.123456001Z a
+1 2024-03-04T05:06:07.123456999Z b
+1 2024-03-04T05:06:08.000000001Z c
+1 2024-03-04T05:06:08.000000002Z d
+
+system ok
+e2e_test/source_inline/spanner_cdc/prepare-data.rs dml "UPDATE timestamp_keys SET v = 'b2' WHERE region = 1 AND k = TIMESTAMP '2024-03-04T05:06:07.123456999Z'"
+
+system ok
+e2e_test/source_inline/spanner_cdc/prepare-data.rs dml "UPDATE timestamp_keys SET v = 'c2' WHERE region = 1 AND k = TIMESTAMP '2024-03-04T05:06:08.000000001Z'"
+
+system ok
+e2e_test/source_inline/spanner_cdc/prepare-data.rs dml "DELETE FROM timestamp_keys WHERE region = 1 AND k IN (TIMESTAMP '2024-03-04T05:06:07.123456001Z', TIMESTAMP '2024-03-04T05:06:08.000000002Z')"
+
+query ITT retry 12 backoff 5s
+select region, k, v from t_timestamp_keys order by k;
+----
+1 2024-03-04T05:06:07.123456999Z b2
+1 2024-03-04T05:06:08.000000001Z c2
+
+statement ok
+DROP TABLE t_timestamp_keys;
+
 # --- 6D: generated columns. A change stream does not carry a generated column
 # outside the primary key, so `(*)` leaves it out and naming it is rejected.
 

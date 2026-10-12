@@ -379,8 +379,9 @@ async fn fetch_columns(
 
 /// Reject key columns whose declared type cannot keep every key distinct and ordered.
 ///
-/// NUMERIC holds 38 significant digits and `DECIMAL` a 96-bit coefficient, so two keys can
-/// round to the same `DECIMAL` and merge into one row; a NUMERIC key must be `VARCHAR`.
+/// Some Spanner key types hold more than their RisingWave counterpart, so two keys can map
+/// to the same value and merge into one row; such a key must be `VARCHAR` (see
+/// [`key_requires_varchar`]).
 ///
 /// The snapshot backfill's split column must also order the same way on both sides:
 /// Spanner computes the split bounds in the column's own type, while the backfill routes
@@ -401,14 +402,18 @@ fn check_key_types(
         };
         let spanner_type = column.spanner_type.as_str();
         let base_type = spanner_type.split('(').next().unwrap_or(spanner_type);
-        if base_type == "NUMERIC" && *data_type != DataType::Varchar {
+        if let Some(reason) = key_requires_varchar(base_type)
+            && *data_type != DataType::Varchar
+        {
             bail!(
-                "primary key column '{}' of table '{}' is NUMERIC, and reading it as {} \
-                 cannot keep every key exact: distinct keys can round to the same value and \
-                 merge into one row. Declare the column VARCHAR in the table definition",
+                "primary key column '{}' of table '{}' is {}, and reading it as {} \
+                 cannot keep every key exact: {}, so distinct keys can map to the same value \
+                 and merge into one row. Declare the column VARCHAR in the table definition",
                 name,
                 table,
+                base_type,
                 data_type,
+                reason,
             );
         }
         if let Some(reason) = lossy_key_conversion(base_type, data_type) {
@@ -439,6 +444,20 @@ fn check_key_types(
         }
     }
     Ok(())
+}
+
+/// Why a key column of `base_type` must be read as `VARCHAR`, or `None` if it need not.
+///
+/// NUMERIC holds 38 significant digits and `DECIMAL` a 96-bit coefficient. TIMESTAMP holds
+/// nanoseconds and RisingWave's timestamp types microseconds. Both the snapshot and the
+/// change stream read these types as Spanner's canonical string, so `VARCHAR` keeps every
+/// key exact.
+fn key_requires_varchar(base_type: &str) -> Option<&'static str> {
+    match base_type {
+        "NUMERIC" => Some("DECIMAL rounds values beyond its 96-bit coefficient"),
+        "TIMESTAMP" => Some("RisingWave timestamps keep only microseconds of its nanoseconds"),
+        _ => None,
+    }
 }
 
 /// Why reading a Spanner column of `base_type` as `data_type` cannot keep every key
@@ -2200,6 +2219,7 @@ mod tests {
             ("ref".to_owned(), column("NUMERIC")),
             ("name".to_owned(), column("STRING(MAX)")),
             ("score".to_owned(), column("FLOAT64")),
+            ("at".to_owned(), column("TIMESTAMP")),
         ]);
         let check = |pk: &[&str], types: &[DataType], split: Option<usize>| {
             check_key_types("orders", &columns, &names(pk), types, split)
@@ -2260,6 +2280,38 @@ mod tests {
         assert!(err.to_string().contains("32-bit float"), "{err}");
         // The exact float type is accepted.
         check(&["score"], &[DataType::Float64], Some(0)).unwrap();
+
+        // A TIMESTAMP key read as a microsecond type can merge two keys within the same
+        // microsecond, with or without the snapshot.
+        for data_type in [DataType::Timestamptz, DataType::Timestamp] {
+            for split in [Some(0), None] {
+                let err = check(&["id", "at"], &[DataType::Int64, data_type.clone()], split)
+                    .unwrap_err();
+                assert!(err.to_string().contains("'at'"), "{err}");
+                assert!(err.to_string().contains("nanoseconds"), "{err}");
+                assert!(
+                    err.to_string().contains("Declare the column VARCHAR"),
+                    "{err}"
+                );
+            }
+        }
+        // VARCHAR keeps every TIMESTAMP key, but not as the split column.
+        check(
+            &["id", "at"],
+            &[DataType::Int64, DataType::Varchar],
+            Some(0),
+        )
+        .unwrap();
+        let err = check(
+            &["id", "at"],
+            &[DataType::Int64, DataType::Varchar],
+            Some(1),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("is TIMESTAMP declared VARCHAR"),
+            "{err}"
+        );
     }
 
     #[test]

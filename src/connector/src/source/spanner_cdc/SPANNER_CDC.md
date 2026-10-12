@@ -418,7 +418,8 @@ CREATE TABLE large_table (*) FROM spanner_cdc_source TABLE 'large_table' WITH (
 ### Type Mapping Table
 
 All Spanner types are mapped to RisingWave types without data loss, except NUMERIC values
-with more digits than `DECIMAL` holds and the non-finite float values described under
+with more digits than `DECIMAL` holds, TIMESTAMP values read as `TIMESTAMPTZ` (microseconds of
+Spanner's nanoseconds), and the non-finite float values described under
 [Limitations](#other-considerations).
 
 | Spanner Type | RisingWave Type | Notes |
@@ -429,7 +430,7 @@ with more digits than `DECIMAL` holds and the non-finite float values described 
 | **FLOAT32** | `REAL` | Direct mapping, including NaN and ±Infinity |
 | **STRING** | `VARCHAR` | Direct mapping |
 | **BYTES** | `BYTEA` | Direct mapping |
-| **TIMESTAMP** | `TIMESTAMPTZ` | Direct mapping |
+| **TIMESTAMP** | `TIMESTAMPTZ` | Microsecond precision; a key column must be `VARCHAR`, see below |
 | **DATE** | `DATE` | Direct mapping |
 | **NUMERIC** | `DECIMAL` | Exact up to 28 significant digits; see below |
 | **JSON** | `JSONB` | Direct mapping |
@@ -476,6 +477,13 @@ split bounds as numbers while the backfill compares the keys as text and would r
 the wrong split. Split on another key column, or set `snapshot = 'false'`. The same holds for
 any other non-`STRING` key column declared `VARCHAR`, such as an `INT64` or `TIMESTAMP` key:
 `CREATE TABLE` rejects it as the split column.
+
+**TIMESTAMP Types**: TIMESTAMP holds nanoseconds, while `TIMESTAMPTZ` and `TIMESTAMP` hold
+microseconds, so a value read as either drops its last three fractional digits. A TIMESTAMP
+primary key column must therefore be declared `VARCHAR`, and `CREATE TABLE ... (*)` rejects a
+table with one: two keys within the same microsecond would merge into one row. Both the snapshot
+and the change stream read it as Spanner's canonical RFC 3339 string. As with NUMERIC, it cannot
+be the snapshot backfill's split column.
 
 An `INT64` key read as `DOUBLE PRECISION`/`REAL`, or a `FLOAT64` key read as `REAL`, is also
 rejected: `f64`/`f32` cannot represent every 64-bit integer or every `f64` exactly, so distinct

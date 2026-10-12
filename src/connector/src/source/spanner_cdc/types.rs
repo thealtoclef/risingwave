@@ -1654,4 +1654,99 @@ mod tests {
         assert_eq!(after["n"], serde_json::json!("12345678901234567.8"));
         assert_eq!(after["na"], serde_json::json!(["0.1", "1234567.123456789"]));
     }
+
+    /// Two TIMESTAMP keys within the same microsecond stay distinct when the key column is
+    /// `VARCHAR`, which `check_key_types` requires, and merge when it is `TIMESTAMPTZ`.
+    ///
+    /// Runs the full path to table rows, as `test_emulator_record_parses_into_rows` does.
+    #[tokio::test]
+    async fn test_timestamp_key_keeps_nanoseconds_as_varchar() {
+        use risingwave_common::catalog::ColumnId;
+        use risingwave_common::row::Row;
+        use risingwave_common::types::ScalarImpl;
+
+        use crate::parser::{
+            DebeziumParser, DebeziumProps, EncodingProperties, JsonProperties, ProtocolProperties,
+            SourceStreamChunkBuilder, SpecificParserConfig,
+        };
+        use crate::source::spanner_cdc::source::{ChangeRecordContext, build_source_message};
+        use crate::source::{SourceColumnDesc, SourceContext, SourceCtrlOpts, SplitId};
+
+        let record = DataChangeRecord::from_json(serde_json::json!({
+            "commit_timestamp": "2026-10-12T03:06:45.00871Z",
+            "record_sequence": "00000000",
+            "server_transaction_id": "1790564800365102",
+            "is_last_record_in_transaction_in_partition": true,
+            "table_name": "t",
+            "column_types": [
+                {"name": "id", "type": {"code": "INT64"}, "is_primary_key": true, "ordinal_position": "1"},
+                {"name": "at", "type": {"code": "TIMESTAMP"}, "is_primary_key": true, "ordinal_position": "2"}
+            ],
+            "mods": [
+                {"keys": {"id": "1", "at": "2024-03-04T05:06:07.123456001Z"}, "new_values": {}, "old_values": {}},
+                {"keys": {"id": "1", "at": "2024-03-04T05:06:07.123456999Z"}, "new_values": {}, "old_values": {}}
+            ],
+            "mod_type": "INSERT",
+            "value_capture_type": "NEW_ROW",
+            "number_of_records_in_transaction": "1",
+            "number_of_partitions_in_transaction": "1",
+            "transaction_tag": "",
+            "is_system_transaction": false
+        }))
+        .unwrap();
+
+        let parse_keys = async |key_type: DataType| {
+            let columns = vec![
+                SourceColumnDesc::simple("id", DataType::Int64, ColumnId::from(0)),
+                SourceColumnDesc::simple("at", key_type, ColumnId::from(1)),
+            ];
+            let props = SpecificParserConfig {
+                encoding_config: EncodingProperties::Json(JsonProperties {
+                    use_schema_registry: false,
+                    timestamptz_handling: None,
+                    timestamp_handling: None,
+                    time_handling: None,
+                    bigint_unsigned_handling: None,
+                    handle_toast_columns: false,
+                }),
+                protocol_config: ProtocolProperties::Debezium(DebeziumProps::default()),
+            };
+            let mut parser =
+                DebeziumParser::new(props, columns.clone(), SourceContext::dummy().into())
+                    .await
+                    .unwrap();
+            let mut builder = SourceStreamChunkBuilder::new(columns, SourceCtrlOpts::for_test());
+            let split_id: SplitId = "0".into();
+            let column_types = record.column_type_map();
+            let ctx = ChangeRecordContext::new("db", &record, &column_types);
+            for m in &record.mods {
+                let msg = build_source_message(&split_id, &ctx, m, "0");
+                parser
+                    .parse_inner(None, msg.payload, builder.row_writer())
+                    .await
+                    .unwrap();
+            }
+            builder.finish_current_chunk();
+            let chunk = builder.consume_ready_chunks().next().unwrap();
+            chunk
+                .rows()
+                .map(|(_, row)| row.datum_at(1).map(|d| d.into_scalar_impl()))
+                .collect::<Vec<_>>()
+        };
+
+        let keys = parse_keys(DataType::Varchar).await;
+        assert_eq!(
+            keys,
+            vec![
+                Some(ScalarImpl::Utf8("2024-03-04T05:06:07.123456001Z".into())),
+                Some(ScalarImpl::Utf8("2024-03-04T05:06:07.123456999Z".into())),
+            ]
+        );
+
+        // Why a microsecond key type is rejected: both keys become the same value.
+        let keys = parse_keys(DataType::Timestamptz).await;
+        assert_eq!(keys.len(), 2);
+        assert!(keys[0].is_some());
+        assert_eq!(keys[0], keys[1]);
+    }
 }
