@@ -281,26 +281,29 @@ enum WatchedColumns {
 
 /// Check that the upstream table and its change stream can feed the CDC table correctly.
 ///
-/// A change stream can watch a subset of tables and columns. A table the stream does not
-/// watch never receives a change after backfill. For a column the stream does not watch, a
-/// `NEW_ROW` record carries no value, so each update overwrites the column with NULL. The
-/// same holds for a generated column outside the primary key, which no change stream
-/// carries. All three are rejected, and so are key columns whose declared type cannot keep
-/// keys distinct or ordered (see [`check_key_types`]). Filter options that drop some
-/// changes by design are returned as notices.
+/// The declared primary key must match the upstream primary key by name and order
+/// (see [`check_primary_key`]), and every declared column's type must decode its
+/// upstream column the same way in the snapshot and the change stream
+/// (see [`check_column_types`]). A change stream can watch a subset of tables and
+/// columns. A table the stream does not watch never receives a change after backfill.
+/// For a column the stream does not watch, a `NEW_ROW` record carries no value, so each
+/// update overwrites the column with NULL. The same holds for a generated column outside
+/// the primary key, which no change stream carries. Those are rejected, and so are key
+/// columns whose declared type cannot keep keys distinct or ordered
+/// (see [`check_key_types`]). Filter options that drop some changes by design are
+/// returned as notices.
 ///
-/// `pk_types` holds the table's type of each `pk_names` column, and `split_pk_index` the
+/// `column_types` holds the declared type of each `column_names` entry in the same order;
+/// `pk_types` holds the declared type of each `pk_names` column, and `split_pk_index` the
 /// key column the snapshot backfill splits on, or `None` without a snapshot backfill.
 pub(crate) async fn check_cdc_table_upstream(
     config: &ExternalTableConfig,
     column_names: &[String],
+    column_types: &[DataType],
     pk_names: &[String],
     pk_types: &[DataType],
     split_pk_index: Option<usize>,
 ) -> ConnectorResult<Vec<String>> {
-    let Some(stream) = config.spanner_change_stream_name.as_deref() else {
-        return Ok(vec![]);
-    };
     let client = create_spanner_client(
         &config.spanner_project,
         &config.spanner_instance,
@@ -312,6 +315,15 @@ pub(crate) async fn check_cdc_table_upstream(
     .await?;
 
     let columns = Box::pin(fetch_columns(&client, &config.table)).await?;
+    let upstream_pk_names = Box::pin(SpannerExternalTable::discover_primary_keys(
+        &client,
+        &config.table,
+    ))
+    .await?;
+
+    check_primary_key(&config.table, &upstream_pk_names, pk_names)?;
+    check_column_types(&config.table, &columns, column_names, column_types)?;
+
     let generated = columns
         .iter()
         .filter(|(_, column)| column.generated)
@@ -320,6 +332,9 @@ pub(crate) async fn check_cdc_table_upstream(
     check_generated_columns(&config.table, &generated, column_names, pk_names)?;
     check_key_types(&config.table, &columns, pk_names, pk_types, split_pk_index)?;
 
+    let Some(stream) = config.spanner_change_stream_name.as_deref() else {
+        return Ok(vec![]);
+    };
     let watched = Box::pin(fetch_watched_columns(&client, stream, &config.table)).await?;
     check_watched_columns(
         stream,
@@ -375,6 +390,148 @@ async fn fetch_columns(
         );
     }
     Ok(columns)
+}
+
+/// Reject a declared primary key that does not match the upstream primary key exactly.
+///
+/// The snapshot backfill and the change stream both route changes by the declared key. A
+/// declared key that omits an upstream key column, adds a mutable column, or reorders the
+/// columns can map distinct upstream rows onto one RisingWave row or route a change to the
+/// wrong row, so the connector requires the same names in the same order.
+fn check_primary_key(
+    table: &str,
+    upstream_pk_names: &[String],
+    pk_names: &[String],
+) -> ConnectorResult<()> {
+    let matches = upstream_pk_names.len() == pk_names.len()
+        && upstream_pk_names
+            .iter()
+            .zip_eq_fast(pk_names)
+            .all(|(upstream, declared)| upstream.eq_ignore_ascii_case(declared.as_str()));
+    if !matches {
+        bail!(
+            "table '{}' has primary key ({}) but the table definition declares ({}). The \
+             declared key must match the upstream primary key columns and order",
+            table,
+            upstream_pk_names.join(", "),
+            pk_names.join(", "),
+        );
+    }
+    Ok(())
+}
+
+/// Reject a declared column whose type cannot decode its upstream column consistently.
+///
+/// The snapshot decodes a cell with the declared RisingWave type, while the change stream
+/// converts the cell to JSON and parses it into the declared type. When the two disagree, the
+/// value either reads as NULL or reaches the backfill parser as a type it rejects, which drops
+/// a non-key value or panics the backfill on a key. Array element types are checked with the
+/// same mapping; see [`incompatible_column_type`].
+fn check_column_types(
+    table: &str,
+    columns: &HashMap<String, UpstreamColumn>,
+    column_names: &[String],
+    column_types: &[DataType],
+) -> ConnectorResult<()> {
+    for (name, data_type) in column_names.iter().zip_eq_fast(column_types) {
+        // A declared column missing upstream cannot be read by the snapshot; that fails the
+        // read itself. Only a column that exists upstream can be type-checked here.
+        let Some(column) = columns.get(&name.to_lowercase()) else {
+            continue;
+        };
+        if let Some(reason) = incompatible_column_type(&column.spanner_type, data_type) {
+            bail!(
+                "column '{}' of table '{}' is {}, which cannot be read as {}: {}. Declare the \
+                 column as a type that decodes the same value in the snapshot and the change \
+                 stream",
+                name,
+                table,
+                column.spanner_type,
+                data_type,
+                reason,
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The reason a Spanner column of `spanner_type` cannot be read as `data_type`, or `None` if
+/// it can.
+///
+/// The accepted mappings are the ones the snapshot and the change stream both decode the same
+/// way. `VARCHAR` is accepted for the upstream types Spanner sends as strings (`STRING`,
+/// `NUMERIC`, `TIMESTAMP`, `DATE`, `BYTES`, `JSON`, `ENUM`, `PROTO`, `TIME`, `INTERVAL`,
+/// `UUID`). It is not accepted for `INT64`/`FLOAT64`/`FLOAT32`, which the change stream turns
+/// into JSON numbers the Strict `VARCHAR` parser rejects; for `BOOL`, whose string the
+/// snapshot's `String` decoder refuses; or for `STRUCT`/`ARRAY`, which become JSON objects and
+/// arrays. `INT64` is accepted only as an integer type: the SDK's float decoders reject an
+/// `INT64` wire string, so a snapshot read as a float would become NULL while the change stream
+/// parses the JSON number. `TIMESTAMP` is never accepted as a `timestamp`: Spanner's wire value
+/// ends in `Z`, which a civil `timestamp` rejects in the change stream, so streamed values
+/// would read as NULL even though the snapshot succeeded. Array element types are checked with
+/// these same rules.
+fn incompatible_column_type(spanner_type: &str, data_type: &DataType) -> Option<String> {
+    if let Some(inner) = spanner_type
+        .strip_prefix("ARRAY<")
+        .and_then(|s| s.strip_suffix('>'))
+    {
+        let DataType::List(list) = data_type else {
+            return Some(format!(
+                "an ARRAY can only be read as a list, not as {}",
+                data_type
+            ));
+        };
+        return incompatible_column_type(inner, list.elem())
+            .map(|reason| format!("its element type cannot be read: {}", reason));
+    }
+
+    // STRUCT carries field names in angle brackets (`STRUCT<a INT64>`), so it is matched
+    // before the `(`-based base-type extraction used for `STRING(MAX)` and `BYTES(MAX)`.
+    if spanner_type.starts_with("STRUCT") {
+        return (!matches!(data_type, DataType::Jsonb))
+            .then(|| "a STRUCT becomes a JSON object, not a string".to_owned());
+    }
+
+    let base = spanner_type.split('(').next().unwrap_or(spanner_type);
+    match base {
+        "BOOL" => (!matches!(data_type, DataType::Boolean))
+            .then(|| "a BOOL becomes a JSON boolean, not a string".to_owned()),
+        "INT64" => (!matches!(
+            data_type,
+            DataType::Int16 | DataType::Int32 | DataType::Int64
+        ))
+        .then(|| {
+            "the snapshot reads it as an integer and the change stream sends a JSON number"
+                .to_owned()
+        }),
+        "FLOAT64" | "FLOAT32" => (!matches!(data_type, DataType::Float32 | DataType::Float64))
+            .then(|| "a floating-point value becomes a JSON number".to_owned()),
+        "STRING" => (!matches!(data_type, DataType::Varchar))
+            .then(|| "a STRING arrives as a JSON string".to_owned()),
+        "TIMESTAMP" => {
+            (!matches!(data_type, DataType::Timestamptz | DataType::Varchar)).then(|| {
+                "Spanner timestamps end in `Z`, which a civil timestamp rejects in the change \
+                 stream"
+                    .to_owned()
+            })
+        }
+        "DATE" => (!matches!(data_type, DataType::Date | DataType::Varchar))
+            .then(|| "a DATE is sent as a `YYYY-MM-DD` string".to_owned()),
+        "NUMERIC" => (!matches!(data_type, DataType::Decimal | DataType::Varchar))
+            .then(|| "a NUMERIC is sent as a decimal string".to_owned()),
+        "BYTES" => (!matches!(data_type, DataType::Bytea | DataType::Varchar))
+            .then(|| "a BYTES value is sent as a base64 string".to_owned()),
+        "JSON" => (!matches!(data_type, DataType::Jsonb | DataType::Varchar))
+            .then(|| "a JSON value is sent as a JSON-formatted string".to_owned()),
+        // PROTO is base64 on the wire; ENUM, TIME, INTERVAL and UUID are strings.
+        t if t.starts_with("PROTO") => (!matches!(data_type, DataType::Bytea | DataType::Varchar))
+            .then(|| "a PROTO is sent as a base64 string".to_owned()),
+        t if t.starts_with("ENUM") => (!matches!(data_type, DataType::Varchar))
+            .then(|| "an ENUM is sent as a string".to_owned()),
+        // TIME, INTERVAL and UUID, and any type this connector does not know, are strings.
+        _ => (!matches!(data_type, DataType::Varchar))
+            .then(|| format!("the upstream type '{}' is sent as a string", spanner_type)),
+    }
 }
 
 /// Reject key columns whose declared type cannot keep every key distinct and ordered.
@@ -667,7 +824,10 @@ pub struct SpannerExternalTableReader {
     rw_schema: Schema,
     field_names: String,
     pk_names: Vec<String>,
-    pk_types: Vec<DataType>,
+    /// Index of each declared key column in `rw_schema`, in declared key order. The backfill
+    /// and the change stream both compare the declared type, so the split column and its
+    /// bounds come from here, not from the upstream column type.
+    pk_indices: Vec<usize>,
     table_name: String,
     enable_databoost: bool,
     /// Database client. Shared across transactions and partition executions.
@@ -694,7 +854,11 @@ impl SpannerExternalTableReader {
         }
     }
 
-    pub async fn new(config: ExternalTableConfig, schema: Schema) -> ConnectorResult<Self> {
+    pub async fn new(
+        config: ExternalTableConfig,
+        schema: Schema,
+        pk_indices: Vec<usize>,
+    ) -> ConnectorResult<Self> {
         let enable_databoost = config.spanner_databoost_enabled;
         let db_client = create_spanner_client(
             &config.spanner_project,
@@ -708,17 +872,6 @@ impl SpannerExternalTableReader {
         let external_table = SpannerExternalTable::connect(&db_client, config).await?;
 
         let pk_names = external_table.pk_names().clone();
-        let pk_types: Vec<DataType> = pk_names
-            .iter()
-            .map(|pk| {
-                external_table
-                    .column_descs()
-                    .iter()
-                    .find(|c| c.name.as_str() == pk.as_str())
-                    .map(|c| c.data_type.clone())
-                    .ok_or_else(|| anyhow!("pk column '{}' not in schema", pk))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
 
         let field_names = schema
             .fields()
@@ -731,7 +884,7 @@ impl SpannerExternalTableReader {
             rw_schema: schema,
             field_names,
             pk_names,
-            pk_types,
+            pk_indices,
             table_name: external_table.table_name().to_owned(),
             enable_databoost,
             db_client,
@@ -782,7 +935,7 @@ impl ExternalTableReader for SpannerExternalTableReader {
                 anyhow!("invalid backfill_num_rows_per_split, must be greater than 0").into(),
             );
         }
-        if options.backfill_split_pk_column_index as usize >= self.pk_names.len() {
+        if options.backfill_split_pk_column_index as usize >= self.pk_indices.len() {
             return Err(anyhow!(
                 "invalid backfill_split_pk_column_index {}, out of bound",
                 options.backfill_split_pk_column_index
@@ -826,7 +979,7 @@ impl SpannerExternalTableReader {
     /// Follows Postgres CDC's `split_column` pattern.
     fn split_column(&self, options: &CdcTableSnapshotSplitOption) -> Field {
         let idx = options.backfill_split_pk_column_index as usize;
-        Field::new(&self.pk_names[idx], self.pk_types[idx].clone())
+        self.rw_schema.fields[self.pk_indices[idx]].clone()
     }
 
     fn get_order_key(primary_keys: &[String]) -> String {
@@ -1013,10 +1166,13 @@ impl SpannerExternalTableReader {
             let split = CdcTableSnapshotSplit {
                 split_id,
                 left_bound_inclusive: OwnedRow::new(vec![
-                    left.map(|l| to_int_scalar(l, &split_column.data_type)),
+                    left.map(|l| to_int_scalar(l, &split_column.data_type))
+                        .transpose()?,
                 ]),
                 right_bound_exclusive: OwnedRow::new(vec![
-                    right.map(|r| to_int_scalar(r, &split_column.data_type)),
+                    right
+                        .map(|r| to_int_scalar(r, &split_column.data_type))
+                        .transpose()?,
                 ]),
             };
 
@@ -1350,16 +1506,33 @@ fn is_supported_even_split_data_type(data_type: &DataType) -> bool {
     )
 }
 
-/// Convert i64 to `ScalarImpl` based on data type (follows Postgres CDC's `to_int_scalar`)
-fn to_int_scalar(i: i64, data_type: &DataType) -> ScalarImpl {
-    match data_type {
-        DataType::Int16 => ScalarImpl::Int16(i.try_into().unwrap()),
-        DataType::Int32 => ScalarImpl::Int32(i.try_into().unwrap()),
+/// Convert i64 to `ScalarImpl` based on the declared split column type.
+///
+/// A boundary the declared type cannot hold is an error, not a panic: the split column now
+/// uses the declared type, which can be narrower than the upstream `INT64` (for example a
+/// key declared `INT32`).
+fn to_int_scalar(i: i64, data_type: &DataType) -> ConnectorResult<ScalarImpl> {
+    let scalar = match data_type {
+        DataType::Int16 => ScalarImpl::Int16(i.try_into().map_err(|_| {
+            anyhow!(
+                "split boundary {} does not fit the declared key type INT16",
+                i
+            )
+        })?),
+        DataType::Int32 => ScalarImpl::Int32(i.try_into().map_err(|_| {
+            anyhow!(
+                "split boundary {} does not fit the declared key type INT32",
+                i
+            )
+        })?),
         DataType::Int64 => ScalarImpl::Int64(i),
-        _ => {
-            panic!("Can't convert int {} to ScalarImpl::{}", i, data_type)
-        }
-    }
+        _ => bail!(
+            "cannot convert split boundary {} to the declared key type {}",
+            i,
+            data_type
+        ),
+    };
+    Ok(scalar)
 }
 
 /// The increment `as_even_splits` uses between split boundaries.
@@ -2285,8 +2458,8 @@ mod tests {
         // microsecond, with or without the snapshot.
         for data_type in [DataType::Timestamptz, DataType::Timestamp] {
             for split in [Some(0), None] {
-                let err = check(&["id", "at"], &[DataType::Int64, data_type.clone()], split)
-                    .unwrap_err();
+                let err =
+                    check(&["id", "at"], &[DataType::Int64, data_type.clone()], split).unwrap_err();
                 assert!(err.to_string().contains("'at'"), "{err}");
                 assert!(err.to_string().contains("nanoseconds"), "{err}");
                 assert!(
@@ -2312,6 +2485,154 @@ mod tests {
             err.to_string().contains("is TIMESTAMP declared VARCHAR"),
             "{err}"
         );
+    }
+
+    /// The upstream columns used by the column-type and primary-key validation tests, one per
+    /// Spanner encoding family.
+    fn upstream_columns_for_validation() -> HashMap<String, UpstreamColumn> {
+        let column = |spanner_type: &str| UpstreamColumn {
+            spanner_type: spanner_type.to_owned(),
+            generated: false,
+        };
+        HashMap::from([
+            ("b".to_owned(), column("BOOL")),
+            ("i".to_owned(), column("INT64")),
+            ("f".to_owned(), column("FLOAT64")),
+            ("n".to_owned(), column("NUMERIC")),
+            ("s".to_owned(), column("STRING(MAX)")),
+            ("bin".to_owned(), column("BYTES(MAX)")),
+            ("d".to_owned(), column("DATE")),
+            ("ts".to_owned(), column("TIMESTAMP")),
+            ("j".to_owned(), column("JSON")),
+            ("st".to_owned(), column("STRUCT<a INT64>")),
+            ("a_i".to_owned(), column("ARRAY<INT64>")),
+            ("a_ts".to_owned(), column("ARRAY<TIMESTAMP>")),
+            ("a_j".to_owned(), column("ARRAY<JSON>")),
+        ])
+    }
+
+    #[test]
+    fn test_check_column_types_accepts_matching_mappings() {
+        let columns = upstream_columns_for_validation();
+        let names = |cols: &[&str]| cols.iter().map(|c| (*c).to_owned()).collect::<Vec<_>>();
+
+        // The canonical mapping of each type, plus the accepted alternatives: VARCHAR over a
+        // string-encoded type (JSON text included) and a narrower integer over INT64.
+        let accepted: &[(&str, DataType)] = &[
+            ("b", DataType::Boolean),
+            ("i", DataType::Int64),
+            ("i", DataType::Int32),
+            ("i", DataType::Int16),
+            ("f", DataType::Float64),
+            ("f", DataType::Float32),
+            ("n", DataType::Decimal),
+            ("n", DataType::Varchar),
+            ("s", DataType::Varchar),
+            ("bin", DataType::Bytea),
+            ("bin", DataType::Varchar),
+            ("d", DataType::Date),
+            ("d", DataType::Varchar),
+            ("ts", DataType::Timestamptz),
+            ("ts", DataType::Varchar),
+            ("j", DataType::Jsonb),
+            ("j", DataType::Varchar),
+            ("st", DataType::Jsonb),
+            ("a_i", DataType::List(ListType::new(DataType::Int64))),
+            ("a_ts", DataType::List(ListType::new(DataType::Timestamptz))),
+            ("a_ts", DataType::List(ListType::new(DataType::Varchar))),
+            ("a_j", DataType::List(ListType::new(DataType::Jsonb))),
+            ("a_j", DataType::List(ListType::new(DataType::Varchar))),
+        ];
+        for (name, data_type) in accepted {
+            check_column_types(
+                "t",
+                &columns,
+                &names(&[*name]),
+                std::slice::from_ref(data_type),
+            )
+            .unwrap_or_else(|e| panic!("'{name}' as {data_type} should be accepted: {e}"));
+        }
+    }
+
+    #[test]
+    fn test_check_column_types_rejects_incompatible_mappings() {
+        let columns = upstream_columns_for_validation();
+        let names = |cols: &[&str]| cols.iter().map(|c| (*c).to_owned()).collect::<Vec<_>>();
+
+        // INT64 -> VARCHAR is the B1 defect: the snapshot reads an integer string, but the
+        // change stream sends a JSON number that Strict VARCHAR rejects.
+        let err =
+            check_column_types("t", &columns, &names(&["i"]), &[DataType::Varchar]).unwrap_err();
+        assert!(err.to_string().contains("'i'"), "{err}");
+        assert!(err.to_string().contains("JSON number"), "{err}");
+
+        let rejected: &[(&str, DataType)] = &[
+            ("b", DataType::Varchar),
+            ("i", DataType::Boolean),
+            // The SDK's float decoders reject an INT64 wire string, so a float snapshot read
+            // of an INT64 column would be NULL while the change stream parses the number.
+            ("i", DataType::Float64),
+            ("i", DataType::Float32),
+            ("f", DataType::Varchar),
+            ("n", DataType::Int64),
+            ("s", DataType::Int64),
+            ("bin", DataType::Int64),
+            ("d", DataType::Int64),
+            // Spanner timestamps end in `Z`; a civil timestamp rejects them in the stream.
+            ("ts", DataType::Timestamp),
+            ("st", DataType::Varchar),
+            ("a_i", DataType::Varchar),
+            ("a_i", DataType::List(ListType::new(DataType::Varchar))),
+            ("a_i", DataType::List(ListType::new(DataType::Float64))),
+            ("a_ts", DataType::List(ListType::new(DataType::Timestamp))),
+        ];
+        for (name, data_type) in rejected {
+            let err = check_column_types(
+                "t",
+                &columns,
+                &names(&[*name]),
+                std::slice::from_ref(data_type),
+            )
+            .unwrap_err();
+            assert!(
+                err.to_string().contains(&format!("'{name}'")),
+                "'{name}' as {data_type} should be rejected: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_check_primary_key_requires_same_names_and_order() {
+        let names = |cols: &[&str]| cols.iter().map(|c| (*c).to_owned()).collect::<Vec<_>>();
+        check_primary_key("t", &names(&["a", "b"]), &names(&["a", "b"])).unwrap();
+        // Names match case-insensitively.
+        check_primary_key("t", &names(&["ID"]), &names(&["id"])).unwrap();
+
+        // A subset, an extra column and a reorder are each rejected.
+        for (upstream, declared) in [
+            (vec!["a", "b"], vec!["a"]),
+            (vec!["a"], vec!["a", "b"]),
+            (vec!["a", "b"], vec!["b", "a"]),
+        ] {
+            let err = check_primary_key("t", &names(&upstream), &names(&declared)).unwrap_err();
+            assert!(err.to_string().contains("must match the upstream"), "{err}");
+        }
+    }
+
+    #[test]
+    fn test_to_int_scalar_is_checked_for_narrow_declared_types() {
+        assert_eq!(
+            to_int_scalar(7, &DataType::Int64).unwrap(),
+            ScalarImpl::Int64(7)
+        );
+        assert_eq!(
+            to_int_scalar(7, &DataType::Int32).unwrap(),
+            ScalarImpl::Int32(7)
+        );
+        // A boundary the declared type cannot hold is an error, not a panic.
+        assert!(to_int_scalar(i64::MAX, &DataType::Int32).is_err());
+        assert!(to_int_scalar(i64::from(i32::MAX) + 1, &DataType::Int32).is_err());
+        assert!(to_int_scalar(0, &DataType::Varchar).is_err());
     }
 
     #[test]

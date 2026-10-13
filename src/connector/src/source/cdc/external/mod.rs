@@ -126,7 +126,7 @@ impl ExternalCdcTableType {
                 SqlServerExternalTableReader::new(config, schema, pk_indices).await?,
             )),
             Self::Spanner => Ok(ExternalTableReaderImpl::Spanner(
-                SpannerExternalTableReader::new(config, schema).await?,
+                SpannerExternalTableReader::new(config, schema, pk_indices).await?,
             )),
             // citus is never supported for cdc backfill (create source + create table).
             Self::Mock => Ok(ExternalTableReaderImpl::Mock(MockExternalTableReader::new())),
@@ -718,14 +718,17 @@ impl ExternalTableImpl {
     }
 
     /// Check that the upstream can feed the CDC table correctly: it delivers every change to
-    /// `column_names`, and the declared key types (`pk_types`) keep every key distinct and,
-    /// for the snapshot split column `split_pk_index`, ordered as upstream orders them.
+    /// `column_names`, the declared primary key matches upstream, and the declared types
+    /// (`column_types`, aligned with `column_names`, and `pk_types`) decode every column and
+    /// keep every key distinct and, for the snapshot split column `split_pk_index`, ordered as
+    /// upstream orders them.
     ///
     /// Returns notices for upstream settings that drop some changes by design. Only Spanner
     /// CDC is checked; other connectors return nothing.
     pub async fn check_cdc_table_upstream(
         config: &ExternalTableConfig,
         column_names: &[String],
+        column_types: &[DataType],
         pk_names: &[String],
         pk_types: &[DataType],
         split_pk_index: Option<usize>,
@@ -737,6 +740,7 @@ impl ExternalTableImpl {
             crate::source::cdc::external::spanner::check_cdc_table_upstream(
                 config,
                 column_names,
+                column_types,
                 pk_names,
                 pk_types,
                 split_pk_index,

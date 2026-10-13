@@ -1725,11 +1725,11 @@ async fn check_cdc_table_upstream(
     let cdc_table_type = ExternalCdcTableType::from_properties(&options);
     let config = ExternalTableConfig::try_from_btreemap(options, secret_refs)
         .context("failed to extract external table config")?;
-    let column_names = columns
+    let (column_names, column_types): (Vec<String>, Vec<_>) = columns
         .iter()
         .filter(|c| !c.is_generated())
-        .map(|c| c.name().to_owned())
-        .collect_vec();
+        .map(|c| (c.name().to_owned(), c.data_type().clone()))
+        .unzip();
     let pk_types = pk_names
         .iter()
         .map(|pk| {
@@ -1746,6 +1746,7 @@ async fn check_cdc_table_upstream(
     let notices = Box::pin(ExternalTableImpl::check_cdc_table_upstream(
         &config,
         &column_names,
+        &column_types,
         pk_names,
         &pk_types,
         split_pk_index,

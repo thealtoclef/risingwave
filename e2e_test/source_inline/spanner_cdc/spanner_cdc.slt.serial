@@ -530,6 +530,53 @@ select region, k, v from t_numeric_keys order by k;
 statement ok
 DROP TABLE t_numeric_keys;
 
+# --- 6C-bis: Declared key and column validation. B1-B3: a declared key must
+# match the upstream key, and every declared type must decode the same value in
+# the snapshot and the change stream.
+
+# B1: an INT64 column arrives as a JSON number, which Strict VARCHAR rejects, so
+# reading it as VARCHAR would drop or panic on a change.
+statement error column 'quantity' of table 'inventory' is INT64
+CREATE TABLE t_bad_scalar (id bigint primary key, name varchar, quantity varchar)
+FROM spanner_source
+TABLE 'inventory';
+
+# B2: a declared key that omits an upstream key column cannot route changes.
+statement error table 'numeric_keys' has primary key
+CREATE TABLE t_bad_key (region bigint primary key, v varchar)
+FROM spanner_source
+TABLE 'numeric_keys';
+
+# B2: a reordered key is rejected, even though it names the same columns.
+statement error table 'numeric_keys' has primary key
+CREATE TABLE t_bad_order (k varchar, region bigint, v varchar, primary key (k, region))
+FROM spanner_source
+TABLE 'numeric_keys';
+
+# B3: an ARRAY<INT64> element is checked like a scalar.
+statement error column 'a_i' of table 'arrays' is ARRAY<INT64>
+CREATE TABLE t_bad_array (id bigint primary key, a_i varchar[])
+FROM spanner_source
+TABLE 'arrays';
+
+# B1: the type check applies without a snapshot too. Disabling the backfill drops
+# the split-column requirement, but a key declared VARCHAR over an INT64 column
+# is still rejected: the change stream sends a JSON number Strict VARCHAR rejects.
+statement error column 'id' of table 'inventory' is INT64
+CREATE TABLE t_bad_snapshot_off (id varchar primary key, name varchar, quantity bigint) WITH (
+    snapshot = 'false',
+)
+FROM spanner_source
+TABLE 'inventory';
+
+# B3: a non-key TIMESTAMP column declared `timestamp` succeeds in the snapshot but
+# the change stream reads NULL (its `Z` suffix is not a civil timestamp), so it is
+# rejected like a key would be.
+statement error column 'ts' of table 'scalars' is TIMESTAMP
+CREATE TABLE t_bad_ts (id bigint primary key, ts timestamp)
+FROM spanner_source
+TABLE 'scalars';
+
 # A TIMESTAMP key holds nanoseconds and TIMESTAMPTZ microseconds, so keys within
 # the same microsecond would merge; read as a microsecond type it is rejected,
 # `(*)` included. Declared VARCHAR, every key stays distinct through the
