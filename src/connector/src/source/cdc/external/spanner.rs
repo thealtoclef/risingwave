@@ -859,6 +859,14 @@ impl SpannerExternalTableReader {
         schema: Schema,
         pk_indices: Vec<usize>,
     ) -> ConnectorResult<Self> {
+        // The snapshot decoder identifies key columns by these indices, so one that misses
+        // the schema would let a key that fails to decode be read as NULL.
+        if let Some(index) = pk_indices.iter().find(|&&index| index >= schema.len()) {
+            bail!(
+                "Spanner snapshot primary-key index {index} is out of bounds for {} columns",
+                schema.len()
+            );
+        }
         let enable_databoost = config.spanner_databoost_enabled;
         let db_client = create_spanner_client(
             &config.spanner_project,
@@ -1327,7 +1335,7 @@ impl SpannerExternalTableReader {
         scan_limit: u32,
     ) {
         let fields = self.rw_schema.fields();
-        let pk_names = &self.pk_names;
+        let pk_indices = &self.pk_indices;
         let order_key = Self::get_order_key(&primary_keys);
 
         let stmt = if let Some(ref pk_row) = start_pk_row {
@@ -1374,7 +1382,7 @@ impl SpannerExternalTableReader {
             .context("snapshot query failed")?;
 
         while let Some(row) = rows.next().await.transpose().context("row read failed")? {
-            yield spanner_row_to_owned_row(&row, fields, pk_names)?;
+            yield spanner_row_to_owned_row(&row, fields, pk_indices)?;
         }
     }
 
@@ -1398,7 +1406,7 @@ impl SpannerExternalTableReader {
         split_columns: Vec<Field>,
     ) {
         let fields = self.rw_schema.fields();
-        let pk_names = &self.pk_names;
+        let pk_indices = &self.pk_indices;
 
         // Use the split column from parameters (follows Postgres CDC pattern)
         // The split column is determined by backfill_split_pk_column_index
@@ -1480,7 +1488,7 @@ impl SpannerExternalTableReader {
 
         #[for_await]
         for row in rows {
-            yield spanner_row_to_owned_row(&row?, fields, pk_names)?;
+            yield spanner_row_to_owned_row(&row?, fields, pk_indices)?;
         }
     }
 }
@@ -2107,15 +2115,29 @@ fn spanner_array_to_list(
 fn spanner_row_to_owned_row(
     row: &SpannerRow,
     fields: &[Field],
-    pk_names: &[String],
+    pk_indices: &[usize],
+) -> ConnectorResult<OwnedRow> {
+    decode_row_with_strict_pk(fields, pk_indices, |idx, field| {
+        spanner_cell_to_datum(row, &field.data_type, idx)
+    })
+}
+
+/// Applies the key/non-key decode policy of [`spanner_row_to_owned_row`] to the cells
+/// produced by `decode`. Key columns are identified by their position in `fields`, not by
+/// name: the declared names can differ in case from the upstream key names, and a key
+/// misread as a non-key column would be stored as NULL instead of failing the read.
+fn decode_row_with_strict_pk(
+    fields: &[Field],
+    pk_indices: &[usize],
+    mut decode: impl FnMut(usize, &Field) -> anyhow::Result<Datum>,
 ) -> ConnectorResult<OwnedRow> {
     static LOG_SUPPRESSOR: LazyLock<LogSuppressor> = LazyLock::new(LogSuppressor::default);
 
     let mut datums = Vec::with_capacity(fields.len());
     for (idx, field) in fields.iter().enumerate() {
-        let datum = match spanner_cell_to_datum(row, &field.data_type, idx) {
+        let datum = match decode(idx, field) {
             Ok(datum) => datum,
-            Err(err) if pk_names.contains(&field.name) => {
+            Err(err) if pk_indices.contains(&idx) => {
                 return Err(err
                     .context(format!(
                         "failed to decode Spanner snapshot primary key `{}`",
@@ -2317,6 +2339,42 @@ mod tests {
         // Epoch.
         let ts = google_cloud_wkt::Timestamp::clamp(0, 0);
         assert_eq!(spanner_ts_to_micros(&ts), 0);
+    }
+
+    #[test]
+    fn test_decode_row_with_strict_pk() {
+        // An upstream key `AccountId` declared without quotes is named `accountid` in the
+        // schema. A key that fails to decode, e.g. an INT64 out of range for a declared INT,
+        // must fail the read whatever the case of its name.
+        let fields = vec![
+            Field::new("accountid", DataType::Int32),
+            Field::new("balance", DataType::Int32),
+        ];
+        let fails_at = |failing: usize| {
+            move |idx: usize, _: &Field| -> anyhow::Result<Datum> {
+                if idx == failing {
+                    Err(anyhow!("out of range integral type conversion attempted"))
+                } else {
+                    Ok(Some(ScalarImpl::Int32(1)))
+                }
+            }
+        };
+
+        let err = decode_row_with_strict_pk(&fields, &[0], fails_at(0)).unwrap_err();
+        assert!(
+            err.to_report_string()
+                .contains("failed to decode Spanner snapshot primary key `accountid`"),
+            "{}",
+            err.to_report_string()
+        );
+
+        // A non-key column that fails to decode is read as NULL.
+        let row = decode_row_with_strict_pk(&fields, &[0], fails_at(1)).unwrap();
+        assert_eq!(row, OwnedRow::new(vec![Some(ScalarImpl::Int32(1)), None]));
+
+        // Spanner allows NULL key columns, so a NULL key is not an error.
+        let row = decode_row_with_strict_pk(&fields, &[0], |_, _| Ok(None)).unwrap();
+        assert_eq!(row, OwnedRow::new(vec![None, None]));
     }
 
     #[test]
