@@ -187,33 +187,12 @@ impl SpannerExternalTable {
         table_name: &str,
         pk_names: &[String],
     ) -> ConnectorResult<Vec<ColumnDesc>> {
-        let (schema, table) = split_table_name(table_name);
-        let stmt = Statement::builder(
-            "SELECT COLUMN_NAME, SPANNER_TYPE, IS_GENERATED \
-             FROM INFORMATION_SCHEMA.COLUMNS \
-             WHERE TABLE_SCHEMA = @schema AND TABLE_NAME = @table \
-             ORDER BY ORDINAL_POSITION",
-        )
-        .add_param("schema", schema)
-        .add_param("table", table)
-        .build();
-
-        let mut rows = db_client
-            .single_use()
-            .build()
-            .execute_query(stmt)
-            .await
-            .context("column query")?;
-
         let mut descs = Vec::new();
-        while let Some(row) = rows.next().await.transpose().context("column row")? {
-            let name: String = row.try_get(0).context("COLUMN_NAME")?;
-            let spanner_type: String = row.try_get(1).context("SPANNER_TYPE")?;
-            let is_generated: String = row.try_get(2).context("IS_GENERATED")?;
-            if is_generated == "ALWAYS" && !pk_names.contains(&name) {
+        for (name, column) in Box::pin(fetch_columns(db_client, table_name)).await? {
+            if column.generated && !pk_names.contains(&name) {
                 continue;
             }
-            let dt = spanner_type_to_rw_type(&spanner_type)?;
+            let dt = spanner_type_to_rw_type(&column.spanner_type)?;
             descs.push(ColumnDesc::named(name, ColumnId::placeholder(), dt));
         }
 
@@ -314,7 +293,12 @@ pub(crate) async fn check_cdc_table_upstream(
     )
     .await?;
 
-    let columns = Box::pin(fetch_columns(&client, &config.table)).await?;
+    // Keyed by lowercased name: Spanner identifiers are case-insensitive.
+    let columns: HashMap<String, UpstreamColumn> = Box::pin(fetch_columns(&client, &config.table))
+        .await?
+        .into_iter()
+        .map(|(name, column)| (name.to_lowercase(), column))
+        .collect();
     let upstream_pk_names = Box::pin(SpannerExternalTable::discover_primary_keys(
         &client,
         &config.table,
@@ -357,18 +341,19 @@ struct UpstreamColumn {
     generated: bool,
 }
 
-/// Read the columns of `table`, keyed by lowercased name.
+/// Read the columns of `table` with their upstream names, in table order.
 async fn fetch_columns(
     client: &DatabaseClient,
     table: &str,
-) -> ConnectorResult<HashMap<String, UpstreamColumn>> {
+) -> ConnectorResult<Vec<(String, UpstreamColumn)>> {
     let (schema, table) = split_table_name(table);
     let stmt = Statement::builder(
         "SELECT COLUMN_NAME, SPANNER_TYPE, IS_GENERATED FROM INFORMATION_SCHEMA.COLUMNS \
-         WHERE TABLE_SCHEMA = @schema AND TABLE_NAME = @t",
+         WHERE TABLE_SCHEMA = @schema AND TABLE_NAME = @table \
+         ORDER BY ORDINAL_POSITION",
     )
     .add_param("schema", schema)
-    .add_param("t", table)
+    .add_param("table", table)
     .build();
     let mut rows = client
         .single_use()
@@ -376,18 +361,18 @@ async fn fetch_columns(
         .execute_query(stmt)
         .await
         .context("column query")?;
-    let mut columns = HashMap::new();
+    let mut columns = Vec::new();
     while let Some(row) = rows.next().await.transpose().context("column row")? {
         let name: String = row.try_get(0).context("COLUMN_NAME")?;
         let spanner_type: String = row.try_get(1).context("SPANNER_TYPE")?;
         let is_generated: String = row.try_get(2).context("IS_GENERATED")?;
-        columns.insert(
-            name.to_lowercase(),
+        columns.push((
+            name,
             UpstreamColumn {
                 spanner_type,
                 generated: is_generated == "ALWAYS",
             },
-        );
+        ));
     }
     Ok(columns)
 }
@@ -471,28 +456,23 @@ fn check_column_types(
 /// would read as NULL even though the snapshot succeeded. Array element types are checked with
 /// these same rules.
 fn incompatible_column_type(spanner_type: &str, data_type: &DataType) -> Option<String> {
-    if let Some(inner) = spanner_type
-        .strip_prefix("ARRAY<")
-        .and_then(|s| s.strip_suffix('>'))
-    {
-        let DataType::List(list) = data_type else {
-            return Some(format!(
-                "an ARRAY can only be read as a list, not as {}",
-                data_type
-            ));
-        };
-        return incompatible_column_type(inner, list.elem())
-            .map(|reason| format!("its element type cannot be read: {}", reason));
-    }
-
-    // STRUCT carries field names in angle brackets (`STRUCT<a INT64>`), so it is matched
-    // before the `(`-based base-type extraction used for `STRING(MAX)` and `BYTES(MAX)`.
-    if spanner_type.starts_with("STRUCT") {
-        return (!matches!(data_type, DataType::Jsonb))
-            .then(|| "a STRUCT becomes a JSON object, not a string".to_owned());
-    }
-
-    let base = spanner_type.split('(').next().unwrap_or(spanner_type);
+    let base = match SpannerTypeName::parse(spanner_type) {
+        SpannerTypeName::Array(elem) => {
+            let DataType::List(list) = data_type else {
+                return Some(format!(
+                    "an ARRAY can only be read as a list, not as {}",
+                    data_type
+                ));
+            };
+            return incompatible_column_type(elem, list.elem())
+                .map(|reason| format!("its element type cannot be read: {}", reason));
+        }
+        SpannerTypeName::Struct => {
+            return (!matches!(data_type, DataType::Jsonb))
+                .then(|| "a STRUCT becomes a JSON object, not a string".to_owned());
+        }
+        SpannerTypeName::Scalar(base) => base,
+    };
     match base {
         "BOOL" => (!matches!(data_type, DataType::Boolean))
             .then(|| "a BOOL becomes a JSON boolean, not a string".to_owned()),
@@ -558,7 +538,11 @@ fn check_key_types(
             continue;
         };
         let spanner_type = column.spanner_type.as_str();
-        let base_type = spanner_type.split('(').next().unwrap_or(spanner_type);
+        // Spanner does not allow ARRAY or STRUCT key columns.
+        let base_type = match SpannerTypeName::parse(spanner_type) {
+            SpannerTypeName::Scalar(base) => base,
+            SpannerTypeName::Array(_) | SpannerTypeName::Struct => spanner_type,
+        };
         if let Some(reason) = key_requires_varchar(base_type)
             && *data_type != DataType::Varchar
         {
@@ -947,15 +931,27 @@ impl ExternalTableReader for SpannerExternalTableReader {
         }
 
         let split_column = self.split_column(&options);
+        // A strong (latest) read. The first and last splits are unbounded, so the splits
+        // cover every key even as the table changes after the bounds are read.
+        let txn = self.strong_read_only_transaction().await?;
+        let Some((min_value, max_value)) = self.min_and_max(&txn, &split_column).await? else {
+            // An empty table gets a single unbounded split.
+            yield CdcTableSnapshotSplit {
+                split_id: CDC_TABLE_SPLIT_ID_START,
+                left_bound_inclusive: OwnedRow::new(vec![None]),
+                right_bound_exclusive: OwnedRow::new(vec![None]),
+            };
+            return Ok(());
+        };
+
         let row_stream = if options.backfill_as_even_splits
             && is_supported_even_split_data_type(&split_column.data_type)
         {
-            // For certain types, use evenly-sized partition to optimize performance.
-            tracing::info!(table_name = %self.table_name, ?split_column, "Using even splits");
-            self.as_even_splits(options)
+            tracing::info!(table_name = %self.table_name, ?split_column, ?min_value, ?max_value, "Using even splits");
+            self.as_even_splits(options, split_column, min_value, max_value)
         } else {
-            tracing::info!(table_name = %self.table_name, ?split_column, "Using uneven splits");
-            self.as_uneven_splits(options)
+            tracing::info!(table_name = %self.table_name, ?split_column, ?min_value, ?max_value, "Using uneven splits");
+            self.as_uneven_splits(options, split_column, txn, min_value, max_value)
         };
         pin_mut!(row_stream);
         #[for_await]
@@ -985,38 +981,37 @@ impl SpannerExternalTableReader {
         self.rw_schema.fields[self.pk_indices[idx]].clone()
     }
 
+    /// Opens a strong (latest) read-only transaction.
+    async fn strong_read_only_transaction(&self) -> ConnectorResult<MultiUseReadOnlyTransaction> {
+        let txn = self
+            .db_client
+            .read_only_transaction()
+            .set_timestamp_bound(TimestampBound::strong())
+            .build()
+            .await
+            .context("failed to create strong read-only transaction")?;
+        Ok(txn)
+    }
+
     /// Queries MIN and MAX values of the split column.
     async fn min_and_max(
         &self,
-        txn: &mut MultiUseReadOnlyTransaction,
+        txn: &MultiUseReadOnlyTransaction,
         split_column: &Field,
     ) -> ConnectorResult<Option<(ScalarImpl, ScalarImpl)>> {
         let col = Self::quote_column(&split_column.name);
         let tbl = Self::quote_table(&self.table_name);
-        let minmax_query =
-            format!("SELECT MIN({col}) as min_val, MAX({col}) as max_val FROM {tbl}",);
+        let stmt = Statement::builder(format!(
+            "SELECT MIN({col}) as min_val, MAX({col}) as max_val FROM {tbl}"
+        ))
+        .build();
 
-        let stmt = Statement::builder(&minmax_query).build();
-        let mut rows = txn
-            .execute_query(stmt)
-            .await
-            .context("min/max query failed")?;
-
-        if let Some(row) = rows
-            .next()
-            .await
-            .transpose()
-            .context("PK range row failed")?
-        {
-            let min_val = spanner_cell_to_datum(&row, &split_column.data_type, 0)?;
-            let max_val = spanner_cell_to_datum(&row, &split_column.data_type, 1)?;
-            match (min_val, max_val) {
-                (Some(min), Some(max)) => Ok(Some((min, max))),
-                _ => Ok(None),
-            }
-        } else {
-            Ok(None)
-        }
+        let Some(row) = query_first_row(txn, stmt, "min/max").await? else {
+            return Ok(None);
+        };
+        let min_val = spanner_cell_to_datum(&row, &split_column.data_type, 0)?;
+        let max_val = spanner_cell_to_datum(&row, &split_column.data_type, 1)?;
+        Ok(min_val.zip(max_val))
     }
 
     /// Gets the right bound exclusive for the next split.
@@ -1026,7 +1021,7 @@ impl SpannerExternalTableReader {
     /// Follows Postgres CDC's CTE pattern exactly.
     async fn next_split_right_bound_exclusive(
         &self,
-        txn: &mut MultiUseReadOnlyTransaction,
+        txn: &MultiUseReadOnlyTransaction,
         left_value: &ScalarImpl,
         max_value: &ScalarImpl,
         max_split_size: u64,
@@ -1038,34 +1033,20 @@ impl SpannerExternalTableReader {
             "WITH t AS (SELECT {col} FROM {tbl} WHERE {col} >= @left ORDER BY {col} ASC LIMIT {max_split_size}) \
              SELECT CASE WHEN MAX({col}) < @max THEN MAX({col}) ELSE NULL END AS val FROM t",
         );
-
         let stmt = Statement::builder(&sql);
         let stmt = add_scalar_param(stmt, "left", left_value)?;
-        let stmt = add_scalar_param(stmt, "max", max_value)?;
-        let stmt = stmt.build();
+        let stmt = add_scalar_param(stmt, "max", max_value)?.build();
 
-        let mut rows = txn
-            .execute_query(stmt)
-            .await
-            .context("boundary query failed")?;
-
-        if let Some(row) = rows
-            .next()
-            .await
+        query_first_row(txn, stmt, "boundary")
+            .await?
+            .map(|row| Ok(spanner_cell_to_datum(&row, &split_column.data_type, 0)?))
             .transpose()
-            .context("boundary row fetch failed")?
-        {
-            let datum = spanner_cell_to_datum(&row, &split_column.data_type, 0)?;
-            Ok(Some(datum))
-        } else {
-            Ok(None)
-        }
     }
 
     /// Finds the next greater distinct value when all rows have the same PK value.
     async fn next_greater_bound(
         &self,
-        txn: &mut MultiUseReadOnlyTransaction,
+        txn: &MultiUseReadOnlyTransaction,
         start_offset: &ScalarImpl,
         max_value: &ScalarImpl,
         split_column: &Field,
@@ -1073,70 +1054,30 @@ impl SpannerExternalTableReader {
         let col = Self::quote_column(&split_column.name);
         let tbl = Self::quote_table(&self.table_name);
         let sql =
-            format!("SELECT MIN({col}) AS val FROM {tbl} WHERE {col} > @start AND {col} < @max",);
-
+            format!("SELECT MIN({col}) AS val FROM {tbl} WHERE {col} > @start AND {col} < @max");
         let stmt = Statement::builder(&sql);
         let stmt = add_scalar_param(stmt, "start", start_offset)?;
-        let stmt = add_scalar_param(stmt, "max", max_value)?;
-        let stmt = stmt.build();
+        let stmt = add_scalar_param(stmt, "max", max_value)?.build();
 
-        let mut rows = txn
-            .execute_query(stmt)
-            .await
-            .context("next_greater_bound query failed")?;
-
-        if let Some(row) = rows
-            .next()
-            .await
+        query_first_row(txn, stmt, "next_greater_bound")
+            .await?
+            .map(|row| Ok(spanner_cell_to_datum(&row, &split_column.data_type, 0)?))
             .transpose()
-            .context("next_greater_bound row fetch failed")?
-        {
-            let datum = spanner_cell_to_datum(&row, &split_column.data_type, 0)?;
-            Ok(Some(datum))
-        } else {
-            Ok(None)
-        }
     }
 
     /// Generates even splits for integer types (Int16, Int32, Int64).
     ///
     /// Uses computed numeric boundaries to create evenly-sized partitions.
     #[try_stream(boxed, ok = CdcTableSnapshotSplit, error = ConnectorError)]
-    async fn as_even_splits(&self, options: CdcTableSnapshotSplitOption) {
-        let split_column = self.split_column(&options);
-
-        tracing::info!("PK range enumeration started (even splits)");
-
-        // Use a strong (latest) read. Splits always cover (-inf, +inf) via the
-        // unbounded first/last splits, so generating boundaries from the current
-        // data distribution is safe even as the table changes.
-        let mut txn = self
-            .db_client
-            .read_only_transaction()
-            .set_timestamp_bound(TimestampBound::strong())
-            .build()
-            .await
-            .context("failed to create strong read-only transaction")?;
-
-        let Some((min_value, max_value)) = self.min_and_max(&mut txn, &split_column).await? else {
-            // Table is empty, return a single empty split
-            yield CdcTableSnapshotSplit {
-                split_id: CDC_TABLE_SPLIT_ID_START,
-                left_bound_inclusive: OwnedRow::new(vec![None]),
-                right_bound_exclusive: OwnedRow::new(vec![None]),
-            };
-            return Ok(());
-        };
-
+    async fn as_even_splits(
+        &self,
+        options: CdcTableSnapshotSplitOption,
+        split_column: Field,
+        min_value: ScalarImpl,
+        max_value: ScalarImpl,
+    ) {
         let min_value = min_value.as_integral();
         let max_value = max_value.as_integral();
-
-        tracing::info!(
-            "PK range: min={}, max={}, type={:?}",
-            min_value,
-            max_value,
-            split_column.data_type
-        );
 
         let requested_step = options
             .backfill_num_rows_per_split
@@ -1153,7 +1094,7 @@ impl SpannerExternalTableReader {
 
         loop {
             let mut is_completed = false;
-            if right.as_ref().map(|r| *r >= max_value).unwrap_or(true) {
+            if right.is_none_or(|r| r >= max_value) {
                 right = None;
                 is_completed = true;
             }
@@ -1187,34 +1128,14 @@ impl SpannerExternalTableReader {
     ///
     /// Uses data-driven sampling to find split points.
     #[try_stream(boxed, ok = CdcTableSnapshotSplit, error = ConnectorError)]
-    async fn as_uneven_splits(&self, options: CdcTableSnapshotSplitOption) {
-        let split_column = self.split_column(&options);
-
-        tracing::info!("PK range enumeration started (uneven splits)");
-
-        // Use a strong (latest) read. Splits always cover (-inf, +inf) via the
-        // unbounded first/last splits, so generating boundaries from the current
-        // data distribution is safe even as the table changes.
-        let mut txn = self
-            .db_client
-            .read_only_transaction()
-            .set_timestamp_bound(TimestampBound::strong())
-            .build()
-            .await
-            .context("failed to create strong read-only transaction")?;
-
-        let Some((min_value, max_value)) = self.min_and_max(&mut txn, &split_column).await? else {
-            // Table is empty, return a single empty split
-            yield CdcTableSnapshotSplit {
-                split_id: CDC_TABLE_SPLIT_ID_START,
-                left_bound_inclusive: OwnedRow::new(vec![None]),
-                right_bound_exclusive: OwnedRow::new(vec![None]),
-            };
-            return Ok(());
-        };
-
-        tracing::info!("PK range: min={:?}, max={:?}", min_value, max_value);
-
+    async fn as_uneven_splits(
+        &self,
+        options: CdcTableSnapshotSplitOption,
+        split_column: Field,
+        txn: MultiUseReadOnlyTransaction,
+        min_value: ScalarImpl,
+        max_value: ScalarImpl,
+    ) {
         // left bound will never be NULL value.
         let mut next_left_bound_inclusive = min_value.clone();
         let mut split_id = CDC_TABLE_SPLIT_ID_START;
@@ -1226,10 +1147,9 @@ impl SpannerExternalTableReader {
                 Some(next_left_bound_inclusive.clone())
             };
 
-            let right_bound_exclusive;
             let mut next_right = self
                 .next_split_right_bound_exclusive(
-                    &mut txn,
+                    &txn,
                     &next_left_bound_inclusive,
                     &max_value,
                     options.backfill_num_rows_per_split,
@@ -1242,33 +1162,16 @@ impl SpannerExternalTableReader {
             if let Some(Some(ref inner)) = next_right
                 && *inner == next_left_bound_inclusive
             {
-                // All rows_per_split rows have the same PK value - find next distinct
                 next_right = self
-                    .next_greater_bound(
-                        &mut txn,
-                        &next_left_bound_inclusive,
-                        &max_value,
-                        &split_column,
-                    )
+                    .next_greater_bound(&txn, &next_left_bound_inclusive, &max_value, &split_column)
                     .await?;
             }
 
-            if let Some(next_right) = next_right {
-                match next_right {
-                    None => {
-                        // NULL found — last split.
-                        right_bound_exclusive = None;
-                    }
-                    Some(next_right) => {
-                        next_left_bound_inclusive = next_right.clone();
-                        right_bound_exclusive = Some(next_right);
-                    }
-                }
-            } else {
-                // Not found.
-                right_bound_exclusive = None;
+            // No row or a NULL boundary means this is the last split.
+            let right_bound_exclusive = next_right.flatten();
+            if let Some(right) = &right_bound_exclusive {
+                next_left_bound_inclusive = right.clone();
             }
-
             let is_completed = right_bound_exclusive.is_none();
 
             if is_completed && left_bound_inclusive.is_none() {
@@ -1282,12 +1185,10 @@ impl SpannerExternalTableReader {
                 "New CDC table snapshot split."
             );
 
-            let left_bound_row = OwnedRow::new(vec![left_bound_inclusive]);
-            let right_bound_row = OwnedRow::new(vec![right_bound_exclusive]);
             let split = CdcTableSnapshotSplit {
                 split_id,
-                left_bound_inclusive: left_bound_row,
-                right_bound_exclusive: right_bound_row,
+                left_bound_inclusive: OwnedRow::new(vec![left_bound_inclusive]),
+                right_bound_exclusive: OwnedRow::new(vec![right_bound_exclusive]),
             };
 
             try_increase_split_id(&mut split_id)?;
@@ -1342,13 +1243,7 @@ impl SpannerExternalTableReader {
         // Use a strong (latest) read so the snapshot reflects the current committed
         // state at read time. Note: we use a regular read_only_transaction (not batch)
         // because the query has a LIMIT clause, which cannot be partitioned.
-        let txn = self
-            .db_client
-            .read_only_transaction()
-            .set_timestamp_bound(TimestampBound::strong())
-            .build()
-            .await
-            .context("failed to create strong read-only transaction")?;
+        let txn = self.strong_read_only_transaction().await?;
 
         // Execute the query directly (no partition, since LIMIT queries can't be partitioned)
         let mut rows = txn
@@ -1466,6 +1361,24 @@ impl SpannerExternalTableReader {
             yield spanner_row_to_owned_row(&row?, fields, pk_indices)?;
         }
     }
+}
+
+/// Runs a query that returns at most one row, and returns that row.
+async fn query_first_row(
+    txn: &MultiUseReadOnlyTransaction,
+    stmt: Statement,
+    what: &str,
+) -> ConnectorResult<Option<SpannerRow>> {
+    let mut rows = txn
+        .execute_query(stmt)
+        .await
+        .with_context(|| format!("{what} query failed"))?;
+    let row = rows
+        .next()
+        .await
+        .transpose()
+        .with_context(|| format!("{what} row failed"))?;
+    Ok(row)
 }
 
 /// Streams the rows of one snapshot partition.
@@ -1873,80 +1786,75 @@ fn spanner_ts_to_micros(ts: &google_cloud_wkt::Timestamp) -> i64 {
 // Type mapping
 // ---------------------------------------------------------------------------
 
-/// Map a Spanner SQL type string to a RisingWave [`DataType`].
+/// A Spanner column type, as `INFORMATION_SCHEMA.COLUMNS.SPANNER_TYPE` names it.
+enum SpannerTypeName<'a> {
+    /// `ARRAY<T>`, holding the element type name `T`.
+    Array(&'a str),
+    /// `STRUCT<...>`, whose field list is not needed here.
+    Struct,
+    /// Any other type, without a length such as the `(MAX)` of `STRING(MAX)`.
+    Scalar(&'a str),
+}
+
+impl<'a> SpannerTypeName<'a> {
+    fn parse(spanner_type: &'a str) -> Self {
+        if let Some(elem) = spanner_type
+            .strip_prefix("ARRAY<")
+            .and_then(|s| s.strip_suffix('>'))
+        {
+            Self::Array(elem)
+        } else if spanner_type.starts_with("STRUCT") {
+            // Matched before the length is cut off: a field type such as `STRING(MAX)`
+            // inside `STRUCT<...>` also contains `(`.
+            Self::Struct
+        } else {
+            Self::Scalar(spanner_type.split('(').next().unwrap_or(spanner_type))
+        }
+    }
+}
+
+/// Maps a Spanner column type to the RisingWave type a wildcard `CREATE TABLE` gives it.
 ///
 /// Reference: <https://cloud.google.com/spanner/docs/reference/standard-sql/data-types>
 ///
-/// ## Type Mapping Strategy
-///
-/// We map all Spanner types to RisingWave types with NO data loss:
-/// - Primitive types: Direct mapping
-/// - PROTO/ENUM: Stored as BYTEA (raw bytes preserved)
-/// - STRUCT: Stored as JSONB (serialized structure preserved)
-/// - ARRAY: Stored as List (element-wise mapping)
-/// - INTERVAL/TIME: Stored as VARCHAR (text representation preserved)
+/// Not every mapping is exact: `NUMERIC` keeps 38 significant digits but `DECIMAL` a 96-bit
+/// coefficient, and `TIMESTAMP` keeps nanoseconds but `timestamptz` microseconds. `STRUCT`
+/// maps to `JSONB`, `PROTO` to its bytes, and `ENUM`, `INTERVAL`, `TIME` and unknown types to
+/// their text.
 pub(crate) fn spanner_type_to_rw_type(spanner_type: &str) -> ConnectorResult<DataType> {
-    if let Some(rest) = spanner_type.strip_prefix("ARRAY<") {
-        let inner = rest
-            .strip_suffix('>')
-            .ok_or_else(|| anyhow!("invalid ARRAY type: {}", spanner_type))?;
-        return Ok(DataType::List(ListType::new(spanner_type_to_rw_type(
-            inner,
-        )?)));
-    }
-
-    // Handle STRUCT type - map to JSONB for serialization
-    if spanner_type.starts_with("STRUCT") {
-        return Ok(DataType::Jsonb);
-    }
-
-    let base = spanner_type.split('(').next().unwrap_or(spanner_type);
-    match base {
-        "BOOL" | "BOOLEAN" => Ok(DataType::Boolean),
-        "INT64" => Ok(DataType::Int64),
-        "FLOAT64" => Ok(DataType::Float64),
-        "FLOAT32" => Ok(DataType::Float32),
-        "STRING" => Ok(DataType::Varchar),
-        "BYTES" => Ok(DataType::Bytea),
-        "TIMESTAMP" => Ok(DataType::Timestamptz),
-        "DATE" => Ok(DataType::Date),
-        "NUMERIC" => Ok(DataType::Decimal),
-        "JSON" => Ok(DataType::Jsonb),
-        // PROTO types - store as raw bytes (data preserved, can be deserialized later)
-        t if t.starts_with("PROTO") => {
-            tracing::info!(
-                "mapping PROTO type '{}' to BYTEA (raw bytes preserved)",
-                spanner_type
-            );
-            Ok(DataType::Bytea)
+    let base = match SpannerTypeName::parse(spanner_type) {
+        SpannerTypeName::Array(elem) => {
+            return Ok(DataType::List(ListType::new(spanner_type_to_rw_type(
+                elem,
+            )?)));
         }
-        // ENUM types - store as VARCHAR (enum name preserved)
-        t if t.starts_with("ENUM") => {
-            tracing::info!(
-                "mapping ENUM type '{}' to VARCHAR (enum name preserved)",
-                spanner_type
-            );
-            Ok(DataType::Varchar)
-        }
-        // INTERVAL - store as VARCHAR (text representation)
-        "INTERVAL" => {
-            tracing::info!("mapping INTERVAL type to VARCHAR (text representation)");
-            Ok(DataType::Varchar)
-        }
-        // TIME - store as VARCHAR (text representation)
-        "TIME" => {
-            tracing::info!("mapping TIME type to VARCHAR (text representation)");
-            Ok(DataType::Varchar)
-        }
-        // Unknown types - log and map to VARCHAR as safe fallback
+        SpannerTypeName::Struct => return Ok(DataType::Jsonb),
+        SpannerTypeName::Scalar(base) => base,
+    };
+    let data_type = match base {
+        "BOOL" | "BOOLEAN" => DataType::Boolean,
+        "INT64" => DataType::Int64,
+        "FLOAT64" => DataType::Float64,
+        "FLOAT32" => DataType::Float32,
+        "STRING" => DataType::Varchar,
+        "BYTES" => DataType::Bytea,
+        "TIMESTAMP" => DataType::Timestamptz,
+        "DATE" => DataType::Date,
+        "NUMERIC" => DataType::Decimal,
+        "JSON" => DataType::Jsonb,
+        t if t.starts_with("ARRAY<") => bail!("invalid ARRAY type: {}", spanner_type),
+        t if t.starts_with("PROTO") => DataType::Bytea,
+        t if t.starts_with("ENUM") => DataType::Varchar,
+        "INTERVAL" | "TIME" => DataType::Varchar,
         _ => {
             tracing::warn!(
                 "unknown Spanner type '{}' mapped to VARCHAR as fallback",
                 spanner_type
             );
-            Ok(DataType::Varchar)
+            DataType::Varchar
         }
-    }
+    };
+    Ok(data_type)
 }
 
 // ---------------------------------------------------------------------------
@@ -2406,6 +2314,20 @@ mod tests {
             spanner_type_to_rw_type("ARRAY<INT64>").unwrap(),
             DataType::List(_)
         ));
+        // Lengths are cut off, including inside arrays and structs.
+        assert_eq!(
+            spanner_type_to_rw_type("STRING(MAX)").unwrap(),
+            DataType::Varchar
+        );
+        assert_eq!(
+            spanner_type_to_rw_type("ARRAY<STRING(MAX)>").unwrap(),
+            DataType::List(ListType::new(DataType::Varchar))
+        );
+        assert_eq!(
+            spanner_type_to_rw_type("STRUCT<a STRING(MAX)>").unwrap(),
+            DataType::Jsonb
+        );
+        assert!(spanner_type_to_rw_type("ARRAY<INT64").is_err());
     }
 
     #[test]
