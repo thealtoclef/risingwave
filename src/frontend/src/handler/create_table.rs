@@ -2540,6 +2540,15 @@ pub async fn generate_stream_graph_for_replace_table(
             // CDC-table branch only: see the comment at the symmetric call site in
             // `handle_create_table_plan`. Plain (non-CDC) tables don't hit this check.
             reject_pk_filtered_by_debezium_column_filter(&pk_names, &cdc_with_options)?;
+            // A column added by `ALTER TABLE` or auto schema change must pass the same upstream
+            // check as the columns of `CREATE TABLE`.
+            Box::pin(check_cdc_table_upstream(
+                &cdc_with_options,
+                &handler_args.with_options,
+                &column_catalogs,
+                &pk_names,
+            ))
+            .await?;
 
             let context: OptimizerContextRef =
                 OptimizerContext::new(handler_args, ExplainOptions::default()).into();
