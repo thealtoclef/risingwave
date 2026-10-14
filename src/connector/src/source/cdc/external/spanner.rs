@@ -14,23 +14,13 @@
 
 //! Spanner external table reader for CDC backfill.
 //!
-//! Snapshot reads use **strong** (latest) reads, so every read observes the
-//! current committed state at read time — exactly like Postgres/MySQL CDC. This
-//! is what lets the CDC backfill executor safely drop change-log events ahead of
-//! the backfill cursor: the snapshot that eventually covers that key is
-//! guaranteed to contain its latest state.
+//! Every snapshot read is a strong (latest) read, like the Postgres and MySQL readers, so the
+//! backfill can drop change-log events ahead of its cursor: the read that later covers those
+//! keys already sees their latest state. Reads are not pinned to a past timestamp, which
+//! would miss rows written after it and can exceed Spanner's `version_retention_period`.
 //!
-//! `current_cdc_offset()` returns the read timestamp resolved by a strong
-//! read-only transaction — the latest commit position visible "now". This is the
-//! Spanner analogue of Postgres CDC's `pg_current_wal_lsn()` / MySQL's
-//! `SHOW MASTER STATUS`, and is used to bracket the change-log against each
-//! snapshot read.
-//!
-//! NOTE: we deliberately do *not* pin reads to a fixed snapshot timestamp. A
-//! fixed past timestamp would (1) hide rows written after it that sort ahead of
-//! the cursor — those change-log events get dropped and never re-supplied,
-//! losing data — and (2) risk exceeding Spanner's `version_retention_period` on
-//! long backfills.
+//! The CDC offset is the read timestamp of a strong read-only transaction, the Spanner
+//! counterpart of Postgres's `pg_current_wal_lsn()`.
 
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
@@ -69,11 +59,8 @@ use crate::source::cdc::external::{
     ExternalTableReader, SchemaTableName,
 };
 
-/// Cap on concurrent partition executions per split during CDC backfill.
-///
-/// Each partition runs as an independent read, which counts against the Data
-/// Boost concurrency limit when Data Boost is enabled. Balanced to keep the
-/// split read well-parallelized without over-fanning out.
+/// Cap on the partitions of one snapshot split read at once. Each is a separate read, which
+/// counts against the Data Boost concurrency limit when Data Boost is enabled.
 const DEFAULT_MAX_CONCURRENT_PARTITIONS: usize = 16;
 
 const DEFAULT_SPANNER_ENDPOINT: &str = "https://spanner.googleapis.com";
@@ -89,10 +76,8 @@ const MAX_EVEN_SPLITS: i64 = 100_000;
 
 /// A position in the Spanner change stream, used as the CDC offset.
 ///
-/// Ordered by the commit timestamp (microseconds since epoch), which is what the
-/// backfill merge compares change-log events against. Also carries per-partition
-/// change-stream metadata (partition token, stream name, progress) for checkpoint
-/// and restoration.
+/// Ordered first by `timestamp`, the commit timestamp in microseconds that the backfill
+/// compares change-log events against. The partition fields restore the change stream reader.
 #[derive(Debug, Clone, Default, PartialEq, PartialOrd, serde::Serialize, serde::Deserialize)]
 pub struct SpannerOffset {
     /// Commit timestamp of the change stream position (microseconds since epoch).
@@ -258,23 +243,15 @@ enum WatchedColumns {
     Only(HashSet<String>),
 }
 
-/// Check that the upstream table and its change stream can feed the CDC table correctly.
+/// Check that the upstream table and its change stream can feed the declared CDC table.
 ///
-/// The declared primary key must match the upstream primary key by name and order
-/// (see [`check_primary_key`]), and every declared column's type must decode its
-/// upstream column the same way in the snapshot and the change stream
-/// (see [`check_column_types`]). A change stream can watch a subset of tables and
-/// columns. A table the stream does not watch never receives a change after backfill.
-/// For a column the stream does not watch, a `NEW_ROW` record carries no value, so each
-/// update overwrites the column with NULL. The same holds for a generated column outside
-/// the primary key, which no change stream carries. Those are rejected, and so are key
-/// columns whose declared type cannot keep keys distinct or ordered
-/// (see [`check_key_types`]). Filter options that drop some changes by design are
-/// returned as notices.
+/// Rejects a declaration that would lose or merge data: see [`check_primary_key`],
+/// [`check_column_types`], [`check_generated_columns`], [`check_key_types`] and
+/// [`check_watched_columns`]. Returns notices for change stream options that drop some
+/// changes by design.
 ///
-/// `column_types` holds the declared type of each `column_names` entry in the same order;
-/// `pk_types` holds the declared type of each `pk_names` column, and `split_pk_index` the
-/// key column the snapshot backfill splits on, or `None` without a snapshot backfill.
+/// `column_types` and `pk_types` are the declared types of `column_names` and `pk_names`.
+/// `split_pk_index` is the key column the snapshot backfill splits on, if there is one.
 pub(crate) async fn check_cdc_table_upstream(
     config: &ExternalTableConfig,
     column_names: &[String],
@@ -377,12 +354,9 @@ async fn fetch_columns(
     Ok(columns)
 }
 
-/// Reject a declared primary key that does not match the upstream primary key exactly.
-///
-/// The snapshot backfill and the change stream both route changes by the declared key. A
-/// declared key that omits an upstream key column, adds a mutable column, or reorders the
-/// columns can map distinct upstream rows onto one RisingWave row or route a change to the
-/// wrong row, so the connector requires the same names in the same order.
+/// Reject a declared primary key that differs from the upstream one in its columns or their
+/// order. Changes are routed by the declared key, so a different key could merge distinct
+/// upstream rows or apply a change to the wrong row.
 fn check_primary_key(
     table: &str,
     upstream_pk_names: &[String],
@@ -405,13 +379,9 @@ fn check_primary_key(
     Ok(())
 }
 
-/// Reject a declared column whose type cannot decode its upstream column consistently.
-///
-/// The snapshot decodes a cell with the declared RisingWave type, while the change stream
-/// converts the cell to JSON and parses it into the declared type. When the two disagree, the
-/// value either reads as NULL or reaches the backfill parser as a type it rejects, which drops
-/// a non-key value or panics the backfill on a key. Array element types are checked with the
-/// same mapping; see [`incompatible_column_type`].
+/// Reject a declared column type that the snapshot and the change stream would decode
+/// differently, which reads a value as NULL or fails the backfill on a key. See
+/// [`incompatible_column_type`].
 fn check_column_types(
     table: &str,
     columns: &HashMap<String, UpstreamColumn>,
@@ -443,18 +413,11 @@ fn check_column_types(
 /// The reason a Spanner column of `spanner_type` cannot be read as `data_type`, or `None` if
 /// it can.
 ///
-/// The accepted mappings are the ones the snapshot and the change stream both decode the same
-/// way. `VARCHAR` is accepted for the upstream types Spanner sends as strings (`STRING`,
-/// `NUMERIC`, `TIMESTAMP`, `DATE`, `BYTES`, `JSON`, `ENUM`, `PROTO`, `TIME`, `INTERVAL`,
-/// `UUID`). It is not accepted for `INT64`/`FLOAT64`/`FLOAT32`, which the change stream turns
-/// into JSON numbers the Strict `VARCHAR` parser rejects; for `BOOL`, whose string the
-/// snapshot's `String` decoder refuses; or for `STRUCT`/`ARRAY`, which become JSON objects and
-/// arrays. `INT64` is accepted only as an integer type: the SDK's float decoders reject an
-/// `INT64` wire string, so a snapshot read as a float would become NULL while the change stream
-/// parses the JSON number. `TIMESTAMP` is never accepted as a `timestamp`: Spanner's wire value
-/// ends in `Z`, which a civil `timestamp` rejects in the change stream, so streamed values
-/// would read as NULL even though the snapshot succeeded. Array element types are checked with
-/// these same rules.
+/// A mapping is accepted only if the snapshot and the change stream decode it the same way.
+/// `VARCHAR` fits the types Spanner sends as strings, but not `INT64` or the float types (sent
+/// as JSON numbers) or `BOOL`. `INT64` must be read as an integer: the SDK's float decoders
+/// reject its wire string. `TIMESTAMP` is never a civil `timestamp`, which rejects the
+/// trailing `Z`. Array elements follow the same rules.
 fn incompatible_column_type(spanner_type: &str, data_type: &DataType) -> Option<String> {
     let base = match SpannerTypeName::parse(spanner_type) {
         SpannerTypeName::Array(elem) => {
@@ -516,15 +479,10 @@ fn incompatible_column_type(spanner_type: &str, data_type: &DataType) -> Option<
 
 /// Reject key columns whose declared type cannot keep every key distinct and ordered.
 ///
-/// Some Spanner key types hold more than their RisingWave counterpart, so two keys can map
-/// to the same value and merge into one row; such a key must be `VARCHAR` (see
-/// [`key_requires_varchar`]).
-///
-/// The snapshot backfill's split column must also order the same way on both sides:
-/// Spanner computes the split bounds in the column's own type, while the backfill routes
-/// changes by comparing the declared type. A split column declared `VARCHAR` over a
-/// non-STRING column compares as text (`"10" < "9"`), so a change can be routed to a split
-/// that has not started and be dropped.
+/// A key type wider than its RisingWave type can merge two keys into one row (see
+/// [`key_requires_varchar`] and [`lossy_key_conversion`]). The split column must also order
+/// keys as Spanner does: one declared `VARCHAR` over a non-`STRING` column compares as text
+/// (`"10" < "9"`), so a change can be routed to a split that has not started and be dropped.
 fn check_key_types(
     table: &str,
     columns: &HashMap<String, UpstreamColumn>,
@@ -587,12 +545,8 @@ fn check_key_types(
     Ok(())
 }
 
-/// Why a key column of `base_type` must be read as `VARCHAR`, or `None` if it need not.
-///
-/// NUMERIC holds 38 significant digits and `DECIMAL` a 96-bit coefficient. TIMESTAMP holds
-/// nanoseconds and RisingWave's timestamp types microseconds. Both the snapshot and the
-/// change stream read these types as Spanner's canonical string, so `VARCHAR` keeps every
-/// key exact.
+/// Why a key column of `base_type` must be read as `VARCHAR`, or `None` if it need not. Both
+/// the snapshot and the change stream read these types as Spanner's exact string.
 fn key_requires_varchar(base_type: &str) -> Option<&'static str> {
     match base_type {
         "NUMERIC" => Some("DECIMAL rounds values beyond its 96-bit coefficient"),
@@ -601,14 +555,9 @@ fn key_requires_varchar(base_type: &str) -> Option<&'static str> {
     }
 }
 
-/// Why reading a Spanner column of `base_type` as `data_type` cannot keep every key
-/// distinct, or `None` if it can.
-///
-/// Spanner's only integer type is `INT64`, whose range exceeds what `f64`/`f32` can
-/// represent exactly, so two distinct keys can round to the same value. A `FLOAT64`
-/// key does not fit in `f32` without rounding either. Narrower integer declarations
-/// fail loudly on an out-of-range value instead of merging two keys, so they are not
-/// rejected here.
+/// Why reading a key of `base_type` as `data_type` can round two keys to one value, or
+/// `None` if it cannot. A narrower integer type is allowed: an out-of-range key fails the
+/// read instead of merging.
 fn lossy_key_conversion(base_type: &str, data_type: &DataType) -> Option<&'static str> {
     match base_type {
         "INT64" if matches!(data_type, DataType::Float64 | DataType::Float32) => {
@@ -795,32 +744,23 @@ fn change_stream_filter_notices(stream: &str, options: &HashMap<String, String>)
 
 /// Reads snapshot data from Spanner for CDC backfill.
 ///
-/// Implements two-level parallelism:
-/// 1. **Inter-actor**: PK range splits distribute work across compute nodes
-/// 2. **Intra-actor**: Within each PK range, uses Spanner's `partition_query` to
-///    further parallelize reads using `BatchReadOnlyTransaction`
-///
-/// All snapshot reads use **strong** (latest) reads. The CDC offset is the read
-/// timestamp resolved by a strong read-only transaction, obtained on demand in
-/// [`ExternalTableReader::current_cdc_offset`]. There is no pinned snapshot
-/// timestamp.
+/// Key-range splits spread a table across backfill actors, and each actor reads its split
+/// in parallel with Spanner's `partition_query`.
 pub struct SpannerExternalTableReader {
     rw_schema: Schema,
-    field_names: String,
-    /// Index of each declared key column in `rw_schema`, in declared key order. The backfill
-    /// and the change stream both compare the declared type, so the split column and its
-    /// bounds come from here, not from the upstream column type.
+    /// The quoted columns of `rw_schema`, for the `SELECT` list.
+    select_columns: String,
+    /// Index of each declared key column in `rw_schema`, in key order. The split column and
+    /// its bounds use the declared type, which the backfill compares changes by.
     pk_indices: Vec<usize>,
     table_name: String,
     enable_databoost: bool,
-    /// Database client. Shared across transactions and partition executions.
     db_client: DatabaseClient,
 }
 
 impl SpannerExternalTableReader {
-    /// Quotes a Spanner identifier (column or table name) with backticks to
-    /// prevent reserved-word conflicts.
-    fn quote_column(name: &str) -> String {
+    /// Quotes a Spanner identifier with backticks, so a reserved word can be a name.
+    fn quote_identifier(name: &str) -> String {
         format!("`{}`", name)
     }
 
@@ -828,11 +768,11 @@ impl SpannerExternalTableReader {
     /// named schema (`` `sch`.`t` ``): `` `sch.t` `` would name a table called `sch.t`.
     fn quote_table(name: &str) -> String {
         match split_table_name(name) {
-            ("", table) => Self::quote_column(table),
+            ("", table) => Self::quote_identifier(table),
             (schema, table) => format!(
                 "{}.{}",
-                Self::quote_column(schema),
-                Self::quote_column(table)
+                Self::quote_identifier(schema),
+                Self::quote_identifier(table)
             ),
         }
     }
@@ -861,16 +801,16 @@ impl SpannerExternalTableReader {
         )
         .await?;
 
-        let field_names = schema
+        let select_columns = schema
             .fields()
             .iter()
-            .map(|f| Self::quote_column(&f.name))
+            .map(|f| Self::quote_identifier(&f.name))
             .collect::<Vec<_>>()
             .join(", ");
 
         Ok(Self {
             rw_schema: schema,
-            field_names,
+            select_columns,
             pk_indices,
             table_name: config.table,
             enable_databoost,
@@ -881,13 +821,8 @@ impl SpannerExternalTableReader {
 
 impl ExternalTableReader for SpannerExternalTableReader {
     async fn current_cdc_offset(&self) -> ConnectorResult<CdcOffset> {
-        // The current CDC offset is the latest commit position visible "now" — the
-        // Spanner analogue of Postgres's `pg_current_wal_lsn()`.
-        //
-        // We obtain it from the read timestamp that Spanner resolves for a strong
-        // read-only transaction. Using `ExplicitBegin` forces a `BeginTransaction`
-        // RPC at build time, so the read timestamp is available immediately without
-        // executing any query (no `SELECT CURRENT_TIMESTAMP` round-trip needed).
+        // The read timestamp of a strong read-only transaction. `ExplicitBegin` resolves it
+        // with the `BeginTransaction` RPC, without running a query.
         let txn = self
             .db_client
             .read_only_transaction()
@@ -916,8 +851,7 @@ impl ExternalTableReader for SpannerExternalTableReader {
 
     #[try_stream(boxed, ok = CdcTableSnapshotSplit, error = ConnectorError)]
     async fn get_parallel_cdc_splits(&self, options: CdcTableSnapshotSplitOption) {
-        let backfill_num_rows_per_split = options.backfill_num_rows_per_split;
-        if backfill_num_rows_per_split == 0 {
+        if options.backfill_num_rows_per_split == 0 {
             return Err(
                 anyhow!("invalid backfill_num_rows_per_split, must be greater than 0").into(),
             );
@@ -944,7 +878,7 @@ impl ExternalTableReader for SpannerExternalTableReader {
             return Ok(());
         };
 
-        let row_stream = if options.backfill_as_even_splits
+        let split_stream = if options.backfill_as_even_splits
             && is_supported_even_split_data_type(&split_column.data_type)
         {
             tracing::info!(table_name = %self.table_name, ?split_column, ?min_value, ?max_value, "Using even splits");
@@ -953,11 +887,10 @@ impl ExternalTableReader for SpannerExternalTableReader {
             tracing::info!(table_name = %self.table_name, ?split_column, ?min_value, ?max_value, "Using uneven splits");
             self.as_uneven_splits(options, split_column, txn, min_value, max_value)
         };
-        pin_mut!(row_stream);
+        pin_mut!(split_stream);
         #[for_await]
-        for row in row_stream {
-            let row = row?;
-            yield row;
+        for split in split_stream {
+            yield split?;
         }
     }
 
@@ -973,9 +906,7 @@ impl ExternalTableReader for SpannerExternalTableReader {
 }
 
 impl SpannerExternalTableReader {
-    /// Returns the split column as a `Field` based on the `backfill_split_pk_column_index`.
-    ///
-    /// Follows Postgres CDC's `split_column` pattern.
+    /// The key column at `backfill_split_pk_column_index`, which the snapshot is split on.
     fn split_column(&self, options: &CdcTableSnapshotSplitOption) -> Field {
         let idx = options.backfill_split_pk_column_index as usize;
         self.rw_schema.fields[self.pk_indices[idx]].clone()
@@ -999,10 +930,10 @@ impl SpannerExternalTableReader {
         txn: &MultiUseReadOnlyTransaction,
         split_column: &Field,
     ) -> ConnectorResult<Option<(ScalarImpl, ScalarImpl)>> {
-        let col = Self::quote_column(&split_column.name);
-        let tbl = Self::quote_table(&self.table_name);
+        let col = Self::quote_identifier(&split_column.name);
+        let table = Self::quote_table(&self.table_name);
         let stmt = Statement::builder(format!(
-            "SELECT MIN({col}) as min_val, MAX({col}) as max_val FROM {tbl}"
+            "SELECT MIN({col}) as min_val, MAX({col}) as max_val FROM {table}"
         ))
         .build();
 
@@ -1014,11 +945,8 @@ impl SpannerExternalTableReader {
         Ok(min_val.zip(max_val))
     }
 
-    /// Gets the right bound exclusive for the next split.
-    ///
-    /// Fetches `max_split_size` rows starting from `left_value` and returns the
-    /// max value if it is less than `max_value`, otherwise returns NULL (last split).
-    /// Follows Postgres CDC's CTE pattern exactly.
+    /// The exclusive right bound of the split starting at `left_value`: the largest of its
+    /// next `max_split_size` keys, or NULL when that reaches `max_value` (the last split).
     async fn next_split_right_bound_exclusive(
         &self,
         txn: &MultiUseReadOnlyTransaction,
@@ -1027,10 +955,10 @@ impl SpannerExternalTableReader {
         max_split_size: u64,
         split_column: &Field,
     ) -> ConnectorResult<Option<Datum>> {
-        let col = Self::quote_column(&split_column.name);
-        let tbl = Self::quote_table(&self.table_name);
+        let col = Self::quote_identifier(&split_column.name);
+        let table = Self::quote_table(&self.table_name);
         let sql = format!(
-            "WITH t AS (SELECT {col} FROM {tbl} WHERE {col} >= @left ORDER BY {col} ASC LIMIT {max_split_size}) \
+            "WITH t AS (SELECT {col} FROM {table} WHERE {col} >= @left ORDER BY {col} ASC LIMIT {max_split_size}) \
              SELECT CASE WHEN MAX({col}) < @max THEN MAX({col}) ELSE NULL END AS val FROM t",
         );
         let stmt = Statement::builder(&sql);
@@ -1043,20 +971,21 @@ impl SpannerExternalTableReader {
             .transpose()
     }
 
-    /// Finds the next greater distinct value when all rows have the same PK value.
+    /// The smallest key between `start_value` and `max_value`, both exclusive. Used when a
+    /// whole split's worth of rows shares one key.
     async fn next_greater_bound(
         &self,
         txn: &MultiUseReadOnlyTransaction,
-        start_offset: &ScalarImpl,
+        start_value: &ScalarImpl,
         max_value: &ScalarImpl,
         split_column: &Field,
     ) -> ConnectorResult<Option<Datum>> {
-        let col = Self::quote_column(&split_column.name);
-        let tbl = Self::quote_table(&self.table_name);
+        let col = Self::quote_identifier(&split_column.name);
+        let table = Self::quote_table(&self.table_name);
         let sql =
-            format!("SELECT MIN({col}) AS val FROM {tbl} WHERE {col} > @start AND {col} < @max");
+            format!("SELECT MIN({col}) AS val FROM {table} WHERE {col} > @start AND {col} < @max");
         let stmt = Statement::builder(&sql);
-        let stmt = add_scalar_param(stmt, "start", start_offset)?;
+        let stmt = add_scalar_param(stmt, "start", start_value)?;
         let stmt = add_scalar_param(stmt, "max", max_value)?.build();
 
         query_first_row(txn, stmt, "next_greater_bound")
@@ -1065,9 +994,7 @@ impl SpannerExternalTableReader {
             .transpose()
     }
 
-    /// Generates even splits for integer types (Int16, Int32, Int64).
-    ///
-    /// Uses computed numeric boundaries to create evenly-sized partitions.
+    /// Splits an integer key into ranges of equal width.
     #[try_stream(boxed, ok = CdcTableSnapshotSplit, error = ConnectorError)]
     async fn as_even_splits(
         &self,
@@ -1124,9 +1051,8 @@ impl SpannerExternalTableReader {
         }
     }
 
-    /// Generates uneven splits for non-integer types (Varchar, etc.).
-    ///
-    /// Uses data-driven sampling to find split points.
+    /// Splits a key of any type into ranges of about `backfill_num_rows_per_split` rows, by
+    /// querying where each range ends.
     #[try_stream(boxed, ok = CdcTableSnapshotSplit, error = ConnectorError)]
     async fn as_uneven_splits(
         &self,
@@ -1136,7 +1062,6 @@ impl SpannerExternalTableReader {
         min_value: ScalarImpl,
         max_value: ScalarImpl,
     ) {
-        // left bound will never be NULL value.
         let mut next_left_bound_inclusive = min_value.clone();
         let mut split_id = CDC_TABLE_SPLIT_ID_START;
 
@@ -1157,8 +1082,7 @@ impl SpannerExternalTableReader {
                 )
                 .await?;
 
-            // Safeguard: if boundary equals left bound (all rows have same PK value),
-            // find next distinct greater value (follows Postgres CDC's next_greater_bound)
+            // A whole split's worth of rows shares the left bound's key: move past it.
             if let Some(Some(ref inner)) = next_right
                 && *inner == next_left_bound_inclusive
             {
@@ -1175,7 +1099,7 @@ impl SpannerExternalTableReader {
             let is_completed = right_bound_exclusive.is_none();
 
             if is_completed && left_bound_inclusive.is_none() {
-                assert_eq!(split_id, CDC_TABLE_SPLIT_ID_START);
+                debug_assert_eq!(split_id, CDC_TABLE_SPLIT_ID_START);
             }
 
             tracing::info!(
@@ -1200,12 +1124,8 @@ impl SpannerExternalTableReader {
         }
     }
 
-    /// Returns a function that parses CDC offset strings.
-    ///
-    /// Spanner CDC uses JSON-serialized `CdcOffset::Spanner` format.
-    /// This is consistent with the offset format produced by both
-    /// the backfill phase (`current_cdc_offset()`) and the CDC phase
-    /// (`make_offset_string()` in reader.rs).
+    /// Parses a JSON `CdcOffset::Spanner`, as both [`ExternalTableReader::current_cdc_offset`]
+    /// and the change stream reader write it.
     pub fn get_cdc_offset_parser() -> crate::source::cdc::external::CdcOffsetParseFunc {
         Box::new(move |offset_str| {
             serde_json::from_str::<CdcOffset>(offset_str)
@@ -1228,7 +1148,7 @@ impl SpannerExternalTableReader {
         let pk_indices = &self.pk_indices;
 
         let sql = build_snapshot_scan_sql(
-            &self.field_names,
+            &self.select_columns,
             &Self::quote_table(&self.table_name),
             &declared_pk_names(&self.rw_schema, pk_indices),
             start_pk_row.is_some(),
@@ -1240,12 +1160,8 @@ impl SpannerExternalTableReader {
             None => stmt.build(),
         };
 
-        // Use a strong (latest) read so the snapshot reflects the current committed
-        // state at read time. Note: we use a regular read_only_transaction (not batch)
-        // because the query has a LIMIT clause, which cannot be partitioned.
+        // Not a batch transaction: a query with `LIMIT` cannot be partitioned.
         let txn = self.strong_read_only_transaction().await?;
-
-        // Execute the query directly (no partition, since LIMIT queries can't be partitioned)
         let mut rows = txn
             .execute_query(stmt)
             .await
@@ -1256,17 +1172,8 @@ impl SpannerExternalTableReader {
         }
     }
 
-    /// Read a split using PK range-based filtering with intra-actor parallelism.
-    ///
-    /// Two-level parallelism:
-    /// 1. **Inter-actor**: This split is one PK range assigned to this actor
-    /// 2. **Intra-actor**: Within this PK range, uses Spanner's `partition_query`
-    ///    to further parallelize reads
-    ///
-    /// Creates a strong (latest) `BatchReadOnlyTransaction`, then uses `partition_query`
-    /// with WHERE clause filtering for intra-actor parallelism. The change-log is
-    /// reconciled against this read via the offsets captured by
-    /// [`ExternalTableReader::current_cdc_offset`] before and after the read.
+    /// Reads the key range `[left, right)` of the split column, with a strong batch read
+    /// whose partitions are read in parallel.
     #[try_stream(boxed, ok = OwnedRow, error = ConnectorError)]
     async fn split_snapshot_read_inner(
         &self,
@@ -1278,33 +1185,12 @@ impl SpannerExternalTableReader {
         let fields = self.rw_schema.fields();
         let pk_indices = &self.pk_indices;
 
-        // Use the split column from parameters (follows Postgres CDC pattern)
-        // The split column is determined by backfill_split_pk_column_index
-        assert_eq!(
-            split_columns.len(),
-            1,
-            "multiple split columns is not supported yet"
-        );
-        assert_eq!(left.len(), 1, "multiple split columns is not supported yet");
-        assert_eq!(
-            right.len(),
-            1,
-            "multiple split columns is not supported yet"
-        );
-
+        if split_columns.len() != 1 || left.len() != 1 || right.len() != 1 {
+            bail!("Spanner snapshot splits support exactly one split column");
+        }
         let is_first_split = left[0].is_none();
         let is_last_split = right[0].is_none();
 
-        tracing::info!(
-            "split_snapshot_read: PK range=[{:?}, {:?}), strong read",
-            left[0],
-            right[0],
-        );
-
-        // Create a strong (latest) BatchReadOnlyTransaction so the read reflects the
-        // current committed state. Each split/actor reads at its own resolved
-        // timestamp; cross-split consistency is provided by change-log reconciliation,
-        // not by a shared pinned timestamp (matches Postgres/MySQL CDC).
         let txn = self
             .db_client
             .batch_read_only_transaction()
@@ -1313,12 +1199,10 @@ impl SpannerExternalTableReader {
             .await
             .context("failed to create strong batch read-only transaction")?;
 
-        // Build query with PK range WHERE clause using parameter binding
-        // Follows Postgres CDC pattern: split on single column specified by backfill_split_pk_column_index
         let where_clause = build_split_filter_sql(&split_columns[0], is_first_split, is_last_split);
         let sql = format!(
             "SELECT {} FROM {} {}",
-            self.field_names,
+            self.select_columns,
             Self::quote_table(&self.table_name),
             where_clause
         );
@@ -1331,27 +1215,22 @@ impl SpannerExternalTableReader {
         }
         let stmt = stmt.build();
 
-        tracing::info!(
-            "split_snapshot_read: executing partition_query with databoost={}, where={}",
-            self.enable_databoost,
-            where_clause
-        );
-
-        // partition_query returns Partition handles that can be cloned and executed
-        // concurrently against the same DatabaseClient.
         let partitions = txn
             .partition_query(stmt, PartitionOptions::default())
             .await
             .context("failed to get partitions for PK range")?;
+        tracing::info!(
+            left = ?left[0],
+            right = ?right[0],
+            partition_count = partitions.len(),
+            data_boost = self.enable_databoost,
+            "reading Spanner snapshot split"
+        );
 
         let data_boost = self.enable_databoost;
         let db_client = self.db_client.clone();
-        let partition_count = partitions.len();
-        tracing::info!(partition_count, "split_snapshot_read: fanning out");
-
-        // Fan out partitions and interleave their rows as they arrive. At most
-        // `DEFAULT_MAX_CONCURRENT_PARTITIONS` partitions are read at once, and a
-        // partition's rows are yielded while it is still being read.
+        // Read up to `DEFAULT_MAX_CONCURRENT_PARTITIONS` partitions at once, yielding rows as
+        // they arrive.
         let rows = futures::stream::iter(partitions)
             .map(|p| read_partition(p.set_data_boost(data_boost), db_client.clone()))
             .flatten_unordered(DEFAULT_MAX_CONCURRENT_PARTITIONS);
@@ -1384,17 +1263,14 @@ async fn query_first_row(
 /// Streams the rows of one snapshot partition.
 #[try_stream(boxed, ok = SpannerRow, error = anyhow::Error)]
 async fn read_partition(partition: Partition, db_client: DatabaseClient) {
-    let mut rs = partition.execute(&db_client).await?;
-    while let Some(row) = rs.next().await.transpose()? {
+    let mut rows = partition.execute(&db_client).await?;
+    while let Some(row) = rows.next().await.transpose()? {
         yield row;
     }
 }
 
-/// Check if the data type supports even-split (numeric range-based) splitting.
-///
-/// This follows Postgres CDC's approach: only integer types can use computed
-/// numeric boundaries. All other types (Varchar, text, UUID, etc.) require
-/// data-driven sampling to find split points.
+/// Whether a split column of `data_type` can be split into ranges of equal width, which
+/// needs an integer key.
 fn is_supported_even_split_data_type(data_type: &DataType) -> bool {
     matches!(
         data_type,
@@ -1402,11 +1278,8 @@ fn is_supported_even_split_data_type(data_type: &DataType) -> bool {
     )
 }
 
-/// Convert i64 to `ScalarImpl` based on the declared split column type.
-///
-/// A boundary the declared type cannot hold is an error, not a panic: the split column now
-/// uses the declared type, which can be narrower than the upstream `INT64` (for example a
-/// key declared `INT32`).
+/// Converts an even-split boundary to the declared type of the split column, which can be
+/// narrower than the upstream `INT64`. A boundary it cannot hold is an error.
 fn to_int_scalar(i: i64, data_type: &DataType) -> ConnectorResult<ScalarImpl> {
     let scalar = match data_type {
         DataType::Int16 => ScalarImpl::Int16(i.try_into().map_err(|_| {
@@ -1443,9 +1316,7 @@ fn even_split_step(min_value: i64, max_value: i64, requested: i64) -> i64 {
     requested.max(min_step)
 }
 
-/// Tries to increase the split ID, returns an error if overflow.
-///
-/// Follows Postgres CDC's `try_increase_split_id` pattern.
+/// Increments the split ID, failing on overflow.
 fn try_increase_split_id(split_id: &mut i64) -> ConnectorResult<()> {
     match split_id.checked_add(1) {
         Some(s) => {
@@ -1520,7 +1391,7 @@ fn declared_pk_names(schema: &Schema, pk_indices: &[usize]) -> Vec<String> {
 ///
 /// `pk_names` must be in the order of the cursor row's values.
 fn build_snapshot_scan_sql(
-    field_names: &str,
+    select_columns: &str,
     quoted_table: &str,
     pk_names: &[String],
     after_cursor: bool,
@@ -1528,16 +1399,18 @@ fn build_snapshot_scan_sql(
 ) -> String {
     let order_key = pk_names
         .iter()
-        .map(|name| SpannerExternalTableReader::quote_column(name))
+        .map(|name| SpannerExternalTableReader::quote_identifier(name))
         .collect::<Vec<_>>()
         .join(", ");
     if after_cursor {
         format!(
-            "SELECT {field_names} FROM {quoted_table} WHERE {} ORDER BY {order_key} LIMIT {scan_limit}",
+            "SELECT {select_columns} FROM {quoted_table} WHERE {} ORDER BY {order_key} LIMIT {scan_limit}",
             build_pk_filter_sql(pk_names)
         )
     } else {
-        format!("SELECT {field_names} FROM {quoted_table} ORDER BY {order_key} LIMIT {scan_limit}")
+        format!(
+            "SELECT {select_columns} FROM {quoted_table} ORDER BY {order_key} LIMIT {scan_limit}"
+        )
     }
 }
 
@@ -1550,7 +1423,7 @@ fn build_snapshot_scan_sql(
 fn build_pk_filter_sql(pk_names: &[String]) -> String {
     let cols: Vec<String> = pk_names
         .iter()
-        .map(|n| SpannerExternalTableReader::quote_column(n))
+        .map(|n| SpannerExternalTableReader::quote_identifier(n))
         .collect();
 
     let mut clauses = Vec::with_capacity(pk_names.len());
@@ -1580,7 +1453,7 @@ fn build_split_filter_sql(
     is_first_split: bool,
     is_last_split: bool,
 ) -> String {
-    let col = SpannerExternalTableReader::quote_column(&split_column.name);
+    let col = SpannerExternalTableReader::quote_identifier(&split_column.name);
     match (is_first_split, is_last_split) {
         (true, true) => String::new(),
         (true, false) => format!("WHERE ({col} < @pk_end OR {col} IS NULL)"),
@@ -1766,10 +1639,9 @@ fn build_service_account_credentials(json: &str) -> ConnectorResult<Credentials>
 
 /// Convert microseconds since epoch to `OffsetDateTime`.
 pub fn micros_to_offset_datetime(micros: i64) -> ConnectorResult<OffsetDateTime> {
-    Ok(
-        OffsetDateTime::from_unix_timestamp_nanos((micros as i128) * 1000)
-            .map_err(|e| anyhow!("invalid microseconds timestamp {}: {}", micros, e))?,
-    )
+    let datetime = OffsetDateTime::from_unix_timestamp_nanos((micros as i128) * 1000)
+        .map_err(|e| anyhow!("invalid microseconds timestamp {}: {}", micros, e))?;
+    Ok(datetime)
 }
 
 /// Convert a `google_cloud_wkt::Timestamp` to microseconds since epoch.
@@ -1957,11 +1829,8 @@ fn parse_spanner_numeric(s: &str) -> anyhow::Result<ScalarImpl> {
         .map_err(|e| anyhow!("NUMERIC {s} does not fit DECIMAL: {e}"))
 }
 
-/// Reads an ARRAY cell as a `ListValue` of `elem_type`.
-///
-/// Spanner sends an ARRAY as a list value, not a string, so each element is decoded by the
-/// SDK with the same `FromValue` impls the scalar branches of `spanner_cell_to_datum`
-/// use. Returns `Ok(None)` for a NULL array.
+/// Reads an ARRAY cell as a `ListValue` of `elem_type`, decoding each element as
+/// [`spanner_cell_to_datum`] decodes a scalar. Returns `Ok(None)` for a NULL array.
 fn spanner_array_to_list(
     row: &SpannerRow,
     elem_type: &DataType,
@@ -1986,11 +1855,8 @@ fn spanner_array_to_list(
     match elem_type {
         DataType::Boolean => collect(row, idx, elem_type, |v: bool| Ok(ScalarImpl::Bool(v))),
         DataType::Int64 => collect(row, idx, elem_type, |v: i64| Ok(ScalarImpl::Int64(v))),
-        // Spanner's only integer element type is INT64. Narrow with a checked conversion,
-        // as the scalar branch does, so an out-of-range element is a decode error rather
-        // than a silent truncation. An array cannot be a primary key, so the error is
-        // handled like any other non-key decode failure: logged, and the whole column
-        // read as NULL. In-range elements decode normally.
+        // INT64 elements narrowed with a checked conversion: an out-of-range element fails
+        // the column's decode instead of being truncated.
         DataType::Int32 => collect(row, idx, elem_type, |v: i64| {
             Ok(ScalarImpl::Int32(i32::try_from(v)?))
         }),
