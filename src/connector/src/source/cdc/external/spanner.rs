@@ -823,7 +823,6 @@ fn change_stream_filter_notices(stream: &str, options: &HashMap<String, String>)
 pub struct SpannerExternalTableReader {
     rw_schema: Schema,
     field_names: String,
-    pk_names: Vec<String>,
     /// Index of each declared key column in `rw_schema`, in declared key order. The backfill
     /// and the change stream both compare the declared type, so the split column and its
     /// bounds come from here, not from the upstream column type.
@@ -877,9 +876,6 @@ impl SpannerExternalTableReader {
             config.credentials_path.as_deref(),
         )
         .await?;
-        let external_table = SpannerExternalTable::connect(&db_client, config).await?;
-
-        let pk_names = external_table.pk_names().clone();
 
         let field_names = schema
             .fields()
@@ -891,9 +887,8 @@ impl SpannerExternalTableReader {
         Ok(Self {
             rw_schema: schema,
             field_names,
-            pk_names,
             pk_indices,
-            table_name: external_table.table_name().to_owned(),
+            table_name: config.table,
             enable_databoost,
             db_client,
         })
@@ -988,14 +983,6 @@ impl SpannerExternalTableReader {
     fn split_column(&self, options: &CdcTableSnapshotSplitOption) -> Field {
         let idx = options.backfill_split_pk_column_index as usize;
         self.rw_schema.fields[self.pk_indices[idx]].clone()
-    }
-
-    fn get_order_key(primary_keys: &[String]) -> String {
-        primary_keys
-            .iter()
-            .map(|col| Self::quote_column(col))
-            .collect::<Vec<_>>()
-            .join(", ")
     }
 
     /// Queries MIN and MAX values of the split column.
@@ -1331,37 +1318,25 @@ impl SpannerExternalTableReader {
         &self,
         _table_name: SchemaTableName,
         start_pk_row: Option<OwnedRow>,
-        primary_keys: Vec<String>,
+        // The key names are taken from the declared schema instead, in the order of
+        // `start_pk_row`.
+        _primary_keys: Vec<String>,
         scan_limit: u32,
     ) {
         let fields = self.rw_schema.fields();
         let pk_indices = &self.pk_indices;
-        let order_key = Self::get_order_key(&primary_keys);
 
-        let stmt = if let Some(ref pk_row) = start_pk_row {
-            let primary_keys: Vec<String> = self.pk_names.clone();
-            let order_key = Self::get_order_key(&primary_keys);
-            // Build filter: `pk0` > @pk0 OR (`pk0` = @pk0 AND `pk1` > @pk1) ...
-            let filter = build_pk_filter_sql(&primary_keys);
-            let sql = format!(
-                "SELECT {} FROM {} WHERE {} ORDER BY {} LIMIT {}",
-                self.field_names,
-                Self::quote_table(&self.table_name),
-                filter,
-                order_key,
-                scan_limit
-            );
-            let stmt = Statement::builder(&sql);
-            add_pk_params(stmt, pk_row)?.build()
-        } else {
-            let sql = format!(
-                "SELECT {} FROM {} ORDER BY {} LIMIT {}",
-                self.field_names,
-                Self::quote_table(&self.table_name),
-                order_key,
-                scan_limit
-            );
-            Statement::builder(&sql).build()
+        let sql = build_snapshot_scan_sql(
+            &self.field_names,
+            &Self::quote_table(&self.table_name),
+            &declared_pk_names(&self.rw_schema, pk_indices),
+            start_pk_row.is_some(),
+            scan_limit,
+        );
+        let stmt = Statement::builder(&sql);
+        let stmt = match start_pk_row {
+            Some(ref pk_row) => add_pk_params(stmt, pk_row)?.build(),
+            None => stmt.build(),
         };
 
         // Use a strong (latest) read so the snapshot reflects the current committed
@@ -1615,6 +1590,42 @@ fn scalar_to_spanner_value(scalar: &ScalarImpl) -> ConnectorResult<Value> {
 /// contain `.`, so the first `.` separates the two.
 fn split_table_name(name: &str) -> (&str, &str) {
     name.split_once('.').unwrap_or(("", name))
+}
+
+/// Names of the declared key columns, in key order. The snapshot cursor row holds the key
+/// values in this order, so the cursor filter and `ORDER BY` must use these names, not the
+/// upstream key names, whose order a table created before key validation may not share.
+fn declared_pk_names(schema: &Schema, pk_indices: &[usize]) -> Vec<String> {
+    pk_indices
+        .iter()
+        .map(|&idx| schema.fields[idx].name.clone())
+        .collect()
+}
+
+/// Builds the cursor-based snapshot query: the next `scan_limit` rows in key order, after
+/// the cursor row bound as `@pk0, @pk1, ...` when `after_cursor` is set.
+///
+/// `pk_names` must be in the order of the cursor row's values.
+fn build_snapshot_scan_sql(
+    field_names: &str,
+    quoted_table: &str,
+    pk_names: &[String],
+    after_cursor: bool,
+    scan_limit: u32,
+) -> String {
+    let order_key = pk_names
+        .iter()
+        .map(|name| SpannerExternalTableReader::quote_column(name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if after_cursor {
+        format!(
+            "SELECT {field_names} FROM {quoted_table} WHERE {} ORDER BY {order_key} LIMIT {scan_limit}",
+            build_pk_filter_sql(pk_names)
+        )
+    } else {
+        format!("SELECT {field_names} FROM {quoted_table} ORDER BY {order_key} LIMIT {scan_limit}")
+    }
 }
 
 /// Builds a lexicographic `>` filter for composite PKs, expanded for Spanner
@@ -2749,6 +2760,27 @@ mod tests {
         assert_eq!(
             expr,
             "(`v1` > @pk0) OR (`v1` = @pk0 AND `v2` > @pk1) OR (`v1` = @pk0 AND `v2` = @pk1 AND `v3` > @pk2)"
+        );
+    }
+
+    #[test]
+    fn test_build_snapshot_scan_sql() {
+        // The key order is the declared one, which the cursor row follows, even when it
+        // differs from the column order.
+        let schema = Schema::new(vec![
+            Field::new("a", DataType::Int64),
+            Field::new("b", DataType::Int64),
+        ]);
+        let pk = declared_pk_names(&schema, &[1, 0]);
+        assert_eq!(pk, ["b", "a"]);
+        assert_eq!(
+            build_snapshot_scan_sql("`a`, `b`", "`t`", &pk, false, 10),
+            "SELECT `a`, `b` FROM `t` ORDER BY `b`, `a` LIMIT 10"
+        );
+        assert_eq!(
+            build_snapshot_scan_sql("`a`, `b`", "`t`", &pk, true, 10),
+            "SELECT `a`, `b` FROM `t` WHERE (`b` > @pk0) OR (`b` = @pk0 AND `a` > @pk1) \
+             ORDER BY `b`, `a` LIMIT 10"
         );
     }
 
