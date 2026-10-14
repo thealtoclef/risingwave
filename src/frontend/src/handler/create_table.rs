@@ -1713,8 +1713,8 @@ async fn bind_cdc_table_schema_externally(
 }
 
 /// Reject a CDC table the upstream cannot feed correctly, and tell the user about upstream
-/// filters that drop some changes. See [`ExternalTableImpl::check_cdc_table_upstream`]; only
-/// Spanner CDC is checked.
+/// filters that drop some changes. See [`ExternalTableImpl::check_cdc_table_upstream`] for
+/// which connectors are checked.
 async fn check_cdc_table_upstream(
     cdc_with_options: &WithOptionsSecResolved,
     table_with_options: &WithOptions,

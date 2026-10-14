@@ -66,7 +66,11 @@ pub enum ExternalCdcTableType {
 impl ExternalCdcTableType {
     pub fn from_properties(with_properties: &impl WithPropertiesExt) -> Self {
         let connector = with_properties.get_connector().unwrap_or_default();
-        match connector.as_str() {
+        Self::from_connector(&connector)
+    }
+
+    pub fn from_connector(connector: &str) -> Self {
+        match connector {
             "mysql-cdc" => Self::MySql,
             "postgres-cdc" => Self::Postgres,
             "citus-cdc" => Self::Citus,
@@ -717,14 +721,15 @@ impl ExternalTableImpl {
         }
     }
 
-    /// Check that the upstream can feed the CDC table correctly: it delivers every change to
-    /// `column_names`, the declared primary key matches upstream, and the declared types
-    /// (`column_types`, aligned with `column_names`, and `pk_types`) decode every column and
-    /// keep every key distinct and, for the snapshot split column `split_pk_index`, ordered as
-    /// upstream orders them.
+    /// Check a Spanner CDC table against its upstream. Other connectors return nothing:
+    /// Debezium-based ones are validated by the connector node instead.
     ///
-    /// Returns notices for upstream settings that drop some changes by design. Only Spanner
-    /// CDC is checked; other connectors return nothing.
+    /// The upstream must deliver every change to `column_names`, the declared primary key must
+    /// match upstream, and the declared types (`column_types`, aligned with `column_names`, and
+    /// `pk_types`) must decode every column and keep every key distinct and, for the snapshot
+    /// split column `split_pk_index`, ordered as upstream orders them.
+    ///
+    /// Returns notices for upstream settings that drop some changes by design.
     pub async fn check_cdc_table_upstream(
         config: &ExternalTableConfig,
         column_names: &[String],
@@ -733,20 +738,20 @@ impl ExternalTableImpl {
         pk_types: &[DataType],
         split_pk_index: Option<usize>,
     ) -> ConnectorResult<Vec<String>> {
-        if config.connector != "spanner-cdc" {
-            return Ok(vec![]);
+        match ExternalCdcTableType::from_connector(&config.connector) {
+            ExternalCdcTableType::Spanner => {
+                Box::pin(spanner::check_cdc_table_upstream(
+                    config,
+                    column_names,
+                    column_types,
+                    pk_names,
+                    pk_types,
+                    split_pk_index,
+                ))
+                .await
+            }
+            _ => Ok(vec![]),
         }
-        Box::pin(
-            crate::source::cdc::external::spanner::check_cdc_table_upstream(
-                config,
-                column_names,
-                column_types,
-                pk_names,
-                pk_types,
-                split_pk_index,
-            ),
-        )
-        .await
     }
 
     /// Discover CDC backfill comparison semantics without loading the full table schema.
