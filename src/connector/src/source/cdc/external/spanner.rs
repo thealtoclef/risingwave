@@ -1927,17 +1927,9 @@ fn spanner_cell_to_datum(
         DataType::List(list_type) => {
             spanner_array_to_list(row, list_type.elem(), idx)?.map(ScalarImpl::List)
         }
-
-        // Unknown or unsupported types - try to read as string as fallback
-        _ => {
-            tracing::warn!(
-                "column at index {} has unsupported type {:?} - reading as string fallback",
-                idx,
-                data_type
-            );
-            row.try_get::<Option<String>, _>(idx)?
-                .map(|s| ScalarImpl::Utf8(s.into()))
-        }
+        // Table validation rejects declared types no Spanner column decodes to. A string read
+        // here would put a VARCHAR value into a column of another type.
+        _ => bail!("cannot read a Spanner column as {data_type}"),
     };
     Ok(datum)
 }
